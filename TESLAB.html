@@ -1248,7 +1248,15 @@
      * Se ejecuta al inicio y periódicamente.
      * Las notificaciones mostradas PERSISTEN hasta interacción del usuario.
      */
+
+    // --- START OF CORRECTED checkReminders FUNCTION ---
+    /**
+     * Comprueba los recordatorios, muestra notificaciones NUEVAS si es necesario
+     * y limpia las notificaciones VISIBLES si el recordatorio subyacente ha sido ELIMINADO.
+     * Las notificaciones mostradas PERSISTEN hasta interacción del usuario o eliminación del recordatorio.
+     */
     function checkReminders() {
+        //console.log("Checking reminders..."); // Log para depuración
         let reminders = [];
         try {
             reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
@@ -1265,70 +1273,95 @@
         const currentlyDisplayedNotifications = notificationContainer.querySelectorAll('.reminder-notification');
         const currentlyDisplayedIds = new Set( Array.from(currentlyDisplayedNotifications).map(el => parseInt(el.dataset.id)).filter(id => !isNaN(id)) );
 
-        const remindersDueNow = new Set(); // IDs de los recordatorios que están vencidos ahora
         const validReminders = []; // Para reconstruir el localStorage si hay cambios
+        const finalReminderIds = new Set(); // IDs de los recordatorios válidos que quedan en storage
         let storageNeedsUpdate = false;
         const processedIds = new Set(); // Para detectar duplicados en la carga
 
+        // 1. Validar, limpiar y determinar qué mostrar
         reminders.forEach(reminder => {
-             // Validación básica y de duplicados
+            // Validación básica y de duplicados
             if (!reminder || typeof reminder.id === 'undefined' || !reminder.type || !reminder.time || !reminder.date) {
                 console.warn("Invalid/incomplete reminder found, scheduling for removal.", reminder);
                 storageNeedsUpdate = true;
+                // Asegurarse de eliminar la notificación si existe para este inválido
+                 const invalidNotif = notificationContainer.querySelector(`.reminder-notification[data-id="${reminder?.id}"]`);
+                 if(invalidNotif) invalidNotif.remove();
                 return; // Saltar inválido
             }
             if (processedIds.has(reminder.id)) {
                 console.warn("Duplicate reminder ID found, scheduling for removal:", reminder.id);
                 storageNeedsUpdate = true;
+                 // Asegurarse de eliminar la notificación si existe para este duplicado
+                 const duplicateNotif = notificationContainer.querySelector(`.reminder-notification[data-id="${reminder.id}"]`);
+                 if(duplicateNotif) duplicateNotif.remove();
                 return; // Saltar duplicado
             }
             processedIds.add(reminder.id);
-            validReminders.push(reminder); // Asumir válido por ahora
 
             // Calcular próxima ocurrencia
             let nextOccurrence = null;
             try {
-                nextOccurrence = calculateNextOccurrence(reminder, now); // Usar 'now' como referencia
+                // Usar 'now' como referencia para ver si YA debería haber saltado
+                nextOccurrence = calculateNextOccurrence(reminder, now);
 
                 if (nextOccurrence && nextOccurrence <= now) {
-                    // Está vencido AHORA o ANTES
-                    remindersDueNow.add(reminder.id);
-                    // Mostrar notificación SÓLO SI NO ESTÁ YA MOSTRADA
+                    // Está vencido AHORA o ANTES. Mostrar si no está ya visible.
                     if (!currentlyDisplayedIds.has(reminder.id)) {
                          console.log(`Showing new notification for due reminder ${reminder.id} (type: ${reminder.type})`);
-                         showReminderNotification(reminder);
+                         showReminderNotification(reminder); // Solo muestra si no existe ya
                      }
+                     // Si ya está visible, no hacemos nada aquí, se mantiene.
+                     validReminders.push(reminder); // Es válido y está vencido o visible
+                     finalReminderIds.add(reminder.id);
+
+                } else if (nextOccurrence && nextOccurrence > now) {
+                    // Es futuro, es válido.
+                    validReminders.push(reminder);
+                    finalReminderIds.add(reminder.id);
                 } else {
-                    // No está vencido (es futuro o inválido/pasado simple)
-                    // Si es simple pasado, marcar para eliminar
-                    if (!nextOccurrence && reminder.type === 'simple') {
-                         console.log(`Simple reminder ${reminder.id} is past/invalid. Scheduling for removal.`);
-                         storageNeedsUpdate = true;
-                         validReminders.pop(); // Quitar el último añadido (este)
+                    // No se pudo calcular ocurrencia o es un 'simple' pasado.
+                    // Eliminar solo si es 'simple' y pasado. Otros tipos (weekly/interval)
+                    // sin ocurrencia futura podrían ser un error, los mantenemos por ahora.
+                    if (reminder.type === 'simple') {
+                        console.log(`Simple reminder ${reminder.id} is past/invalid. Scheduling for removal from storage.`);
+                        storageNeedsUpdate = true;
+                        // Eliminar la notificación asociada si existe
+                        const pastSimpleNotif = notificationContainer.querySelector(`.reminder-notification[data-id="${reminder.id}"]`);
+                        if(pastSimpleNotif) pastSimpleNotif.remove();
+                        // No lo añadimos a validReminders
+                    } else {
+                         console.warn(`Could not calculate a valid future occurrence for non-simple reminder ${reminder.id} (type: ${reminder.type}). Keeping it.`, reminder);
+                         validReminders.push(reminder); // Mantenerlo por si acaso
+                         finalReminderIds.add(reminder.id);
                     }
                 }
             } catch (error) {
                 console.error(`Error processing reminder ID ${reminder.id}:`, error, reminder);
-                storageNeedsUpdate = true; // Marcar para posible limpieza
-                 const indexInValid = validReminders.findIndex(r => r.id === reminder.id);
-                 if (indexInValid > -1) validReminders.splice(indexInValid, 1); // Quitar de válidos si dio error
+                storageNeedsUpdate = true; // Marcar para posible limpieza del storage
+                // Eliminar la notificación asociada si existe
+                const errorNotif = notificationContainer.querySelector(`.reminder-notification[data-id="${reminder.id}"]`);
+                if(errorNotif) errorNotif.remove();
+                // No lo añadimos a validReminders
             }
         });
 
-        // Limpiar notificaciones que ya NO están vencidas
+        // 2. Limpiar notificaciones VISIBLES cuyo recordatorio YA NO EXISTE en el storage final
         currentlyDisplayedIds.forEach(displayedId => {
-            if (!remindersDueNow.has(displayedId)) {
-                const oldNotification = notificationContainer.querySelector(`.reminder-notification[data-id="${displayedId}"]`);
-                if (oldNotification) {
-                    console.log(`Removing obsolete notification for ID ${displayedId} (no longer due).`);
-                    oldNotification.remove();
+            if (!finalReminderIds.has(displayedId)) {
+                // Este ID estaba visible, pero ya no está en la lista final de IDs válidos
+                const removedNotification = notificationContainer.querySelector(`.reminder-notification[data-id="${displayedId}"]`);
+                if (removedNotification) {
+                    console.log(`Removing notification for ID ${displayedId} because the reminder no longer exists in valid storage.`);
+                    removedNotification.remove();
                 }
             }
         });
 
-        // Actualizar localStorage si hubo limpieza de inválidos/duplicados/simples pasados
+
+        // 3. Actualizar localStorage SI HUBO CAMBIOS (inválidos, duplicados, simples pasados eliminados)
         if (storageNeedsUpdate) {
-            console.log("Updating localStorage for reminders due to invalid/duplicate/past entries.");
+            console.log("Updating localStorage with valid reminders:", validReminders);
             try {
                 localStorage.setItem('reminders', JSON.stringify(validReminders));
                 updateReminderCount(); // Actualizar contador después de limpiar
@@ -1339,13 +1372,16 @@
             }
         }
 
-        // Reajustar posiciones verticales de las notificaciones restantes
+        // 4. Reajustar posiciones verticales de las notificaciones restantes (sin cambios aquí)
         const finalNotifications = notificationContainer.querySelectorAll('.reminder-notification');
         finalNotifications.forEach((notif, index) => {
             const newOffset = index * 20;
             notif.style.top = `calc(45% + ${newOffset}px)`;
         });
+
     }
+    // --- END OF CORRECTED checkReminders FUNCTION ---
+
 
     function calculatePostponedDateTime(mins) { const now = new Date(); const postponedDate = new Date(now.getTime() + mins * 60000); const year = postponedDate.getFullYear(); const month = (postponedDate.getMonth() + 1).toString().padStart(2, '0'); const day = postponedDate.getDate().toString().padStart(2, '0'); const hours = postponedDate.getHours().toString().padStart(2, '0'); const minutes = postponedDate.getMinutes().toString().padStart(2, '0'); const newDateISO = `${year}-${month}-${day}`; const newTime = `${hours}:${minutes}`; return { newDateISO: newDateISO, newTime: newTime }; }
 
