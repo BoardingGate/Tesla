@@ -1,3 +1,4 @@
+```html
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -611,6 +612,7 @@
     let touchStartX = 0; let touchStartY = 0; let currentTouchTarget = null; // Elemento bajo el dedo
     let isPasswordActive = false; let storedPin = null;
     let spaceAddedFor24s = false; // Flag para el auto-espacio del recordatorio
+    let reminderCheckIntervalId = null; // ID del intervalo de checkReminders
 
     // --- Core Functions ---
     async function loadNotices() { try { const r = await fetch('https://boardinggate.github.io/Tesla/avisos.txt', { cache: 'no-cache' }); if (!r.ok) throw new Error('Fetch failed'); const txt = await r.text(); notices = txt.split('\n').map(l => l.trim()).filter(l => l.length > 0); if (notices.length === 0) notices = ['No hay avisos.']; } catch (e) { console.error('Avisos load err:', e); notices = ['Error carga avisos.']; } updateNotice(); }
@@ -994,11 +996,14 @@
 
     // --- MODIFIED JS FUNCTION START ---
     function showReminderNotification(reminder) {
+        // Comprobación: No mostrar si ya existe una notificación para este ID
         const existing = document.querySelector(`.reminder-notification[data-id="${reminder.id}"]`);
         if (existing) {
-            console.log(`Notification for ${reminder.id} already exists, skipping.`);
+            console.log(`Notification for ${reminder.id} already displayed, skipping show.`);
             return;
         }
+
+        console.log(`Showing notification for ${reminder.id} (Type: ${reminder.type})`);
         const n = document.createElement('div');
         n.className = 'reminder-notification';
         n.setAttribute('data-id', reminder.id);
@@ -1006,11 +1011,11 @@
 
         const notificationContainer = document.getElementById('reminder-notifications');
         const existingNotifications = notificationContainer.querySelectorAll('.reminder-notification');
-        const verticalOffset = existingNotifications.length * 20; // Mantenemos el apilamiento vertical
+        const verticalOffset = existingNotifications.length * 20; // Apilamiento vertical
         n.style.top = `calc(45% + ${verticalOffset}px)`; // Posición vertical inicial
 
         // Construcción de los detalles
-        let detailsHtml = ''; // Usamos HTML directamente
+        let detailsHtml = '';
         if (reminder.time) detailsHtml += `<p class="reminder-details">Hora: ${reminder.time}</p>`;
         if (reminder.date) detailsHtml += `<p class="reminder-details">Fecha: ${formatDateToDDMMMYY(reminder.date)}</p>`;
         if (reminder.type === 'weekly' && reminder.repeatDays.length > 0) detailsHtml += `<p class="reminder-details">Repite: ${reminder.repeatDays.map(d => ['Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb'][d]).join(', ')}</p>`;
@@ -1019,7 +1024,6 @@
         const isCyclic = reminder.type === 'weekly' || reminder.type === 'interval';
         const cyclicCancelButtonHtml = isCyclic ? `<button class="cancel-cyclic">Anular Ciclo</button>` : '';
 
-        // MODIFICADO: Envolver texto y detalles en el div scrollable
         n.innerHTML = `
             <div class="reminder-content-scrollable">
                 <p class="reminder-text">${reminder.text}</p>
@@ -1034,13 +1038,14 @@
 
         notificationContainer.appendChild(n);
 
-        const cancelButton = n.querySelector('.cancel');
-        const cancelCyclicButton = n.querySelector('.cancel-cyclic');
-
-        // Función para limpiar y rechequear (sin cambios aquí)
-        const removeNotificationAndRecheck = () => {
-            if (n.parentNode) n.parentNode.removeChild(n);
-            sessionStorage.removeItem(`reminder_last_notified_${reminder.id}`);
+        // Función para limpiar y rechequear (se llama al cerrar la notificación)
+        const removeNotificationAndRecheck = (reminderId) => {
+            const notificationToRemove = notificationContainer.querySelector(`.reminder-notification[data-id="${reminderId}"]`);
+            if (notificationToRemove && notificationToRemove.parentNode) {
+                 notificationToRemove.parentNode.removeChild(notificationToRemove);
+                 console.log(`Removed notification visually for ID ${reminderId}`);
+            }
+            // No limpiar sessionStorage aquí, se hace en checkReminders si ya no está pendiente
             updateReminderCount();
             updateButtonStyles();
             // Reajustar posiciones de las notificaciones restantes
@@ -1049,58 +1054,98 @@
                 const newOffset = index * 20;
                 notif.style.top = `calc(45% + ${newOffset}px)`;
             });
-            checkReminders(); // Volver a comprobar por si acaso
+            // checkReminders(); // <-- IMPORTANTE: No llamar a checkReminders aquí directamente para evitar bucles o eliminaciones prematuras. El intervalo principal lo hará.
         };
 
-        // Lógica de los botones (sin cambios aquí)
+        // Lógica de los botones
+        const cancelButton = n.querySelector('.cancel');
         cancelButton.addEventListener('click', () => {
+             console.log(`User clicked 'Visto/Próximo' for ${reminder.id}`);
              let rems = JSON.parse(localStorage.getItem('reminders') || '[]');
              const index = rems.findIndex(r => r.id === reminder.id);
-             if (index === -1) { console.warn(`Reminder ${reminder.id} not found in storage during cancel/reschedule.`); showToast('Error: Recordatorio no encontrado.', 'error'); removeNotificationAndRecheck(); return; }
+             if (index === -1) {
+                 console.warn(`Reminder ${reminder.id} not found in storage during cancel/reschedule.`);
+                 showToast('Error: Recordatorio no encontrado.', 'error');
+                 removeNotificationAndRecheck(reminder.id);
+                 return;
+             }
              const currentReminder = rems[index];
              if (currentReminder.type === 'weekly' || currentReminder.type === 'interval') {
-                 let referenceDateForNext = new Date();
-                 try { const reminderDateTime = new Date(currentReminder.date + 'T' + (currentReminder.time || '00:01') + ':00'); if (!isNaN(reminderDateTime) && reminderDateTime <= referenceDateForNext) { referenceDateForNext = new Date(reminderDateTime.getTime() + 60000); } } catch (e) { console.warn(`Error parsing reminder date/time (${currentReminder.date} ${currentReminder.time}) for reference:`, e); }
+                 let referenceDateForNext = new Date(); // Usar ahora como referencia para calcular el *siguiente*
+                  try { // Asegurarse que la fecha de referencia sea posterior a la ocurrencia actual
+                     const reminderDateTime = new Date(currentReminder.date + 'T' + (currentReminder.time || '00:01') + ':00');
+                     if (!isNaN(reminderDateTime) && reminderDateTime >= referenceDateForNext) {
+                        referenceDateForNext = new Date(reminderDateTime.getTime() + 60000); // +1 minuto para asegurar que busca la *siguiente*
+                     }
+                 } catch (e) { console.warn(`Error parsing reminder date/time (${currentReminder.date} ${currentReminder.time}) for reference:`, e); }
+
                  const nextOcc = calculateNextOccurrence(currentReminder, referenceDateForNext);
-                 if (nextOcc) { const nextDateISO = `${nextOcc.getFullYear()}-${(nextOcc.getMonth() + 1).toString().padStart(2, '0')}-${nextOcc.getDate().toString().padStart(2, '0')}`; rems[index].date = nextDateISO; localStorage.setItem('reminders', JSON.stringify(rems)); showToast('Recordatorio actualizado al próximo periodo', 'info'); console.log(`Cyclic reminder ${reminder.id} updated. Next occurrence date: ${nextDateISO}`);
-                 } else { console.error(`Could not calculate next occurrence for cyclic reminder ${reminder.id}. Removing it.`); rems = rems.filter(r => r.id !== reminder.id); localStorage.setItem('reminders', JSON.stringify(rems)); showToast('Error al calcular siguiente periodo. Recordatorio eliminado.', 'error'); }
-             } else { rems = rems.filter(r => r.id !== reminder.id); localStorage.setItem('reminders', JSON.stringify(rems)); showToast('Recordatorio borrado', 'info'); }
-             removeNotificationAndRecheck();
+                 if (nextOcc) {
+                     const nextDateISO = `${nextOcc.getFullYear()}-${(nextOcc.getMonth() + 1).toString().padStart(2, '0')}-${nextOcc.getDate().toString().padStart(2, '0')}`;
+                     rems[index].date = nextDateISO;
+                     localStorage.setItem('reminders', JSON.stringify(rems));
+                     showToast('Recordatorio actualizado al próximo periodo', 'info');
+                     console.log(`Cyclic reminder ${reminder.id} updated. Next occurrence date: ${nextDateISO}`);
+                 } else {
+                     console.error(`Could not calculate next occurrence for cyclic reminder ${reminder.id}. Removing it.`);
+                     rems = rems.filter(r => r.id !== reminder.id);
+                     localStorage.setItem('reminders', JSON.stringify(rems));
+                     showToast('Error al calcular siguiente periodo. Recordatorio eliminado.', 'error');
+                 }
+             } else {
+                 // Si no es cíclico, simplemente se elimina
+                 rems = rems.filter(r => r.id !== reminder.id);
+                 localStorage.setItem('reminders', JSON.stringify(rems));
+                 showToast('Recordatorio borrado', 'info');
+                 console.log(`Simple reminder ${reminder.id} marked as seen and removed.`);
+             }
+             // Limpiar la marca de notificación de sessionStorage PARA ESTA OCURRENCIA específica
+             // Se hará automáticamente en el próximo checkReminders si la fecha se actualizó o el recordatorio se borró.
+             // sessionStorage.removeItem(`reminder_last_notified_${reminder.id}`); // Ya no es necesario aquí explícitamente
+
+             removeNotificationAndRecheck(reminder.id); // Quita la notificación visual
         });
 
+        const cancelCyclicButton = n.querySelector('.cancel-cyclic');
         if (cancelCyclicButton) {
             cancelCyclicButton.addEventListener('click', () => {
+                console.log(`User clicked 'Anular Ciclo' for ${reminder.id}`);
                 let rems = JSON.parse(localStorage.getItem('reminders') || '[]');
                 rems = rems.filter(r => r.id !== reminder.id);
                 localStorage.setItem('reminders', JSON.stringify(rems));
                 showToast('Evento cíclico anulado permanentemente', 'success');
-                removeNotificationAndRecheck();
+                // sessionStorage.removeItem(`reminder_last_notified_${reminder.id}`); // Limpiar por si acaso
+                removeNotificationAndRecheck(reminder.id);
             });
         }
 
         n.querySelector('.modify').addEventListener('click', () => {
+            console.log(`User clicked 'Modificar' for ${reminder.id}`);
             let remindersFromStorage = JSON.parse(localStorage.getItem('reminders') || '[]');
             const reminderToModify = remindersFromStorage.find(r => r.id === reminder.id);
             if (reminderToModify) {
-                removeNotificationAndRecheck(); // Quita la notificación actual antes de abrir el modal de edición
+                // sessionStorage.removeItem(`reminder_last_notified_${reminder.id}`); // Limpiar antes de modificar
+                removeNotificationAndRecheck(reminder.id); // Quita la notificación actual ANTES de abrir el modal de edición
                 showReminderModal(reminderToModify);
             } else {
                 console.error("Reminder to modify not found:", reminder.id);
                 showToast("Error: no se pudo encontrar el recordatorio para modificar.", "error");
-                removeNotificationAndRecheck(); // Quita la notificación aunque haya error
+                removeNotificationAndRecheck(reminder.id); // Quita la notificación aunque haya error
             }
         });
 
         n.querySelector('.postpone').addEventListener('click', () => {
+             console.log(`User clicked 'Posponer' for ${reminder.id}`);
             let remindersFromStorage = JSON.parse(localStorage.getItem('reminders') || '[]');
             const reminderToPostpone = remindersFromStorage.find(r => r.id === reminder.id);
             if (reminderToPostpone) {
-                // No necesitamos quitar la notificación aquí, el modal de posponer se superpone
+                // No quitamos la notificación aquí, el modal de posponer se superpone.
+                // El modal de posponer se encargará de quitarla si se pospone.
                 showPostponeOptionsModal(reminderToPostpone, 'notification');
             } else {
                 console.error("Reminder to postpone not found:", reminder.id);
                 showToast("Error: no se pudo encontrar el recordatorio para posponer.", "error");
-                removeNotificationAndRecheck(); // Quita la notificación si hay error
+                removeNotificationAndRecheck(reminder.id); // Quita la notificación si hay error
             }
         });
     }
@@ -1110,29 +1155,32 @@
     const nA = calculateNextOccurrence(a, new Date(0)); const nB = calculateNextOccurrence(b, new Date(0)); if (nA && nB) { const timeDiff = nA.getTime() - nB.getTime(); if (timeDiff !== 0) return timeDiff; } else if (nA) { return -1; // Los que tienen fecha calculable van primero
     } else if (nB) { return 1; } // Los que no, al final
     // Desempate por tipo y fecha de creación si las fechas son iguales o no calculables
-    const typeOrder = { 'simple': 1, 'hourly': 2, 'daily': 3, 'weekly': 4, 'interval': 5 }; const typeDiff = (typeOrder[a.type] ?? 99) - (typeOrder[b.type] ?? 99); if (typeDiff !== 0) return typeDiff; const createdAtA = a.createdAt ? new Date(a.createdAt).getTime() : 0; const createdAtB = b.createdAt ? new Date(b.createdAt).getTime() : 0; return createdAtA - createdAtB; }); const existingModal = document.querySelector('.reminder-table-modal'); if (existingModal) { if (existingModal.autoCloseInterval) clearInterval(existingModal.autoCloseInterval); if (existingModal.parentNode) existingModal.parentNode.removeChild(existingModal); } const modal = document.createElement('div'); modal.className = 'reminder-table-modal'; modal.setAttribute('aria-label', 'Tabla recordatorios'); modal.innerHTML = `<h2 style="text-align:center;margin-bottom:1rem;font-size:1.5rem;color:#333;">Recordatorios</h2><div class="top-button-container"><button type="button" id="close-reminders-top">SALIR <span class="button-countdown"></span></button></div><table><thead><tr><th style="width:15%;">Acciones</th><th>Texto</th><th style="width:10%;">Hora</th><th style="width:10%;">Fecha Prox.</th><th style="width:15%;">Días Rep.</th><th style="width:10%;">Cada x días</th><th style="width:10%;">Creado</th></tr></thead><tbody>${reminders.length === 0 ? '<tr><td colspan="7" style="text-align:center;padding:1rem;">No hay recordatorios.</td></tr>' : reminders.map(r => `<tr data-id="${r.id}"><td><button class="delete" data-id="${r.id}" title="Borrar">Visto</button><button class="postpone" data-id="${r.id}" title="Posponer">Posponer</button></td><td class="text-column" title="Modificar">${r.text}</td><td>${r.time || '-'}</td><td class="date-column">${formatDateToDDMMMYY(r.date)}</td><td>${r.type === 'weekly' && r.repeatDays.length > 0 ? r.repeatDays.map(d => ['Dom','Lun','Mar','Mié','Jue','Vie','Sáb'][d]).join(', ') : '-'}</td><td>${r.type === 'interval' ? r.intervalDays || '-' : '-'}</td><td class="date-column">${r.createdAt ? formatDateToDDMMMYY(r.createdAt.split('T')[0]) : '-'}</td></tr>`).join('')}</tbody></table><div class="button-group flex justify-start"><button type="button" id="close-reminders">SALIR <span class="button-countdown"></span></button></div>`; document.body.appendChild(modal); let count = 60; const countdownSpans = modal.querySelectorAll('.button-countdown'); countdownSpans.forEach(span => span.textContent = `(${count})`); const closeClean = () => { clearInterval(modal.autoCloseInterval); modal.autoCloseInterval = null; if (modal.parentNode) document.body.removeChild(modal); if (fromReminderModal) { fromReminderModal = false; showReminderModal(); } }; modal.autoCloseInterval = setInterval(() => { count--; countdownSpans.forEach(span => span.textContent = `(${count})`); if (count <= 0) { closeClean(); } }, 1000); const resetTimer = () => { if (!modal.autoCloseInterval) return; clearInterval(modal.autoCloseInterval); count = 60; countdownSpans.forEach(span => span.textContent = `(${count})`); modal.autoCloseInterval = setInterval(() => { count--; countdownSpans.forEach(span => span.textContent = `(${count})`); if (count <= 0) { closeClean(); } }, 1000); }; modal.addEventListener('click', resetTimer); modal.addEventListener('touchstart', resetTimer, { passive: true }); modal.addEventListener('input', resetTimer); modal.querySelectorAll('.delete').forEach(button => { button.addEventListener('click', (e) => { e.stopPropagation(); const id = parseInt(button.dataset.id); if (isNaN(id)) return; const notification = document.querySelector(`.reminder-notification[data-id="${id}"]`); if (notification) notification.remove(); let rems = JSON.parse(localStorage.getItem('reminders') || '[]'); const reminderIndex = rems.findIndex(r => r.id === id); if (reminderIndex > -1) { const currentReminder = rems[reminderIndex]; // Si es cíclico, recalcular y guardar siguiente; si no, borrar
-    if (currentReminder.type === 'weekly' || currentReminder.type === 'interval') { let referenceDateForNext = new Date(); try { const reminderDateTime = new Date(currentReminder.date + 'T' + (currentReminder.time || '00:01') + ':00'); if (!isNaN(reminderDateTime) && reminderDateTime <= referenceDateForNext) { referenceDateForNext = new Date(reminderDateTime.getTime() + 60000); } } catch (err) { console.warn("Error parsing date for next calc:", err); } const nextOcc = calculateNextOccurrence(currentReminder, referenceDateForNext); if (nextOcc) { const nextDateISO = `${nextOcc.getFullYear()}-${(nextOcc.getMonth() + 1).toString().padStart(2, '0')}-${nextOcc.getDate().toString().padStart(2, '0')}`; rems[reminderIndex].date = nextDateISO; localStorage.setItem('reminders', JSON.stringify(rems)); showToast('Recordatorio actualizado al próximo periodo', 'info'); } else { rems = rems.filter(r => r.id !== id); localStorage.setItem('reminders', JSON.stringify(rems)); showToast('Error al calcular siguiente periodo. Recordatorio eliminado.', 'error'); } } else { rems = rems.filter(r => r.id !== id); localStorage.setItem('reminders', JSON.stringify(rems)); showToast('Recordatorio borrado', 'info'); } sessionStorage.removeItem(`reminder_last_notified_${id}`); closeClean(); updateReminderCount(); updateButtonStyles(); showAllReminders(); checkReminders(); } else { showToast('Error: Recordatorio no encontrado para borrar/actualizar.', 'error'); } }); }); modal.querySelectorAll('.postpone').forEach(button => { button.addEventListener('click', (e) => { e.stopPropagation(); const id = parseInt(button.dataset.id); if (isNaN(id)) return; const reminderToPostpone = reminders.find(r => r.id === id); if (reminderToPostpone) { closeClean(); showPostponeOptionsModal(reminderToPostpone, 'table'); } else { console.error("Reminder not found for postpone:", id); showToast('Error: Recordatorio no encontrado.', 'error'); } }); }); modal.querySelector('#close-reminders').addEventListener('click', closeClean); modal.querySelector('#close-reminders-top').addEventListener('click', closeClean); const tableBody = modal.querySelector('tbody'); if (tableBody) { tableBody.addEventListener('click', (e) => { if (e.target.closest('td:first-child button')) { return; } const row = e.target.closest('tr[data-id]'); if (row?.dataset.id) { const id = parseInt(row.dataset.id); if (isNaN(id)) return; const reminderToModify = reminders.find(r => r.id === id); if (reminderToModify) { closeClean(); showReminderModal(reminderToModify); sessionStorage.removeItem(`reminder_last_notified_${id}`); } else { console.error("Reminder not found for modify:", id); showToast('Error: Recordatorio no encontrado.', 'error'); } } }); } }
+    const typeOrder = { 'simple': 1, 'hourly': 2, 'daily': 3, 'weekly': 4, 'interval': 5 }; const typeDiff = (typeOrder[a.type] ?? 99) - (typeOrder[b.type] ?? 99); if (typeDiff !== 0) return typeDiff; const createdAtA = a.createdAt ? new Date(a.createdAt).getTime() : 0; const createdAtB = b.createdAt ? new Date(b.createdAt).getTime() : 0; return createdAtA - createdAtB; }); const existingModal = document.querySelector('.reminder-table-modal'); if (existingModal) { if (existingModal.autoCloseInterval) clearInterval(existingModal.autoCloseInterval); if (existingModal.parentNode) existingModal.parentNode.removeChild(existingModal); } const modal = document.createElement('div'); modal.className = 'reminder-table-modal'; modal.setAttribute('aria-label', 'Tabla recordatorios'); modal.innerHTML = `<h2 style="text-align:center;margin-bottom:1rem;font-size:1.5rem;color:#333;">Recordatorios</h2><div class="top-button-container"><button type="button" id="close-reminders-top">SALIR <span class="button-countdown"></span></button></div><table><thead><tr><th style="width:15%;">Acciones</th><th>Texto</th><th style="width:10%;">Hora</th><th style="width:10%;">Fecha Prox.</th><th style="width:15%;">Días Rep.</th><th style="width:10%;">Cada x días</th><th style="width:10%;">Creado</th></tr></thead><tbody>${reminders.length === 0 ? '<tr><td colspan="7" style="text-align:center;padding:1rem;">No hay recordatorios.</td></tr>' : reminders.map(r => `<tr data-id="${r.id}"><td><button class="delete" data-id="${r.id}" title="Borrar">Visto</button><button class="postpone" data-id="${r.id}" title="Posponer">Posponer</button></td><td class="text-column" title="Modificar">${r.text}</td><td>${r.time || '-'}</td><td class="date-column">${formatDateToDDMMMYY(r.date)}</td><td>${r.type === 'weekly' && r.repeatDays.length > 0 ? r.repeatDays.map(d => ['Dom','Lun','Mar','Mié','Jue','Vie','Sáb'][d]).join(', ') : '-'}</td><td>${r.type === 'interval' ? r.intervalDays || '-' : '-'}</td><td class="date-column">${r.createdAt ? formatDateToDDMMMYY(r.createdAt.split('T')[0]) : '-'}</td></tr>`).join('')}</tbody></table><div class="button-group flex justify-start"><button type="button" id="close-reminders">SALIR <span class="button-countdown"></span></button></div>`; document.body.appendChild(modal); let count = 60; const countdownSpans = modal.querySelectorAll('.button-countdown'); countdownSpans.forEach(span => span.textContent = `(${count})`); const closeClean = () => { clearInterval(modal.autoCloseInterval); modal.autoCloseInterval = null; if (modal.parentNode) document.body.removeChild(modal); if (fromReminderModal) { fromReminderModal = false; showReminderModal(); } }; modal.autoCloseInterval = setInterval(() => { count--; countdownSpans.forEach(span => span.textContent = `(${count})`); if (count <= 0) { closeClean(); } }, 1000); const resetTimer = () => { if (!modal.autoCloseInterval) return; clearInterval(modal.autoCloseInterval); count = 60; countdownSpans.forEach(span => span.textContent = `(${count})`); modal.autoCloseInterval = setInterval(() => { count--; countdownSpans.forEach(span => span.textContent = `(${count})`); if (count <= 0) { closeClean(); } }, 1000); }; modal.addEventListener('click', resetTimer); modal.addEventListener('touchstart', resetTimer, { passive: true }); modal.addEventListener('input', resetTimer); modal.querySelectorAll('.delete').forEach(button => { button.addEventListener('click', (e) => { e.stopPropagation(); const id = parseInt(button.dataset.id); if (isNaN(id)) return; const notification = document.querySelector(`.reminder-notification[data-id="${id}"]`); if (notification) notification.remove(); // Quitar notificación si estaba visible
+    let rems = JSON.parse(localStorage.getItem('reminders') || '[]'); const reminderIndex = rems.findIndex(r => r.id === id); if (reminderIndex > -1) { const currentReminder = rems[reminderIndex]; // Si es cíclico, recalcular y guardar siguiente; si no, borrar
+    if (currentReminder.type === 'weekly' || currentReminder.type === 'interval') { let referenceDateForNext = new Date(); try { const reminderDateTime = new Date(currentReminder.date + 'T' + (currentReminder.time || '00:01') + ':00'); if (!isNaN(reminderDateTime) && reminderDateTime >= referenceDateForNext) { referenceDateForNext = new Date(reminderDateTime.getTime() + 60000); } } catch (err) { console.warn("Error parsing date for next calc:", err); } const nextOcc = calculateNextOccurrence(currentReminder, referenceDateForNext); if (nextOcc) { const nextDateISO = `${nextOcc.getFullYear()}-${(nextOcc.getMonth() + 1).toString().padStart(2, '0')}-${nextOcc.getDate().toString().padStart(2, '0')}`; rems[reminderIndex].date = nextDateISO; localStorage.setItem('reminders', JSON.stringify(rems)); showToast('Recordatorio actualizado al próximo periodo', 'info'); } else { rems = rems.filter(r => r.id !== id); localStorage.setItem('reminders', JSON.stringify(rems)); showToast('Error al calcular siguiente periodo. Recordatorio eliminado.', 'error'); } } else { rems = rems.filter(r => r.id !== id); localStorage.setItem('reminders', JSON.stringify(rems)); showToast('Recordatorio borrado', 'info'); } sessionStorage.removeItem(`reminder_last_notified_${id}`); // Limpiar marca notificación
+    closeClean(); updateReminderCount(); updateButtonStyles(); showAllReminders(); // Refrescar tabla
+    // checkReminders(); // No llamar aquí, el intervalo lo hará
+    } else { showToast('Error: Recordatorio no encontrado para borrar/actualizar.', 'error'); } }); }); modal.querySelectorAll('.postpone').forEach(button => { button.addEventListener('click', (e) => { e.stopPropagation(); const id = parseInt(button.dataset.id); if (isNaN(id)) return; const reminderToPostpone = reminders.find(r => r.id === id); if (reminderToPostpone) { closeClean(); showPostponeOptionsModal(reminderToPostpone, 'table'); } else { console.error("Reminder not found for postpone:", id); showToast('Error: Recordatorio no encontrado.', 'error'); } }); }); modal.querySelector('#close-reminders').addEventListener('click', closeClean); modal.querySelector('#close-reminders-top').addEventListener('click', closeClean); const tableBody = modal.querySelector('tbody'); if (tableBody) { tableBody.addEventListener('click', (e) => { if (e.target.closest('td:first-child button')) { return; } const row = e.target.closest('tr[data-id]'); if (row?.dataset.id) { const id = parseInt(row.dataset.id); if (isNaN(id)) return; const reminderToModify = reminders.find(r => r.id === id); if (reminderToModify) { const notification = document.querySelector(`.reminder-notification[data-id="${id}"]`); if (notification) notification.remove(); // Quitar notificación si estaba visible
+    closeClean(); showReminderModal(reminderToModify); sessionStorage.removeItem(`reminder_last_notified_${id}`); // Limpiar marca notificación
+    } else { console.error("Reminder not found for modify:", id); showToast('Error: Recordatorio no encontrado.', 'error'); } } }); } }
     function updateReminderCount() { const rems = JSON.parse(localStorage.getItem('reminders') || '[]'); const count = rems.length; const globe = document.getElementById('reminder-count-globe'); if (globe) { globe.textContent = count > 0 ? count : ''; globe.style.display = count > 0 ? 'block' : 'none'; } const remBtn = document.getElementById('reminder-button'); if (remBtn) { const existingSpan = remBtn.querySelector('.reminder-count'); if (count > 0) { if (existingSpan) { existingSpan.textContent = count; } else { const newSpan = document.createElement('span'); newSpan.className = 'reminder-count'; newSpan.textContent = count; remBtn.appendChild(newSpan); } } else { if (existingSpan) { existingSpan.remove(); } } } }
-    // MODIFICADO: Lógica `calculateNextOccurrence` revisada
+
+    // --- MODIFIED: calculateNextOccurrence - Revisada para robustez ---
     function calculateNextOccurrence(reminder, referenceDate) {
-        if (!reminder || !reminder.type || !reminder.time || !reminder.date) {
-            //console.warn("Invalid reminder data for calculation:", reminder);
-            // Si falta fecha u hora (y no es un timer simple creado por texto tipo "en 5 min"), no se puede calcular
+        if (!reminder || typeof reminder.id === 'undefined' || !reminder.type || !reminder.time || !reminder.date) {
+            // console.warn("Invalid reminder data for calculation:", reminder);
             if (reminder && reminder.type === 'simple' && reminder.date && reminder.time) {
-                 // Para 'simple' (que puede venir de un timer), devolver la fecha/hora fija si existe
-                try {
+                try { // Para 'simple', devolver la fecha/hora fija si existe y es válida
                     const [y, m, d] = reminder.date.split('-').map(Number);
                     const [h, min] = reminder.time.split(':').map(Number);
                     let occurrenceDate = new Date();
                     occurrenceDate.setFullYear(y, m - 1, d);
                     occurrenceDate.setHours(h, min, 0, 0);
+                    if (isNaN(occurrenceDate.getTime())) return null; // Fecha inválida
                     return occurrenceDate;
-                } catch (e) {
-                   // console.error("Error parsing simple reminder date/time:", reminder, e);
-                    return null;
-                }
+                } catch (e) { console.error("Error parsing simple reminder date/time:", reminder, e); return null; }
             }
-            return null;
+            return null; // Datos insuficientes o inválidos
         }
 
         let refDate = referenceDate instanceof Date && !isNaN(referenceDate) ? new Date(referenceDate) : new Date();
@@ -1140,59 +1188,61 @@
 
         try {
             const [h, min] = reminder.time.split(':').map(Number);
-            const [initialYear, initialMonth, initialDay] = reminder.date.split('-').map(Number);
+            if (isNaN(h) || isNaN(min) || h < 0 || h > 23 || min < 0 || min > 59) {
+                console.error(`Invalid time in reminder ${reminder.id}: ${reminder.time}`); return null;
+            }
 
+            const [initialYear, initialMonth, initialDay] = reminder.date.split('-').map(Number);
+             if (isNaN(initialYear) || isNaN(initialMonth) || isNaN(initialDay)) {
+                 console.error(`Invalid date in reminder ${reminder.id}: ${reminder.date}`); return null;
+             }
             let baseDate = new Date();
             baseDate.setFullYear(initialYear, initialMonth - 1, initialDay);
-            baseDate.setHours(h, min, 0, 0); // Establecer fecha y hora base del recordatorio
+            baseDate.setHours(h, min, 0, 0); // Fecha y hora base guardadas
+
+            if (isNaN(baseDate.getTime())) {
+                 console.error(`Could not create valid baseDate for reminder ${reminder.id}: ${reminder.date} ${reminder.time}`); return null;
+            }
 
             switch (reminder.type) {
-                case 'simple': // Tipo simple (timer o fecha única pasada)
-                case 'daily': // Repite diariamente (pero la fecha base puede estar en el pasado)
-                case 'hourly': // Similar a daily para esta lógica, saltará si la hora es futura hoy.
-                    if (baseDate >= refDate) {
-                        return baseDate; // Si la fecha/hora base aún no ha pasado, esa es la próxima ocurrencia
-                    } else if (reminder.type === 'daily' || reminder.type === 'hourly') {
-                         // Si ya pasó hoy, para daily/hourly, calcular la de mañana
-                         baseDate.setDate(baseDate.getDate() + 1);
-                         baseDate.setHours(h,min,0,0); // Asegurar la hora correcta para mañana
-                         return baseDate;
+                case 'simple':
+                case 'daily':
+                case 'hourly': // Tratar hourly como daily para buscar ocurrencia
+                    let checkDate = new Date(baseDate); // Empezar con la fecha/hora guardada
+                    if (checkDate >= refDate) {
+                        return checkDate; // Si la guardada es futura o ahora, es la próxima
+                    } else {
+                         // Si la fecha/hora guardada ya pasó
+                         if (reminder.type === 'simple') return null; // Simple pasado no tiene próxima
+
+                         // Para daily/hourly, calcular para el mismo tiempo pero mañana
+                         let tomorrow = new Date(refDate);
+                         tomorrow.setDate(tomorrow.getDate() + 1);
+                         tomorrow.setHours(h, min, 0, 0);
+                         return tomorrow;
                     }
-                    // Si es 'simple' y ya pasó, no hay próxima ocurrencia
-                    return null;
 
                 case 'weekly':
                     if (!reminder.repeatDays || reminder.repeatDays.length === 0) return null; // Necesita días
+                    let searchDateWeekly = new Date(refDate); // Empezar desde la fecha/hora de referencia
+                    searchDateWeekly.setHours(h, min, 0, 0); // Fijar la hora deseada
 
-                    let searchDateWeekly = new Date(baseDate); // Empezar desde la fecha base
-
-                    // Si la hora base ya pasó HOY O la fecha base es anterior a la referencia,
-                    // empezar a buscar desde MAÑANA a la hora correcta.
+                    // Si la hora deseada ya pasó hoy, empezar a buscar desde mañana
                     if (searchDateWeekly < refDate) {
-                       searchDateWeekly = new Date(refDate); // Empezar búsqueda desde ahora
+                         searchDateWeekly.setDate(searchDateWeekly.getDate() + 1);
+                         searchDateWeekly.setHours(h, min, 0, 0);
                     }
-                     searchDateWeekly.setHours(h, min, 0, 0); // Fijar hora para la búsqueda
-                     if(searchDateWeekly < refDate) { // Si la hora fijada ya pasó hoy
-                         searchDateWeekly.setDate(searchDateWeekly.getDate() + 1); // Empezar desde mañana
-                         searchDateWeekly.setHours(h, min, 0, 0); // Hora correcta mañana
-                     }
-
 
                     for (let i = 0; i < 7; i++) { // Buscar en los próximos 7 días
                         const currentDayOfWeek = searchDateWeekly.getDay();
                         if (reminder.repeatDays.includes(currentDayOfWeek)) {
-                           // Encontrado el próximo día válido
-                           // Asegurarse de que la hora no haya pasado ya si es hoy
-                           if (searchDateWeekly >= refDate) {
-                               return searchDateWeekly;
-                           }
-                           // Si es hoy pero la hora ya pasó, seguir buscando (se incrementará la fecha en el loop)
+                           return searchDateWeekly; // Encontrado el próximo día válido
                         }
                         searchDateWeekly.setDate(searchDateWeekly.getDate() + 1);
-                        searchDateWeekly.setHours(h, min, 0, 0); // Resetear hora para el nuevo día
+                         searchDateWeekly.setHours(h, min, 0, 0); // Asegurar hora para el siguiente día
                     }
                     console.warn(`Weekly calculation couldn't find next occurrence within 7 days for ID ${reminder.id}`);
-                    return null; // No debería pasar si hay días de repetición
+                    return null; // No debería pasar
 
                 case 'interval':
                     if (!reminder.intervalDays || reminder.intervalDays <= 0) return null;
@@ -1201,9 +1251,9 @@
 
                     // Avanzar en intervalos hasta encontrar una fecha >= referencia
                     let safe = 0;
-                    while (currentIntervalDate < refDate && safe < 1000) { // Límite de seguridad grande
+                    while (currentIntervalDate < refDate && safe < 1000) {
                         currentIntervalDate.setDate(currentIntervalDate.getDate() + reminder.intervalDays);
-                        // No es necesario resetear hora aquí, ya está en la fecha base
+                        currentIntervalDate.setHours(h, min, 0, 0); // Asegurar hora correcta
                         safe++;
                     }
 
@@ -1222,7 +1272,8 @@
             return null;
         }
     }
-    // MODIFICADO: Lógica `checkReminders` revisada
+
+    // --- MODIFIED: checkReminders - Logic refined for persistence and load check ---
     function checkReminders() {
         let reminders = [];
         try {
@@ -1236,82 +1287,111 @@
         }
 
         const now = new Date();
+        const notificationContainer = document.getElementById('reminder-notifications');
+        const currentlyDisplayedNotifications = notificationContainer.querySelectorAll('.reminder-notification');
+        const currentlyDisplayedIds = new Set( Array.from(currentlyDisplayedNotifications).map(el => parseInt(el.dataset.id)).filter(id => !isNaN(id)) );
         const remindersToNotify = [];
+        const validReminders = [];
         let storageNeedsUpdate = false;
         const processedIds = new Set();
-        const validReminders = []; // Mantendrá los recordatorios válidos
+
+        // console.log(`Checking reminders at ${now.toLocaleTimeString()}. Displayed: [${Array.from(currentlyDisplayedIds).join(', ')}]`);
 
         reminders.forEach(reminder => {
+            // 1. Validación básica y de duplicados
             if (!reminder || typeof reminder.id === 'undefined' || !reminder.type || !reminder.time || !reminder.date) {
-                console.warn("Invalid or incomplete reminder found, scheduling for removal.", reminder);
+                console.warn("Invalid/incomplete reminder found, scheduling for removal.", reminder);
                 storageNeedsUpdate = true;
                 sessionStorage.removeItem(`reminder_last_notified_${reminder?.id}`);
-                return; // Saltar este recordatorio inválido
+                return;
             }
-
             if (processedIds.has(reminder.id)) {
                 console.warn("Duplicate reminder ID found, scheduling for removal:", reminder.id);
                 storageNeedsUpdate = true;
                 sessionStorage.removeItem(`reminder_last_notified_${reminder.id}`);
-                return; // Saltar duplicado
+                return;
             }
+            processedIds.add(reminder.id);
+            validReminders.push(reminder); // Asumir válido por ahora
 
-            processedIds.add(reminder.id); // Marcar como procesado
-            validReminders.push(reminder); // Añadir a la lista de válidos por ahora
-
+            // 2. Calcular próxima ocurrencia
             let nextOccurrence = null;
             try {
                  // Usar 'now' como referencia para ver si YA debería haber saltado
-                nextOccurrence = calculateNextOccurrence(reminder, now);
+                 nextOccurrence = calculateNextOccurrence(reminder, now);
 
                 if (nextOccurrence && nextOccurrence <= now) {
-                    // La próxima ocurrencia calculada es AHORA o en el PASADO
-                    const lastNotifiedTimestamp = sessionStorage.getItem(`reminder_last_notified_${reminder.id}`);
-                    let shouldNotify = true;
-
-                    if (lastNotifiedTimestamp) {
-                        try {
-                            const lastNotifiedDate = new Date(parseInt(lastNotifiedTimestamp));
-                             // Si ya notificamos ESTA MISMA ocurrencia (ej: dentro del último minuto), no volver a notificar.
-                            if (nextOccurrence.getTime() === lastNotifiedDate.getTime()) {
-                               // console.log(`Occurrence ${reminder.id} at ${nextOccurrence.toISOString()} already notified.`);
-                                shouldNotify = false;
-                            }
-                        } catch(e) { console.error("Error parsing last notified timestamp", e); }
-                    }
-
-                    if (shouldNotify) {
-                        remindersToNotify.push({ ...reminder, calculatedNextOccurrence: nextOccurrence });
-                         // Guardar la marca de tiempo de ESTA ocurrencia para evitar notificaciones repetidas
-                         sessionStorage.setItem(`reminder_last_notified_${reminder.id}`, nextOccurrence.getTime().toString());
-                         console.log(`Scheduling notification for ${reminder.id} (type: ${reminder.type}) due at ${nextOccurrence.toISOString()}`);
-                    }
-
-                } else if (nextOccurrence && nextOccurrence > now) {
-                    // La próxima ocurrencia es en el futuro, quitar la marca de notificación si existe
-                     sessionStorage.removeItem(`reminder_last_notified_${reminder.id}`);
-                } else {
-                    // No se pudo calcular ocurrencia o es un 'simple' pasado.
-                    // Si es simple y pasó, marcar para eliminar si no es ya viejo.
-                    if (reminder.type === 'simple') {
-                        console.log(`Simple reminder ${reminder.id} is past or invalid. Scheduling for removal.`);
-                        storageNeedsUpdate = true;
-                         validReminders.pop(); // Quitar el último añadido (este recordatorio)
-                         sessionStorage.removeItem(`reminder_last_notified_${reminder.id}`);
+                    // 3. Está vencido (ocurrencia es ahora o en el pasado)
+                    // 4. ¿Ya está mostrándose?
+                    if (currentlyDisplayedIds.has(reminder.id)) {
+                        // console.log(`Reminder ${reminder.id} is due but already displayed. Leaving it.`);
+                        // Ya está en pantalla, no hacer nada. La notificación persistirá.
                     } else {
-                         console.warn(`Could not calculate a valid future occurrence for reminder ${reminder.id} (type: ${reminder.type}). Keeping it.`, reminder);
-                         sessionStorage.removeItem(`reminder_last_notified_${reminder.id}`); // Limpiar por si acaso
+                        // 5. No está mostrándose. ¿Deberíamos mostrarlo?
+                        // Evitar re-notificar la *misma ocurrencia exacta* si ya se procesó en esta sesión (evita parpadeos)
+                        const lastNotifiedTimestamp = sessionStorage.getItem(`reminder_last_notified_${reminder.id}`);
+                        let shouldNotify = true;
+                        if (lastNotifiedTimestamp) {
+                           try {
+                                const lastNotifiedDate = new Date(parseInt(lastNotifiedTimestamp));
+                                if (nextOccurrence.getTime() === lastNotifiedDate.getTime()) {
+                                    // console.log(`Occurrence ${reminder.id} at ${nextOccurrence.toISOString()} already processed in this session.`);
+                                    shouldNotify = false;
+                                }
+                            } catch(e) { console.error("Error parsing last notified timestamp", e); }
+                        }
+
+                        if (shouldNotify) {
+                             console.log(`Reminder ${reminder.id} is due and NOT displayed. Scheduling notification.`);
+                             remindersToNotify.push({ ...reminder }); // Añadir a la lista para mostrar
+                             // Marcar esta ocurrencia como procesada en esta sesión
+                             sessionStorage.setItem(`reminder_last_notified_${reminder.id}`, nextOccurrence.getTime().toString());
+                        }
                     }
-                }
+                } else if (nextOccurrence && nextOccurrence > now) {
+                    // 6. La próxima ocurrencia es futura
+                    // Limpiar la marca de notificación de sesión si existiera, ya no es relevante para esta ocurrencia pasada/actual.
+                    sessionStorage.removeItem(`reminder_last_notified_${reminder.id}`);
+                     // Si estaba mostrándose y ahora es futuro (p.ej. se pospuso), debería quitarse (aunque el handler del botón ya lo hace)
+                     if (currentlyDisplayedIds.has(reminder.id)) {
+                         console.warn(`Notification for ${reminder.id} is displayed but its next occurrence is now in the future. This should ideally be handled by button clicks.`)
+                         // No la quitamos aquí para evitar efectos secundarios, confiamos en los botones.
+                     }
+                } else {
+                     // 7. No se pudo calcular ocurrencia o es un 'simple' pasado y no válido.
+                     sessionStorage.removeItem(`reminder_last_notified_${reminder.id}`); // Limpiar marca
+                     if (reminder.type === 'simple') {
+                         console.log(`Simple reminder ${reminder.id} is past or has invalid date/time. Scheduling for removal.`);
+                         storageNeedsUpdate = true;
+                         const indexInValid = validReminders.findIndex(r => r.id === reminder.id);
+                         if (indexInValid > -1) validReminders.splice(indexInValid, 1); // Quitar de válidos
+                     } else {
+                         console.warn(`Could not calculate a valid occurrence for reminder ${reminder.id} (type: ${reminder.type}). Keeping it.`, reminder);
+                     }
+                      // Si estaba mostrándose y ahora no se puede calcular (error?), debería quitarse
+                      if (currentlyDisplayedIds.has(reminder.id)) {
+                          console.error(`Displayed notification ${reminder.id} now has uncalculable occurrence. Removing visual.`);
+                          const oldNotification = notificationContainer.querySelector(`.reminder-notification[data-id="${reminder.id}"]`);
+                          if (oldNotification) oldNotification.remove();
+                      }
+                 }
+
             } catch (error) {
                 console.error(`Error processing reminder ID ${reminder.id}:`, error, reminder);
                 storageNeedsUpdate = true; // Marcar para posible limpieza
                 sessionStorage.removeItem(`reminder_last_notified_${reminder.id}`);
                  const indexInValid = validReminders.findIndex(r => r.id === reminder.id);
                  if (indexInValid > -1) validReminders.splice(indexInValid, 1); // Quitar de válidos si dio error
+                 // Si estaba mostrándose y dio error, quitarla
+                 if (currentlyDisplayedIds.has(reminder.id)) {
+                     console.error(`Removing displayed notification ${reminder.id} due to processing error.`);
+                     const oldNotification = notificationContainer.querySelector(`.reminder-notification[data-id="${reminder.id}"]`);
+                     if (oldNotification) oldNotification.remove();
+                 }
             }
         });
 
+        // 8. Actualizar localStorage si hubo eliminaciones
         if (storageNeedsUpdate) {
             console.log("Updating localStorage for reminders due to invalid/duplicate/past entries.");
             try {
@@ -1324,44 +1404,29 @@
             }
         }
 
-        // Gestionar las notificaciones visuales
-        const notificationContainer = document.getElementById('reminder-notifications');
-        const currentlyDisplayedNotifications = notificationContainer.querySelectorAll('.reminder-notification');
-        const currentlyDisplayedIds = new Set( Array.from(currentlyDisplayedNotifications).map(el => parseInt(el.dataset.id)).filter(id => !isNaN(id)) );
-
-        // Mostrar nuevas notificaciones
+        // 9. Mostrar las nuevas notificaciones necesarias
         remindersToNotify.forEach(rem => {
-            if (!currentlyDisplayedIds.has(rem.id)) {
-                showReminderNotification(rem);
-            } else {
-               // console.log(`Notification for ${rem.id} already displayed.`);
+            // Doble check por si acaso se mostró mientras se procesaba el bucle
+            if (!document.querySelector(`.reminder-notification[data-id="${rem.id}"]`)) {
+                 showReminderNotification(rem);
             }
         });
 
-        // Eliminar notificaciones obsoletas (si el recordatorio ya no existe o ya no está vencido)
-        currentlyDisplayedIds.forEach(displayedId => {
-             const reminderStillExistsAndIsDue = remindersToNotify.some(r => r.id === displayedId);
-             if (!reminderStillExistsAndIsDue) {
-                const oldNotification = notificationContainer.querySelector(`.reminder-notification[data-id="${displayedId}"]`);
-                if (oldNotification) {
-                    console.log(`Removing obsolete notification for ID ${displayedId}.`);
-                    oldNotification.remove();
-                    // No limpiar sessionStorage aquí, ya se hizo antes si correspondía
-                }
-            }
-        });
-
-        // Reajustar posiciones verticales de notificaciones
+        // 10. Reajustar posiciones verticales (esto es opcional si la eliminación siempre reajusta)
         const finalNotifications = notificationContainer.querySelectorAll('.reminder-notification');
         finalNotifications.forEach((notif, index) => {
             const newOffset = index * 20;
             notif.style.top = `calc(45% + ${newOffset}px)`;
         });
     }
+    // --- END OF MODIFIED Reminder Functions ---
+
     function calculatePostponedDateTime(mins) { const now = new Date(); const postponedDate = new Date(now.getTime() + mins * 60000); const year = postponedDate.getFullYear(); const month = (postponedDate.getMonth() + 1).toString().padStart(2, '0'); const day = postponedDate.getDate().toString().padStart(2, '0'); const hours = postponedDate.getHours().toString().padStart(2, '0'); const minutes = postponedDate.getMinutes().toString().padStart(2, '0'); const newDateISO = `${year}-${month}-${day}`; const newTime = `${hours}:${minutes}`; return { newDateISO: newDateISO, newTime: newTime }; }
     function showPostponeOptionsModal(reminder, source = 'notification') { const existingModal = document.getElementById('postpone-options-modal'); if (existingModal) { if (existingModal.autoPostponeInterval) clearInterval(existingModal.autoPostponeInterval); if (existingModal.parentNode) existingModal.parentNode.removeChild(existingModal); } const modal = document.createElement('div'); modal.id = 'postpone-options-modal'; modal.className = 'reminder-notification postpone-options'; modal.style.cssText = `position:fixed; top:50%; left:50%; transform:translate(-50%, -50%); width:90%; max-width:480px; max-height:85vh; overflow-y:auto; background-color:#F5E1A9; padding:1.5rem; border-radius:1rem; box-shadow:0 10px 25px rgba(0,0,0,0.2); z-index:4000; `; modal.setAttribute('aria-label', 'Posponer recordatorio'); let countdown = 10; modal.innerHTML = `<style> .postpone-options .reminder-text { color:#333; font-size:1.2rem; margin-bottom:.5rem; word-wrap:break-word; } .postpone-options .reminder-details { color:#555; font-size:1rem; margin-bottom:1.5rem; } .postpone-options .button-group { flex-direction:column; gap:1rem; align-items:stretch; } .postpone-options button.postpone-option { font-size:1.3rem; font-weight:bold; padding:.8rem 1rem; background-color:#F59E0B; color:white; border:none; border-radius:.375rem; cursor:pointer; text-align:center; transition:background-color .2s ease; } .postpone-options button.postpone-option:hover { background-color:#D97706; } #postpone-countdown { text-align:center; margin-top:1.8rem; font-size:1.1rem; font-weight:500; color:#444; } #postpone-timer-value { font-weight:bold; font-size:1.2rem; } #cancel-postpone { margin-top:1.2rem; width:100%; padding:.7rem 1rem; font-size:1.1rem; background-color:#EF4444; color:white; border:none; border-radius:.375rem; cursor:pointer; text-align:center; transition:background-color .2s ease; } #cancel-postpone:hover { background-color:#DC2626; } </style> <p class="reminder-text">Posponer: ${reminder.text.replace(/<[^>]*>/g, '')}</p> <p class="reminder-details">Selecciona tiempo:</p> <div class="button-group"> <button data-minutes="15" class="postpone-option">15 Minutos</button> <button data-minutes="60" class="postpone-option">1 Hora</button> <button data-minutes="180" class="postpone-option">3 Horas</button> <button data-minutes="1440" class="postpone-option">1 Día</button> <button data-minutes="4320" class="postpone-option">3 Días</button> </div> <p id="postpone-countdown">Automático en <span id="postpone-timer-value">${countdown}</span>s (15 min)</p> <button id="cancel-postpone">Cancelar</button> `; document.body.appendChild(modal); const countdownDisplay = modal.querySelector('#postpone-timer-value'); const handlePostpone = (minutes) => { if (modal.autoPostponeInterval) clearInterval(modal.autoPostponeInterval); modal.autoPostponeInterval = null; const originalNotification = document.querySelector(`.reminder-notification[data-id="${reminder.id}"]:not(.postpone-options)`); if (originalNotification) originalNotification.remove(); let reminders = JSON.parse(localStorage.getItem('reminders') || '[]'); const index = reminders.findIndex(r => r.id === reminder.id); if (index === -1) { console.error("Reminder not found for postponement:", reminder.id); showToast('Error: El recordatorio ya no existe.', 'error', 4000); if (modal.parentNode) document.body.removeChild(modal); if (source === 'table') { setTimeout(showAllReminders, 100); } sessionStorage.removeItem(`reminder_last_notified_${reminder.id}`); updateReminderCount(); updateButtonStyles(); checkReminders(); return; } const { newDateISO, newTime } = calculatePostponedDateTime(minutes); reminders[index].date = newDateISO; reminders[index].time = newTime; // MODIFICADO: Al posponer, se convierte en un recordatorio de tipo 'daily' (un solo disparo en la nueva fecha/hora)
     reminders[index].type = 'daily'; // Ya no es cíclico ni de intervalo tras posponer
-    reminders[index].repeatDays = []; reminders[index].intervalDays = null; localStorage.setItem('reminders', JSON.stringify(reminders)); console.log(`Reminder ${reminder.id} postponed to: ${newDateISO} ${newTime} (now type: daily)`); sessionStorage.removeItem(`reminder_last_notified_${reminder.id}`); updateReminderCount(); updateButtonStyles(); showToast(`Pospuesto ${minutes} minutos`, 'info'); if (modal.parentNode) document.body.removeChild(modal); if (source === 'table') { setTimeout(showAllReminders, 100); } checkReminders(); const notifContainer = document.getElementById('reminder-notifications'); const remainingNotifs = notifContainer.querySelectorAll('.reminder-notification'); remainingNotifs.forEach((notif, idx) => { const newOffset = idx * 20; notif.style.top = `calc(45% + ${newOffset}px)`; }); }; modal.autoPostponeInterval = setInterval(() => { countdown--; if (countdownDisplay) countdownDisplay.textContent = countdown; if (countdown <= 0) { handlePostpone(15); } }, 1000); modal.querySelectorAll('.postpone-option').forEach(button => { button.addEventListener('click', () => { const minutes = parseInt(button.dataset.minutes); if (!isNaN(minutes)) { handlePostpone(minutes); } }); }); modal.querySelector('#cancel-postpone').addEventListener('click', () => { clearInterval(modal.autoPostponeInterval); modal.autoPostponeInterval = null; if (modal.parentNode) document.body.removeChild(modal); if (source === 'table') { setTimeout(showAllReminders, 100); } console.log(`Postpone cancelled for reminder ${reminder.id}.`); showToast('Posposición cancelada', 'info'); }); }
+    reminders[index].repeatDays = []; reminders[index].intervalDays = null; localStorage.setItem('reminders', JSON.stringify(reminders)); console.log(`Reminder ${reminder.id} postponed to: ${newDateISO} ${newTime} (now type: daily)`); sessionStorage.removeItem(`reminder_last_notified_${reminder.id}`); // Limpiar marca de notificación
+    updateReminderCount(); updateButtonStyles(); showToast(`Pospuesto ${minutes} minutos`, 'info'); if (modal.parentNode) document.body.removeChild(modal); if (source === 'table') { setTimeout(showAllReminders, 100); } // checkReminders(); // No es necesario llamar aquí explícitamente
+    const notifContainer = document.getElementById('reminder-notifications'); const remainingNotifs = notifContainer.querySelectorAll('.reminder-notification'); remainingNotifs.forEach((notif, idx) => { const newOffset = idx * 20; notif.style.top = `calc(45% + ${newOffset}px)`; }); }; modal.autoPostponeInterval = setInterval(() => { countdown--; if (countdownDisplay) countdownDisplay.textContent = countdown; if (countdown <= 0) { handlePostpone(15); } }, 1000); modal.querySelectorAll('.postpone-option').forEach(button => { button.addEventListener('click', () => { const minutes = parseInt(button.dataset.minutes); if (!isNaN(minutes)) { handlePostpone(minutes); } }); }); modal.querySelector('#cancel-postpone').addEventListener('click', () => { clearInterval(modal.autoPostponeInterval); modal.autoPostponeInterval = null; if (modal.parentNode) document.body.removeChild(modal); if (source === 'table') { setTimeout(showAllReminders, 100); } console.log(`Postpone cancelled for reminder ${reminder.id}.`); showToast('Posposición cancelada', 'info'); }); }
     function showConfigModal() { const otherModals = document.querySelectorAll('.choice-modal, .edit-modal, .edit-info-modal, .help-modal, .reminder-modal, .reminder-table-modal, #postpone-options-modal'); otherModals.forEach(m => m.remove()); const GAS_URL = 'https://script.google.com/macros/s/AKfycbw7UTvYBwSdKRlQTwuTav-Gj5Yul4St9HzrN80635u4QQtiseQq_h5SBrrYhWFbBqR7/exec'; const exMods = document.querySelectorAll('.help-modal, .reminder-modal, .reminder-table-modal, #postpone-options-modal, #config-modal, .edit-modal'); exMods.forEach(m => { if (m.classList.contains('reminder-modal') && typeof m.cleanUpModalTimers === 'function') { m.cleanUpModalTimers(true); } else if (m.autoCloseInterval) { clearInterval(m.autoCloseInterval); } else if (m.autoPostponeInterval) { clearInterval(m.autoPostponeInterval); } if (m.parentNode) m.parentNode.removeChild(m); }); const modal = document.createElement('div'); modal.id = 'config-modal'; modal.style.cssText = `position:fixed; top:15px; left:50%; transform:translate(-50%, 0); background-color:#ECEFE8; padding:1.5rem; border-radius:.75rem; box-shadow:0 8px 16px rgba(0,0,0,.25); z-index:5000; max-width:1000px; width:95%; max-height:58vh; display:flex; flex-direction:column; `; modal.setAttribute('aria-label','Configuración'); const managedKeys = ['reminders','darkMode','toggleStates','zoomState','onOffState','noticesActive','footerVisible','teslaHtmlLastModified','teslaHtmlLastModifiedTimestamp','userData_userId','userData_teslaModel','userData_teslaYear','userData_teslaProvince','userData_allowDMs', 'customGridData', 'personalizationHelpShown', 'gridFilterValue', 'password_pin', 'password_active']; const managedDesc = managedKeys.map(k => { switch(k){case 'reminders':return 'Recordatorios';case 'darkMode':return 'Modo Oscuro';case 'toggleStates':return 'Visibilidad Secc.';case 'zoomState':return 'Zoom Grid';case 'onOffState':return 'On/Off Gral';case 'noticesActive':return 'Avisos/Footer';case 'footerVisible':return 'Vis. Footer';case 'teslaHtmlLastModified':return 'Cache Versión';case 'teslaHtmlLastModifiedTimestamp':return 'TS Cache';case 'userData_userId':return 'ID Usuario';case 'userData_teslaModel':return 'Modelo';case 'userData_teslaYear':return 'Año';case 'userData_teslaProvince':return 'Provincia';case 'userData_allowDMs':return 'Permitir DMs';case 'customGridData': return 'Grid Pers.'; case 'personalizationHelpShown': return 'Ayuda Pers. Vista'; case 'gridFilterValue': return 'Filtro Grid'; case 'password_pin': return 'PIN Acceso'; case 'password_active': return 'PIN Activo'; default:return k;}}).join(', '); // MODIFICADO: HTML y CSS para la sección PIN dentro del modal
     modal.innerHTML = `<style>/* Config Styles */ .config-tab-button{padding:.7rem 1.2rem;cursor:pointer;border:1px solid #ccc;border-bottom:none;background-color:#e0e0d0;margin-right:.3rem;border-radius:.5rem .5rem 0 0;font-size:1rem;font-weight:500;color:#555;transition:background-color .2s ease,color .2s ease;outline:none;}.config-tab-button:hover{background-color:#d8d8d0;}.config-tab-button.active{background-color:#ECEFE8;border-color:#ccc;border-bottom:1px solid #ECEFE8;font-weight:bold;color:#2F4F4F;position:relative;top:1px;z-index:2;}.tab-buttons{margin-bottom:-1px;flex-shrink:0;border-bottom:1px solid #ccc;padding-left:1rem; display: flex; overflow-x: auto; }.tab-contents{flex-grow:1;overflow-y:auto;position:relative;z-index:1;border-top:none;min-height:200px;}.config-tab-content{display:none;padding:1.8rem;border:1px solid #ccc;border-top:none;border-radius:0 0 .5rem .5rem;background-color:#ECEFE8; max-height:calc(58vh - 120px); }.config-tab-content.active{display:block;}#config-modal h2{font-size:1.6rem;margin-bottom:1.5rem;color:#2F4F4F;text-align:center;flex-shrink:0;}#config-modal h3{font-size:1.3rem;margin-bottom:.8rem;color:#4682B4;}#config-modal p,#config-modal label{font-size:1rem;line-height:1.5;color:#333;}#config-modal em{font-size:.85rem;}#config-modal button:not(.config-tab-button){font-size:1.05rem;padding:.8rem 1.5rem;}#config-modal textarea{font-size:.9rem;height:110px;width:100%;border:1px solid #ccc;border-radius:.25rem;padding:.5rem;resize:vertical;}#config-modal input[type=text],#config-modal input[type=number],#config-modal input[type=password]{font-size:1rem;padding:.6rem;width:100%;border:1px solid #ccc;border-radius:.25rem;}#config-modal .status-message{font-size:.9rem;min-height:1.1em;font-weight:500;text-align:center;margin-top:.5rem;}.user-data-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1.2rem 1.8rem;align-items:start;margin-bottom:1rem;}.user-data-grid label{margin-bottom:.3rem;display:block;font-weight:500;}.user-data-grid .checkbox-container{grid-column:1 / -1;display:flex;align-items:center;gap:.5rem;justify-content:center;margin-top:.5rem;}.user-data-grid .checkbox-container input{width:1.2rem;height:1.2rem;}.user-data-grid .checkbox-container label{margin-bottom:0;}.user-buttons-container{display:flex;justify-content:space-around;gap:1.5rem;margin-top:1.5rem;margin-bottom:1rem;}.user-buttons-container button{border:none;border-radius:.25rem;cursor:pointer;flex-grow:1;}#config-user-status{min-height:1.2em;}.backup-restore-container{display:flex;gap:2.5rem;flex-wrap:wrap;}.backup-restore-container>div{flex:1;min-width:250px;}.backup-restore-container p{margin-bottom:1.2rem;}.backup-restore-container textarea{margin-bottom:1rem;background-color:#f9f9f9;}.backup-restore-container button{margin-bottom:1rem;border:none;border-radius:.25rem;cursor:pointer;width:100%;}#config-restore-grid-button{background-color:#ff8c00;color:white; margin-top: 10px;} .backup-restore-container .status-message{margin-top:.6rem;}.borrar-container h3{margin-bottom:.8rem;}.borrar-container p{margin-top:.6rem;}.borrar-container button{margin-top:1.5rem;border:none;border-radius:.25rem;cursor:pointer;width:100%;background-color:#EF4444;color:white;}#config-close-modal{font-size:1.15rem;padding:.8rem 2.5rem;background-color:#6B7280;color:white;border:none;border-radius:.25rem;cursor:pointer;}
     /* PIN Config Alignment Styles */
@@ -1418,7 +1483,99 @@
       <div id="tab-content-borrar" class="config-tab-content borrar-container"> <h3>Acción Irreversible</h3><p>Elimina TODOS los datos locales.</p><button id="config-clear-cache">Borrar TODO</button><p><strong style="color:red;">¡Sin deshacer!</strong> Ten backup.</p> </div>
     </div>
     <div style="text-align:center;margin-top:1rem;flex-shrink:0;"><button id="config-close-modal">Cerrar</button></div>`;
-    document.body.appendChild(modal); const tabBtns = modal.querySelectorAll('.config-tab-button'); const tabConts = modal.querySelectorAll('.config-tab-content'); const userIdI = modal.querySelector('#user-id'); const modelI = modal.querySelector('#tesla-model'); const yearI = modal.querySelector('#tesla-year'); const provinceI = modal.querySelector('#tesla-province'); const dmsChk = modal.querySelector('#allow-dms'); const saveBtn = modal.querySelector('#config-save-user'); const resetBtn = modal.querySelector('#config-reset-user'); const userStat = modal.querySelector('#config-user-status'); const genBkupBtn = modal.querySelector('#config-generate-backup'); const bkupDisp = modal.querySelector('#config-backup-display'); const restInp = modal.querySelector('#config-restore-input'); const restBtn = modal.querySelector('#config-restore-backup'); const clearBtn = modal.querySelector('#config-clear-cache'); const closeBtn = modal.querySelector('#config-close-modal'); const restoreGridBtn = modal.querySelector('#config-restore-grid-button'); const restoreGridStatus = modal.querySelector('#config-restore-grid-status'); const savePinBtn = modal.querySelector('#config-save-pin'); const removePinBtn = modal.querySelector('#config-remove-pin'); tabBtns.forEach(button => { button.addEventListener('click', () => { const tabTarget = button.dataset.tabTarget; tabBtns.forEach(btn => btn.classList.remove('active')); tabConts.forEach(content => content.classList.remove('active')); button.classList.add('active'); modal.querySelector(tabTarget).classList.add('active'); }); }); const loadUData = () => { userIdI.value = localStorage.getItem('userData_userId') || ''; modelI.value = localStorage.getItem('userData_teslaModel') || ''; yearI.value = localStorage.getItem('userData_teslaYear') || ''; provinceI.value = localStorage.getItem('userData_teslaProvince') || ''; dmsChk.checked = localStorage.getItem('userData_allowDMs') === 'true'; }; const callGAS = async (action, data = {}) => { if (!GAS_URL || GAS_URL === 'URL_DE_TU_GOOGLE_APPS_SCRIPT_WEB_APP') { console.error("GAS_URL not set."); return { status:'error', message:'URL API no conf.' }; } if(userStat)userStat.textContent=''; setUserDataLoading(true); try { const resp = await fetch(GAS_URL, { method:'POST', mode:'cors', cache:'no-cache', headers:{'Content-Type':'application/json'}, redirect:'follow', body:JSON.stringify({ action, ...data }), }); let res; const ct = resp.headers.get("content-type"); if(ct?.includes("application/json")) res = await resp.json(); else { const txt = await resp.text(); try { res = JSON.parse(txt); } catch (e) { console.error("Non-JSON GAS resp:", txt); if (!resp.ok) throw new Error(`Server error (${resp.status}): ${txt.substring(0,200)}`); console.warn("Unexpected non-JSON success:", txt); res = { status:'success', message:'OK (non-JSON).' }; } } if (!resp.ok && res.status !== 'exists' && res.status !== 'not_found') throw new Error(res.message || `Server error (${resp.status})`); return res; } catch (e) { console.error(`GAS call err (${action}):`, e); return { status:'error', message: e.message || 'API Conn Error.' }; } finally { setUserDataLoading(false); } }; const setUserDataLoading = (isLoading) => { [userIdI, modelI, yearI, provinceI, dmsChk, saveBtn, resetBtn].forEach(el => { if(el) el.disabled = isLoading; }); if (saveBtn) saveBtn.style.opacity = isLoading?0.6:1; if (resetBtn) resetBtn.style.opacity = isLoading?0.6:1; if(isLoading && userStat) { userStat.textContent = 'Procesando...'; userStat.style.color = '#1E40AF'; } else if (userStat && userStat.textContent === 'Procesando...') { userStat.textContent = ''; } }; saveBtn.addEventListener('click', async () => { const userId = userIdI.value.trim(); const model = modelI.value.trim(); const year = yearI.value.trim(); const province = provinceI.value.trim(); const allowDMs = dmsChk.checked; if (!userId) { showToast('ID Usuario (Apodo) obligatorio.', 'warning', 4000); if(userStat) { userStat.textContent = 'ID de Usuario es obligatorio.'; userStat.style.color = '#EF4444'; } return; } const storedUserId = localStorage.getItem('userData_userId'); let syncAttempted = false; let syncSuccess = false; let syncMessage = ''; try { localStorage.setItem('userData_userId', userId); localStorage.setItem('userData_teslaModel', model); localStorage.setItem('userData_teslaYear', year); localStorage.setItem('userData_teslaProvince', province); localStorage.setItem('userData_allowDMs', allowDMs.toString()); console.log("User data saved locally."); updateUserIdDisplay(); } catch (e) { console.error("Local save err:", e); showToast(`Error local: ${e.message}`, 'error', 5000); if(userStat) { userStat.textContent = `Error local: ${e.message.substring(0, 100)}`; userStat.style.color = '#EF4444'; } return; } let proceedRemoteSave = false; if(userStat)userStat.textContent='Sincronizando con servidor...'; try { if (!storedUserId || userId !== storedUserId) { if(userStat)userStat.textContent='Validando ID en servidor...'; const chk = await callGAS('checkUserIdExists',{userId:userId}); syncAttempted=true; if(chk.status==='exists'){ syncMessage=`El ID "${userId}" ya existe en el servidor. No se guardó remotamente.`; showToast(syncMessage,'error', 6000); if(userStat) { userStat.textContent = syncMessage; userStat.style.color = '#EF4444'; } return; } else if(chk.status==='not_found'||chk.status==='success'){ if(storedUserId&&userId!==storedUserId){ if(userStat)userStat.textContent='Eliminando registro antiguo en servidor...'; const delOld=await callGAS('deleteUserRow',{userId:storedUserId}); if(delOld.status!=='success'&&delOld.status!=='not_found')console.warn("Fallo al eliminar registro antiguo en servidor:",delOld.message);} proceedRemoteSave=true; } else throw new Error(chk.message||"Error al validar ID en servidor."); } else proceedRemoteSave=true; if(proceedRemoteSave){ if(userStat)userStat.textContent='Guardando datos en servidor...'; const uData={userId:userId,model:model,year:year,province:province,allowDMs:allowDMs?'SI':'NO'}; const sav=await callGAS('addUserData',{userData:uData}); syncAttempted=true; if(sav.status==='success'){ syncSuccess=true; syncMessage='Datos guardados local y remotamente.'; if(userStat) { userStat.textContent = 'Sincronización OK.'; userStat.style.color = '#28a745'; } } else throw new Error(sav.message||"Error al guardar datos en servidor."); } } catch (e) { syncSuccess = false; syncMessage = `Guardado local. Error de sincronización: ${e.message}`; console.error("Error de sincronización GAS:", e); if(userStat) { userStat.textContent = `Sync error: ${e.message.substring(0, 100)}`; userStat.style.color = '#ffc107'; } } finally { if (syncAttempted) showToast(syncMessage, syncSuccess ? 'success' : 'warning', syncSuccess ? 3000 : 6000); else showToast('Datos guardados localmente.', 'success', 3000); if(userStat && userStat.textContent === 'Procesando...') userStat.textContent = 'Guardado local OK.'; setUserDataLoading(false); } }); resetBtn.addEventListener('click', async () => { const storedUserId = localStorage.getItem('userData_userId'); if (!storedUserId) { showToast('No hay registro de usuario local para resetear.', 'info', 3000); if(userStat) { userStat.textContent = 'No hay registro local.'; userStat.style.color = '#17a2b8';} return; } if (!confirm(`¿Estás seguro de que deseas resetear el registro de usuario "${storedUserId}"?\nEsta acción borrará tanto los datos compartidos en el servidor como tu registro local.`)) { showToast('Reseteo de usuario cancelado.', 'info', 2000); if(userStat) { userStat.textContent = 'Reseteo cancelado.'; userStat.style.color = '#17a2b8';} return; } let remoteDeletionAttempted = false; let remoteDeletionSuccess = false; let remoteMessage = ''; setUserDataLoading(true); if(userStat)userStat.textContent=`Eliminando registro remoto "${storedUserId}"...`; try { const delRes = await callGAS('deleteUserRow', { userId: storedUserId }); remoteDeletionAttempted = true; if (delRes.status === 'success') { remoteDeletionSuccess = true; remoteMessage = 'Registro remoto eliminado. '; console.log("Registro remoto eliminado exitosamente."); if(userStat) { userStat.textContent = 'Registro remoto eliminado.'; userStat.style.color = '#28a745'; } } else if (delRes.status === 'not_found') { remoteDeletionSuccess = true; remoteMessage = 'Registro remoto no encontrado (ya eliminado?). '; console.warn("Registro remoto no encontrado para eliminar."); if(userStat) { userStat.textContent = 'Registro remoto no encontrado.'; userStat.style.color = '#ffc107'; } } else { remoteMessage = `Error al eliminar registro remoto (${delRes.message || '?'}). `; console.error("Error al eliminar registro remoto:", delRes.message); if(userStat) { userStat.textContent = `Error remoto: ${delRes.message.substring(0, 100)}`; userStat.style.color = '#EF4444'; } } } catch (e) { remoteMessage = `Error de conexión al intentar eliminar remoto (${e.message}). `; console.error("Error de conexión GAS al eliminar:", e); if(userStat) { userStat.textContent = `Error conexión: ${e.message.substring(0, 100)}`; userStat.style.color = '#EF4444'; } } finally { if(!remoteDeletionAttempted && userStat) { userStat.textContent = ''; } } try { localStorage.removeItem('userData_userId'); localStorage.removeItem('userData_teslaModel'); localStorage.removeItem('userData_teslaYear'); localStorage.removeItem('userData_teslaProvince'); localStorage.removeItem('userData_allowDMs'); userIdI.value=''; modelI.value=''; yearI.value=''; provinceI.value=''; dmsChk.checked=false; updateUserIdDisplay(); showToast(`${remoteMessage}Datos locales reseteados.`, remoteDeletionSuccess ? 'success' : (remoteDeletionAttempted ? 'warning' : 'success'), 4000); if(userStat) { userStat.textContent = `Datos locales reseteados.`; userStat.style.color = '#28a745'; } } catch (e) { console.error("Error al limpiar datos de usuario localmente:", e); showToast(`${remoteMessage}Error al limpiar datos locales.`, 'error', 5000); if(userStat) { userStat.textContent = `Error limpiar local: ${e.message.substring(0, 100)}`; userStat.style.color = '#EF4444'; } } finally { setUserDataLoading(false); } }); clearBtn.addEventListener('click', () => { if (confirm('¿Estás MUY SEGURO de que deseas borrar TODO el caché local?\n\nEsta acción es IRREVERSIBLE y eliminará:\n- Todos tus recordatorios.\n- La configuración de modo oscuro y visibilidad.\n- Tus datos de usuario (ID, modelo, etc.).\n- Tu configuración de edición de la rejilla.\n- Tu clave de acceso guardada.\n\nAsegúrate de tener un código de Backup si no quieres perder tus personalizaciones.')) { const storedUserId = localStorage.getItem('userData_userId'); if (storedUserId) { console.log(`Attempting remote deletion for user ID ${storedUserId} before local clear.`); callGAS('deleteUserRow',{userId:storedUserId}).then(r=>console.log("Remote deletion result:",r)).catch(e=>console.warn("Error during remote deletion before local clear:",e)); } localStorage.clear(); sessionStorage.clear(); if (modal.parentNode) modal.parentNode.removeChild(modal); showToast('Datos borrados. Recargando la página...', 'info', 2000); setTimeout(() => { location.reload(); }, 500); } else { showToast('Borrado de caché cancelado.', 'info', 2000); } }); genBkupBtn.addEventListener('click', () => { bkupDisp.value = ''; bkupDisp.style.display = 'none'; const backupData = {}; let keysCount = 0; let skippedKeys = []; for (let i = 0; i < localStorage.length; i++) { const key = localStorage.key(i); if (key !== null) { if (managedKeys.includes(key)) { try { backupData[key] = localStorage.getItem(key); keysCount++; } catch (e) { console.warn(`Skipping backup for key "${key}" due to error:`, e); skippedKeys.push(`${key}(err)`); } } else { skippedKeys.push(key); } } } if (keysCount === 0) { showToast('No se encontraron datos locales para crear el backup.', 'warning', 4000); if(userStat) { userStat.textContent = 'No hay datos para backup.'; userStat.style.color = '#ffc107'; } return; } try { const jsonString = JSON.stringify(backupData, null, 2); bkupDisp.value = jsonString; bkupDisp.style.display = 'block'; bkupDisp.select(); let message = `Código de backup (${keysCount} claves) generado. Cópialo.`; if(skippedKeys.length > 0) { message += ` (Ignoradas: ${skippedKeys.length})`; console.warn("Skipped keys during backup:", skippedKeys); } showToast(message, 'success', 5000); if(userStat) { userStat.textContent = 'Backup generado OK.'; userStat.style.color = '#28a745'; } } catch (e) { console.error("Error al generar el código de backup:", e); bkupDisp.value = `Error al generar el código:\n${e.message}`; bkupDisp.style.display = 'block'; showToast('Error al generar el código de backup.', 'error', 5000); if(userStat) { userStat.textContent = `Error backup: ${e.message.substring(0, 100)}`; userStat.style.color = '#EF4444'; } } }); restBtn.addEventListener('click', () => { const jsonString = restInp.value.trim(); if (!jsonString) { showToast('Pega el código de backup en el campo de texto.', 'warning', 4000); if(userStat) { userStat.textContent = 'Pega el código.'; userStat.style.color = '#ffc107'; } return; } try { const restoredData = JSON.parse(jsonString); if (typeof restoredData !== 'object' || restoredData === null || Array.isArray(restoredData)) throw new Error("El código no tiene un formato de objeto válido."); if (!confirm('¿Estás seguro de que deseas restaurar los datos?\nEsto borrará tus datos locales actuales y los reemplazará con los datos compatibles de la copia de seguridad.')) { showToast('Restauración cancelada.', 'info', 2000); if(userStat) { userStat.textContent = 'Restauración cancelada.'; userStat.style.color = '#17a2b8'; } return; } managedKeys.forEach(key => localStorage.removeItem(key)); Object.keys(sessionStorage).forEach(key => { if (key.startsWith('reminder_last_notified_') || key === 'personalizationHelpShown') sessionStorage.removeItem(key); }); let restoredCount = 0; let skippedKeys = []; for (const key in restoredData) { if (Object.hasOwnProperty.call(restoredData, key)) { if (managedKeys.includes(key)) { try { localStorage.setItem(key, restoredData[key]); restoredCount++; } catch (e) { console.warn(`Error al restaurar la clave "${key}":`, e); skippedKeys.push(`${key}(err)`); } } else { skippedKeys.push(key); } } } let message = ''; let toastType = 'info'; if (restoredCount > 0) { message = `Restauradas ${restoredCount} claves compatibles.`; if (skippedKeys.length > 0) { console.log("Claves ignoradas durante la restauración:", skippedKeys); message += ` Ignoradas ${skippedKeys.length} (incompatibles o con error).`; } message += ' Recargando la página...'; toastType = 'success'; if (modal.parentNode) modal.parentNode.removeChild(modal); showToast(message, toastType, 3000); setTimeout(() => { location.reload(); }, 1800); } else { message = 'No se encontraron datos compatibles en el código de backup.'; if (skippedKeys.length > 0) { message += ` Ignoradas ${skippedKeys.length} (no compatibles).`; console.warn("Claves ignoradas durante la restauración:", skippedKeys); } toastType = 'warning'; showToast(message, toastType, 5000); if(userStat) { userStat.textContent = message.substring(0, 100); userStat.style.color = '#ffc107'; } } } catch (e) { console.error("Error al restaurar el backup:", e); showToast(`Error al restaurar: ${e.message}`, 'error', 5000); if(userStat) { userStat.textContent = `Error restaurar: ${e.message.substring(0, 100)}`; userStat.style.color = '#EF4444'; } } }); restoreGridBtn.addEventListener('click', () => { if(restoreGridStatus) restoreGridStatus.textContent = '';
+    document.body.appendChild(modal); const tabBtns = modal.querySelectorAll('.config-tab-button'); const tabConts = modal.querySelectorAll('.config-tab-content'); const userIdI = modal.querySelector('#user-id'); const modelI = modal.querySelector('#tesla-model'); const yearI = modal.querySelector('#tesla-year'); const provinceI = modal.querySelector('#tesla-province'); const dmsChk = modal.querySelector('#allow-dms'); const saveBtn = modal.querySelector('#config-save-user'); const resetBtn = modal.querySelector('#config-reset-user'); const userStat = modal.querySelector('#config-user-status'); const genBkupBtn = modal.querySelector('#config-generate-backup'); const bkupDisp = modal.querySelector('#config-backup-display'); const restInp = modal.querySelector('#config-restore-input'); const restBtn = modal.querySelector('#config-restore-backup'); const clearBtn = modal.querySelector('#config-clear-cache'); const closeBtn = modal.querySelector('#config-close-modal'); const restoreGridBtn = modal.querySelector('#config-restore-grid-button'); const restoreGridStatus = modal.querySelector('#config-restore-grid-status'); const savePinBtn = modal.querySelector('#config-save-pin'); const removePinBtn = modal.querySelector('#config-remove-pin'); tabBtns.forEach(button => { button.addEventListener('click', () => { const tabTarget = button.dataset.tabTarget; tabBtns.forEach(btn => btn.classList.remove('active')); tabConts.forEach(content => content.classList.remove('active')); button.classList.add('active'); modal.querySelector(tabTarget).classList.add('active'); }); }); const loadUData = () => { userIdI.value = localStorage.getItem('userData_userId') || ''; modelI.value = localStorage.getItem('userData_teslaModel') || ''; yearI.value = localStorage.getItem('userData_teslaYear') || ''; provinceI.value = localStorage.getItem('userData_teslaProvince') || ''; dmsChk.checked = localStorage.getItem('userData_allowDMs') === 'true'; }; const callGAS = async (action, data = {}) => { if (!GAS_URL || GAS_URL === 'URL_DE_TU_GOOGLE_APPS_SCRIPT_WEB_APP') { console.error("GAS_URL not set."); return { status:'error', message:'URL API no conf.' }; } if(userStat)userStat.textContent=''; setUserDataLoading(true); try { const resp = await fetch(GAS_URL, { method:'POST', mode:'cors', cache:'no-cache', headers:{'Content-Type':'application/json'}, redirect:'follow', body:JSON.stringify({ action, ...data }), }); let res; const ct = resp.headers.get("content-type"); if(ct?.includes("application/json")) res = await resp.json(); else { const txt = await resp.text(); try { res = JSON.parse(txt); } catch (e) { console.error("Non-JSON GAS resp:", txt); if (!resp.ok) throw new Error(`Server error (${resp.status}): ${txt.substring(0,200)}`); console.warn("Unexpected non-JSON success:", txt); res = { status:'success', message:'OK (non-JSON).' }; } } if (!resp.ok && res.status !== 'exists' && res.status !== 'not_found') throw new Error(res.message || `Server error (${resp.status})`); return res; } catch (e) { console.error(`GAS call err (${action}):`, e); return { status:'error', message: e.message || 'API Conn Error.' }; } finally { setUserDataLoading(false); } }; const setUserDataLoading = (isLoading) => { [userIdI, modelI, yearI, provinceI, dmsChk, saveBtn, resetBtn].forEach(el => { if(el) el.disabled = isLoading; }); if (saveBtn) saveBtn.style.opacity = isLoading?0.6:1; if (resetBtn) resetBtn.style.opacity = isLoading?0.6:1; if(isLoading && userStat) { userStat.textContent = 'Procesando...'; userStat.style.color = '#1E40AF'; } else if (userStat && userStat.textContent === 'Procesando...') { userStat.textContent = ''; } }; saveBtn.addEventListener('click', async () => { const userId = userIdI.value.trim(); const model = modelI.value.trim(); const year = yearI.value.trim(); const province = provinceI.value.trim(); const allowDMs = dmsChk.checked; if (!userId) { showToast('ID Usuario (Apodo) obligatorio.', 'warning', 4000); if(userStat) { userStat.textContent = 'ID de Usuario es obligatorio.'; userStat.style.color = '#EF4444'; } return; } const storedUserId = localStorage.getItem('userData_userId'); let syncAttempted = false; let syncSuccess = false; let syncMessage = ''; try { localStorage.setItem('userData_userId', userId); localStorage.setItem('userData_teslaModel', model); localStorage.setItem('userData_teslaYear', year); localStorage.setItem('userData_teslaProvince', province); localStorage.setItem('userData_allowDMs', allowDMs.toString()); console.log("User data saved locally."); updateUserIdDisplay(); } catch (e) { console.error("Local save err:", e); showToast(`Error local: ${e.message}`, 'error', 5000); if(userStat) { userStat.textContent = `Error local: ${e.message.substring(0, 100)}`; userStat.style.color = '#EF4444'; } return; } let proceedRemoteSave = false; if(userStat)userStat.textContent='Sincronizando con servidor...'; try { if (!storedUserId || userId !== storedUserId) { if(userStat)userStat.textContent='Validando ID en servidor...'; const chk = await callGAS('checkUserIdExists',{userId:userId}); syncAttempted=true; if(chk.status==='exists'){ syncMessage=`El ID "${userId}" ya existe en el servidor. No se guardó remotamente.`; showToast(syncMessage,'error', 6000); if(userStat) { userStat.textContent = syncMessage; userStat.style.color = '#EF4444'; } return; } else if(chk.status==='not_found'||chk.status==='success'){ if(storedUserId&&userId!==storedUserId){ if(userStat)userStat.textContent='Eliminando registro antiguo en servidor...'; const delOld=await callGAS('deleteUserRow',{userId:storedUserId}); if(delOld.status!=='success'&&delOld.status!=='not_found')console.warn("Fallo al eliminar registro antiguo en servidor:",delOld.message);} proceedRemoteSave=true; } else throw new Error(chk.message||"Error al validar ID en servidor."); } else proceedRemoteSave=true; if(proceedRemoteSave){ if(userStat)userStat.textContent='Guardando datos en servidor...'; const uData={userId:userId,model:model,year:year,province:province,allowDMs:allowDMs?'SI':'NO'}; const sav=await callGAS('addUserData',{userData:uData}); syncAttempted=true; if(sav.status==='success'){ syncSuccess=true; syncMessage='Datos guardados local y remotamente.'; if(userStat) { userStat.textContent = 'Sincronización OK.'; userStat.style.color = '#28a745'; } } else throw new Error(sav.message||"Error al guardar datos en servidor."); } } catch (e) { syncSuccess = false; syncMessage = `Guardado local. Error de sincronización: ${e.message}`; console.error("Error de sincronización GAS:", e); if(userStat) { userStat.textContent = `Sync error: ${e.message.substring(0, 100)}`; userStat.style.color = '#ffc107'; } } finally { if (syncAttempted) showToast(syncMessage, syncSuccess ? 'success' : 'warning', syncSuccess ? 3000 : 6000); else showToast('Datos guardados localmente.', 'success', 3000); if(userStat && userStat.textContent === 'Procesando...') userStat.textContent = 'Guardado local OK.'; setUserDataLoading(false); } }); resetBtn.addEventListener('click', async () => { const storedUserId = localStorage.getItem('userData_userId'); if (!storedUserId) { showToast('No hay registro de usuario local para resetear.', 'info', 3000); if(userStat) { userStat.textContent = 'No hay registro local.'; userStat.style.color = '#17a2b8';} return; } if (!confirm(`¿Estás seguro de que deseas resetear el registro de usuario "${storedUserId}"?\nEsta acción borrará tanto los datos compartidos en el servidor como tu registro local.`)) { showToast('Reseteo de usuario cancelado.', 'info', 2000); if(userStat) { userStat.textContent = 'Reseteo cancelado.'; userStat.style.color = '#17a2b8';} return; } let remoteDeletionAttempted = false; let remoteDeletionSuccess = false; let remoteMessage = ''; setUserDataLoading(true); if(userStat)userStat.textContent=`Eliminando registro remoto "${storedUserId}"...`; try { const delRes = await callGAS('deleteUserRow', { userId: storedUserId }); remoteDeletionAttempted = true; if (delRes.status === 'success') { remoteDeletionSuccess = true; remoteMessage = 'Registro remoto eliminado. '; console.log("Registro remoto eliminado exitosamente."); if(userStat) { userStat.textContent = 'Registro remoto eliminado.'; userStat.style.color = '#28a745'; } } else if (delRes.status === 'not_found') { remoteDeletionSuccess = true; remoteMessage = 'Registro remoto no encontrado (ya eliminado?). '; console.warn("Registro remoto no encontrado para eliminar."); if(userStat) { userStat.textContent = 'Registro remoto no encontrado.'; userStat.style.color = '#ffc107'; } } else { remoteMessage = `Error al eliminar registro remoto (${delRes.message || '?'}). `; console.error("Error al eliminar registro remoto:", delRes.message); if(userStat) { userStat.textContent = `Error remoto: ${delRes.message.substring(0, 100)}`; userStat.style.color = '#EF4444'; } } } catch (e) { remoteMessage = `Error de conexión al intentar eliminar remoto (${e.message}). `; console.error("Error de conexión GAS al eliminar:", e); if(userStat) { userStat.textContent = `Error conexión: ${e.message.substring(0, 100)}`; userStat.style.color = '#EF4444'; } } finally { if(!remoteDeletionAttempted && userStat) { userStat.textContent = ''; } } try { localStorage.removeItem('userData_userId'); localStorage.removeItem('userData_teslaModel'); localStorage.removeItem('userData_teslaYear'); localStorage.removeItem('userData_teslaProvince'); localStorage.removeItem('userData_allowDMs'); userIdI.value=''; modelI.value=''; yearI.value=''; provinceI.value=''; dmsChk.checked=false; updateUserIdDisplay(); showToast(`${remoteMessage}Datos locales reseteados.`, remoteDeletionSuccess ? 'success' : (remoteDeletionAttempted ? 'warning' : 'success'), 4000); if(userStat) { userStat.textContent = `Datos locales reseteados.`; userStat.style.color = '#28a745'; } } catch (e) { console.error("Error al limpiar datos de usuario localmente:", e); showToast(`${remoteMessage}Error al limpiar datos locales.`, 'error', 5000); if(userStat) { userStat.textContent = `Error limpiar local: ${e.message.substring(0, 100)}`; userStat.style.color = '#EF4444'; } } finally { setUserDataLoading(false); } }); clearBtn.addEventListener('click', () => { if (confirm('¿Estás MUY SEGURO de que deseas borrar TODO el caché local?\n\nEsta acción es IRREVERSIBLE y eliminará:\n- Todos tus recordatorios.\n- La configuración de modo oscuro y visibilidad.\n- Tus datos de usuario (ID, modelo, etc.).\n- Tu configuración de edición de la rejilla.\n- Tu clave de acceso guardada.\n\nAsegúrate de tener un código de Backup si no quieres perder tus personalizaciones.')) { const storedUserId = localStorage.getItem('userData_userId'); if (storedUserId) { console.log(`Attempting remote deletion for user ID ${storedUserId} before local clear.`); callGAS('deleteUserRow',{userId:storedUserId}).then(r=>console.log("Remote deletion result:",r)).catch(e=>console.warn("Error during remote deletion before local clear:",e)); } localStorage.clear(); sessionStorage.clear(); if (modal.parentNode) modal.parentNode.removeChild(modal); showToast('Datos borrados. Recargando la página...', 'info', 2000); setTimeout(() => { location.reload(); }, 500); } else { showToast('Borrado de caché cancelado.', 'info', 2000); } }); genBkupBtn.addEventListener('click', () => { bkupDisp.value = ''; bkupDisp.style.display = 'none'; const backupData = {}; let keysCount = 0; let skippedKeys = []; for (let i = 0; i < localStorage.length; i++) { const key = localStorage.key(i); if (key !== null) { if (managedKeys.includes(key)) { try { backupData[key] = localStorage.getItem(key); keysCount++; } catch (e) { console.warn(`Skipping backup for key "${key}" due to error:`, e); skippedKeys.push(`${key}(err)`); } } else { skippedKeys.push(key); } } } if (keysCount === 0) { showToast('No se encontraron datos locales para crear el backup.', 'warning', 4000                if(userStat) { userStat.textContent = 'No hay datos para backup.'; userStat.style.color = '#ffc107'; } return;
+            }
+            try {
+                const jsonString = JSON.stringify(backupData, null, 2);
+                bkupDisp.value = jsonString;
+                bkupDisp.style.display = 'block';
+                bkupDisp.select();
+                let message = `Código de backup (${keysCount} claves) generado. Cópialo.`;
+                if(skippedKeys.length > 0) { message += ` (Ignoradas: ${skippedKeys.length})`; console.warn("Skipped keys during backup:", skippedKeys); }
+                showToast(message, 'success', 5000);
+                if(userStat) { userStat.textContent = 'Backup generado OK.'; userStat.style.color = '#28a745'; }
+            } catch (e) {
+                console.error("Error al generar el código de backup:", e);
+                bkupDisp.value = `Error al generar el código:\n${e.message}`;
+                bkupDisp.style.display = 'block';
+                showToast('Error al generar el código de backup.', 'error', 5000);
+                if(userStat) { userStat.textContent = `Error backup: ${e.message.substring(0, 100)}`; userStat.style.color = '#EF4444'; }
+            }
+        });
+
+        restBtn.addEventListener('click', () => {
+            const jsonString = restInp.value.trim();
+            if (!jsonString) {
+                showToast('Pega el código de backup en el campo de texto.', 'warning', 4000);
+                if(userStat) { userStat.textContent = 'Pega el código.'; userStat.style.color = '#ffc107'; }
+                return;
+            }
+            try {
+                const restoredData = JSON.parse(jsonString);
+                if (typeof restoredData !== 'object' || restoredData === null || Array.isArray(restoredData)) throw new Error("El código no tiene un formato de objeto válido.");
+                if (!confirm('¿Estás seguro de que deseas restaurar los datos?\nEsto borrará tus datos locales actuales y los reemplazará con los datos compatibles de la copia de seguridad.')) {
+                    showToast('Restauración cancelada.', 'info', 2000);
+                    if(userStat) { userStat.textContent = 'Restauración cancelada.'; userStat.style.color = '#17a2b8'; }
+                    return;
+                }
+                // Clean relevant local storage and session storage before restore
+                managedKeys.forEach(key => localStorage.removeItem(key));
+                Object.keys(sessionStorage).forEach(key => {
+                    if (key.startsWith('reminder_last_notified_') || key === 'personalizationHelpShown') sessionStorage.removeItem(key);
+                });
+
+                let restoredCount = 0;
+                let skippedKeys = [];
+                for (const key in restoredData) {
+                    if (Object.hasOwnProperty.call(restoredData, key)) {
+                        if (managedKeys.includes(key)) {
+                            try {
+                                localStorage.setItem(key, restoredData[key]);
+                                restoredCount++;
+                            } catch (e) {
+                                console.warn(`Error al restaurar la clave "${key}":`, e);
+                                skippedKeys.push(`${key}(err)`);
+                            }
+                        } else {
+                            skippedKeys.push(key);
+                        }
+                    }
+                }
+
+                let message = '';
+                let toastType = 'info';
+                if (restoredCount > 0) {
+                    message = `Restauradas ${restoredCount} claves compatibles.`;
+                    if (skippedKeys.length > 0) {
+                        console.log("Claves ignoradas durante la restauración:", skippedKeys);
+                        message += ` Ignoradas ${skippedKeys.length} (incompatibles o con error).`;
+                    }
+                    message += ' Recargando la página...';
+                    toastType = 'success';
+                    if (modal.parentNode) modal.parentNode.removeChild(modal);
+                    showToast(message, toastType, 3000);
+                    setTimeout(() => {
+                        location.reload();
+                    }, 1800);
+                } else {
+                    message = 'No se encontraron datos compatibles en el código de backup.';
+                    if (skippedKeys.length > 0) {
+                        message += ` Ignoradas ${skippedKeys.length} (no compatibles).`;
+                        console.warn("Claves ignoradas durante la restauración:", skippedKeys);
+                    }
+                    toastType = 'warning';
+                    showToast(message, toastType, 5000);
+                    if(userStat) { userStat.textContent = message.substring(0, 100); userStat.style.color = '#ffc107'; }
+                }
+            } catch (e) {
+                console.error("Error al restaurar el backup:", e);
+                showToast(`Error al restaurar: ${e.message}`, 'error', 5000);
+                if(userStat) { userStat.textContent = `Error restaurar: ${e.message.substring(0, 100)}`; userStat.style.color = '#EF4444'; }
+            }
+        });
+
+         restoreGridBtn.addEventListener('click', () => {
+                if(restoreGridStatus) restoreGridStatus.textContent = '';
                 if (confirm('¿Estás seguro de que deseas restaurar la configuración original del grid?\n\nEsto eliminará TODAS tus personalizaciones de:\n- Posición de los marcadores.\n- Nombres, URLs y favicons modificados.\n- Asignaciones de botones laterales (PdR,s, iAs, etc.).\n\nEsta acción NO afecta a tus recordatorios, modo oscuro ni otros ajustes.')) {
                     try {
                         localStorage.removeItem('customGridData');
@@ -1523,9 +1680,14 @@
              startNoticeRotation();
         } catch (e) { console.error("Notices fail", e); }
 
+        // --- MODIFIED: Reminder Initialization ---
         checkReminders(); // Comprobar recordatorios VENCIDOS al inicio
-        const remInterval = setInterval(checkReminders, 60000); // Comprobar cada minuto
-        window.addEventListener('beforeunload', () => clearInterval(remInterval));
+        if (reminderCheckIntervalId) clearInterval(reminderCheckIntervalId); // Limpiar intervalo anterior si existe
+        reminderCheckIntervalId = setInterval(checkReminders, 60000); // Comprobar cada minuto
+        window.addEventListener('beforeunload', () => {
+            if (reminderCheckIntervalId) clearInterval(reminderCheckIntervalId);
+        });
+        // --- END MODIFIED Reminder Initialization ---
 
         showToast("Consejo: Arrastra pantalla izq/der para historial nav.", 'info', 7000);
 
@@ -1596,6 +1758,13 @@
 
         // Listener limpieza al cerrar
          window.addEventListener('beforeunload', () => {
+             // Limpiar intervalo de recordatorios si está activo
+            if (reminderCheckIntervalId) {
+                clearInterval(reminderCheckIntervalId);
+                reminderCheckIntervalId = null;
+                console.log("Cleared reminder check interval on page unload.");
+            }
+
             // Limpiar estados visuales temporales
             if (editingTargetElement) { editingTargetElement.classList.remove('editing-target'); editingTargetElement = null; }
 
@@ -1628,7 +1797,6 @@
             }
         });
     });
-
 </script>
 </body>
 </html>
