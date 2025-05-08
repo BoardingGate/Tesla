@@ -911,18 +911,442 @@
 </div>
 
 <!-- NUEVO: Contenedor para el modal de mapa de ubicaciones -->
-<div id="location-map-modal-overlay" class="location-map-modal-overlay hidden">
-    <div class="location-map-modal-content">
-        <h2>Ubicaciones de Recordatorios</h2>
-        <div id="large-location-map-container">
-            <div id="large-location-map"></div>
-        </div>
-        <div class="location-map-modal-buttons">
-            <button id="large-map-locate-me">ESTÁS AQUÍ</button>
-            <button id="close-large-map">SALIR</button>
+    </div> <!-- This closes the reminder-table-modal div -->
+
+    <!-- NEW CODE STARTS HERE -->
+
+    <!-- Add the new map view modal HTML here, immediately after the reminder-table-modal closing div -->
+    <div id="location-map-view-modal" class="hidden">
+        <h2 style="text-align:center;margin-bottom:1rem;font-size:1.5rem;color:#333;">Ubicaciones de Recordatorios</h2>
+        <div id="all-locations-map" style="width: 100%; height: calc(96vh - 120px); min-height: 300px; border-radius: 0.5rem; margin-bottom: 1rem;"></div>
+        <div class="button-group" style="justify-content: center; gap: 1rem;">
+            <button id="map-view-close" style="background-color: #D1D5DB; color: #111827;">SALIR</button>
+            <button id="map-view-locate-me" style="background-color: #2563EB; color: white;">ESTÁS AQUÍ</button>
         </div>
     </div>
-</div>
+
+    <!-- Add the new CSS rules here, preferably inside the main <style> tag in the <head>,
+         but per instruction to group all new code below, adding a new style block here. -->
+    <style>
+        #location-map-view-modal {
+            position: fixed;
+            top: 2%; /* Slightly down from the top */
+            left: 2%; /* Slightly in from the left */
+            right: 2%; /* Slightly in from the right */
+            bottom: 2%; /* Slightly up from the bottom */
+            width: 96%; /* Adjust based on top/left/right/bottom */
+            max-width: none; /* Allow nearly full width */
+            max-height: 96vh; /* Allow nearly full height */
+            overflow: hidden; /* Map handles its own overflow */
+            background-color: #E6D6A8; /* Similar to reminder-table-modal */
+            border-radius: 1rem;
+            box-shadow: 0 6px 15px rgba(0, 0, 0, 0.3);
+            z-index: 4500; /* Above reminder-table-modal (3500) but maybe below postpone (4000) */
+            display: flex;
+            flex-direction: column;
+            padding: 1.5rem;
+            box-sizing: border-box; /* Include padding in width/height */
+        }
+         #location-map-view-modal .button-group {
+             flex-shrink: 0; /* Prevent buttons from shrinking */
+             padding-top: 1rem;
+             border-top: 1px solid #ccc; /* Optional separator */
+         }
+        #all-locations-map {
+             flex-grow: 1; /* Map takes remaining space */
+             width: 100%;
+             min-height: 300px; /* Ensure a minimum size */
+             border: 1px solid #ccc;
+             border-radius: 0.5rem;
+             background-color: #eee;
+             margin-bottom: 1rem;
+        }
+        #location-map-view-modal button {
+             padding: 0.75rem 1.5rem;
+             font-size: 1.1rem;
+             border-radius: 0.25rem;
+             cursor: pointer;
+             border: none;
+        }
+        #map-view-close:hover { background-color: #B0B0B0; }
+        #map-view-locate-me:hover { background-color: #1D4ED8; }
+
+        #all-locations-map .leaflet-popup-content-wrapper {
+            max-height: 150px; /* Adjust max height */
+            overflow-y: auto; /* Add scroll if content exceeds max height */
+        }
+        #all-locations-map .leaflet-popup-content {
+            font-size: 0.9rem;
+        }
+        #all-locations-map .leaflet-popup-content .popup-modify-button {
+             display: block;
+             width: 100%;
+             padding: 0.5rem;
+             margin-top: 0.5rem;
+             background-color: #10B981;
+             color: white;
+             text-align: center;
+             border: none;
+             border-radius: 0.25rem;
+             cursor: pointer;
+             font-weight: bold;
+        }
+         #all-locations-map .leaflet-popup-content .popup-modify-button:hover {
+             background-color: #059669;
+         }
+    </style>
+
+    <script>
+        // Add the new modal variable
+        let allLocationsMapViewModal = null;
+        let allLocationsMapInstance = null;
+        let userLocationMarker = null;
+
+        // Add the new function to show the map modal
+        function showLocationsMapModal(locations) {
+            hideUnifiedReminderWindow();
+            const otherModals = document.querySelectorAll('.choice-modal, .edit-modal, .edit-info-modal, .help-modal, .reminder-modal, .reminder-table-modal, #postpone-options-modal, .versions-modal-overlay, .saved-locations-modal');
+            otherModals.forEach(m => m.remove());
+
+            allLocationsMapViewModal = document.getElementById('location-map-view-modal');
+            const mapContainer = document.getElementById('all-locations-map');
+            const closeButton = document.getElementById('map-view-close');
+            const locateMeButton = document.getElementById('map-view-locate-me');
+
+            if (!allLocationsMapViewModal || !mapContainer || !closeButton || !locateMeButton) {
+                console.error("Map view modal elements not found.");
+                return;
+            }
+
+            // Destroy previous map instance if it exists
+            if (allLocationsMapInstance) {
+                try { allLocationsMapInstance.remove(); } catch(e) { console.warn("Error removing previous all locations map:", e); }
+                allLocationsMapInstance = null;
+                userLocationMarker = null;
+            }
+
+            // Clear map container HTML content just in case
+            mapContainer.innerHTML = '';
+
+            allLocationsMapViewModal.classList.remove('hidden');
+
+            // Initialize the map
+            allLocationsMapInstance = L.map('all-locations-map', { zoomControl: true }).setView([0, 0], 2); // Initial view, will be adjusted
+
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '© OpenStreetMap contributors'
+            }).addTo(allLocationsMapInstance);
+
+            let markerCoords = [];
+            let markers = []; // To keep track of markers to add click listeners
+
+            locations.forEach(reminder => {
+                if (reminder.locationCoordinates?.latitude !== undefined && reminder.locationCoordinates?.longitude !== undefined) {
+                    const latlng = [reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude];
+                    const marker = L.marker(latlng).addTo(allLocationsMapInstance);
+
+                    let popupContent = `
+                        <div style="max-width: 250px;">
+                            <p style="font-weight: bold; margin-bottom: 0.5rem;">${reminder.text.replace(/<[^>]*>/g, '')}</p>
+                            ${reminder.time ? `<p style="margin-bottom: 0.2rem;">Hora: ${formatTimeWithPeriod(reminder.time)}</p>` : ''}
+                            ${reminder.date ? `<p style="margin-bottom: 0.2rem;">Fecha: ${formatDateDetailed(reminder.date)}</p>` : ''}
+                             ${reminder.type === 'weekly' && reminder.repeatDays?.length > 0 ? `<p style="margin-bottom: 0.2rem;">Repite: ${reminder.repeatDays.map(d => ['Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb'][d]).join(', ')}</p>` : ''}
+                             ${reminder.type === 'interval' && reminder.intervalDays ? `<p style="margin-bottom: 0.2rem;">Cada: ${reminder.intervalDays} días</p>` : ''}
+                            <p style="margin-bottom: 0.2rem;">Radio: ${reminder.radiusMeters || 1500}m</p>
+                            <button class="popup-modify-button" data-id="${reminder.id}">Modificar</button>
+                        </div>
+                    `;
+
+                    marker.bindPopup(popupContent);
+                    markerCoords.push(latlng);
+                    markers.push({ marker: marker, reminder: reminder }); // Store marker and reminder data
+
+                    // Add click listener AFTER the marker is added and popup is bound
+                     marker.on('popupopen', function() {
+                         const modifyButton = marker._popup._contentNode.querySelector('.popup-modify-button');
+                         if (modifyButton) {
+                              modifyButton.addEventListener('click', () => {
+                                  const remId = parseInt(modifyButton.dataset.id);
+                                  if (!isNaN(remId)) {
+                                       markReminderAsManaged(remId, true); // Mark as managed
+                                       let remindersFromStorage = JSON.parse(localStorage.getItem('reminders') || '[]');
+                                       const reminderToModify = remindersFromStorage.find(r => r.id === remId);
+                                       if (reminderToModify) {
+                                            closeMapModal(); // Close map modal first
+                                            showReminderModal(reminderToModify); // Open reminder modal
+                                       } else {
+                                            console.error("Recordatorio para modificar no encontrado:", remId);
+                                            showToast("Error: no se pudo encontrar el recordatorio.", "error");
+                                       }
+                                  }
+                              });
+                         }
+                     });
+                }
+            });
+
+            // Fit bounds to include all markers + 5km margin
+            if (markerCoords.length > 0) {
+                const bounds = L.latLngBounds(markerCoords);
+                // Leaflet's pad method adds a percentage, not fixed km.
+                // A simple way to add a margin might be to pad by a percentage
+                // or manually calculate based on the furthest point.
+                // Let's try padding first, it's simpler. A value like 0.2 might roughly correspond to a margin.
+                 allLocationsMapInstance.fitBounds(bounds, { padding: [50, 50] }); // Add 50px padding
+            }
+
+
+            // "ESTÁS AQUÍ" button listener
+            locateMeButton.addEventListener('click', () => {
+                 if (!allLocationsMapInstance) return;
+                 locateMeButton.disabled = true; locateMeButton.textContent = 'Buscando...';
+                 getCurrentLocation(
+                     (coords) => {
+                         const userLatlng = [coords.latitude, coords.longitude];
+                         allLocationsMapInstance.setView(userLatlng, 16); // Zoom closer to user location
+                         if (!userLocationMarker) {
+                             userLocationMarker = L.marker(userLatlng, { icon: L.icon({ iconUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-icon.png', shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-shadow.png', iconRetinaUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-icon-2x.png', iconSize: [25, 41], iconAnchor: [12, 41], popupAnchor: [1, -34], tooltipAnchor: [16, -28], shadowSize: [41, 41] }) }).addTo(allLocationsMapInstance)
+                             .bindTooltip("Estás aquí", {permanent: true, direction: 'right'});
+                         } else {
+                              userLocationMarker.setLatLng(userLatlng);
+                         }
+                         showToast('Tu ubicación encontrada.', 'success');
+                         locateMeButton.disabled = false; locateMeButton.textContent = 'ESTÁS AQUÍ';
+                     },
+                     (errorMsg) => {
+                         showToast(`Error al localizar: ${errorMsg}`, 'error');
+                         locateMeButton.disabled = false; locateMeButton.textContent = 'ESTÁS AQUÍ';
+                     }
+                 );
+            });
+
+            // "SALIR" button listener
+            closeButton.addEventListener('click', closeMapModal);
+
+            // Invalidate map size after modal is visible
+            setTimeout(() => {
+                 if (allLocationsMapInstance) {
+                     allLocationsMapInstance.invalidateSize();
+                      // If only one marker, center on it after invalidating size
+                      if (markerCoords.length === 1) {
+                          allLocationsMapInstance.setView(markerCoords[0], 14); // Zoom in slightly for a single point
+                      } else if (markerCoords.length > 1) {
+                          allLocationsMapInstance.fitBounds(L.latLngBounds(markerCoords), { padding: [50, 50] }); // Re-fit bounds after size update
+                      }
+                 }
+            }, 100);
+        }
+
+        function closeMapModal() {
+            if (allLocationsMapInstance) {
+                 try { allLocationsMapInstance.remove(); } catch(e) { console.warn("Error removing map instance:", e); }
+                 allLocationsMapInstance = null;
+                 userLocationMarker = null;
+            }
+            if (allLocationsMapViewModal && allLocationsMapViewModal.parentNode) {
+                allLocationsMapViewModal.classList.add('hidden');
+                 // Optionally clear the map container HTML to free memory more aggressively
+                 const mapContainer = document.getElementById('all-locations-map');
+                 if (mapContainer) mapContainer.innerHTML = '';
+            }
+        }
+
+
+        // Modify showAllReminders to add the button and its logic
+         function showAllReminders() {
+             hideUnifiedReminderWindow();
+             Object.values(previewMaps).forEach(map => map?.remove()); previewMaps = {};
+             const otherModals = document.querySelectorAll('.choice-modal, .edit-modal, .edit-info-modal, .help-modal, .reminder-modal, .versions-modal-overlay, .saved-locations-modal'); otherModals.forEach(m => m.remove());
+
+             let allReminders = [];
+             try {
+                 allReminders = JSON.parse(localStorage.getItem('reminders') || '[]').map(r => ({ ...r }));
+             } catch(e) {
+                 console.error("Error parsing reminders for table:", e);
+                 showToast("Error al cargar lista de recordatorios.", "error");
+                 return;
+             }
+
+             const showExcluded = JSON.parse(localStorage.getItem(SHOW_EXCLUDED_REMINDERS_KEY)) || false;
+             let remindersToDisplay = allReminders;
+             if (!showExcluded) {
+                 remindersToDisplay = allReminders.filter(r => !r.excludeFromList);
+             }
+
+
+             remindersToDisplay.sort((a, b) => {
+                 const nowForSort = new Date();
+                 const nextA = calculateNextOccurrence(a, nowForSort);
+                 const nextB = calculateNextOccurrence(b, nowForSort);
+
+                 if (nextA && nextB) {
+                     const timeDiff = nextA.getTime() - nextB.getTime();
+                     if (timeDiff !== 0) return timeDiff;
+                 } else if (nextA) {
+                     return -1;
+                 } else if (nextB) {
+                     return 1;
+                 }
+                 const typeOrder = { 'simple': 1, 'hourly': 2, 'daily': 3, 'weekly': 4, 'interval': 5 };
+                 const typeDiff = (typeOrder[a.type] ?? 99) - (typeOrder[b.type] ?? 99);
+                 if (typeDiff !== 0) return typeDiff;
+
+                 const createdAtA = a.createdAt ? new Date(a.createdAt).getTime() : 0;
+                 const createdAtB = b.createdAt ? new Date(b.createdAt).getTime() : 0;
+                 return createdAtA - createdAtB;
+             });
+
+             const existingModal = document.querySelector('.reminder-table-modal');
+             if (existingModal) {
+                 if (existingModal.autoCloseInterval) clearInterval(existingModal.autoCloseInterval);
+                 if (existingModal.parentNode) existingModal.parentNode.removeChild(existingModal);
+             }
+
+             const modalTable = document.createElement('div');
+             modalTable.className = 'reminder-table-modal';
+             modalTable.setAttribute('aria-label', 'Tabla recordatorios');
+
+             modalTable.innerHTML = `
+                 <h2 style="text-align:center;margin-bottom:1rem;font-size:1.5rem;color:#333;">Recordatorios</h2>
+
+               <div class="top-button-container" style="justify-content: space-between; flex-wrap: wrap; gap: 10px;"> <!-- Added flex-wrap and gap -->
+                     <!-- Botones a la izquierda -->
+                     <div style="display: flex; align-items: center; gap: 1rem;"> <!-- Added gap -->
+                         <button type="button" id="close-reminders-top">SALIR <span class="button-countdown"></span></button>
+                         <!-- NEW BUTTON -->
+                         <button type="button" id="view-locations-button" style="background-color: #2563EB; color: white;">VER UBICACIONES</button>
+                     </div>
+                     <!-- Checkbox a la derecha -->
+                     <div style="display: flex; align-items: center;">
+                        <input type="checkbox" id="show-excluded-reminders" ${showExcluded ? 'checked' : ''} style="transform: scale(1.3);">
+                        <label for="show-excluded-reminders" style="margin-left: 0.5rem; font-size: 1.1rem;">MOSTRAR RADARES u OTROS</label>
+                     </div>
+                 </div>
+
+
+                 <table>
+                     <thead>
+                         <tr>
+                             <th style="width:12%;">Acciones</th>
+                             <th>Texto</th>
+                             <th style="width:8%;">Hora</th>
+                             <th style="width:10%;">Fecha Prox.</th>
+                             <th style="width:15%;">Días Rep.</th>
+                             <th style="width:8%;">Cada x días</th>
+                             <th style="width:8%;">Geoloc.</th>
+                             <th style="width:10%;">Creado</th>
+                         </tr>
+                     </thead>
+                     <tbody id="reminder-table-body">
+                         ${remindersToDisplay.length === 0 ? `<tr><td colspan="8" style="text-align:center;padding:1rem;">No hay recordatorios ${showExcluded ? ' (incluyendo excluidos)' : ''}.</td></tr>` :
+                         remindersToDisplay.map(r => {
+                             const isCyclic = r.type === 'weekly' || r.type === 'interval';
+                             const rowBackgroundColor = isCyclic ? (r.excludeFromList ? '#C0D8C0' : '#D9E5DB') : (r.excludeFromList ? '#D8BFBF' : '#EAD9D9'); // Color más tenue si excludeFromList es true
+                             const nextOccurrenceDate = calculateNextOccurrence(r, new Date());
+                             const formattedNextDate = nextOccurrenceDate ? formatDateToDDMMMYY(nextOccurrenceDate.toISOString().split('T')[0]) : formatDateToDDMMMYY(r.date);
+                             const timeDisplay = r.time ? r.time : '-';
+                             const geoIndicator = r.isLocationEnabled ? '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#008000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path><circle cx="12" cy="10" r="3"></circle></svg>' : '-';
+
+                             return `<tr data-id="${r.id}" style="background-color: ${rowBackgroundColor};">
+                                         <td>
+                                             <button class="visto-prox" data-id="${r.id}" title="${isCyclic ? 'Marcar Visto y Avanzar al Próximo Ciclo' : 'Marcar Visto y Borrar'}">Visto/Prox</button>
+                                             <button class="postpone" data-id="${r.id}" title="Posponer">Posponer</button>
+                                             ${isCyclic ? `<button class="cancel-cyclic-table" data-id="${r.id}" title="Anular Ciclo Permanente">Anular Ciclo</button>` : ''}
+                                         </td>
+                                         <td class="text-column" title="Modificar">${r.text}</td>
+                                         <td class="time-column">${timeDisplay}</td>
+                                         <td class="date-column">${formattedNextDate}</td>
+                                         <td>${r.type === 'weekly' && r.repeatDays?.length > 0 ? r.repeatDays.map(d => ['Dom','Lun','Mar','Mié','Jue','Vie','Sáb'][d]).join(', ') : '-'}</td>
+                                         <td>${r.type === 'interval' ? r.intervalDays || '-' : '-'}</td>
+                                         <td>${geoIndicator}</td>
+                                         <td class="date-column">${r.createdAt ? formatDateToDDMMMYY(r.createdAt.split('T')[0]) : '-'}</td>
+                                     </tr>`;
+                         }).join('')}
+                     </tbody>
+                 </table>
+                 <div class="button-group flex justify-start"><button type="button" id="close-reminders">SALIR <span class="button-countdown"></span></button></div>`;
+             document.body.appendChild(modalTable);
+
+             // NUEVO: Listener para el botón "VER UBICACIONES"
+             const viewLocationsButton = modalTable.querySelector('#view-locations-button');
+             if (viewLocationsButton) {
+                  viewLocationsButton.addEventListener('click', () => {
+                      const remindersWithLocation = allReminders.filter(r =>
+                          r.isLocationEnabled && r.locationCoordinates &&
+                          typeof r.locationCoordinates.latitude === 'number' && typeof r.locationCoordinates.longitude === 'number'
+                      );
+
+                      if (remindersWithLocation.length === 0) {
+                          showToast("No hay recordatorios con ubicación fijada.", "warning");
+                      } else {
+                          // Close the table modal before showing the map modal
+                          if (modalTable.autoCloseInterval) clearInterval(modalTable.autoCloseInterval);
+                          modalTable.remove();
+                          showLocationsMapModal(remindersWithLocation);
+                      }
+                  });
+             }
+
+             // NUEVO: Listener para el checkbox de "MOSTRAR RADARES U OTROS"
+             const showExcludedCheckbox = modalTable.querySelector('#show-excluded-reminders');
+             if (showExcludedCheckbox) {
+                 showExcludedCheckbox.addEventListener('change', () => {
+                     localStorage.setItem(SHOW_EXCLUDED_REMINDERS_KEY, JSON.stringify(showExcludedCheckbox.checked));
+                     if (modalTable.autoCloseInterval) clearInterval(modalTable.autoCloseInterval);
+                     modalTable.remove(); // Eliminar modal actual
+                     showAllReminders(); // Volver a mostrar con el filtro actualizado
+                 });
+             }
+
+
+             let count = 60;
+             const countdownSpans = modalTable.querySelectorAll('.button-countdown');
+             countdownSpans.forEach(span => span.textContent = `(${count})`);
+             const closeClean = () => {
+                 clearInterval(modalTable.autoCloseInterval);
+                 modalTable.autoCloseInterval = null;
+                 if (modalTable.parentNode) modalTable.parentNode.removeChild(modalTable);
+                 if (fromReminderModal) {
+                     fromReminderModal = false;
+                     showReminderModal();
+                 }
+             };
+             modalTable.autoCloseInterval = setInterval(() => {
+                 count--;
+                 countdownSpans.forEach(span => span.textContent = `(${count})`);
+                 if (count <= 0) {
+                     closeClean();
+                 }
+             }, 1000);
+             const resetTimer = () => {
+                 if (!modalTable.autoCloseInterval) return;
+                 clearInterval(modalTable.autoCloseInterval);
+                 count = 60;
+                 countdownSpans.forEach(span => span.textContent = `(${count})`);
+                 modalTable.autoCloseInterval = setInterval(() => {
+                     count--;
+                     countdownSpans.forEach(span => span.textContent = `(${count})`);
+                     if (count <= 0) {
+                         closeClean();
+                     }
+                 }, 1000);
+             };
+             modalTable.addEventListener('click', resetTimer);
+             modalTable.addEventListener('touchstart', resetTimer, { passive: true });
+             modalTable.addEventListener('input', resetTimer);
+
+             modalTable.querySelector('#close-reminders').addEventListener('click', closeClean);
+             modalTable.querySelector('#close-reminders-top').addEventListener('click', closeClean);
+
+             setupReminderTableListeners(modalTable);
+         }
+
+    </script>
+
+    <!-- NEW CODE ENDS HERE -->
+
+
+
 
 
 <div id="scroll-toggle" class="scroll-toggle-button" title="Ir al inicio o fin">
