@@ -3549,198 +3549,197 @@ function postponeAllVisibleReminders() {
 
 
      function checkReminders() {
-         let currentReminders = [];
-         try {
-             currentReminders = JSON.parse(localStorage.getItem('reminders') || '[]');
-         } catch (e) {
-             console.error("Error parsing reminders:", e);
-             localStorage.setItem('reminders_backup_error', localStorage.getItem('reminders') || '[]');
-             localStorage.removeItem('reminders');
-             showToast("Error al cargar recordatorios. Backup intentado.", "error", 5000);
-             return;
-         }
+    let currentReminders = [];
+    try {
+        currentReminders = JSON.parse(localStorage.getItem('reminders') || '[]');
+    } catch (e) {
+        console.error("Error parsing reminders:", e);
+        localStorage.setItem('reminders_backup_error', localStorage.getItem('reminders') || '[]');
+        localStorage.removeItem('reminders');
+        showToast("Error al cargar recordatorios. Backup intentado.", "error", 5000);
+        return;
+    }
 
-         const now = new Date();
-         let overdueReminders = [];
-         const validRemindersForStorage = [];
-         let storageNeedsUpdate = false;
-         const processedIds = new Set(); 
-         let newOverdueFound = false;
+    const now = new Date();
+    let overdueReminders = [];
+    const validRemindersForStorage = [];
+    let storageNeedsUpdate = false;
+    const processedIds = new Set();
+    let newOverdueFound = false;
 
-         let currentLocationPromise = null;
-         const needsLocationCheck = currentReminders.some(r => r.isLocationEnabled && !r.managedByUser);
-         if (needsLocationCheck) {
-             currentLocationPromise = new Promise((resolve) => {
-                 getCurrentLocation(
-                     (coords) => resolve(coords),
-                     (errorMsg) => {
-                         console.warn("No se pudo obtener la ubicación para la comprobación:", errorMsg);
-                         resolve(null); 
-                     }
-                 );
-             });
-         } else {
-             currentLocationPromise = Promise.resolve(null); 
-         }
+    let currentLocationPromise = null;
+    // Necesitamos obtener la ubicación si hay recordatorios por ubicación no gestionados
+    // O si el mapa de todas las ubicaciones está abierto (para actualizar el Coche.PNG)
+    const needsLocationCheckForReminders = currentReminders.some(r => r.isLocationEnabled && !r.managedByUser);
+    const isAllLocationsMapOpen = !!(allLocationsMapInstance && document.getElementById('reminders-location-map-modal'));
 
-         // NUEVO: Lógica para actualizar mapa si está abierto
-         if (allLocationsMapInstance) {
+    if (needsLocationCheckForReminders || isAllLocationsMapOpen) {
+        currentLocationPromise = new Promise((resolve) => {
             getCurrentLocation(
-                (coords) => {
-                    if (allLocationsMapInstance) { // Volver a comprobar por si se cerró mientras tanto
-                        const latLng = L.latLng(coords.latitude, coords.longitude);
-                        // Actualizar marcador "Coche.PNG" (initialUserLocationMarker)
-                        if (initialUserLocationMarker) {
-                            initialUserLocationMarker.setLatLng(latLng);
-                        } else {
-                            // Si no existe, podría crearse aquí si se desea, pero el diseño actual
-                            // lo crea solo al abrir el mapa la primera vez.
-                        }
-                        if(initialUserLocationCircle) {
-                            initialUserLocationCircle.setLatLng(latLng);
-                        }
-
-                        // Actualizar marcador "ESTÁS AQUÍ" (userLocationMarkerOnAllMap) si existe
-                        if (userLocationMarkerOnAllMap) {
-                            userLocationMarkerOnAllMap.setLatLng(latLng);
-                             if (userLocationAccuracyCircleOnAllMap && userLocationAccuracyCircleOnAllMap.options.radius === 200) {
-                                 userLocationAccuracyCircleOnAllMap.setLatLng(latLng);
-                             }
-                        }
-                        // No se hace setView aquí para no interrumpir al usuario si está navegando por el mapa
-                        console.log("Posición actual actualizada en el mapa de ubicaciones.");
-                    }
-                },
+                (coords) => resolve(coords),
                 (errorMsg) => {
-                    console.warn("Error al actualizar posición en mapa abierto:", errorMsg);
+                    console.warn("checkReminders: No se pudo obtener la ubicación:", errorMsg);
+                    resolve(null); // Resolver con null para que el .then continúe
                 }
             );
+        });
+    } else {
+        currentLocationPromise = Promise.resolve(null); // No se necesita ubicación
+    }
+
+    currentLocationPromise.then(currentCoords => {
+        // Actualizar posición en el mapa general si está abierto y tenemos coordenadas
+        if (isAllLocationsMapOpen && currentCoords && allLocationsMapInstance) {
+            const latLng = L.latLng(currentCoords.latitude, currentCoords.longitude);
+            
+            // Actualizar marcador "Coche.PNG" (initialUserLocationMarker)
+            if (initialUserLocationMarker) {
+                initialUserLocationMarker.setLatLng(latLng);
+            } else {
+                // Si no existe y el mapa está abierto, crearlo.
+                initialUserLocationMarker = L.marker(latLng, { icon: carIcon, zIndexOffset: 1000 })
+                    .addTo(allLocationsMapInstance)
+                    .bindPopup("Tu posición actual (actualizada periódicamente)");
+            }
+            // Actualizar círculo del "Coche.PNG"
+            if(initialUserLocationCircle) {
+                initialUserLocationCircle.setLatLng(latLng);
+            } else {
+                 initialUserLocationCircle = L.circle(latLng, {
+                    radius: 200, color: 'blue', fillColor: '#ADD8E6', fillOpacity: 0.15
+                }).addTo(allLocationsMapInstance);
+            }
+
+            // Actualizar marcador "ESTÁS AQUÍ" (userLocationMarkerOnAllMap) si existe Y es el icono del coche
+            // Esto es para que si el usuario pulsó "ESTÁS AQUÍ", ese marcador también siga moviéndose
+            if (userLocationMarkerOnAllMap && userLocationMarkerOnAllMap.options.icon === carIcon) {
+                userLocationMarkerOnAllMap.setLatLng(latLng);
+                 // Actualizar su círculo asociado si también es el de "ESTÁS AQUÍ" (200m)
+                 if (userLocationAccuracyCircleOnAllMap && userLocationAccuracyCircleOnAllMap.options.radius === 200 && userLocationAccuracyCircleOnAllMap.options.color === 'blue') {
+                     userLocationAccuracyCircleOnAllMap.setLatLng(latLng);
+                 }
+            }
+            console.log("Posición GPS actualizada en el mapa de ubicaciones (checkReminders).");
         }
 
+        // Procesamiento de recordatorios
+        currentReminders.forEach(reminder => {
+            if (!reminder || typeof reminder.id !== 'number' || typeof reminder.managedByUser === 'undefined' || !reminder.type || !reminder.time || !reminder.date || !reminder.createdAt) {
+                console.warn("Invalid/incomplete reminder structure found, removing.", reminder);
+                storageNeedsUpdate = true;
+                return;
+            }
+            if (processedIds.has(reminder.id)) {
+                 console.warn("Duplicate reminder ID found, removing.", reminder.id);
+                 storageNeedsUpdate = true;
+                 return;
+            }
+            processedIds.add(reminder.id);
 
-         currentLocationPromise.then(currentCoords => {
-             currentReminders.forEach(reminder => {
-                 if (!reminder || typeof reminder.id !== 'number' || typeof reminder.managedByUser === 'undefined' || !reminder.type || !reminder.time || !reminder.date || !reminder.createdAt) {
-                     console.warn("Invalid/incomplete reminder structure found, removing.", reminder);
-                     storageNeedsUpdate = true;
-                     return; 
+            const isManagedByUser = reminder.managedByUser === true;
+            let keepInStorage = true;
+            let isOverdue = false;
+            let locationConditionMet = true;
+
+            if (!isManagedByUser) {
+                let reminderLocalDueTime = null;
+                try {
+                    const [year, month, day] = reminder.date.split('-').map(Number);
+                    const [hour, minute] = reminder.time.split(':').map(Number);
+                    reminderLocalDueTime = new Date(year, month - 1, day, hour, minute);
+
+                    if (isNaN(reminderLocalDueTime.getTime())) {
+                        throw new Error("Invalid date/time components");
+                    }
+
+                    if (reminderLocalDueTime <= now) {
+                        isOverdue = true;
+                        if (reminder.isLocationEnabled && reminder.locationCoordinates) {
+                            if (currentCoords) { // Solo verificar distancia si tenemos la ubicación actual
+                                const distance = calculateDistance(
+                                    currentCoords.latitude, currentCoords.longitude,
+                                    reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude
+                                );
+                                locationConditionMet = distance <= (reminder.radiusMeters || 1500);
+                            } else {
+                                // Si se requiere ubicación pero no tenemos GPS, no consideramos que la condición se cumpla
+                                locationConditionMet = false;
+                                // console.warn(`Reminder ${reminder.id} (${reminder.text.replace(/<[^>]*>/g, '')}): Ubicación requerida pero GPS no disponible para check.`);
+                            }
+                        }
+                    }
+                } catch (error) {
+                    console.error(`Error parsing/comparing date/time for reminder ID ${reminder.id} (${reminder.text.replace(/<[^>]*>/g, '')}):`, error, reminder);
+                    storageNeedsUpdate = true;
+                    keepInStorage = false;
+                    isOverdue = false;
+                    locationConditionMet = false;
+                }
+            }
+
+            if (isOverdue && locationConditionMet) {
+                overdueReminders.push(reminder);
+                 if (!isUnifiedWindowVisibleByLogic || !document.querySelector(`#unified-reminder-window .reminder-slide[data-id="${reminder.id}"]`)) {
+                     newOverdueFound = true;
                  }
-                 if (processedIds.has(reminder.id)) {
-                      console.warn("Duplicate reminder ID found, removing.", reminder.id);
-                      storageNeedsUpdate = true;
-                      return; 
-                 }
-                 processedIds.add(reminder.id);
+            }
 
+            if (keepInStorage) {
+                validRemindersForStorage.push(reminder);
+            }
+        });
 
-                 const isManagedByUser = reminder.managedByUser === true;
-                 let keepInStorage = true; 
-                 let isOverdue = false;
-                 let locationConditionMet = true; 
+        if (storageNeedsUpdate) {
+            try {
+                const oldStorageString = localStorage.getItem('reminders') || '[]';
+                const newStorageString = JSON.stringify(validRemindersForStorage);
+                if (oldStorageString !== newStorageString) {
+                    localStorage.setItem('reminders', newStorageString);
+                    console.log("Reminders storage updated after cleanup.");
+                }
+            } catch (e) {
+                console.error("Error writing updated reminders after cleanup:", e);
+                showToast("Error al actualizar recordatorios tras limpieza.", "error", 5000);
+            }
+        }
 
-                 if (!isManagedByUser) {
-                     let reminderLocalDueTime = null;
-                     try {
-                         const [year, month, day] = reminder.date.split('-').map(Number);
-                         const [hour, minute] = reminder.time.split(':').map(Number);
-                         reminderLocalDueTime = new Date(year, month - 1, day, hour, minute);
+        if (overdueReminders.length > 0) {
+            if (!isUnifiedWindowVisibleByLogic || newOverdueFound) {
+                currentNotificationSlideIndex = 0;
+                if (newOverdueFound) showYellowBorder();
+            }
+             displayUnifiedReminderWindow(overdueReminders);
+        }
+        else {
+             hideUnifiedReminderWindow();
+             currentNotificationSlideIndex = 0;
+        }
 
-                         if (isNaN(reminderLocalDueTime.getTime())) {
-                             throw new Error("Invalid date/time components");
-                         }
+        updateReminderCount();
+        updateButtonStyles();
 
-                         if (reminderLocalDueTime <= now) {
-                             isOverdue = true;
+        const swiperContainer = document.getElementById('reminder-swiper-container');
+        const windowElement = document.getElementById('unified-reminder-window');
 
-                             if (reminder.isLocationEnabled && reminder.locationCoordinates) {
-                                 if (currentCoords) {
-                                     const distance = calculateDistance(
-                                         currentCoords.latitude, currentCoords.longitude,
-                                         reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude
-                                     );
-                                     locationConditionMet = distance <= (reminder.radiusMeters || 1500);
-                                 } else {
-                                     locationConditionMet = false; // Si no hay GPS, no se cumple condición de ubicación
-                                     console.warn(`Reminder ${reminder.id}: Ubicación requerida pero GPS no disponible.`);
-                                 }
-                             }
-                         }
-                     } catch (error) {
-                         console.error(`Error parsing/comparing date/time for reminder ID ${reminder.id}:`, error, reminder);
-                         storageNeedsUpdate = true; // Marcar para guardar los válidos
-                         keepInStorage = false; // No mantener este recordatorio inválido
-                         isOverdue = false; // No se puede determinar si está vencido
-                         locationConditionMet = false; // No se puede determinar condición de ubicación
-                     }
-                 }
+        if (swiperContainer && overdueReminders.length > 0 && windowElement.classList.contains('visible')) {
+            const totalSlides = overdueReminders.length;
+            let nextSlideIndex = currentNotificationSlideIndex;
 
-                 if (isOverdue && locationConditionMet) {
-                     overdueReminders.push(reminder);
-                      if (!isUnifiedWindowVisibleByLogic || !document.querySelector(`#unified-reminder-window .reminder-slide[data-id="${reminder.id}"]`)) {
-                          newOverdueFound = true;
-                      }
-                 }
+            if (totalSlides > 1) {
+                nextSlideIndex = (currentNotificationSlideIndex + 1) % totalSlides;
+            } else {
+                nextSlideIndex = 0;
+            }
 
-                 if (keepInStorage) {
-                     validRemindersForStorage.push(reminder);
-                 }
-             });
-
-             if (storageNeedsUpdate) {
-                 try {
-                     const oldStorageString = localStorage.getItem('reminders') || '[]';
-                     const newStorageString = JSON.stringify(validRemindersForStorage);
-                     if (oldStorageString !== newStorageString) { // Solo guardar si hubo cambios reales
-                         localStorage.setItem('reminders', newStorageString);
-                         console.log("Reminders storage updated after cleanup.");
-                     }
-                 } catch (e) {
-                     console.error("Error writing updated reminders after cleanup:", e);
-                     showToast("Error al actualizar recordatorios tras limpieza.", "error", 5000);
-                 }
-             }
-
-             if (overdueReminders.length > 0) {
-                 if (!isUnifiedWindowVisibleByLogic || newOverdueFound) {
-                     currentNotificationSlideIndex = 0; // Resetear al primer slide
-                     if (newOverdueFound) showYellowBorder(); // Mostrar borde si hay nuevos
-                 }
-                  displayUnifiedReminderWindow(overdueReminders);
-             }
-             else {
-                  hideUnifiedReminderWindow(); // Ocultar si no hay recordatorios vencidos
-                  currentNotificationSlideIndex = 0; // Resetear índice
-             }
-
-             updateReminderCount();
-             updateButtonStyles();
-
-
-             // Lógica de carrusel automático para la ventana unificada
-             const swiperContainer = document.getElementById('reminder-swiper-container');
-             const windowElement = document.getElementById('unified-reminder-window');
-
-             if (swiperContainer && overdueReminders.length > 0 && windowElement.classList.contains('visible')) {
-                 const totalSlides = overdueReminders.length;
-                 let nextSlideIndex = currentNotificationSlideIndex; // Por defecto, no cambiar
-
-                 if (totalSlides > 1) { // Solo si hay más de un slide
-                     nextSlideIndex = (currentNotificationSlideIndex + 1) % totalSlides; // Avanzar al siguiente
-                 } else {
-                     nextSlideIndex = 0; // Si solo hay uno, siempre es el 0
-                 }
-
-                 // Solo hacer scroll si el índice realmente cambia o si solo hay un slide (para asegurar que se muestra)
-                 if (totalSlides === 1 || nextSlideIndex !== currentNotificationSlideIndex) {
-                     currentNotificationSlideIndex = nextSlideIndex; // Actualizar índice global
-                     const targetScrollLeft = currentNotificationSlideIndex * swiperContainer.offsetWidth;
-                     swiperContainer.scrollTo({ left: targetScrollLeft, behavior: 'smooth' });
-                     // Esperar a que termine el scroll para actualizar el display del índice
-                     setTimeout(updateReminderIndexDisplay, 400); // 400ms es un tiempo razonable para scroll suave
-                 }
-             }
-         }); 
-     } 
+            if (totalSlides === 1 || nextSlideIndex !== currentNotificationSlideIndex) {
+                currentNotificationSlideIndex = nextSlideIndex;
+                const targetScrollLeft = currentNotificationSlideIndex * swiperContainer.offsetWidth;
+                swiperContainer.scrollTo({ left: targetScrollLeft, behavior: 'smooth' });
+                setTimeout(updateReminderIndexDisplay, 400);
+            }
+        }
+    });
+}
 
 
     function getSavedLocations() {
@@ -3984,194 +3983,539 @@ function postponeAllVisibleReminders() {
         tempSavedLocations[slotIndex].lng = latlng.lng;
     }
 
-     function showAllRemindersLocationMap() {
-         const reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
-         const remindersWithLocation = reminders.filter(r => r.isLocationEnabled && r.locationCoordinates?.latitude && r.locationCoordinates?.longitude);
+function showAllRemindersLocationMap() {
+    const reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
+    const remindersWithLocation = reminders.filter(r => r.isLocationEnabled && r.locationCoordinates?.latitude && r.locationCoordinates?.longitude);
 
-         const existingModal = document.getElementById('reminders-location-map-modal');
-         if (existingModal) {
-             existingModal.remove();
-         }
-         if (allLocationsMapInstance) {
-             allLocationsMapInstance.remove();
-             allLocationsMapInstance = null;
-             userLocationMarkerOnAllMap = null; // Limpiar marcador de "ESTÁS AQUÍ"
-             if (userLocationAccuracyCircleOnAllMap) {
-                userLocationAccuracyCircleOnAllMap.remove();
-                userLocationAccuracyCircleOnAllMap = null;
-            }
-            if (initialUserLocationMarker) { // Limpiar marcador de coche
-                initialUserLocationMarker.remove();
-                initialUserLocationMarker = null;
-            }
-            if (initialUserLocationCircle) { // Limpiar círculo de coche
-                initialUserLocationCircle.remove();
-                initialUserLocationCircle = null;
-            }
-         }
+    const existingModal = document.getElementById('reminders-location-map-modal');
+    if (existingModal) {
+        existingModal.remove();
+    }
+    
+    // LIMPIEZA PREVIA COMPLETA de marcadores y círculos de posición del usuario
+    if (allLocationsMapInstance) {
+        if (userLocationMarkerOnAllMap) { // Marcador específico del botón "ESTÁS AQUÍ"
+            userLocationMarkerOnAllMap.remove();
+            userLocationMarkerOnAllMap = null;
+        }
+        if (userLocationAccuracyCircleOnAllMap) { // Círculo asociado a "ESTÁS AQUÍ" o "AQUÍ HAY RADAR"
+            userLocationAccuracyCircleOnAllMap.remove();
+            userLocationAccuracyCircleOnAllMap = null;
+        }
+        if (initialUserLocationMarker) { // Marcador "Coche.PNG" de la posición actual al abrir
+            initialUserLocationMarker.remove();
+            initialUserLocationMarker = null;
+        }
+        if (initialUserLocationCircle) { // Círculo asociado a "Coche.PNG"
+            initialUserLocationCircle.remove();
+            initialUserLocationCircle = null;
+        }
+        try {
+            allLocationsMapInstance.remove(); // Eliminar instancia anterior completa del mapa principal
+        } catch (e) { console.warn("Error removing previous allLocationsMapInstance:", e); }
+        allLocationsMapInstance = null;
+    }
 
-         const mapModal = document.createElement('div');
-         mapModal.id = 'reminders-location-map-modal';
-         mapModal.innerHTML = `
-             <div id="reminders-location-map-content-wrapper">
-                 <div id="reminders-location-map-header">
-                     <div class="button-group">
-                         <button id="close-reminders-location-map" class="reminders-map-button-action" title="Cerrar mapa">SALIR</button>
-                         <button id="locate-me-on-reminders-map" class="reminders-map-button-action" title="Mostrar mi posición actual y radio 200m">ESTÁS AQUÍ</button>
-                         <button id="add-radar-here" class="reminders-map-button-action" title="Crear RADAR en mi posición actual (radio 1km)">AQUÍ HAY UN RADAR</button>
-                         <button id="reminders-map-help-button" class="reminders-map-button-action" title="Ayuda del mapa de radares">AYUDA</button>
-                     </div>
-                     <h2>Ubicaciones de Recordatorios</h2>
-                 </div>
-                 <div id="reminders-location-map-div"></div>
-             </div>
-         `;
-         document.body.appendChild(mapModal);
 
-         const mapContainer = document.getElementById('reminders-location-map-div');
-         const closeButton = document.getElementById('close-reminders-location-map');
-         const locateMeButton = document.getElementById('locate-me-on-reminders-map');
-         const helpButton = document.getElementById('reminders-map-help-button'); 
-         const addRadarButton = document.getElementById('add-radar-here'); // Nuevo botón
+    const mapModal = document.createElement('div');
+    mapModal.id = 'reminders-location-map-modal';
+    mapModal.innerHTML = `
+        <div id="reminders-location-map-content-wrapper">
+            <div id="reminders-location-map-header">
+                <div class="button-group">
+                    <button id="close-reminders-location-map" class="reminders-map-button-action" title="Cerrar mapa">SALIR</button>
+                    <button id="locate-me-on-reminders-map" class="reminders-map-button-action" title="Mostrar mi posición actual con Coche.PNG y radio 200m">ESTÁS AQUÍ</button>
+                    <button id="add-radar-here" class="reminders-map-button-action" title="Crear RADAR en mi posición actual (radio 1km)">AQUÍ HAY UN RADAR</button>
+                    <button id="reminders-map-help-button" class="reminders-map-button-action" title="Ayuda del mapa de radares">AYUDA</button>
+                </div>
+                <h2>Ubicaciones de Recordatorios</h2>
+            </div>
+            <div id="reminders-location-map-div"></div>
+        </div>
+    `;
+    document.body.appendChild(mapModal);
 
-         closeButton.addEventListener('click', () => {
-             if (allLocationsMapInstance) {
-                 allLocationsMapInstance.remove();
-                 allLocationsMapInstance = null;
-                 userLocationMarkerOnAllMap = null;
-                 if (userLocationAccuracyCircleOnAllMap) {userLocationAccuracyCircleOnAllMap.remove(); userLocationAccuracyCircleOnAllMap = null;}
-                 if (initialUserLocationMarker) { initialUserLocationMarker.remove(); initialUserLocationMarker = null; }
-                 if (initialUserLocationCircle) { initialUserLocationCircle.remove(); initialUserLocationCircle = null; }
-             }
-             mapModal.remove();
-             const helpModalInstance = document.getElementById('reminders-map-help-modal-instance');
-             if (helpModalInstance) helpModalInstance.remove();
-         });
+    const mapContainer = document.getElementById('reminders-location-map-div');
+    const closeButton = document.getElementById('close-reminders-location-map');
+    const locateMeButton = document.getElementById('locate-me-on-reminders-map');
+    const helpButton = document.getElementById('reminders-map-help-button');
+    const addRadarButton = document.getElementById('add-radar-here');
 
-         locateMeButton.addEventListener('click', () => {
-             locateMeButton.disabled = true;
-             locateMeButton.textContent = 'Buscando...';
-             getCurrentLocation(
-                 (coords) => {
-                     const latLng = L.latLng(coords.latitude, coords.longitude);
-                     if (allLocationsMapInstance) {
-                         if (userLocationMarkerOnAllMap) {
-                             userLocationMarkerOnAllMap.setLatLng(latLng);
-                         } else {
-                             userLocationMarkerOnAllMap = L.marker(latLng, { icon: userPositionMarkerIconGreen })
-                             .addTo(allLocationsMapInstance).bindPopup("Tu posición actual (aproximada)");
-                         }
-                         // Radio de 200m para "ESTÁS AQUÍ"
-                         if (userLocationAccuracyCircleOnAllMap) {
-                             userLocationAccuracyCircleOnAllMap.setLatLng(latLng).setRadius(200).setStyle({color: 'green', fillColor: '#7CFC00', fillOpacity: 0.1});
-                         } else {
-                             userLocationAccuracyCircleOnAllMap = L.circle(latLng, {
-                                 radius: 200, color: 'green', fillColor: '#7CFC00', fillOpacity: 0.1
-                             }).addTo(allLocationsMapInstance);
-                         }
-                         allLocationsMapInstance.setView(latLng, 16);
-                         showToast("Ubicación actual marcada con radio de 200 metros", "success");
-                     }
-                     locateMeButton.disabled = false;
-                     locateMeButton.textContent = 'ESTÁS AQUÍ';
-                 },
-                 (errorMsg) => {
-                     showToast(`Error al localizar: ${errorMsg}`, "error");
-                     locateMeButton.disabled = false;
-                     locateMeButton.textContent = 'ESTÁS AQUÍ';
-                 }
-             );
-         });
+    closeButton.addEventListener('click', () => {
+        if (allLocationsMapInstance) {
+            allLocationsMapInstance.remove();
+            allLocationsMapInstance = null;
+        }
+        // Limpiar referencias globales al cerrar
+        userLocationMarkerOnAllMap = null;
+        userLocationAccuracyCircleOnAllMap = null;
+        initialUserLocationMarker = null;
+        initialUserLocationCircle = null;
+        mapModal.remove();
+        const helpModalInstance = document.getElementById('reminders-map-help-modal-instance');
+        if (helpModalInstance) helpModalInstance.remove();
+    });
 
-        addRadarButton.addEventListener('click', () => {
-            addRadarButton.disabled = true; addRadarButton.textContent = 'Marcando...';
-            getCurrentLocation(
-                (coords) => {
-                    const now = new Date();
-                    const newRadarReminder = {
-                        id: Date.now(),
-                        text: '<b>RADAR</b>',
-                        type: 'simple', // O 'daily' si se quiere que aparezca una vez al día
-                        time: `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`,
-                        date: `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`,
-                        createdAt: now.toISOString(),
-                        managedByUser: false,
-                        isLocationEnabled: true,
-                        locationCoordinates: { latitude: coords.latitude, longitude: coords.longitude },
-                        radiusMeters: 1000,
-                        excludeFromList: true
-                    };
+    locateMeButton.addEventListener('click', () => {
+        locateMeButton.disabled = true;
+        locateMeButton.textContent = 'Buscando...';
+        getCurrentLocation(
+            (coords) => {
+                const latLng = L.latLng(coords.latitude, coords.longitude);
+                if (allLocationsMapInstance) {
+                    // Limpiar marcadores de posición actual iniciales si "ESTÁS AQUÍ" los va a reemplazar o actualizar
+                    if (initialUserLocationMarker) {
+                        initialUserLocationMarker.remove();
+                        initialUserLocationMarker = null;
+                    }
+                    if (initialUserLocationCircle) {
+                        initialUserLocationCircle.remove();
+                        initialUserLocationCircle = null;
+                    }
 
-                    let currentRemindersList = JSON.parse(localStorage.getItem('reminders') || '[]');
-                    currentRemindersList.push(newRadarReminder);
-                    localStorage.setItem('reminders', JSON.stringify(currentRemindersList));
-                    
-                    showToast("Recordatorio RADAR creado en tu ubicación actual.", "success");
-                    updateReminderCount();
-                    updateButtonStyles();
-
-                    // Añadir el nuevo RADAR al mapa sin recargar todo
-                    if (allLocationsMapInstance) {
-                        const radarLatLng = [newRadarReminder.locationCoordinates.latitude, newRadarReminder.locationCoordinates.longitude];
-                        const radarMarker = L.marker(radarLatLng, { icon: radarMarkerIcon })
+                    // Usar/crear userLocationMarkerOnAllMap para "ESTÁS AQUÍ" con el icono Coche.PNG
+                    if (userLocationMarkerOnAllMap) {
+                        userLocationMarkerOnAllMap.setLatLng(latLng).setIcon(carIcon); // Asegurar ícono Coche
+                    } else {
+                        userLocationMarkerOnAllMap = L.marker(latLng, { icon: carIcon, zIndexOffset: 1001 }) // zIndex alto
                             .addTo(allLocationsMapInstance)
-                            .bindPopup(`<b>RADAR</b><br>Radio: 1000m<br>Creado: Ahora`);
-                        
-                        L.circle(radarLatLng, {
-                            radius: newRadarReminder.radiusMeters,
-                            color: '#800080', // Morado
-                            fillColor: '#DA70D6', // Orquídea
-                            fillOpacity: 0.2
-                        }).addTo(allLocationsMapInstance);
-                        allLocationsMapInstance.setView(radarLatLng, 15); // Centrar en el nuevo radar
+                            .bindPopup("Tu posición actual (botón 'ESTÁS AQUÍ')");
                     }
                     
-                    addRadarButton.disabled = false; addRadarButton.textContent = 'AQUÍ HAY UN RADAR';
-                },
-                (errorMsg) => {
-                    showToast(`Error al obtener ubicación para RADAR: ${errorMsg}`, "error");
-                    addRadarButton.disabled = false; addRadarButton.textContent = 'AQUÍ HAY UN RADAR';
-                }
-            );
-        });
-
-        helpButton.addEventListener('click', showRemindersMapHelpModal);
-
-
-         try {
-              const bounds = L.latLngBounds();
-              let userPositionIncludedInBounds = false;
-
-              // Primero intentar obtener la posición actual del usuario
-              getCurrentLocation(
-                (userCoords) => {
-                    const userLatLng = L.latLng(userCoords.latitude, userCoords.longitude);
-                    bounds.extend(userLatLng);
-                    userPositionIncludedInBounds = true;
-
-                    if (allLocationsMapInstance && !initialUserLocationMarker) { // Solo crear si no existe ya
-                        initialUserLocationMarker = L.marker(userLatLng, { icon: carIcon, zIndexOffset: 1000 }) // Ponerlo encima
-                            .addTo(allLocationsMapInstance)
-                            .bindPopup("Tu posición actual (aproximada)");
-                        initialUserLocationCircle = L.circle(userLatLng, { // Círculo de 200m para el coche
+                    // Círculo de 200m para "ESTÁS AQUÍ" (radio idéntico al de Coche.PNG inicial)
+                    if (userLocationAccuracyCircleOnAllMap) {
+                        userLocationAccuracyCircleOnAllMap.setLatLng(latLng).setRadius(200).setStyle({color: 'blue', fillColor: '#ADD8E6', fillOpacity: 0.15 });
+                    } else {
+                        userLocationAccuracyCircleOnAllMap = L.circle(latLng, {
                             radius: 200, color: 'blue', fillColor: '#ADD8E6', fillOpacity: 0.15
                         }).addTo(allLocationsMapInstance);
                     }
-                    // Continuar con la inicialización del mapa después de obtener la ubicación
-                    initializeMapWithBounds(bounds, userPositionIncludedInBounds, remindersWithLocation);
-                },
-                () => { // Error al obtener ubicación o permiso denegado
-                    console.warn("No se pudo obtener la posición actual para el zoom inicial del mapa.");
-                    // Continuar inicializando el mapa solo con los recordatorios
-                    initializeMapWithBounds(bounds, false, remindersWithLocation);
+                    allLocationsMapInstance.setView(latLng, 16); // Ajustar el zoom
+                    showToast("Ubicación actual marcada con Coche.PNG y radio de 200 metros", "success");
+                }
+                locateMeButton.disabled = false;
+                locateMeButton.textContent = 'ESTÁS AQUÍ';
+            },
+            (errorMsg) => {
+                showToast(`Error al localizar: ${errorMsg}`, "error");
+                locateMeButton.disabled = false;
+                locateMeButton.textContent = 'ESTÁS AQUÍ';
+            }
+        );
+    });
+
+    addRadarButton.addEventListener('click', () => {
+        addRadarButton.disabled = true; addRadarButton.textContent = 'Marcando...';
+        getCurrentLocation(
+            (coords) => {
+                const now = new Date();
+                const newRadarReminder = {
+                    id: Date.now(),
+                    text: '<b>RADAR</b>',
+                    type: 'simple',
+                    time: `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`,
+                    date: `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`,
+                    createdAt: now.toISOString(),
+                    managedByUser: false,
+                    isLocationEnabled: true,
+                    locationCoordinates: { latitude: coords.latitude, longitude: coords.longitude },
+                    radiusMeters: 1000,
+                    excludeFromList: true
+                };
+
+                let currentRemindersList = JSON.parse(localStorage.getItem('reminders') || '[]');
+                currentRemindersList.push(newRadarReminder);
+                localStorage.setItem('reminders', JSON.stringify(currentRemindersList));
+                
+                showToast("Recordatorio RADAR creado en tu ubicación actual.", "success");
+                updateReminderCount();
+                updateButtonStyles();
+
+                if (allLocationsMapInstance) {
+                    const radarLatLng = [newRadarReminder.locationCoordinates.latitude, newRadarReminder.locationCoordinates.longitude];
+                    const radarMapMarker = L.marker(radarLatLng, { icon: radarMarkerIcon })
+                        .addTo(allLocationsMapInstance);
+                    
+                    L.circle(radarLatLng, {
+                        radius: newRadarReminder.radiusMeters,
+                        color: '#800080',
+                        fillColor: '#DA70D6',
+                        fillOpacity: 0.2
+                    }).addTo(allLocationsMapInstance);
+
+                    let popupContentRadar = `
+                        <div style="max-width: 250px; font-family: sans-serif; font-size: 0.9rem;">
+                            <strong style="font-size: 1rem; color: #333; display: block; margin-bottom: 5px;">RADAR</strong>
+                            <hr style="margin: 4px 0;">
+                            <p style="margin: 3px 0;"><strong>Radio:</strong> 1000m</p>
+                            <p style="margin: 3px 0;"><strong>Creado:</strong> Ahora</p>
+                            <button data-reminder-id="${newRadarReminder.id}" class="modify-reminder-from-map" style="margin-top: 8px; padding: 4px 8px; font-size: 0.8rem; background-color: #10B981; color: white; border: none; border-radius: 3px; cursor: pointer;">Modificar</button>
+                        </div>`;
+                    radarMapMarker.bindPopup(popupContentRadar);
+                    radarMapMarker.on('popupopen', () => {
+                        const modifyButton = radarMapMarker.getPopup().getElement().querySelector('.modify-reminder-from-map');
+                        if (modifyButton) {
+                            const newModifyButton = modifyButton.cloneNode(true);
+                            modifyButton.parentNode.replaceChild(newModifyButton, modifyButton);
+                            newModifyButton.addEventListener('click', (e) => {
+                                const id = parseInt(e.target.dataset.reminderId);
+                                if (!isNaN(id)) {
+                                    const rems = JSON.parse(localStorage.getItem('reminders') || '[]');
+                                    const remToMod = rems.find(r => r.id === id);
+                                    if (remToMod) {
+                                        const mapModalElement = document.getElementById('reminders-location-map-modal');
+                                        if (allLocationsMapInstance) { allLocationsMapInstance.remove(); allLocationsMapInstance = null; }
+                                        userLocationMarkerOnAllMap = null; if (userLocationAccuracyCircleOnAllMap) { userLocationAccuracyCircleOnAllMap.remove(); userLocationAccuracyCircleOnAllMap = null; } 
+                                        initialUserLocationMarker=null; if(initialUserLocationCircle){initialUserLocationCircle.remove(); initialUserLocationCircle=null;}
+                                        
+                                        if (mapModalElement) mapModalElement.remove();
+                                        const tableModal = document.querySelector('.reminder-table-modal');
+                                        if (tableModal) { if (tableModal.autoCloseInterval) clearInterval(tableModal.autoCloseInterval);tableModal.remove(); }
+                                        showReminderModal(remToMod);
+                                    } else { showToast("Error: No se encontró el recordatorio para modificar.", "error"); }
+                                }
+                            });
+                        }
+                    });
+                    allLocationsMapInstance.setView(radarLatLng, 15);
+                }
+                
+                addRadarButton.disabled = false; addRadarButton.textContent = 'AQUÍ HAY UN RADAR';
+            },
+            (errorMsg) => {
+                showToast(`Error al obtener ubicación para RADAR: ${errorMsg}`, "error");
+                addRadarButton.disabled = false; addRadarButton.textContent = 'AQUÍ HAY UN RADAR';
+            }
+        );
+    });
+
+    helpButton.addEventListener('click', showRemindersMapHelpModal);
+
+    try {
+        allLocationsMapInstance = L.map(mapContainer);
+        
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap contributors'
+        }).addTo(allLocationsMapInstance);
+
+        const bounds = L.latLngBounds();
+        let userPositionForBounds = null;
+
+        const finalizeMapInitialization = () => {
+            remindersWithLocation.forEach(reminder => {
+                const latLng = [reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude];
+                bounds.extend(latLng);
+
+                const isRadar = reminder.text.toUpperCase().includes("RADAR");
+                const markerIconToUse = isRadar ? radarMarkerIcon : defaultLocationMarkerIconBlue;
+                const circleColor = isRadar ? '#800080' : 'blue';
+                const circleFillColor = isRadar ? '#DA70D6' : '#ADD8E6';
+
+                const marker = L.marker(latLng, {
+                    icon: markerIconToUse,
+                    title: reminder.text.replace(/<[^>]*>/g, '').substring(0, 50)
+                }).addTo(allLocationsMapInstance);
+
+                L.circle(latLng, {
+                    radius: reminder.radiusMeters || 1500,
+                    color: circleColor,
+                    fillColor: circleFillColor,
+                    fillOpacity: 0.2
+                }).addTo(allLocationsMapInstance);
+
+                let popupContent = `
+                    <div style="max-width: 250px; font-family: sans-serif; font-size: 0.9rem;">
+                        <strong style="font-size: 1rem; color: #333; display: block; margin-bottom: 5px;">${reminder.text.replace(/<b>|<\/b>/gi,'')}</strong>
+                        <hr style="margin: 4px 0;">
+                        ${reminder.time ? `<p style="margin: 3px 0;"><strong>Hora:</strong> ${formatTimeWithPeriod(reminder.time)}</p>` : ''}
+                        ${reminder.date ? `<p style="margin: 3px 0;"><strong>Fecha:</strong> ${formatDateDetailed(reminder.date)}</p>` : ''}
+                        ${reminder.type === 'weekly' && reminder.repeatDays?.length > 0 ? `<p style="margin: 3px 0;"><strong>Repite:</strong> ${reminder.repeatDays.map(d => ['Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb'][d]).join(', ')}</p>` : ''}
+                        ${reminder.type === 'interval' && reminder.intervalDays ? `<p style="margin: 3px 0;"><strong>Cada:</strong> ${reminder.intervalDays} días</p>` : ''}
+                        <p style="margin: 3px 0;"><strong>Radio:</strong> ${reminder.radiusMeters || 1500}m</p>
+                        <button data-reminder-id="${reminder.id}" class="modify-reminder-from-map" style="margin-top: 8px; padding: 4px 8px; font-size: 0.8rem; background-color: #10B981; color: white; border: none; border-radius: 3px; cursor: pointer;">Modificar</button>
+                    </div>`;
+                marker.bindPopup(popupContent);
+
+                marker.on('popupopen', () => {
+                    const modifyButton = marker.getPopup().getElement().querySelector('.modify-reminder-from-map');
+                    if (modifyButton) {
+                        const newModifyButton = modifyButton.cloneNode(true);
+                        modifyButton.parentNode.replaceChild(newModifyButton, modifyButton);
+                        newModifyButton.addEventListener('click', (e) => {
+                            const id = parseInt(e.target.dataset.reminderId);
+                            if (!isNaN(id)) {
+                                const rems = JSON.parse(localStorage.getItem('reminders') || '[]');
+                                const remToMod = rems.find(r => r.id === id);
+                                if (remToMod) {
+                                    const mapModalElement = document.getElementById('reminders-location-map-modal');
+                                    if (allLocationsMapInstance) { allLocationsMapInstance.remove(); allLocationsMapInstance = null; }
+                                    userLocationMarkerOnAllMap = null; if (userLocationAccuracyCircleOnAllMap) { userLocationAccuracyCircleOnAllMap.remove(); userLocationAccuracyCircleOnAllMap = null; } 
+                                    initialUserLocationMarker=null; if(initialUserLocationCircle){initialUserLocationCircle.remove(); initialUserLocationCircle=null;}
+                                    
+                                    if (mapModalElement) mapModalElement.remove();
+                                    const tableModal = document.querySelector('.reminder-table-modal');
+                                    if (tableModal) { if (tableModal.autoCloseInterval) clearInterval(tableModal.autoCloseInterval); tableModal.remove(); }
+                                    showReminderModal(remToMod);
+                                } else { showToast("Error: No se encontró el recordatorio para modificar.", "error"); }
+                            }
+                        });
+                    }
+                });
+            });
+
+            if (bounds.isValid()) {
+                allLocationsMapInstance.fitBounds(bounds.pad(0.15));
+            } else if (userPositionForBounds) {
+                allLocationsMapInstance.setView(userPositionForBounds, 13);
+            } else {
+                allLocationsMapInstance.setView([40.416775, -3.703790], 6);
+            }
+
+            allLocationsMapInstance.on('contextmenu', function(e) { 
+                e.originalEvent.preventDefault(); 
+                if (e.latlng) { handleRadarMapLongPress(e.latlng); }
+            });
+            allLocationsMapInstance.on('click', function(e) { 
+                if (e.latlng) { handleRadarMapLongPress(e.latlng); }
+            });
+            if (L.Browser.touch) {
+                allLocationsMapInstance.on('contextmenu', function(e) { 
+                    e.originalEvent.preventDefault(); 
+                    if (e.latlng) { handleRadarMapLongPress(e.latlng); }
+                });
+                allLocationsMapInstance.on('click', function(e) { 
+                    if (e.latlng) { handleRadarMapLongPress(e.latlng); }
+                });
+            }
+        };
+
+        getCurrentLocation(
+            (userCoords) => {
+                userPositionForBounds = L.latLng(userCoords.latitude, userCoords.longitude);
+                bounds.extend(userPositionForBounds);
+
+                if (allLocationsMapInstance) {
+                    if (initialUserLocationMarker) initialUserLocationMarker.remove();
+                    initialUserLocationMarker = L.marker(userPositionForBounds, { icon: carIcon, zIndexOffset: 1000 })
+                        .addTo(allLocationsMapInstance)
+                        .bindPopup("Tu posición actual (al abrir mapa)");
+
+                    if (initialUserLocationCircle) initialUserLocationCircle.remove();
+                    initialUserLocationCircle = L.circle(userPositionForBounds, {
+                        radius: 200, color: 'blue', fillColor: '#ADD8E6', fillOpacity: 0.15
+                    }).addTo(allLocationsMapInstance);
+                }
+                finalizeMapInitialization();
+            },
+            () => {
+                console.warn("No se pudo obtener la posición actual para el mapa de recordatorios.");
+                userPositionForBounds = null;
+                finalizeMapInitialization();
+            }
+        );
+
+    } catch (error) {
+        console.error("Error al inicializar el mapa de ubicaciones:", error);
+        mapContainer.innerHTML = `<p style="color:red; text-align:center; padding:20px;">Error al cargar el mapa: ${error.message}</p>`;
+    }
+}
+```
+
+**Función `checkReminders()` completa:**
+
+```javascript
+function checkReminders() {
+    let currentReminders = [];
+    try {
+        currentReminders = JSON.parse(localStorage.getItem('reminders') || '[]');
+    } catch (e) {
+        console.error("Error parsing reminders:", e);
+        localStorage.setItem('reminders_backup_error', localStorage.getItem('reminders') || '[]');
+        localStorage.removeItem('reminders');
+        showToast("Error al cargar recordatorios. Backup intentado.", "error", 5000);
+        return;
+    }
+
+    const now = new Date();
+    let overdueReminders = [];
+    const validRemindersForStorage = [];
+    let storageNeedsUpdate = false;
+    const processedIds = new Set();
+    let newOverdueFound = false;
+
+    let currentLocationPromise = null;
+    // Necesitamos obtener la ubicación si hay recordatorios por ubicación no gestionados
+    // O si el mapa de todas las ubicaciones está abierto (para actualizar el Coche.PNG)
+    const needsLocationCheckForReminders = currentReminders.some(r => r.isLocationEnabled && !r.managedByUser);
+    const isAllLocationsMapOpen = !!(allLocationsMapInstance && document.getElementById('reminders-location-map-modal'));
+
+    if (needsLocationCheckForReminders || isAllLocationsMapOpen) {
+        currentLocationPromise = new Promise((resolve) => {
+            getCurrentLocation(
+                (coords) => resolve(coords),
+                (errorMsg) => {
+                    console.warn("checkReminders: No se pudo obtener la ubicación:", errorMsg);
+                    resolve(null); // Resolver con null para que el .then continúe
                 }
             );
+        });
+    } else {
+        currentLocationPromise = Promise.resolve(null); // No se necesita ubicación
+    }
 
-         } catch (error) {
-              console.error("Error al inicializar el mapa de ubicaciones:", error);
-              mapContainer.innerHTML = `<p style="color:red; text-align:center; padding:20px;">Error al cargar el mapa: ${error.message}</p>`;
-         }
-     }
+    currentLocationPromise.then(currentCoords => {
+        // Actualizar posición en el mapa general si está abierto y tenemos coordenadas
+        if (isAllLocationsMapOpen && currentCoords && allLocationsMapInstance) {
+            const latLng = L.latLng(currentCoords.latitude, currentCoords.longitude);
+            
+            // Actualizar marcador "Coche.PNG" (initialUserLocationMarker)
+            if (initialUserLocationMarker) {
+                initialUserLocationMarker.setLatLng(latLng);
+            } else {
+                // Si no existe y el mapa está abierto, crearlo.
+                initialUserLocationMarker = L.marker(latLng, { icon: carIcon, zIndexOffset: 1000 })
+                    .addTo(allLocationsMapInstance)
+                    .bindPopup("Tu posición actual (actualizada periódicamente)");
+            }
+            // Actualizar círculo del "Coche.PNG"
+            if(initialUserLocationCircle) {
+                initialUserLocationCircle.setLatLng(latLng);
+            } else {
+                 initialUserLocationCircle = L.circle(latLng, {
+                    radius: 200, color: 'blue', fillColor: '#ADD8E6', fillOpacity: 0.15
+                }).addTo(allLocationsMapInstance);
+            }
+
+            // Actualizar marcador "ESTÁS AQUÍ" (userLocationMarkerOnAllMap) si existe Y es el icono del coche
+            // Esto es para que si el usuario pulsó "ESTÁS AQUÍ", ese marcador también siga moviéndose
+            if (userLocationMarkerOnAllMap && userLocationMarkerOnAllMap.options.icon === carIcon) {
+                userLocationMarkerOnAllMap.setLatLng(latLng);
+                 // Actualizar su círculo asociado si también es el de "ESTÁS AQUÍ" (200m)
+                 if (userLocationAccuracyCircleOnAllMap && userLocationAccuracyCircleOnAllMap.options.radius === 200 && userLocationAccuracyCircleOnAllMap.options.color === 'blue') {
+                     userLocationAccuracyCircleOnAllMap.setLatLng(latLng);
+                 }
+            }
+            console.log("Posición GPS actualizada en el mapa de ubicaciones (checkReminders).");
+        }
+
+        // Procesamiento de recordatorios
+        currentReminders.forEach(reminder => {
+            if (!reminder || typeof reminder.id !== 'number' || typeof reminder.managedByUser === 'undefined' || !reminder.type || !reminder.time || !reminder.date || !reminder.createdAt) {
+                console.warn("Invalid/incomplete reminder structure found, removing.", reminder);
+                storageNeedsUpdate = true;
+                return;
+            }
+            if (processedIds.has(reminder.id)) {
+                 console.warn("Duplicate reminder ID found, removing.", reminder.id);
+                 storageNeedsUpdate = true;
+                 return;
+            }
+            processedIds.add(reminder.id);
+
+            const isManagedByUser = reminder.managedByUser === true;
+            let keepInStorage = true;
+            let isOverdue = false;
+            let locationConditionMet = true;
+
+            if (!isManagedByUser) {
+                let reminderLocalDueTime = null;
+                try {
+                    const [year, month, day] = reminder.date.split('-').map(Number);
+                    const [hour, minute] = reminder.time.split(':').map(Number);
+                    reminderLocalDueTime = new Date(year, month - 1, day, hour, minute);
+
+                    if (isNaN(reminderLocalDueTime.getTime())) {
+                        throw new Error("Invalid date/time components");
+                    }
+
+                    if (reminderLocalDueTime <= now) {
+                        isOverdue = true;
+                        if (reminder.isLocationEnabled && reminder.locationCoordinates) {
+                            if (currentCoords) { // Solo verificar distancia si tenemos la ubicación actual
+                                const distance = calculateDistance(
+                                    currentCoords.latitude, currentCoords.longitude,
+                                    reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude
+                                );
+                                locationConditionMet = distance <= (reminder.radiusMeters || 1500);
+                            } else {
+                                // Si se requiere ubicación pero no tenemos GPS, no consideramos que la condición se cumpla
+                                locationConditionMet = false;
+                                // console.warn(`Reminder ${reminder.id} (${reminder.text.replace(/<[^>]*>/g, '')}): Ubicación requerida pero GPS no disponible para check.`);
+                            }
+                        }
+                    }
+                } catch (error) {
+                    console.error(`Error parsing/comparing date/time for reminder ID ${reminder.id} (${reminder.text.replace(/<[^>]*>/g, '')}):`, error, reminder);
+                    storageNeedsUpdate = true;
+                    keepInStorage = false;
+                    isOverdue = false;
+                    locationConditionMet = false;
+                }
+            }
+
+            if (isOverdue && locationConditionMet) {
+                overdueReminders.push(reminder);
+                 if (!isUnifiedWindowVisibleByLogic || !document.querySelector(`#unified-reminder-window .reminder-slide[data-id="${reminder.id}"]`)) {
+                     newOverdueFound = true;
+                 }
+            }
+
+            if (keepInStorage) {
+                validRemindersForStorage.push(reminder);
+            }
+        });
+
+        if (storageNeedsUpdate) {
+            try {
+                const oldStorageString = localStorage.getItem('reminders') || '[]';
+                const newStorageString = JSON.stringify(validRemindersForStorage);
+                if (oldStorageString !== newStorageString) {
+                    localStorage.setItem('reminders', newStorageString);
+                    console.log("Reminders storage updated after cleanup.");
+                }
+            } catch (e) {
+                console.error("Error writing updated reminders after cleanup:", e);
+                showToast("Error al actualizar recordatorios tras limpieza.", "error", 5000);
+            }
+        }
+
+        if (overdueReminders.length > 0) {
+            if (!isUnifiedWindowVisibleByLogic || newOverdueFound) {
+                currentNotificationSlideIndex = 0;
+                if (newOverdueFound) showYellowBorder();
+            }
+             displayUnifiedReminderWindow(overdueReminders);
+        }
+        else {
+             hideUnifiedReminderWindow();
+             currentNotificationSlideIndex = 0;
+        }
+
+        updateReminderCount();
+        updateButtonStyles();
+
+        const swiperContainer = document.getElementById('reminder-swiper-container');
+        const windowElement = document.getElementById('unified-reminder-window');
+
+        if (swiperContainer && overdueReminders.length > 0 && windowElement.classList.contains('visible')) {
+            const totalSlides = overdueReminders.length;
+            let nextSlideIndex = currentNotificationSlideIndex;
+
+            if (totalSlides > 1) {
+                nextSlideIndex = (currentNotificationSlideIndex + 1) % totalSlides;
+            } else {
+                nextSlideIndex = 0;
+            }
+
+            if (totalSlides === 1 || nextSlideIndex !== currentNotificationSlideIndex) {
+                currentNotificationSlideIndex = nextSlideIndex;
+                const targetScrollLeft = currentNotificationSlideIndex * swiperContainer.offsetWidth;
+                swiperContainer.scrollTo({ left: targetScrollLeft, behavior: 'smooth' });
+                setTimeout(updateReminderIndexDisplay, 400);
+            }
+        }
+    });
+}
 
     function initializeMapWithBounds(bounds, userPositionIncluded, remindersWithLoc) {
         if (remindersWithLoc.length > 0) {
