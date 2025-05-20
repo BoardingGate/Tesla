@@ -4508,28 +4508,1056 @@ L.control.orientationAltitude = function(opts) {
 }
 
 
- 
+function showAllRemindersLocationMap() {
+    isRemindersLocationMapActive = true;
+
+    const reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
+    const remindersWithLocation = reminders.filter(r => r.isLocationEnabled && r.locationCoordinates?.latitude && r.locationCoordinates?.longitude);
+
+    const existingModal = document.getElementById('reminders-location-map-modal');
+    if (existingModal) {
+        existingModal.remove(); // Limpia cualquier modal anterior
+    }
+
+    // Limpieza de instancias de mapa y watchers anteriores
+    if (allLocationsMapInstance) {
+        if (initialUserLocationMarker) { initialUserLocationMarker.remove(); initialUserLocationMarker = null; }
+        if (initialUserLocationCircle) { initialUserLocationCircle.remove(); initialUserLocationCircle = null; }
+        if (orientationAltitudeControl && allLocationsMapInstance && typeof allLocationsMapInstance.hasControl === 'function' && allLocationsMapInstance.hasControl(orientationAltitudeControl)) {
+            allLocationsMapInstance.removeControl(orientationAltitudeControl);
+        }
+        orientationAltitudeControl = null;
+        try { allLocationsMapInstance.remove(); } catch (e) { console.warn("Error removing previous allLocationsMapInstance:", e); }
+        allLocationsMapInstance = null;
+    }
+    if (locationWatchId !== null) {
+        navigator.geolocation.clearWatch(locationWatchId);
+        locationWatchId = null;
+    }
+    shouldCenterOnUserInAllLocationsMap = false;
+    clearNavigationState(); // Limpiar estado de navegación OSRM
+
+    const mapModal = document.createElement('div');
+    mapModal.id = 'reminders-location-map-modal';
+    mapModal.innerHTML = `
+        <div id="reminders-location-map-content-wrapper">
+            <div id="reminders-location-map-header">
+                <div class="button-group">
+                    <button id="close-reminders-location-map" class="reminders-map-button-action" title="Cerrar mapa">SALIR</button>
+                    <button id="locate-me-on-reminders-map" class="reminders-map-button-action" title="Mostrar mi posición actual y activar seguimiento">ESTÁS AQUÍ</button>
+                    <button id="add-radar-here" class="reminders-map-button-action" title="Crear RADAR en mi posición actual (radio 1000m)">AQUÍ HAY UN RADAR</button>
+                    <button id="start-navigation-button" class="reminders-map-button-action" title="Iniciar/Detener Navegación GPS">INICIAR NAVEGACIÓN</button>
+                    <button id="reminders-map-help-button" class="reminders-map-button-action" title="Ayuda del mapa de radares y navegación">AYUDA</button>
+                </div>
+                <h2>Ubicaciones y Navegación</h2>
+            </div>
+            <div id="reminders-location-map-div"></div>
+        </div>
+    `;
+    document.body.appendChild(mapModal);
+
+    // Seleccionar elementos usando mapModal como contexto
+    const mapContainer = mapModal.querySelector('#reminders-location-map-div');
+    const closeButton = mapModal.querySelector('#close-reminders-location-map');
+    const locateMeButton = mapModal.querySelector('#locate-me-on-reminders-map');
+    const helpButton = mapModal.querySelector('#reminders-map-help-button');
+    const addRadarButton = mapModal.querySelector('#add-radar-here');
+    const startNavigationButton = mapModal.querySelector('#start-navigation-button');
+
+    const closeHandler = () => {
+        isRemindersLocationMapActive = false;
+        clearNavigationState();
+
+        if (locationWatchId !== null) {
+            navigator.geolocation.clearWatch(locationWatchId);
+            locationWatchId = null;
+        }
+        if (allLocationsMapInstance) {
+            if (orientationAltitudeControl && typeof allLocationsMapInstance.hasControl === 'function' && allLocationsMapInstance.hasControl(orientationAltitudeControl)) {
+                allLocationsMapInstance.removeControl(orientationAltitudeControl);
+            }
+            try { allLocationsMapInstance.remove(); } catch (e) { console.warn("Error removing allLocationsMapInstance on close:", e); }
+            allLocationsMapInstance = null;
+        }
+        initialUserLocationMarker = null; initialUserLocationMarkerLat = null; initialUserLocationMarkerLng = null;
+        if (initialUserLocationCircle) { initialUserLocationCircle.remove(); initialUserLocationCircle = null; }
+        orientationAltitudeControl = null;
+
+        const mapModalElement = document.getElementById('reminders-location-map-modal');
+        if (mapModalElement) {
+            mapModalElement.remove();
+        }
+
+        const helpModalInstance = document.getElementById('reminders-map-help-modal-instance');
+        if (helpModalInstance) {
+             const helpCloseButton = helpModalInstance.querySelector('#close-reminders-map-help-instance');
+             if(helpCloseButton) clearModalAutoCloseTimer(helpModalInstance, helpCloseButton, 'reminders-map-help-modal-instance');
+             helpModalInstance.remove();
+        }
+        // Limpiar elementos de UI de navegación
+        document.getElementById('navigation-progress-bar-container').classList.add('hidden');
+        document.getElementById('next-turn-info-container').classList.add('hidden');
+
+        sessionStorage.removeItem('boardinggate_map_should_reopen_after_form');
+        sessionStorage.removeItem('boardinggate_map_should_reopen_when_unified_closes');
+        sessionStorage.removeItem('boardinggate_map_was_open_before_table');
+        sessionStorage.removeItem('boardinggate_map_should_reopen_after_config');
+
+        hideUnifiedReminderWindow();
+    };
+    if (closeButton) closeButton.addEventListener('click', closeHandler);
+
+    if (locateMeButton) {
+        locateMeButton.addEventListener('click', function handleLocateMeClick() {
+            if (!allLocationsMapInstance) return;
+            if (locateMeButton.textContent === "ESTÁS AQUÍ") {
+                shouldCenterOnUserInAllLocationsMap = true;
+                isMapFollowingUser = true; // Usado por la navegación OSRM
+                locateMeButton.textContent = 'DEJAR DE SEGUIR';
+                locateMeButton.title = "Dejar de centrar el mapa automáticamente en mi posición";
+                if (initialUserLocationMarkerLat && initialUserLocationMarkerLng) {
+                    const latLng = L.latLng(initialUserLocationMarkerLat, initialUserLocationMarkerLng);
+                    allLocationsMapInstance.setView(latLng, 16);
+                } else {
+                     getCurrentLocation(
+                        (coords) => {
+                            const latLng = L.latLng(coords.latitude, coords.longitude);
+                            if (allLocationsMapInstance) allLocationsMapInstance.setView(latLng, 16);
+                            updateInitialUserPosition(coords, false);
+                        },
+                        () => showToast("No se pudo obtener tu ubicación para centrar.", "warning")
+                    );
+                }
+            } else if (locateMeButton.textContent === "DEJAR DE SEGUIR") {
+                shouldCenterOnUserInAllLocationsMap = false;
+                isMapFollowingUser = false; // Usado por la navegación OSRM
+                locateMeButton.textContent = 'ESTÁS AQUÍ';
+                locateMeButton.title = "Mostrar mi posición actual y activar seguimiento";
+            }
+        });
+    }
+
+    if (addRadarButton) {
+        addRadarButton.addEventListener('click', () => {
+            addRadarButton.disabled = true; addRadarButton.textContent = 'Marcando...';
+            getCurrentLocation(
+                (coords) => {
+                    const now = new Date();
+                    const newRadarReminder = {
+                        id: Date.now(),
+                        text: '<b>RADAR: EN ESTA UBICACION (Añadido manualmente)</b>',
+                        type: 'simple',
+                        time: `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`,
+                        date: `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`,
+                        createdAt: now.toISOString(),
+                        managedByUser: false,
+                        isLocationEnabled: true,
+                        locationCoordinates: { latitude: coords.latitude, longitude: coords.longitude },
+                        radiusMeters: 1000,
+                        excludeFromList: true
+                    };
+
+                    let currentRemindersList = JSON.parse(localStorage.getItem('reminders') || '[]');
+                    currentRemindersList.push(newRadarReminder);
+                    localStorage.setItem('reminders', JSON.stringify(currentRemindersList));
+
+                    showToast("Recordatorio RADAR creado en tu ubicación actual (radio 1000 metros).", "success");
+                    updateReminderCount();
+                    updateButtonStyles();
+
+                    if (allLocationsMapInstance) {
+                        const radarLatLng = [newRadarReminder.locationCoordinates.latitude, newRadarReminder.locationCoordinates.longitude];
+                        const radarMapMarker = L.marker(radarLatLng, { icon: radarMarkerIcon })
+                            .addTo(allLocationsMapInstance);
+
+                        L.circle(radarLatLng, {
+                            radius: newRadarReminder.radiusMeters,
+                            color: '#800080',
+                            fillColor: '#DA70D6',
+                            fillOpacity: 0.1
+                        }).addTo(allLocationsMapInstance);
+
+                        let popupContentRadar = `
+                            <div style="max-width: 250px; font-family: sans-serif; font-size: 0.9rem;">
+                                <strong style="font-size: 1rem; color: #333; display: block; margin-bottom: 5px;">${newRadarReminder.text.replace(/<b>|<\/b>/gi,'')}</strong>
+                                <hr style="margin: 4px 0;">
+                                <p style="margin: 3px 0;"><strong>Radio:</strong> ${newRadarReminder.radiusMeters}m</p>
+                                <p style="margin: 3px 0;"><strong>Creado:</strong> Ahora</p>
+                                <button data-reminder-id="${newRadarReminder.id}" class="modify-reminder-from-map" style="margin-top: 8px; padding: 4px 8px; font-size: 0.8rem; background-color: #10B981; color: white; border: none; border-radius: 3px; cursor: pointer;">Modificar</button>
+                            </div>`;
+                        radarMapMarker.bindPopup(popupContentRadar);
+                        radarMapMarker.on('popupopen', () => {
+                            const modifyButton = radarMapMarker.getPopup().getElement().querySelector('.modify-reminder-from-map');
+                            if (modifyButton) {
+                                const newModifyButton = modifyButton.cloneNode(true);
+                                modifyButton.parentNode.replaceChild(newModifyButton, modifyButton);
+                                newModifyButton.addEventListener('click', (e) => {
+                                    const id = parseInt(e.target.dataset.reminderId);
+                                    if (!isNaN(id)) {
+                                        const rems = JSON.parse(localStorage.getItem('reminders') || '[]');
+                                        const remToMod = rems.find(r => r.id === id);
+                                        if (remToMod) {
+                                            // Limpiar modal actual del mapa de ubicaciones antes de mostrar el modal de edición
+                                            closeHandler(); // Llama a la función que cierra y limpia el mapa de ubicaciones
+                                            showReminderModal(remToMod);
+                                        } else { showToast("Error: No se encontró el recordatorio para modificar.", "error"); }
+                                    }
+                                });
+                            }
+                        });
+                        allLocationsMapInstance.setView(radarLatLng, 15);
+                    }
+                    addRadarButton.disabled = false; addRadarButton.textContent = 'AQUÍ HAY UN RADAR';
+                },
+                (errorMsg) => {
+                    showToast(`Error al obtener ubicación para RADAR: ${errorMsg}`, "error");
+                    addRadarButton.disabled = false; addRadarButton.textContent = 'AQUÍ HAY UN RADAR';
+                }
+            );
+        });
+    }
+
+    if (helpButton) helpButton.addEventListener('click', showRemindersMapHelpModal);
+    if (startNavigationButton) startNavigationButton.addEventListener('click', toggleNavigation);
+
+    try {
+        allLocationsMapInstance = L.map(mapContainer, {
+            zoomControl: true
+        });
+        allLocationsMapInstance.zoomControl.setPosition('topright');
+
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© OpenStreetMap contributors'
+        }).addTo(allLocationsMapInstance);
+
+        orientationAltitudeControl = L.control.orientationAltitude({ position: 'topleft' });
+        if(allLocationsMapInstance && orientationAltitudeControl) {
+            orientationAltitudeControl.addTo(allLocationsMapInstance);
+        }
+
+        allLocationsMapInstance.on('zoomend', () => {
+            if (initialUserLocationCircle && initialUserLocationMarkerLat && initialUserLocationMarkerLng && allLocationsMapInstance) {
+                const zoomLevel = allLocationsMapInstance.getZoom();
+                const minZoom = allLocationsMapInstance.getMinZoom() || 0;
+                const maxZoom = allLocationsMapInstance.getMaxZoom() || 18;
+                const zoomFraction = Math.max(0, Math.min(1, (zoomLevel - minZoom) / (maxZoom - minZoom)));
+                const minRadius = 3;
+                const maxRadius = 150;
+                const newRadius = minRadius + (maxRadius - minRadius) * (1 - zoomFraction);
+                initialUserLocationCircle.setRadius(Math.max(minRadius, Math.min(maxRadius, newRadius)));
+            }
+        });
+
+        const plotReminders = () => {
+            remindersWithLocation.forEach(reminder => {
+                const latLng = [reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude];
+                const isRadar = reminder.text.toUpperCase().includes("RADAR:") || reminder.excludeFromList;
+                const markerIconToUse = isRadar ? radarMarkerIcon : defaultLocationMarkerIconBlue;
+                const circleColor = isRadar ? '#800080' : 'blue';
+                const circleFillColor = isRadar ? '#DA70D6' : '#ADD8E6';
+                const circleFillOpacity = isRadar ? 0.1 : 0.05;
+
+                const marker = L.marker(latLng, {
+                    icon: markerIconToUse,
+                    title: reminder.text.replace(/<[^>]*>/g, '').substring(0, 50)
+                }).addTo(allLocationsMapInstance);
+
+                L.circle(latLng, {
+                    radius: reminder.radiusMeters || 1000,
+                    color: circleColor,
+                    fillColor: circleFillColor,
+                    weight: 1,
+                    fillOpacity: circleFillOpacity
+                }).addTo(allLocationsMapInstance);
+
+                let popupContent = `
+                    <div style="max-width: 250px; font-family: sans-serif; font-size: 0.9rem;">
+                        <strong style="font-size: 1rem; color: #333; display: block; margin-bottom: 5px;">${reminder.text.replace(/<b>|<\/b>/gi,'')}</strong>
+                        <hr style="margin: 4px 0;">
+                        ${reminder.time ? `<p style="margin: 3px 0;"><strong>Hora:</strong> ${formatTimeWithPeriod(reminder.time)}</p>` : ''}
+                        ${reminder.date ? `<p style="margin: 3px 0;"><strong>Fecha:</strong> ${formatDateDetailed(reminder.date)}</p>` : ''}
+                        ${reminder.type === 'weekly' && reminder.repeatDays?.length > 0 ? `<p style="margin: 3px 0;"><strong>Repite:</strong> ${reminder.repeatDays.map(d => ['Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb'][d]).join(', ')}</p>` : ''}
+                        ${reminder.type === 'interval' && reminder.intervalDays ? `<p style="margin: 3px 0;"><strong>Cada:</strong> ${reminder.intervalDays} días</p>` : ''}
+                        <p style="margin: 3px 0;"><strong>Radio:</strong> ${reminder.radiusMeters || 1000}m</p>
+                        <button data-reminder-id="${reminder.id}" class="modify-reminder-from-map" style="margin-top: 8px; padding: 4px 8px; font-size: 0.8rem; background-color: #10B981; color: white; border: none; border-radius: 3px; cursor: pointer;">Modificar</button>
+                    </div>`;
+                marker.bindPopup(popupContent);
+
+                marker.on('popupopen', () => {
+                    const modifyButton = marker.getPopup().getElement().querySelector('.modify-reminder-from-map');
+                    if (modifyButton) {
+                        const newModifyButton = modifyButton.cloneNode(true);
+                        modifyButton.parentNode.replaceChild(newModifyButton, modifyButton);
+                        newModifyButton.addEventListener('click', (e) => {
+                            const id = parseInt(e.target.dataset.reminderId);
+                            if (!isNaN(id)) {
+                                const rems = JSON.parse(localStorage.getItem('reminders') || '[]');
+                                const remToMod = rems.find(r => r.id === id);
+                                if (remToMod) {
+                                    closeHandler(); // Llama a la función que cierra y limpia el mapa de ubicaciones
+                                    showReminderModal(remToMod);
+                                } else { showToast("Error: No se encontró el recordatorio para modificar.", "error"); }
+                            }
+                        });
+                    }
+                });
+            });
+        };
+
+        const updateInitialUserPosition = (coords, isInitialViewSetup = false) => {
+            if (!allLocationsMapInstance) return;
+
+            const latLng = L.latLng(coords.latitude, coords.longitude);
+            initialUserLocationMarkerLat = coords.latitude;
+            initialUserLocationMarkerLng = coords.longitude;
+            const currentHeading = coords.heading;
+            const currentAltitude = coords.altitude;
+
+            if (initialUserLocationMarker) {
+                initialUserLocationMarker.setLatLng(latLng);
+                // No se usa setRotationAngle aquí para evitar el error.
+            } else {
+                initialUserLocationMarker = L.marker(latLng, {
+                    icon: carIcon,
+                    zIndexOffset: 1000,
+                })
+                .addTo(allLocationsMapInstance)
+                .bindPopup("Tu posición actual");
+            }
+
+            if (orientationAltitudeControl) {
+                orientationAltitudeControl.updateOrientation(currentHeading);
+                orientationAltitudeControl.updateAltitude(currentAltitude);
+            }
+
+            const zoomLevel = allLocationsMapInstance.getZoom();
+            const minZoom = allLocationsMapInstance.getMinZoom() || 0;
+            const maxZoom = allLocationsMapInstance.getMaxZoom() || 18;
+            const zoomFraction = Math.max(0, Math.min(1, (zoomLevel - minZoom) / (maxZoom - minZoom)));
+            const minRadius = 3;
+            const maxRadius = 150;
+            const dynamicRadius = minRadius + (maxRadius - minRadius) * (1 - zoomFraction);
+
+            const circleStyle = {
+                radius: Math.max(minRadius, Math.min(maxRadius, dynamicRadius)),
+                color: 'green',
+                weight: 3,
+                fillColor: 'yellow',
+                fillOpacity: 0.4
+            };
+
+            if (initialUserLocationCircle) {
+                initialUserLocationCircle.setLatLng(latLng).setRadius(circleStyle.radius).setStyle({
+                    color: circleStyle.color,
+                    weight: circleStyle.weight,
+                    fillColor: circleStyle.fillColor,
+                    fillOpacity: circleStyle.fillOpacity
+                });
+            } else {
+                 initialUserLocationCircle = L.circle(latLng, circleStyle).addTo(allLocationsMapInstance);
+            }
+
+            if (isInitialViewSetup) {
+                const bounds = L.latLngBounds(remindersWithLocation.map(r => [r.locationCoordinates.latitude, r.locationCoordinates.longitude]));
+                if (latLng) bounds.extend(latLng);
+
+                if (bounds.isValid()) {
+                    allLocationsMapInstance.fitBounds(bounds.pad(0.15));
+                } else if (latLng) {
+                    allLocationsMapInstance.setView(latLng, 16);
+                } else {
+                     allLocationsMapInstance.setView([40.416775, -3.703790], 6);
+                }
+            } else if (shouldCenterOnUserInAllLocationsMap && latLng) {
+                 allLocationsMapInstance.panTo(latLng);
+            }
+        };
+
+        plotReminders(); // Dibuja los recordatorios con ubicación
+
+        // Configuración inicial de la vista y posición del usuario
+        if (remindersWithLocation.length > 0) {
+            const bounds = L.latLngBounds(remindersWithLocation.map(r => [r.locationCoordinates.latitude, r.locationCoordinates.longitude]));
+            if (bounds.isValid()) {
+                allLocationsMapInstance.fitBounds(bounds.pad(0.15));
+            } else {
+                allLocationsMapInstance.setView([40.416775, -3.703790], 6); // Vista por defecto si no hay recordatorios
+            }
+        } else {
+             allLocationsMapInstance.setView([40.416775, -3.703790], 6); // Vista por defecto
+        }
+
+        getCurrentLocation(
+            (currentPos) => {
+                updateInitialUserPosition({
+                    latitude: currentPos.latitude,
+                    longitude: currentPos.longitude,
+                    accuracy: currentPos.accuracy,
+                    heading: currentPos.heading,
+                    altitude: currentPos.altitude
+                }, remindersWithLocation.length === 0); // isInitialViewSetup es true si no hay recordatorios para centrar
+
+                if (locationWatchId === null && 'geolocation' in navigator && 'watchPosition' in navigator.geolocation) {
+                    locationWatchId = navigator.geolocation.watchPosition(
+                        (position) => {
+                            const coordsForUpdate = {
+                                latitude: position.coords.latitude,
+                                longitude: position.coords.longitude,
+                                accuracy: position.coords.accuracy,
+                                heading: position.coords.heading,
+                                altitude: position.coords.altitude
+                            };
+                            updateInitialUserPosition(coordsForUpdate, false);
+                            if(isNavigating) { // Si está navegando, actualiza la posición para la navegación
+                                updateUserPositionForNavigation(coordsForUpdate);
+                            }
+                        },
+                        (error) => {
+                            showToast(`Error seguimiento GPS: ${error.message}`, "warning");
+                            if (locationWatchId !== null) {
+                                navigator.geolocation.clearWatch(locationWatchId);
+                                locationWatchId = null;
+                            }
+                        },
+                        { enableHighAccuracy: true, timeout: 15000, maximumAge: 5000, distanceFilter: 10 }
+                    );
+                }
+            },
+            () => {
+                showToast("No se pudo obtener tu ubicación actual. El mapa mostrará los recordatorios.", "warning");
+                 if (orientationAltitudeControl) {
+                    orientationAltitudeControl.updateOrientation(null);
+                    orientationAltitudeControl.updateAltitude(null);
+                }
+            }
+        );
+
+        // Manejador de clics en el mapa para añadir puntos de ruta OSRM o recordatorios RADAR
+        let lastMapClickTime = 0;
+        allLocationsMapInstance.on('click', function(e) {
+            if (e.latlng) {
+                const clickTime = Date.now();
+                // En modo no navegación, o si la navegación está activa pero no se está siguiendo al usuario (permitiendo modificar ruta)
+                if (!isNavigating || (isNavigating && !isMapFollowingUser)) {
+                    if (L.Browser.touch && (clickTime - (this.lastMapTapTime || 0)) < 350) { // Doble tap en móvil
+                        handleRadarMapLongPress(e.latlng); // Crear RADAR con doble tap
+                        this.lastMapTapTime = 0; // Reset para evitar triple tap
+                    } else if (!L.Browser.touch) { // Click normal en PC para añadir punto de ruta
+                         handleAddRoutePoint(e.latlng);
+                    } else { // Primer tap en móvil, también añade punto de ruta
+                         handleAddRoutePoint(e.latlng);
+                    }
+                }
+                this.lastMapTapTime = clickTime;
+            }
+        });
+
+         allLocationsMapInstance.on('contextmenu', function(e) { // Click derecho en PC
+            e.originalEvent.preventDefault();
+            if (e.latlng) {
+                if (!isNavigating || (isNavigating && !isMapFollowingUser)) {
+                    handleAddRoutePoint(e.latlng);
+                } else {
+                    handleRadarMapLongPress(e.latlng); // Si está navegando y siguiendo, click derecho crea RADAR
+                }
+            }
+        });
 
 
+        setTimeout(() => {
+            if (allLocationsMapInstance) {
+                allLocationsMapInstance.invalidateSize();
+            }
+        }, 150);
+        loadSavedRoutes(); // Cargar rutas guardadas al iniciar el mapa
 
+    } catch (error) {
+        if (mapContainer) {
+           mapContainer.innerHTML = `<p style="color:red; text-align:center; padding:20px;">Error al cargar el mapa: ${error.message}</p>`;
+        }
+        console.error("Error en showAllRemindersLocationMap:", error);
+    }
+}
 
+// --- Implementación de la lógica OSRM ---
+
+function handleAddRoutePoint(latlng) {
+    if (!allLocationsMapInstance) return;
+
+    let pointType;
+    if (routePoints.length === 0) {
+        // Si es el primer punto y la ubicación actual está disponible y es diferente, usarla como 'S'
+        if (initialUserLocationMarkerLat && initialUserLocationMarkerLng &&
+            (Math.abs(initialUserLocationMarkerLat - latlng.lat) > 0.0001 || Math.abs(initialUserLocationMarkerLng - latlng.lng) > 0.0001) ) {
+            
+            const startPoint = { lat: initialUserLocationMarkerLat, lng: initialUserLocationMarkerLng, type: 'S', marker: null };
+            routePoints.push(startPoint);
+            pointType = 'F'; // El punto clickeado será el final
+        } else {
+             pointType = 'S'; // Si no hay ubicación actual o es el mismo punto, el clickeado es Salida
+        }
+    } else if (routePoints.length === 1) {
+        pointType = 'F';
+    } else { // Ya hay Salida y Fin, este es una etapa
+        const lastPoint = routePoints.pop(); // Quitar el 'F' temporalmente
+        if (lastPoint.marker) lastPoint.marker.remove();
+
+        const newStageType = (routePoints.length -1).toString(); // S, 1, 2...
+        const newStagePoint = { lat: latlng.lat, lng: latlng.lng, type: newStageType, marker: null };
+        routePoints.push(newStagePoint);
+        
+        routePoints.push(lastPoint); // Volver a poner el 'F'
+        pointType = 'F'; // Reasignar el último como F
+    }
     
-                
-                                    
-          
-     
- 
-        
+    if (pointType !== 'F' || routePoints.find(p => p.type === 'F') === undefined) {
+         const newPoint = { lat: latlng.lat, lng: latlng.lng, type: pointType, marker: null };
+         routePoints.push(newPoint);
+    } else { // Si ya hay F, y estamos añadiendo una etapa, el punto final (lastPoint) ya se re-añadió
+        // No hacer nada aquí, la lógica anterior ya manejó la inserción de etapa y re-asignación de F
+    }
 
 
-                 
+    updateRoutePointMarkersAndLabels();
+    fetchAndDrawOSRMRoute();
+    updateStartNavigationButtonVisibility();
+}
+
+function updateRoutePointMarkersAndLabels() {
+    // Eliminar marcadores antiguos
+    routePoints.forEach(point => {
+        if (point.marker) {
+            allLocationsMapInstance.removeLayer(point.marker);
+            point.marker = null;
+        }
+    });
+
+    if (routePoints.length === 0) return;
+
+    // Reasignar tipos
+    if (routePoints.length === 1) {
+        routePoints[0].type = 'S'; // O 'F', depende de la lógica deseada para un solo punto
+    } else {
+        routePoints[0].type = 'S';
+        for (let i = 1; i < routePoints.length - 1; i++) {
+            routePoints[i].type = i.toString();
+        }
+        routePoints[routePoints.length - 1].type = 'F';
+    }
+
+    // Crear nuevos marcadores
+    routePoints.forEach((point, index) => {
+        const iconHtml = `
+            <div class="route-point-marker">
+                <span class="marker-text">${point.type}</span>
+                <span class="marker-remove" data-index="${index}">&times;</span>
+            </div>`;
+        const customIcon = L.divIcon({
+            html: iconHtml,
+            className: '', // Evitar clases de Leaflet por defecto que puedan interferir
+            iconSize: [30, 30],
+            iconAnchor: [15, 15]
+        });
+
+        point.marker = L.marker([point.lat, point.lng], { icon: customIcon, draggable: true })
+            .addTo(allLocationsMapInstance);
+
+        point.marker.on('dragend', (event) => {
+            const newLatLng = event.target.getLatLng();
+            point.lat = newLatLng.lat;
+            point.lng = newLatLng.lng;
+            fetchAndDrawOSRMRoute();
+        });
         
-        
-                       
-                
-      
+        // El listener para eliminar se añade después de que el marcador esté en el DOM.
+        // Esto es un poco más complejo con DivIcon, se podría hacer delegación de eventos en el mapa.
+        // O, más simple, al crear el HTML del icono, añadir el data-index al botón de borrar
+        // y luego usar un selector global para esos botones.
+    });
     
+    // Añadir listeners a los botones de borrado (necesario después de que los marcadores están en el DOM)
+    // Esto es un poco hacky, idealmente se haría de otra forma, pero para DivIcon es común.
+    setTimeout(() => {
+        document.querySelectorAll('.route-point-marker .marker-remove').forEach(removeBtn => {
+            // Clonar y reemplazar para evitar múltiples listeners si se llama varias veces
+            const newRemoveBtn = removeBtn.cloneNode(true);
+            removeBtn.parentNode.replaceChild(newRemoveBtn, removeBtn);
+            newRemoveBtn.addEventListener('click', (e) => {
+                e.stopPropagation(); // Evitar que el click se propague al mapa
+                L.DomEvent.stop(e); // Más robusto para Leaflet
+                const pointIndex = parseInt(e.target.dataset.index);
+                removeRoutePoint(pointIndex);
+            });
+        });
+    }, 0);
+}
 
-  
+function removeRoutePoint(index) {
+    if (index < 0 || index >= routePoints.length) return;
+    
+    const removedPoint = routePoints.splice(index, 1)[0];
+    if (removedPoint.marker) {
+        allLocationsMapInstance.removeLayer(removedPoint.marker);
+    }
 
-                                                      
+    updateRoutePointMarkersAndLabels(); // Re-etiqueta y redibuja
+    if (routePoints.length > 1) {
+        fetchAndDrawOSRMRoute();
+    } else {
+        if (osrmRouteLayer) {
+            allLocationsMapInstance.removeLayer(osrmRouteLayer);
+            osrmRouteLayer = null;
+        }
+        currentRouteGeoJSON = null;
+        currentRouteDetails = null;
+    }
+    updateStartNavigationButtonVisibility();
+}
+
+async function fetchAndDrawOSRMRoute() {
+    if (routePoints.length < 2) {
+        if (osrmRouteLayer) {
+            allLocationsMapInstance.removeLayer(osrmRouteLayer);
+            osrmRouteLayer = null;
+        }
+        currentRouteGeoJSON = null;
+        currentRouteDetails = null; // Limpiar detalles de ruta
+        return;
+    }
+
+    const coordinates = routePoints.map(p => `${p.lng},${p.lat}`).join(';');
+    const url = `https://router.project-osrm.org/route/v1/driving/${coordinates}?overview=full&geometries=geojson&steps=true&alternatives=false&annotations=true&language=es&access_token=${OSRM_API_KEY}`;
+    
+    try {
+        const response = await fetch(url);
+        if (!response.ok) {
+            const errorData = await response.json();
+            throw new Error(errorData.message || `OSRM API Error: ${response.status}`);
+        }
+        const data = await response.json();
+
+        if (data.routes && data.routes.length > 0) {
+            currentRouteDetails = data; // Guardar la respuesta completa
+            const route = data.routes[0];
+            currentRouteGeoJSON = route.geometry; // Guardar la geometría para la barra de progreso
+
+            if (osrmRouteLayer) {
+                allLocationsMapInstance.removeLayer(osrmRouteLayer);
+            }
+            osrmRouteLayer = L.geoJSON(route.geometry, {
+                style: { color: 'blue', weight: 5, opacity: 0.7 }
+            }).addTo(allLocationsMapInstance);
+            //allLocationsMapInstance.fitBounds(osrmRouteLayer.getBounds()); // Opcional: ajustar vista a la ruta
+            
+            updateNavigationUI(true); // Actualiza la UI si la navegación está activa
+
+        } else {
+            showToast("No se encontró ruta.", "warning");
+            currentRouteGeoJSON = null;
+            currentRouteDetails = null;
+        }
+    } catch (error) {
+        console.error("Error fetching OSRM route:", error);
+        showToast(`Error al calcular ruta: ${error.message}`, "error");
+        currentRouteGeoJSON = null;
+        currentRouteDetails = null;
+    }
+}
+
+function toggleNavigation() {
+    const startNavButton = document.getElementById('start-navigation-button');
+    const progressBarContainer = document.getElementById('navigation-progress-bar-container');
+    const nextTurnContainer = document.getElementById('next-turn-info-container');
+
+    if (!isNavigating) { // Iniciar navegación
+        if (routePoints.length < 2 || !currentRouteDetails) {
+            showToast("Define al menos un origen y destino para navegar.", "warning");
+            return;
+        }
+        isNavigating = true;
+        isMapFollowingUser = true; // Activar seguimiento por defecto
+        shouldCenterOnUserInAllLocationsMap = true; // Para el botón "ESTÁS AQUÍ"
+        
+        document.getElementById('locate-me-on-reminders-map').textContent = 'DEJAR DE SEGUIR';
+        startNavButton.textContent = 'DETENER NAVEGACIÓN';
+        progressBarContainer.classList.remove('hidden');
+        nextTurnContainer.classList.remove('hidden');
+
+        // Forzar la obtención de la ubicación actual para iniciar el seguimiento
+        getCurrentLocation(coords => {
+            updateInitialUserPosition(coords);
+            if (allLocationsMapInstance && coords) {
+                allLocationsMapInstance.setView([coords.latitude, coords.longitude], 17); // Zoom más cercano
+            }
+            updateUserPositionForNavigation(coords); // Primera actualización de UI de navegación
+        });
+        
+        // Si el watchId de geolocalización general no está activo, activarlo
+        if (locationWatchId === null && 'geolocation' in navigator && 'watchPosition' in navigator.geolocation) {
+             locationWatchId = navigator.geolocation.watchPosition(
+                (position) => {
+                    const coordsForUpdate = { latitude: position.coords.latitude, longitude: position.coords.longitude, accuracy: position.coords.accuracy, heading: position.coords.heading, altitude: position.coords.altitude };
+                    updateInitialUserPosition(coordsForUpdate, false); // Actualiza el marcador del coche general
+                    if(isNavigating) updateUserPositionForNavigation(coordsForUpdate); // Actualiza UI de navegación
+                },
+                (error) => console.warn("Error en watchPosition (navegación):", error.message),
+                { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+            );
+        }
+
+
+    } else { // Detener navegación
+        clearNavigationState();
+    }
+}
+
+function clearNavigationState() {
+    isNavigating = false;
+    // isMapFollowingUser se gestiona por el botón "ESTÁS AQUÍ / DEJAR DE SEGUIR"
+    // shouldCenterOnUserInAllLocationsMap también
+
+    const startNavButton = document.getElementById('start-navigation-button');
+    if (startNavButton) startNavButton.textContent = 'INICIAR NAVEGACIÓN';
+    
+    document.getElementById('navigation-progress-bar-container').classList.add('hidden');
+    document.getElementById('next-turn-info-container').classList.add('hidden');
+
+    // Limpiar puntos de ruta y la capa de ruta del mapa
+    routePoints.forEach(point => {
+        if (point.marker) allLocationsMapInstance.removeLayer(point.marker);
+    });
+    routePoints = [];
+    if (osrmRouteLayer) {
+        allLocationsMapInstance.removeLayer(osrmRouteLayer);
+        osrmRouteLayer = null;
+    }
+    currentRouteGeoJSON = null;
+    currentRouteDetails = null;
+    currentLegIndex = 0;
+    currentStepIndex = 0;
+
+    // No detener el watchId general aquí, ya que puede ser usado por el mapa sin navegación.
+    // El botón "ESTÁS AQUÍ / DEJAR DE SEGUIR" controla isMapFollowingUser.
+    // Si el usuario pulsa "DEJAR DE SEGUIR", isMapFollowingUser será false.
+    // Si no, seguirá activo.
+
+    updateStartNavigationButtonVisibility(); // Ocultará el botón de navegación si no hay ruta
+}
+
+
+function updateStartNavigationButtonVisibility() {
+    const startNavButton = document.getElementById('start-navigation-button');
+    const saveRouteButton = document.getElementById('save-osrm-route-button'); // Asumiendo que tendrás estos botones
+    const loadRouteButton = document.getElementById('load-osrm-route-button');
+
+    if (startNavButton) {
+        if (routePoints.length >= 2 || isNavigating) { // Mostrar si hay ruta o se está navegando
+            startNavButton.style.display = 'flex';
+        } else {
+            startNavButton.style.display = 'none';
+        }
+    }
+    // Lógica similar para botones de guardar/cargar
+    // if (saveRouteButton) saveRouteButton.style.display = routePoints.length >= 2 ? 'flex' : 'none';
+    // if (loadRouteButton) loadRouteButton.style.display = 'flex'; // Siempre visible o según tu lógica
+}
+
+
+function updateUserPositionForNavigation(userLocation) {
+    if (!isNavigating || !currentRouteDetails || !allLocationsMapInstance) return;
+
+    const userLatLng = L.latLng(userLocation.latitude, userLocation.longitude);
+
+    if (isMapFollowingUser) {
+        allLocationsMapInstance.panTo(userLatLng);
+    }
+    
+    // Lógica para encontrar el punto más cercano en la ruta y actualizar el progreso
+    // Esto es complejo: implica encontrar el segmento más cercano, el punto en ese segmento,
+    // recalcular distancias, tiempos, y determinar si se ha pasado un paso o etapa.
+    // OSRM no da directamente "progreso en la ruta", hay que calcularlo.
+
+    // Simplificación: por ahora, solo actualizamos la UI general de la ruta.
+    // Una implementación completa requeriría "snap to road" y seguimiento de pasos.
+    updateNavigationUI();
+}
+
+
+function updateNavigationUI(forceRecalculateTotal = false) {
+    if (!isNavigating || !currentRouteDetails) {
+        document.getElementById('navigation-progress-bar-container').classList.add('hidden');
+        document.getElementById('next-turn-info-container').classList.add('hidden');
+        return;
+    }
+
+    const route = currentRouteDetails.routes[0];
+    const legs = route.legs;
+
+    // --- Barra de Progreso Inferior ---
+    const progressBarFill = document.getElementById('nav-progress-fill');
+    const navTimeToStage = document.getElementById('nav-time-to-stage');
+    const navDistanceToStage = document.getElementById('nav-distance-to-stage');
+    const navTotalTime = document.getElementById('nav-total-time');
+    const navTotalDistance = document.getElementById('nav-total-distance');
+    const navEtaDestination = document.getElementById('nav-eta-destination');
+    const progressBar = document.querySelector('#navigation-progress-bar-container .progress-bar');
+
+    // Total de la ruta
+    const totalDurationSeconds = route.duration;
+    const totalDistanceMeters = route.distance;
+
+    navTotalTime.textContent = `${Math.round(totalDurationSeconds / 60)} min`;
+    navTotalDistance.textContent = `${(totalDistanceMeters / 1000).toFixed(1)} km`;
+    
+    const now = new Date();
+    const eta = new Date(now.getTime() + totalDurationSeconds * 1000);
+    navEtaDestination.textContent = `${eta.getHours().toString().padStart(2, '0')}:${eta.getMinutes().toString().padStart(2, '0')}`;
+
+    // Información a la próxima etapa (simplificado al primer leg no completado)
+    // En una implementación real, esto se actualizaría dinámicamente
+    const currentLeg = legs[currentLegIndex] || legs[0];
+    navTimeToStage.textContent = `${Math.round(currentLeg.duration / 60)} min`;
+    navDistanceToStage.textContent = `${(currentLeg.distance / 1000).toFixed(1)} km`;
+    
+    // Progreso (muy simplificado, asume que estamos al inicio de la ruta)
+    // Para un progreso real, necesitarías rastrear la posición del usuario a lo largo de la ruta.
+    let traveledDistance = 0; // Esto debería ser calculado
+    progressBarFill.style.width = `${(traveledDistance / totalDistanceMeters) * 100}%`;
+
+    // Marcadores de etapa en la barra de progreso
+    progressBar.querySelectorAll('.stage-marker').forEach(m => m.remove());
+    let accumulatedDistance = 0;
+    if (totalDistanceMeters > 0) {
+        for (let i = 0; i < legs.length -1; i++) { // No marcar el destino final como etapa en la barra
+            accumulatedDistance += legs[i].distance;
+            const percentage = (accumulatedDistance / totalDistanceMeters) * 100;
+            const stageMarker = document.createElement('div');
+            stageMarker.className = 'stage-marker';
+            stageMarker.style.left = `${percentage}%`;
+            progressBar.appendChild(stageMarker);
+        }
+    }
+
+
+    // --- Información del Próximo Giro (Superior) ---
+    const nextTurnIconImg = document.getElementById('next-turn-icon-img');
+    const nextTurnDistanceEl = document.getElementById('next-turn-distance');
+    const nextTurnStreetEl = document.getElementById('next-turn-street');
+    const nextTurnDistanceProgress = document.getElementById('next-turn-distance-progress');
+
+    const steps = currentLeg.steps;
+    const currentStep = steps[currentStepIndex] || steps[0];
+
+    if (currentStep) {
+        // Distancia al giro (simplificado, distancia del paso actual)
+        const distanceToTurnMeters = currentStep.distance;
+        nextTurnDistanceEl.textContent = distanceToTurnMeters > 1000 ? `${(distanceToTurnMeters/1000).toFixed(1)} km` : `${Math.round(distanceToTurnMeters)} m`;
+        
+        // Barra de progreso para la distancia al giro (asume que estamos al inicio del paso)
+        // En realidad, esto disminuiría a medida que el usuario avanza en el paso.
+        let traveledInStep = 0; // Esto debería ser calculado
+        nextTurnDistanceProgress.style.width = distanceToTurnMeters > 0 ? `${100 - (traveledInStep / distanceToTurnMeters) * 100}%` : '0%';
+
+        nextTurnStreetEl.textContent = currentStep.name || (currentStep.destinations ? currentStep.destinations.split(',')[0] : 'Continuar');
+
+        // Icono de giro (mapeo simple, OSRM tiene muchos tipos de maniobra)
+        const maneuverType = currentStep.maneuver.type;
+        let iconName = 'straight.png'; // Por defecto
+        if (maneuverType.includes('left')) iconName = 'left.png';
+        else if (maneuverType.includes('right')) iconName = 'right.png';
+        else if (maneuverType.includes('roundabout')) iconName = 'roundabout.png';
+        else if (maneuverType === 'arrive') iconName = 'finish.png';
+        // Necesitarías tener estos iconos en tu servidor/repo
+        nextTurnIconImg.src = `https://raw.githubusercontent.com/Project-OSRM/osrm-frontend/gh-pages/images/icons/${iconName}`;
+        // O usar una URL base si tienes los iconos de Tesla o similar
+        // nextTurnIconImg.src = `./path/to/your/icons/${iconName}`; 
+    }
+}
+
+// Guardar y Cargar Rutas (básico, en localStorage)
+const SAVED_ROUTES_KEY = 'osrm_saved_routes';
+
+function saveCurrentRoute(routeName) {
+    if (!routeName || routePoints.length < 2) {
+        showToast("Nombre de ruta vacío o ruta inválida para guardar.", "warning");
+        return;
+    }
+    let savedRoutes = JSON.parse(localStorage.getItem(SAVED_ROUTES_KEY) || "[]");
+    // Evitar duplicados por nombre
+    savedRoutes = savedRoutes.filter(r => r.name !== routeName);
+    savedRoutes.push({ name: routeName, points: routePoints.map(p => ({lat: p.lat, lng: p.lng})) }); // Solo guardar lat/lng
+    localStorage.setItem(SAVED_ROUTES_KEY, JSON.stringify(savedRoutes));
+    showToast(`Ruta "${routeName}" guardada.`, "success");
+    // Podrías actualizar una UI para mostrar rutas guardadas si la tienes
+}
+
+function loadRouteByName(routeName) {
+    const savedRoutes = JSON.parse(localStorage.getItem(SAVED_ROUTES_KEY) || "[]");
+    const routeToLoad = savedRoutes.find(r => r.name === routeName);
+
+    if (routeToLoad) {
+        clearNavigationState(); // Limpiar cualquier ruta actual
+        routePoints = routeToLoad.points.map(p => ({ ...p, type: '', marker: null })); // Reconstruir con tipo vacío
+        
+        if (routePoints.length > 0) {
+           // El primer punto es la ubicación actual si es diferente del primer punto de la ruta guardada.
+           // Esta lógica es un poco compleja si la ubicación actual cambia mucho.
+           // Por simplicidad, asumimos que la ruta guardada incluye el punto de inicio deseado.
+           // O, podríamos forzar el primer punto a ser la ubicación actual.
+            getCurrentLocation(
+                (currentPos) => {
+                    // Opción 1: Usar el primer punto de la ruta guardada como inicio absoluto
+                    // Opción 2: Forzar el inicio a la ubicación actual
+                    routePoints[0].lat = currentPos.latitude;
+                    routePoints[0].lng = currentPos.longitude;
+                    
+                    updateRoutePointMarkersAndLabels();
+                    fetchAndDrawOSRMRoute();
+                    updateStartNavigationButtonVisibility();
+                    showToast(`Ruta "${routeName}" cargada.`, "success");
+                },
+                () => { // Si no se puede obtener la ubicación actual, usar la ruta tal cual
+                    updateRoutePointMarkersAndLabels();
+                    fetchAndDrawOSRMRoute();
+                    updateStartNavigationButtonVisibility();
+                    showToast(`Ruta "${routeName}" cargada (sin ajustar inicio a ubicación actual).`, "info");
+                }
+            );
+        } else {
+             showToast(`Ruta "${routeName}" está vacía.`, "warning");
+        }
+    } else {
+        showToast(`Ruta "${routeName}" no encontrada.`, "error");
+    }
+}
+
+function loadSavedRoutes() { // Se podría llamar al mostrar el mapa de navegación
+    const savedRoutes = JSON.parse(localStorage.getItem(SAVED_ROUTES_KEY) || "[]");
+    // Aquí podrías poblar un <select> o una lista para que el usuario elija qué ruta cargar.
+    // Por ejemplo:
+    const loadRouteButton = document.getElementById('load-osrm-route-button'); // Si tienes un botón para esto
+    if (loadRouteButton && savedRoutes.length > 0) {
+        // Ejemplo: pedir al usuario el nombre de la ruta
+        // loadRouteButton.onclick = () => {
+        //     const routeName = prompt("Nombre de la ruta a cargar:", savedRoutes[0].name);
+        //     if (routeName) loadRouteByName(routeName);
+        // };
+    }
+    // El botón "Guardar Ruta" podría pedir un nombre y luego llamar a saveCurrentRoute.
+}
+
+// --- Fin de Implementación OSRM ---
+
+
+    async function initializeApp() {
+        isRemindersLocationMapActive = false;
+        renderGrid();
+        createOtherButtons();
+        renderToggleButtons();
+        try { await updateVersion(); } catch (e) { console.error("Error updating version:", e); }
+        loadSavedSettings();
+        try { await loadNotices(); startNoticeRotation(); } catch (e) { console.error("Error loading notices:", e); }
+        if (reminderCheckIntervalId) { clearInterval(reminderCheckIntervalId); }
+        checkReminders();
+        reminderCheckIntervalId = setInterval(checkReminders, currentCheckIntervalDuration);
+
+
+        const noticeToggleIcon = document.getElementById('notice-toggle-icon');
+        if (noticeToggleIcon) noticeToggleIcon.addEventListener('click', toggleNotices);
+
+        const countEl = document.getElementById('reminder-count-globe');
+        if (countEl) {
+             const openTable = (e) => {
+                 if (isEditMode || isAssignmentMode || isKeywordAssignmentMode) return;
+                 e.preventDefault(); e.stopPropagation();
+                 showAllReminders();
+             };
+             countEl.addEventListener('click', openTable);
+             countEl.style.cursor = 'pointer';
+        }
+
+        const filterInput = document.getElementById('grid-filter-input');
+        const clearButton = document.getElementById('clear-filter-button');
+        if (filterInput) {
+            filterInput.addEventListener('input', () => {
+                 localStorage.setItem('gridFilterValue', filterInput.value);
+                 filterGridItems();
+                 if(isKeywordAssignmentMode) applyInitialKeywordHighlights();
+            });
+        }
+        if (clearButton) {
+            clearButton.addEventListener('click', () => {
+                 if (filterInput) filterInput.value = '';
+                 localStorage.removeItem('gridFilterValue');
+                 filterGridItems();
+                 if(isKeywordAssignmentMode) applyInitialKeywordHighlights();
+            });
+        }
+
+        adjustButtonPositions();
+        window.addEventListener('resize', adjustButtonPositions);
+        checkVersionsIconOpacity();
+    }
+
+    document.addEventListener('DOMContentLoaded', async () => {
+         loadCustomData();
+         storedPin = localStorage.getItem('password_pin');
+         const savedPasswordActive = localStorage.getItem('password_active');
+         isPasswordActive = savedPasswordActive ? JSON.parse(savedPasswordActive) : false;
+
+         if (isPasswordActive && storedPin) {
+             promptForPin();
+         } else {
+             await initializeApp();
+         }
+
+         window.addEventListener('beforeunload', () => {
+             if (reminderCheckIntervalId) { clearInterval(reminderCheckIntervalId); }
+             if (locationWatchId !== null) { navigator.geolocation.clearWatch(locationWatchId); locationWatchId = null; }
+             if (editingTargetElement) { editingTargetElement.classList.remove('editing-target'); editingTargetElement = null; }
+             const openReminderModal = document.querySelector('.reminder-modal');
+             if (openReminderModal && typeof openReminderModal.cleanUpModalTimers === 'function') { openReminderModal.cleanUpModalTimers(true); }
+
+             Object.keys(globalModalTimers).forEach(modalId => {
+                const timerData = globalModalTimers[modalId];
+                if (timerData) {
+                    clearModalAutoCloseTimer(timerData.modalElement, timerData.closeButtonElement, modalId);
+                }
+             });
+             globalModalTimers = {};
+
+             const openTableModal = document.querySelector('.reminder-table-modal');
+             if(openTableModal && openTableModal.autoCloseInterval) { clearInterval(openTableModal.autoCloseInterval); }
+             const openPostponeModal = document.getElementById('postpone-options-modal');
+             if(openPostponeModal && openPostponeModal.autoPostponeInterval) { clearInterval(openPostponeModal.autoPostponeInterval); }
+             const openSavedLocationsModal = document.querySelector('.saved-locations-modal');
+             if (openSavedLocationsModal && locationPickerMap) { try { locationPickerMap.remove(); } catch(e){} locationPickerMap = null; locationPickerMarker = null; }
+             const openAllLocationsMapModal = document.getElementById('reminders-location-map-modal');
+             if (openAllLocationsMapModal && allLocationsMapInstance) {
+                if (locationWatchId !== null) { navigator.geolocation.clearWatch(locationWatchId); locationWatchId = null; }
+                 if (navigationWatchId !== null) { navigator.geolocation.clearWatch(navigationWatchId); navigationWatchId = null; }
+                try {allLocationsMapInstance.remove();} catch(e){}
+                allLocationsMapInstance = null; initialUserLocationMarker = null; initialUserLocationMarkerLat = null; initialUserLocationMarkerLng = null;
+                if (initialUserLocationCircle) { initialUserLocationCircle.remove(); initialUserLocationCircle = null; }
+                orientationAltitudeControl = null;
+             }
+
+
+             if (isAssignmentMode || isEditMode || isKeywordAssignmentMode) { saveCustomData(); }
+
+             const filterInput = document.getElementById('grid-filter-input');
+             if (filterInput && filterInput.value.trim()) {
+                  localStorage.setItem('gridFilterValue', filterInput.value);
+             } else {
+                  localStorage.removeItem('gridFilterValue');
+             }
+              saveSettings();
+
+              if (reminderModalMap) try {reminderModalMap.remove();} catch(e){}
+              Object.values(previewMaps).forEach(map => {try {map?.remove();} catch(e){}});
+         });
+    });
+
+</script>
+</body>
+</html>
