@@ -1,4 +1,4 @@
-qqq
+
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -3108,12 +3108,158 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
     if (shouldCenterOnUser && mapInstanceToUse) { mapInstanceToUse.panTo(latLng); }
 }
 
+// ... (resto de tu código) ...
 
-function plotRemindersOnNavigationMap() {
-    if (!navigationMapInstance) return;
-    const reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
-    const remindersWithLocation = reminders.filter(r => r.isLocationEnabled && r.locationCoordinates?.latitude && r.locationCoordinates?.longitude);
-    remindersWithLocation.forEach(reminder => { plotSingleReminderOnMap(reminder, navigationMapInstance); });
+function updateTurnByTurnDisplay(route) {
+    const topInfoBar = document.getElementById('navigation-top-info-bar');
+    if (!route || !topInfoBar ) {
+        if(topInfoBar) topInfoBar.style.display = 'none';
+        return;
+    }
+    
+    // MODIFICADO: Asegurar que el mapa y la capa de ruta estén listos
+    if (!isNavigating && (!navigationCurrentRouteData || navigationWaypoints.length < 2 || !navigationMapInstance || !navigationRouteLayer)) {
+         if(topInfoBar) topInfoBar.style.display = 'none';
+         return;
+    }
+    topInfoBar.style.display = 'block';
+
+
+    const turnIconEl = document.getElementById('turn-icon-display');
+    const distanceEl = document.getElementById('distance-to-turn-display');
+    const streetEl = document.getElementById('street-name-display');
+    const progressBarEl = document.getElementById('distance-progress-bar-to-turn');
+
+    let currentStep = null;
+    let distanceToStepManeuver = Infinity; 
+
+    if (route.legs && route.legs.length > 0 && (navigationCurrentLocation || !isNavigating) ) { 
+        let closestStepInfo = { step: null, legIndex: -1, stepIndex: -1, distance: Infinity };
+        const currentCarLoc = navigationCurrentLocation ? L.latLng(navigationCurrentLocation.latitude, navigationCurrentLocation.longitude) : (navigationWaypoints.length > 0 ? L.latLng(navigationWaypoints[0].lat, navigationWaypoints[0].lng) : null);
+
+        // MODIFICADO: Comprobación robusta de mapa y capa de ruta
+        if (currentCarLoc && navigationMapInstance && navigationRouteLayer && navigationRouteLayer.getLatLngs && navigationRouteLayer.getLatLngs().length > 0) { 
+            try { // AÑADIDO: try-catch para L.GeometryUtil
+                for (let legIdx = 0; legIdx < route.legs.length; legIdx++) {
+                    const leg = route.legs[legIdx];
+                    for (let stepIdx = 0; stepIdx < leg.steps.length; stepIdx++) {
+                        const step = leg.steps[stepIdx];
+                        const maneuverLocation = L.latLng(step.maneuver.location[1], step.maneuver.location[0]);
+                        
+                        const distToManeuver = currentCarLoc.distanceTo(maneuverLocation);
+
+                        let isOnThisStep = false;
+                        if (stepIdx < leg.steps.length -1) {
+                            const nextStepManeuverLoc = L.latLng(leg.steps[stepIdx+1].maneuver.location[1], leg.steps[stepIdx+1].maneuver.location[0]);
+                             // Asegurarse de que la polylinea tiene al menos dos puntos para isNear
+                            if (maneuverLocation && nextStepManeuverLoc) {
+                                isOnThisStep = L.GeometryUtil.isNear(navigationMapInstance, L.polyline([maneuverLocation, nextStepManeuverLoc]), currentCarLoc, 30); 
+                            }
+                        } else if (legIdx < route.legs.length - 1) { 
+                             const nextLegFirstStepLoc = L.latLng(route.legs[legIdx+1].steps[0].maneuver.location[1], route.legs[legIdx+1].steps[0].maneuver.location[0]);
+                             if (maneuverLocation && nextLegFirstStepLoc) {
+                                isOnThisStep = L.GeometryUtil.isNear(navigationMapInstance, L.polyline([maneuverLocation, nextLegFirstStepLoc]), currentCarLoc, 30);
+                             }
+                        } else { 
+                            isOnThisStep = distToManeuver < 50; 
+                        }
+
+
+                        if (isOnThisStep && distToManeuver < closestStepInfo.distance) {
+                             if (stepIdx + 1 < leg.steps.length) { 
+                                closestStepInfo = { step: leg.steps[stepIdx + 1], legIndex: legIdx, stepIndex: stepIdx + 1, distance: currentCarLoc.distanceTo(L.latLng(leg.steps[stepIdx + 1].maneuver.location[1], leg.steps[stepIdx + 1].maneuver.location[0])) };
+                            } else if (legIdx + 1 < route.legs.length && route.legs[legIdx + 1].steps.length > 0) { 
+                                closestStepInfo = { step: route.legs[legIdx + 1].steps[0], legIndex: legIdx + 1, stepIndex: 0, distance: currentCarLoc.distanceTo(L.latLng(route.legs[legIdx + 1].steps[0].maneuver.location[1], route.legs[legIdx + 1].steps[0].maneuver.location[0])) };
+                            } else { 
+                                 closestStepInfo = { step: step, legIndex: legIdx, stepIndex: stepIdx, distance: distToManeuver };
+                            }
+                        }
+                    }
+                }
+            } catch (e) {
+                console.error("Error en L.GeometryUtil.isNear dentro de updateTurnByTurnDisplay:", e);
+                // No se asigna currentStep si hay error, para que muestre 'Calculando...'
+                currentStep = null; 
+            }
+        }
+        
+        currentStep = closestStepInfo.step;
+        distanceToStepManeuver = closestStepInfo.distance;
+
+        if (!currentStep && route.legs.length > 0 && route.legs[0].steps.length > 0) { 
+            currentStep = route.legs[0].steps[0];
+            distanceToStepManeuver = navigationCurrentLocation ? calculateDistance(navigationCurrentLocation.latitude, navigationCurrentLocation.longitude, currentStep.maneuver.location[1], currentStep.maneuver.location[0]) : currentStep.distance;
+        }
+    } else if (route.legs && route.legs.length > 0 && route.legs[0].steps.length > 0) { 
+        currentStep = route.legs[0].steps[0];
+        distanceToStepManeuver = currentStep.distance;
+    }
+
+
+    if (currentStep) {
+        const maneuver = currentStep.maneuver;
+        const type = maneuver.type;
+        const modifier = maneuver.modifier || '';
+        
+        turnIconEl.textContent = turnIcons[type + (modifier ? ' ' + modifier : '')] || turnIcons[type] || turnIcons['default'];
+        streetEl.textContent = currentStep.name || (type === 'arrive' ? 'Has llegado a tu destino' : 'Continuar en la ruta');
+
+        let displayDistance = distanceToStepManeuver;
+
+        if (displayDistance >= 1000) {
+            distanceEl.textContent = `${(displayDistance / 1000).toFixed(1)} km`;
+        } else {
+            distanceEl.textContent = `${Math.round(displayDistance)} m`;
+        }
+        const maxAnticipationDistance = Math.max(500, currentStep.distance || 500); 
+        const progressToTurnPercent = Math.max(0, Math.min(100, (1 - (displayDistance / maxAnticipationDistance)) * 100));
+        progressBarEl.style.width = `${progressToTurnPercent}%`;
+
+    } else {
+        turnIconEl.textContent = '🏁';
+        distanceEl.textContent = '0 m';
+        streetEl.textContent = 'Calculando... o destino alcanzado.';
+        progressBarEl.style.width = '100%';
+    }
+}
+
+
+function plotSingleReminderOnMap(reminder, mapInstance) {
+    if (!mapInstance || !reminder.isLocationEnabled || !reminder.locationCoordinates) return;
+    const latLng = [reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude];
+    const isRadarType = reminder.text.toUpperCase().includes("RADAR:") || reminder.excludeFromList;
+    
+    let markerIconToUse;
+    let circleColor, circleFillColor, circleFillOpacity;
+
+    if (isRadarType) {
+        markerIconToUse = smallRadarMarkerIcon; 
+        circleColor = '#800080'; 
+        circleFillColor = '#DA70D6'; 
+        circleFillOpacity = 0.2; // MODIFICADO: Aumentada opacidad/saturación
+    } else {
+        markerIconToUse = largeGreenLocationMarkerIcon; 
+        circleColor = '#008000'; 
+        circleFillColor = '#90EE90'; 
+        circleFillOpacity = 0.2; // MODIFICADO: Aumentada opacidad/saturación
+    }
+
+    const marker = L.marker(latLng, { icon: markerIconToUse, title: reminder.text.replace(/<[^>]*>/g, '').substring(0, 50) }).addTo(mapInstance);
+    L.circle(latLng, { radius: reminder.radiusMeters || 1000, color: circleColor, fillColor: circleFillColor, weight: 0, fillOpacity: circleFillOpacity }).addTo(mapInstance); // MODIFICADO: weight: 0
+    let popupContent = ` <div style="max-width: 250px; font-family: sans-serif; font-size: 0.9rem;"> <strong style="font-size: 1rem; color: #333; display: block; margin-bottom: 5px;">${reminder.text.replace(/<b>|<\/b>/gi,'')}</strong> <hr style="margin: 4px 0;"> ${reminder.time ? `<p style="margin: 3px 0;"><strong>Hora:</strong> ${formatTimeWithPeriod(reminder.time)}</p>` : ''} ${reminder.date ? `<p style="margin: 3px 0;"><strong>Fecha:</strong> ${formatDateDetailed(reminder.date)}</p>` : ''} <p style="margin: 3px 0;"><strong>Radio:</strong> ${reminder.radiusMeters || 1000}m</p> <button data-reminder-id="${reminder.id}" class="modify-reminder-from-map" style="margin-top: 8px; padding: 4px 8px; font-size: 0.8rem; background-color: #10B981; color: white; border: none; border-radius: 3px; cursor: pointer;">Modificar</button> </div>`;
+    marker.bindPopup(popupContent);
+    marker.on('popupopen', () => {
+        const modifyButton = marker.getPopup().getElement().querySelector('.modify-reminder-from-map');
+        if (modifyButton) {
+            const newModifyButton = modifyButton.cloneNode(true); modifyButton.parentNode.replaceChild(newModifyButton, modifyButton);
+            newModifyButton.addEventListener('click', (e) => {
+                const id = parseInt(e.target.dataset.reminderId); if (!isNaN(id)) {
+                    const rems = JSON.parse(localStorage.getItem('reminders') || '[]'); const remToMod = rems.find(r => r.id === id);
+                    if (remToMod) {
+                        if (isNavigationMapActive) closeNavigationMap(true); 
+                        else if (isRemindersLocationMapActive) showAllRemindersLocationMap(); 
+                        showReminderModal(remToMod); 
+                    } else { showToast("Error: No se encontró el recordatorio para modificar.", "error"); } } }); } });
 }
 
 function plotSingleReminderOnMap(reminder, mapInstance) {
@@ -3605,14 +3751,13 @@ function updateNavigationProgressDisplay(route) {
                     const dot = document.createElement('div');
                     dot.className = 'waypoint-dot-on-progress-bar';
                     dot.style.left = `calc(${percent}% - 4px)`; 
-                    dot.title = `Etapa ${navigationWaypoints[i].label}`;
+                   dot.title = `Etapa ${navigationWaypoints[i].label}`;
                     overallProgressContainer.appendChild(dot);
                 }
             }
         }
     }
 }
-
 
 function updateTurnByTurnDisplay(route) {
     const topInfoBar = document.getElementById('navigation-top-info-bar');
@@ -3621,8 +3766,9 @@ function updateTurnByTurnDisplay(route) {
         return;
     }
     
-    if (!isNavigating && (!navigationCurrentRouteData || navigationWaypoints.length < 2)) {
-         topInfoBar.style.display = 'none';
+    // MODIFICADO: Asegurar que el mapa y la capa de ruta estén listos
+    if (!isNavigating && (!navigationCurrentRouteData || navigationWaypoints.length < 2 || !navigationMapInstance || !navigationRouteLayer)) {
+         if(topInfoBar) topInfoBar.style.display = 'none';
          return;
     }
     topInfoBar.style.display = 'block';
@@ -3640,38 +3786,49 @@ function updateTurnByTurnDisplay(route) {
         let closestStepInfo = { step: null, legIndex: -1, stepIndex: -1, distance: Infinity };
         const currentCarLoc = navigationCurrentLocation ? L.latLng(navigationCurrentLocation.latitude, navigationCurrentLocation.longitude) : (navigationWaypoints.length > 0 ? L.latLng(navigationWaypoints[0].lat, navigationWaypoints[0].lng) : null);
 
+        // MODIFICADO: Comprobación robusta de mapa y capa de ruta
+        if (currentCarLoc && navigationMapInstance && navigationRouteLayer && navigationRouteLayer.getLatLngs && navigationRouteLayer.getLatLngs().length > 0) { 
+            try { // AÑADIDO: try-catch para L.GeometryUtil
+                for (let legIdx = 0; legIdx < route.legs.length; legIdx++) {
+                    const leg = route.legs[legIdx];
+                    for (let stepIdx = 0; stepIdx < leg.steps.length; stepIdx++) {
+                        const step = leg.steps[stepIdx];
+                        const maneuverLocation = L.latLng(step.maneuver.location[1], step.maneuver.location[0]);
+                        
+                        const distToManeuver = currentCarLoc.distanceTo(maneuverLocation);
 
-        if (currentCarLoc && navigationMapInstance && navigationRouteLayer) { // MODIFICADO: Añadido check de navigationMapInstance y navigationRouteLayer
-            for (let legIdx = 0; legIdx < route.legs.length; legIdx++) {
-                const leg = route.legs[legIdx];
-                for (let stepIdx = 0; stepIdx < leg.steps.length; stepIdx++) {
-                    const step = leg.steps[stepIdx];
-                    const maneuverLocation = L.latLng(step.maneuver.location[1], step.maneuver.location[0]);
-                    
-                    const distToManeuver = currentCarLoc.distanceTo(maneuverLocation);
-
-                    let isOnThisStep = false;
-                    if (stepIdx < leg.steps.length -1) {
-                        const nextStepManeuverLoc = L.latLng(leg.steps[stepIdx+1].maneuver.location[1], leg.steps[stepIdx+1].maneuver.location[0]);
-                        isOnThisStep = L.GeometryUtil.isNear(navigationMapInstance, L.polyline([maneuverLocation, nextStepManeuverLoc]), currentCarLoc, 30); 
-                    } else if (legIdx < route.legs.length - 1) { 
-                         const nextLegFirstStepLoc = L.latLng(route.legs[legIdx+1].steps[0].maneuver.location[1], route.legs[legIdx+1].steps[0].maneuver.location[0]);
-                         isOnThisStep = L.GeometryUtil.isNear(navigationMapInstance, L.polyline([maneuverLocation, nextLegFirstStepLoc]), currentCarLoc, 30);
-                    } else { 
-                        isOnThisStep = distToManeuver < 50; 
-                    }
-
-
-                    if (isOnThisStep && distToManeuver < closestStepInfo.distance) {
-                         if (stepIdx + 1 < leg.steps.length) { 
-                            closestStepInfo = { step: leg.steps[stepIdx + 1], legIndex: legIdx, stepIndex: stepIdx + 1, distance: currentCarLoc.distanceTo(L.latLng(leg.steps[stepIdx + 1].maneuver.location[1], leg.steps[stepIdx + 1].maneuver.location[0])) };
-                        } else if (legIdx + 1 < route.legs.length && route.legs[legIdx + 1].steps.length > 0) { 
-                            closestStepInfo = { step: route.legs[legIdx + 1].steps[0], legIndex: legIdx + 1, stepIndex: 0, distance: currentCarLoc.distanceTo(L.latLng(route.legs[legIdx + 1].steps[0].maneuver.location[1], route.legs[legIdx + 1].steps[0].maneuver.location[0])) };
+                        let isOnThisStep = false;
+                        if (stepIdx < leg.steps.length -1) {
+                            const nextStepManeuverLoc = L.latLng(leg.steps[stepIdx+1].maneuver.location[1], leg.steps[stepIdx+1].maneuver.location[0]);
+                             // Asegurarse de que la polylinea tiene al menos dos puntos para isNear
+                            if (maneuverLocation && nextStepManeuverLoc) {
+                                isOnThisStep = L.GeometryUtil.isNear(navigationMapInstance, L.polyline([maneuverLocation, nextStepManeuverLoc]), currentCarLoc, 30); 
+                            }
+                        } else if (legIdx < route.legs.length - 1) { 
+                             const nextLegFirstStepLoc = L.latLng(route.legs[legIdx+1].steps[0].maneuver.location[1], route.legs[legIdx+1].steps[0].maneuver.location[0]);
+                             if (maneuverLocation && nextLegFirstStepLoc) {
+                                isOnThisStep = L.GeometryUtil.isNear(navigationMapInstance, L.polyline([maneuverLocation, nextLegFirstStepLoc]), currentCarLoc, 30);
+                             }
                         } else { 
-                             closestStepInfo = { step: step, legIndex: legIdx, stepIndex: stepIdx, distance: distToManeuver };
+                            isOnThisStep = distToManeuver < 50; 
+                        }
+
+
+                        if (isOnThisStep && distToManeuver < closestStepInfo.distance) {
+                             if (stepIdx + 1 < leg.steps.length) { 
+                                closestStepInfo = { step: leg.steps[stepIdx + 1], legIndex: legIdx, stepIndex: stepIdx + 1, distance: currentCarLoc.distanceTo(L.latLng(leg.steps[stepIdx + 1].maneuver.location[1], leg.steps[stepIdx + 1].maneuver.location[0])) };
+                            } else if (legIdx + 1 < route.legs.length && route.legs[legIdx + 1].steps.length > 0) { 
+                                closestStepInfo = { step: route.legs[legIdx + 1].steps[0], legIndex: legIdx + 1, stepIndex: 0, distance: currentCarLoc.distanceTo(L.latLng(route.legs[legIdx + 1].steps[0].maneuver.location[1], route.legs[legIdx + 1].steps[0].maneuver.location[0])) };
+                            } else { 
+                                 closestStepInfo = { step: step, legIndex: legIdx, stepIndex: stepIdx, distance: distToManeuver };
+                            }
                         }
                     }
                 }
+            } catch (e) {
+                console.error("Error en L.GeometryUtil.isNear dentro de updateTurnByTurnDisplay:", e);
+                // No se asigna currentStep si hay error, para que muestre 'Calculando...'
+                currentStep = null; 
             }
         }
         
