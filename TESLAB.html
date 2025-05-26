@@ -5517,6 +5517,686 @@ function clearModalAutoCloseTimer(modalElement, closeButtonElement, modalId) {
                     }
                 }
 
+            document.body.style.overflow = ''; // Asegura restaurar overflow
+        };
+
+        newConfirmButton.addEventListener('click', async () => {
+            try {
+                const newOrderIds = Array.from(listElement.children).map(li => parseInt(li.dataset.id));
+                const newWaypoints = newOrderIds.map(id => navigationWaypoints.find(wp => wp.id === id));
+
+                navigationWaypoints = newWaypoints;
+                updateWaypointTypesAndLabels();
+                renderWaypointMarkers();
+                await recalculateAndDrawRoute();
+                const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+                if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
+                    toggleRadaresRuta(true);
+                }
+                showToast("Etapas reordenadas y ruta recalculada.", "success");
+            } catch (error) {
+                console.error("Error al recalcular la ruta después de reordenar:", error);
+                showToast("Error recalculando ruta tras reordenar.", "error");
+            } finally {
+                 closeReorderModal();
+            }
+        });
+
+
+        newCancelButton.addEventListener('click', () => {
+            showToast("Reordenación cancelada.", "info");
+            closeReorderModal();
+        });
+
+        addModalAutoCloseTimer(modal, newConfirmButton, 'reorder-stages-modal', 60000);
+
+        listElement.addEventListener('dragstart', handleDragStartReorder);
+        listElement.addEventListener('dragend', handleDragEndReorder);
+        listElement.addEventListener('dragover', handleDragOverReorder);
+        listElement.addEventListener('touchstart', handleStageTouchStart, { passive: false });
+        listElement.addEventListener('touchmove', handleStageTouchMove, { passive: false });
+        listElement.addEventListener('touchend', handleStageTouchEnd);
+        listElement.addEventListener('touchcancel', handleStageTouchEnd);
+    }
+
+    function getDragAfterElement(container, y) {
+        const draggableElements = [...container.querySelectorAll('li:not(.dragging)')];
+        return draggableElements.reduce((closest, child) => {
+            const box = child.getBoundingClientRect();
+            const offset = y - box.top - box.height / 2;
+            if (offset < 0 && offset > closest.offset) {
+                return { offset: offset, element: child };
+            } else {
+                return closest;
+            }
+        }, { offset: Number.NEGATIVE_INFINITY }).element;
+    }
+
+
+    function showToast(message, type = 'info', duration = 3000) {
+        const existingToast = document.getElementById('toast-notification-element');
+        if (existingToast) { existingToast.remove(); }
+
+        const toast = document.createElement('div');
+        toast.id = 'toast-notification-element';
+        toast.className = `toast-notification toast-${type}`;
+        toast.textContent = message;
+        document.body.appendChild(toast);
+
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+                toast.classList.add('show');
+            });
+        });
+
+        setTimeout(() => {
+            toast.classList.remove('show');
+            toast.addEventListener('transitionend', () => {
+                 if (toast.parentNode) { toast.parentNode.removeChild(toast); }
+            }, { once: true });
+        }, duration);
+    }
+
+
+    function formatDateToDDMMMYY(dateString) {
+         if (!dateString) return '-';
+         try {
+             const [year, month, day] = dateString.split('-').map(Number);
+             const date = new Date(Date.UTC(year, month - 1, day));
+             if (isNaN(date.getTime())) return '-';
+
+             const dayOfMonth = String(date.getUTCDate()).padStart(2, '0');
+             const monthNames = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic'];
+             const monthName = monthNames[date.getUTCMonth()];
+             const yearShort = String(date.getUTCFullYear()).slice(-2);
+
+             return `${dayOfMonth} ${monthName} ${yearShort}`;
+         } catch (e) {
+             return '-';
+         }
+    }
+    function formatDateDetailed(dateString) {
+        if (!dateString || !dateString.match(/^\d{4}-\d{2}-\d{2}$/)) return '-';
+        try {
+            const [year, month, day] = dateString.split('-').map(Number);
+            const date = new Date(Date.UTC(year, month - 1, day));
+            if (isNaN(date.getTime())) return dateString;
+
+            const dayOfMonth = String(date.getUTCDate()).padStart(2, '0');
+            const monthNames = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
+            const monthName = monthNames[date.getUTCMonth()];
+            const fullYear = date.getUTCFullYear();
+
+            return `${dayOfMonth}-${monthName}-${fullYear}`;
+        } catch (e) {
+            return dateString;
+        }
+    }
+    function formatTimeWithPeriod(timeString) {
+         if (!timeString || !timeString.match(/^\d{2}:\d{2}$/)) return '-';
+         try {
+             const [hourStr, minuteStr] = timeString.split(':');
+             const hour = parseInt(hourStr);
+             const minute = parseInt(minuteStr);
+             if (isNaN(hour) || isNaN(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+                 return timeString;
+             }
+             let period = '';
+             if (hour >= 22 || hour < 5) { period = 'de la Noche'; }
+             else if (hour >= 5 && hour < 12) { period = 'de la Mañana'; }
+             else if (hour >= 12 && hour < 14) { period = 'del Mediodía'; }
+             else { period = 'de la Tarde'; }
+
+             return `${hourStr}:${minuteStr} (${period})`;
+         } catch (e) {
+             return timeString;
+         }
+    }
+
+let globalModalTimers = {};
+
+function addModalAutoCloseTimer(modalElement, closeButtonElement, modalId, duration = 60000) {
+    if (!modalElement || !closeButtonElement || !modalId) {
+        return;
+    }
+    modalElement.dataset.modalTimerId = modalId;
+
+    clearModalAutoCloseTimer(modalElement, closeButtonElement, modalId);
+
+    let countdown = duration / 1000;
+    const originalButtonText = closeButtonElement.textContent.split(' (')[0];
+    const countdownSpanId = `modal-countdown-${modalId}`;
+    let countdownSpan = closeButtonElement.querySelector(`.button-countdown-timer`);
+
+    if (!countdownSpan) {
+        countdownSpan = document.createElement('span');
+        countdownSpan.className = 'button-countdown-timer';
+        countdownSpan.style.marginLeft = '5px';
+        countdownSpan.style.fontWeight = 'normal';
+        closeButtonElement.appendChild(countdownSpan);
+    }
+    countdownSpan.textContent = ` (${countdown})`;
+
+    const intervalId = setInterval(() => {
+        countdown--;
+        if (countdownSpan && document.body.contains(countdownSpan)) {
+          countdownSpan.textContent = ` (${countdown})`;
+        }
+        if (countdown <= 0) {
+            if (globalModalTimers[modalId]) {
+                clearInterval(globalModalTimers[modalId].intervalId);
+                delete globalModalTimers[modalId];
+            }
+            if (closeButtonElement && document.body.contains(closeButtonElement)) {
+                closeButtonElement.click();
+            } else if (modalElement && modalElement.parentNode) {
+                 if (!STATIC_MODAL_IDS.includes(modalElement.id)) {
+                    modalElement.parentNode.removeChild(modalElement);
+                 } else {
+                    modalElement.classList.add('hidden');
+                 }
+            }
+        }
+    }, 1000);
+
+    const resetTimerHandler = () => {
+        if (!globalModalTimers[modalId] || !globalModalTimers[modalId].intervalId) return;
+        clearInterval(globalModalTimers[modalId].intervalId);
+        countdown = duration / 1000;
+        if (countdownSpan && document.body.contains(countdownSpan)) {
+           countdownSpan.textContent = ` (${countdown})`;
+        }
+        const newIntervalId = setInterval(() => {
+            countdown--;
+            if (countdownSpan && document.body.contains(countdownSpan)) {
+                countdownSpan.textContent = ` (${countdown})`;
+            }
+            if (countdown <= 0) {
+                if (globalModalTimers[modalId]) {
+                    clearInterval(globalModalTimers[modalId].intervalId);
+                    delete globalModalTimers[modalId];
+                }
+                if (closeButtonElement && document.body.contains(closeButtonElement)) {
+                    closeButtonElement.click();
+                } else if (modalElement && modalElement.parentNode) {
+                    if (!STATIC_MODAL_IDS.includes(modalElement.id)) {
+                       modalElement.parentNode.removeChild(modalElement);
+                    } else {
+                       modalElement.classList.add('hidden');
+                    }
+                }
+            }
+        }, 1000);
+        globalModalTimers[modalId].intervalId = newIntervalId;
+    };
+
+    modalElement.addEventListener('click', resetTimerHandler);
+    modalElement.addEventListener('touchstart', resetTimerHandler, { passive: true });
+    modalElement.addEventListener('input', resetTimerHandler);
+    modalElement.addEventListener('scroll', resetTimerHandler, { passive: true });
+
+    globalModalTimers[modalId] = {
+        intervalId: intervalId,
+        resetHandler: resetTimerHandler,
+        modalElement: modalElement,
+        closeButtonElement: closeButtonElement,
+        countdownSpan: countdownSpan
+    };
+}
+
+function clearModalAutoCloseTimer(modalElement, closeButtonElement, modalId) {
+    const timerIdToClear = modalId || (modalElement ? modalElement.dataset.modalTimerId : null);
+
+    if (timerIdToClear && globalModalTimers[timerIdToClear]) {
+        clearInterval(globalModalTimers[timerIdToClear].intervalId);
+        const timerData = globalModalTimers[timerIdToClear];
+        if (timerData.modalElement && timerData.resetHandler) {
+            timerData.modalElement.removeEventListener('click', timerData.resetHandler);
+            timerData.modalElement.removeEventListener('touchstart', timerData.resetHandler);
+            timerData.modalElement.removeEventListener('input', timerData.resetHandler);
+            timerData.modalElement.removeEventListener('scroll', timerData.resetHandler);
+        }
+        if (timerData.countdownSpan && timerData.countdownSpan.parentNode) {
+            timerData.countdownSpan.remove();
+        }
+        delete globalModalTimers[timerIdToClear];
+    }
+    if(closeButtonElement){
+        const orphanSpans = closeButtonElement.querySelectorAll('.button-countdown-timer');
+        orphanSpans.forEach(s => s.remove());
+    }
+     if(modalElement && modalElement.dataset.modalTimerId) {
+        delete modalElement.dataset.modalTimerId;
+    }
+}
+
+    function saveUserData() {
+        const userId = document.getElementById('user-id').value.trim();
+        const teslaModel = document.getElementById('tesla-model').value.trim();
+        const teslaYear = document.getElementById('tesla-year').value.trim();
+        const teslaProvince = document.getElementById('tesla-province').value.trim();
+        const allowDMs = document.getElementById('allow-dms').checked;
+        const statusEl = document.getElementById('config-user-status');
+
+        if (!userId) {
+            statusEl.textContent = 'El ID de Usuario (Apodo) es obligatorio.';
+            statusEl.style.color = '#EF4444';
+            return;
+        }
+
+        localStorage.setItem('userData_userId', userId);
+        localStorage.setItem('userData_teslaModel', teslaModel);
+        localStorage.setItem('userData_teslaYear', teslaYear);
+        localStorage.setItem('userData_teslaProvince', teslaProvince);
+        localStorage.setItem('userData_allowDMs', JSON.stringify(allowDMs));
+
+        updateUserIdDisplay();
+        statusEl.textContent = 'Datos de usuario guardados localmente.';
+        statusEl.style.color = '#28a745';
+        showToast('Datos de usuario guardados.', 'success');
+    }
+
+    function resetUserData() {
+        if (confirm('¿Estás seguro de que deseas resetear tus datos de usuario compartidos (los eliminará de la caché local y deberías eliminarlos manualmente de la hoja de cálculo si los enviaste)?')) {
+            document.getElementById('user-id').value = '';
+            document.getElementById('tesla-model').value = '';
+            document.getElementById('tesla-year').value = '';
+            document.getElementById('tesla-province').value = '';
+            document.getElementById('allow-dms').checked = false;
+            localStorage.removeItem('userData_userId');
+            localStorage.removeItem('userData_teslaModel');
+            localStorage.removeItem('userData_teslaYear');
+            localStorage.removeItem('userData_teslaProvince');
+            localStorage.removeItem('userData_allowDMs');
+            updateUserIdDisplay();
+            const statusEl = document.getElementById('config-user-status');
+            statusEl.textContent = 'Datos de usuario reseteados.';
+            statusEl.style.color = '#17a2b8';
+            showToast('Datos de usuario reseteados.', 'info');
+        }
+    }
+
+    function generateBackup() {
+        const backupData = {};
+        managedKeys.forEach(key => {
+            const value = localStorage.getItem(key);
+            if (value !== null) {
+                backupData[key] = value;
+            }
+        });
+        const backupString = JSON.stringify(backupData);
+        const backupDisplay = document.getElementById('config-backup-display');
+        backupDisplay.value = btoa(unescape(encodeURIComponent(backupString)));
+        backupDisplay.style.display = 'block';
+        backupDisplay.select();
+        try {
+            document.execCommand('copy');
+            showToast('Backup copiado al portapapeles.', 'success');
+             document.getElementById('config-backup-status').textContent = '¡Copiado! Guarda este código en un lugar seguro.';
+             document.getElementById('config-backup-status').style.color = '#28a745';
+        } catch (err) {
+            showToast('Error al copiar. Por favor, copia manualmente.', 'warning');
+            document.getElementById('config-backup-status').textContent = 'Copia este código manualmente y guárdalo.';
+            document.getElementById('config-backup-status').style.color = '#ffc107';
+        }
+    }
+
+    function restoreBackup() {
+        const restoreInput = document.getElementById('config-restore-input');
+        const backupStringBase64 = restoreInput.value.trim();
+        const statusEl = document.getElementById('config-restore-status');
+        statusEl.textContent = '';
+
+        if (!backupStringBase64) {
+            statusEl.textContent = 'Pega el código de backup primero.';
+            statusEl.style.color = '#EF4444';
+            return;
+        }
+
+        try {
+            const backupString = decodeURIComponent(escape(atob(backupStringBase64)));
+            const backupData = JSON.parse(backupString);
+            let restoredCount = 0;
+            let incompatibleCount = 0;
+
+            if (confirm('Esto sobreescribirá tus datos actuales con los del backup. ¿Estás seguro?')) {
+                Object.keys(backupData).forEach(key => {
+                    if (managedKeys.includes(key)) {
+                        localStorage.setItem(key, backupData[key]);
+                        restoredCount++;
+                    } else {
+                        incompatibleCount++;
+                    }
+                });
+
+                loadCustomData();
+                loadSavedSettings();
+                updateUserIdDisplay();
+                checkReminders();
+
+                statusEl.textContent = `Restauración completada. ${restoredCount} claves restauradas. ${incompatibleCount} claves ignoradas (incompatibles). La página se recargará.`;
+                statusEl.style.color = '#28a745';
+                showToast('Restauración completada. Recargando...', 'success');
+                setTimeout(() => location.reload(), 2500);
+            } else {
+                 statusEl.textContent = 'Restauración cancelada.';
+                 statusEl.style.color = '#6c757d';
+            }
+        } catch (e) {
+            statusEl.textContent = 'Error: Código de backup inválido o corrupto.';
+            statusEl.style.color = '#EF4444';
+            showToast('Error en el código de backup.', 'error');
+        }
+    }
+
+    function restoreOriginalGrid() {
+        if (confirm('¿Restaurar el grid de botones a su estado original? Perderás tu personalización del grid (URLs, nombres, orden).')) {
+            localStorage.removeItem('customGridData');
+            localStorage.removeItem('gridFilterValue');
+            loadCustomData();
+            renderGrid();
+            renderToggleButtons();
+            loadSavedSettings();
+            filterGridItems();
+            document.getElementById('config-restore-grid-status').textContent = 'Grid restaurado al original. Recargando...';
+            document.getElementById('config-restore-grid-status').style.color = '#28a745';
+            showToast('Grid restaurado. Recargando...', 'success');
+            setTimeout(() => location.reload(), 1500);
+        }
+    }
+
+    function clearAllLocalData() {
+        if (confirm('¡ATENCIÓN! Esto borrará TODOS los datos locales (marcadores personalizados, recordatorios, configuración de usuario, PIN, etc.). Esta acción NO SE PUEDE DESHACER. ¿Estás seguro?')) {
+            if (confirm('DE VERDAD, ¿ESTÁS COMPLETAMENTE SEGURO? SE BORRARÁ TODO.')) {
+                managedKeys.forEach(key => localStorage.removeItem(key));
+                localStorage.removeItem('personalizationHelpShown');
+                localStorage.removeItem('gridFilterValue');
+                showToast('Todos los datos locales borrados. Recargando...', 'success');
+                setTimeout(() => location.reload(), 1500);
+            } else {
+                showToast('Borrado cancelado.', 'info');
+            }
+        } else {
+            showToast('Borrado cancelado.', 'info');
+        }
+    }
+
+    async function importRadars() {
+        const latFilterValue = document.getElementById('radar-filter-lat').value.trim();
+        const lonFilterValue = document.getElementById('radar-filter-lon').value.trim();
+        const keywordsFilterRaw = document.getElementById('radar-filter-keywords').value.trim().toUpperCase();
+        const keywordsFilter = keywordsFilterRaw ? keywordsFilterRaw.split(/\s+/).filter(k => k) : [];
+        const importExtra = document.getElementById('import-extra-radars-checkbox').checked;
+
+        const progressBar = document.getElementById('radar-import-progress-bar');
+        const statusMessage = document.getElementById('radar-import-status');
+        const progressContainer = document.getElementById('radar-import-progress-container');
+
+        progressContainer.style.display = 'block';
+        progressBar.value = 0;
+        statusMessage.textContent = 'Iniciando importación...';
+        statusMessage.style.color = '';
+
+        try {
+            let filesToProcess = await fetchKMLFilesList(KML_FILES_LIST_STANDARD);
+            if (importExtra) {
+                const extraFiles = await fetchKMLFilesList(KML_FILES_LIST_EXTRA);
+                filesToProcess = filesToProcess.concat(extraFiles.filter(f => !filesToProcess.includes(f)));
+            }
+
+            if (filesToProcess.length === 0) {
+                statusMessage.textContent = 'No se encontraron listas de archivos KML para procesar.';
+                progressBar.value = 100;
+                showToast('No hay archivos KML en las listas.', 'warning');
+                setTimeout(() => { progressContainer.style.display = 'none'; }, 3000);
+                return;
+            }
+
+            statusMessage.textContent = `Encontrados ${filesToProcess.length} archivos KML. Procesando...`;
+            let reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
+            let newRadarsCount = 0;
+            let totalFilesProcessed = 0;
+
+            for (const kmlFileName of filesToProcess) {
+                try {
+                    statusMessage.textContent = `Procesando ${kmlFileName}... (${totalFilesProcessed + 1}/${filesToProcess.length})`;
+                    const placemarks = await fetchAndParseKML(KML_BASE_PATH + kmlFileName);
+
+                    placemarks.forEach(placemark => {
+                        const name = placemark.name.toUpperCase();
+                        const coords = placemark.coordinates;
+
+                        const matchesKeywords = keywordsFilter.length === 0 || keywordsFilter.some(kw => name.includes(kw));
+
+                        if (coords && matchesKeywords) {
+                            const [lonStr, latStr] = coords.split(',');
+                            const lon = parseFloat(lonStr);
+                            const lat = parseFloat(latStr);
+
+                            if (isNaN(lat) || isNaN(lon)) return;
+                            const matchesLat = parseCoordinateFilter(latFilterValue, lat);
+                            const matchesLon = parseCoordinateFilter(lonFilterValue, lon);
+
+                            if (matchesLat && matchesLon) {
+                                const existingRadar = reminders.find(r =>
+                                    r.isLocationEnabled &&
+                                    r.locationCoordinates &&
+                                    Math.abs(r.locationCoordinates.latitude - lat) < COORD_EPSILON &&
+                                    Math.abs(r.locationCoordinates.longitude - lon) < COORD_EPSILON &&
+                                    (r.text.toUpperCase().includes("RADAR:") || r.excludeFromList)
+                                );
+
+                                if (!existingRadar) {
+                                    const now = new Date();
+                                    const newRadar = {
+                                        id: Date.now() + Math.random() + newRadarsCount,
+                                        text: `<b>RADAR: ${placemark.name}</b>`,
+                                        type: 'simple',
+                                        time: '00:01',
+                                        date: `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`,
+                                        createdAt: now.toISOString(),
+                                        managedByUser: false,
+                                        isLocationEnabled: true,
+                                        locationCoordinates: { latitude: lat, longitude: lon },
+                                        radiusMeters: 400,
+                                        excludeFromList: true
+                                    };
+                                    reminders.push(newRadar);
+                                    newRadarsCount++;
+                                }
+                            }
+                        }
+                    });
+                } catch (fileError) {
+                    console.error(`Error procesando el archivo ${kmlFileName}:`, fileError);
+                    statusMessage.textContent = `Error en ${kmlFileName}: ${fileError.message}. Continuando...`;
+                    statusMessage.style.color = 'orange';
+                    await new Promise(resolve => setTimeout(resolve, 1500));
+                }
+                totalFilesProcessed++;
+                progressBar.value = (totalFilesProcessed / filesToProcess.length) * 100;
+            }
+
+            localStorage.setItem('reminders', JSON.stringify(reminders));
+            statusMessage.textContent = `Importación completa. ${newRadarsCount} nuevos radares/POIs añadidos.`;
+            statusMessage.style.color = '#28a745';
+            showToast(`${newRadarsCount} nuevos radares/POIs añadidos.`, 'success');
+            updateReminderCount();
+            updateButtonStyles();
+            checkReminders();
+
+        } catch (error) {
+            console.error("Error en la importación de radares:", error);
+            statusMessage.textContent = `Error general: ${error.message}`;
+            statusMessage.style.color = 'red';
+            showToast('Error durante la importación.', 'error');
+        } finally {
+             setTimeout(() => {
+                progressContainer.style.display = 'none';
+                statusMessage.style.color = '';
+            }, 5000);
+        }
+    }
+
+    async function fetchKMLFilesList(listUrl) {
+        try {
+            const response = await fetch(listUrl, { cache: 'no-cache' });
+            if (!response.ok) throw new Error(`Error HTTP ${response.status} obteniendo lista KML: ${listUrl}`);
+            const text = await response.text();
+            return text.split('\n').map(f => f.trim()).filter(f => f.length > 0 && f.toLowerCase().endsWith('.kml'));
+        } catch (error) {
+            console.error(`Error al obtener la lista de archivos KML desde ${listUrl}:`, error);
+            showToast(`Error cargando lista ${listUrl.split('/').pop()}`, 'error');
+            return [];
+        }
+    }
+
+    async function fetchAndParseKML(kmlFileUrl) {
+        try {
+            const response = await fetch(kmlFileUrl, { cache: 'no-cache' });
+            if (!response.ok) throw new Error(`Error HTTP ${response.status} obteniendo KML: ${kmlFileUrl}`);
+
+            const buffer = await response.arrayBuffer();
+            const decoder = new TextDecoder('iso-8859-1');
+            const kmlText = decoder.decode(buffer);
+
+            return parseKML(kmlText);
+        } catch (error) {
+            console.error(`Error al obtener o parsear KML ${kmlFileUrl}:`, error);
+            throw error;
+        }
+    }
+
+    function parseKML(kmlText) {
+        const placemarks = [];
+        const parser = new DOMParser();
+        const xmlDoc = parser.parseFromString(kmlText, "application/xml");
+
+        const parserErrorNode = xmlDoc.querySelector("parsererror");
+        if (parserErrorNode) {
+            let errorMessage = "Error de parseo XML desconocido.";
+            if (parserErrorNode.textContent) {
+                const match = parserErrorNode.textContent.match(/error on line \d+ at column \d+: ([^\n]+)/);
+                if (match && match[1]) {
+                    errorMessage = match[1];
+                } else {
+                    errorMessage = parserErrorNode.textContent.split('\n')[0] || parserErrorNode.textContent;
+                }
+            } else if (parserErrorNode.innerText) {
+                 errorMessage = parserErrorNode.innerText.split('\n')[0] || parserErrorNode.innerText;
+            }
+            console.error("Error de parseo XML en el KML:", errorMessage, parserErrorNode);
+            throw new Error("KML parsing error: " + errorMessage);
+        }
+
+        const KML_NS_GOOGLE = "http://earth.google.com/kml/2.0";
+        const KML_NS_OGC = "http://www.opengis.net/kml/2.2";
+
+        let placemarkNodes = xmlDoc.getElementsByTagNameNS(KML_NS_GOOGLE, 'Placemark');
+        if (placemarkNodes.length === 0) {
+            placemarkNodes = xmlDoc.getElementsByTagNameNS(KML_NS_OGC, 'Placemark');
+        }
+         if (placemarkNodes.length === 0) {
+            placemarkNodes = xmlDoc.getElementsByTagName('Placemark');
+        }
+
+        for (let i = 0; i < placemarkNodes.length; i++) {
+            const node = placemarkNodes[i];
+            let nameNode, coordinatesNode;
+
+            nameNode = node.getElementsByTagNameNS(KML_NS_GOOGLE, 'name')[0] || node.getElementsByTagNameNS(KML_NS_OGC, 'name')[0] || node.getElementsByTagName('name')[0];
+            coordinatesNode = node.getElementsByTagNameNS(KML_NS_GOOGLE, 'coordinates')[0] || node.getElementsByTagNameNS(KML_NS_OGC, 'coordinates')[0] || node.getElementsByTagName('coordinates')[0];
+
+            if (nameNode && coordinatesNode) {
+                const name = nameNode.textContent.trim();
+                const coordinatesRaw = coordinatesNode.textContent.trim();
+
+                const coordPartsMatch = coordinatesRaw.match(/^(-?\d+\.?\d*)[,\s]+(-?\d+\.?\d*)/);
+
+                if (name && coordPartsMatch && coordPartsMatch.length >= 3) {
+                    const lonStr = coordPartsMatch[1];
+                    const latStr = coordPartsMatch[2];
+                    const coordinates = `${lonStr},${latStr}`;
+
+                    const lon = parseFloat(lonStr);
+                    const lat = parseFloat(latStr);
+
+                    if (!isNaN(lon) && !isNaN(lat)) {
+                        if (name.startsWith("Radares BBS www.laradiobbs.net") && lon === 0 && lat === 0) {
+                            continue;
+                        }
+                        placemarks.push({ name, coordinates });
+                    }
+                }
+            }
+        }
+        return placemarks;
+    }
+
+    async function deleteFilteredRadars() {
+        const latFilterValue = document.getElementById('radar-filter-lat').value.trim();
+        const lonFilterValue = document.getElementById('radar-filter-lon').value.trim();
+        const keywordsFilterRaw = document.getElementById('radar-filter-keywords').value.trim().toUpperCase();
+        const keywordsFilter = keywordsFilterRaw ? keywordsFilterRaw.split(/\s+/).filter(k => k) : [];
+
+        const statusMessage = document.getElementById('radar-import-status');
+        const progressContainer = document.getElementById('radar-import-progress-container');
+
+        const noFiltersProvided = !latFilterValue && !lonFilterValue && keywordsFilter.length === 0;
+        let confirmationMessage = "";
+
+        if (noFiltersProvided) {
+            confirmationMessage = "¿Estás seguro de que quieres borrar TODOS los recordatorios tipo RADAR/POI (ya que no has especificado ningún filtro)? Esta acción no se puede deshacer.";
+        } else {
+            confirmationMessage = "¿Estás seguro de que quieres borrar los recordatorios tipo RADAR/POI que coincidan con los filtros actuales? Esta acción no se puede deshacer.";
+        }
+
+        if (!confirm(confirmationMessage)) {
+            showToast("Borrado cancelado.", "info");
+            return;
+        }
+
+        progressContainer.style.display = 'block';
+        const progressBar = document.getElementById('radar-import-progress-bar');
+        if(progressBar) progressBar.style.display = 'none';
+        statusMessage.textContent = 'Borrando recordatorios...';
+        statusMessage.style.color = '';
+
+        try {
+            let reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
+            let originalLength = reminders.length;
+
+            reminders = reminders.filter(r => {
+                const isRadarType = r.isLocationEnabled && (r.text.toUpperCase().includes("RADAR:") || r.excludeFromList);
+                if (!isRadarType) return true;
+
+                if (noFiltersProvided) {
+                    return false;
+                }
+
+                let matchesKeywords = true;
+                if (keywordsFilter.length > 0) {
+                    matchesKeywords = keywordsFilter.some(kw => r.text.toUpperCase().includes(kw));
+                }
+
+                let matchesLat = true;
+                if (latFilterValue) {
+                    if (r.locationCoordinates) {
+                        matchesLat = parseCoordinateFilter(latFilterValue, r.locationCoordinates.latitude);
+                    } else {
+                        matchesLat = false;
+                    }
+                }
+
+                let matchesLon = true;
+                if (lonFilterValue) {
+                    if (r.locationCoordinates) {
+                        matchesLon = parseCoordinateFilter(lonFilterValue, r.locationCoordinates.longitude);
+                    } else {
+                        matchesLon = false;
+                    }
+                }
+
                 return !(matchesKeywords && matchesLat && matchesLon);
             });
 
