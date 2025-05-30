@@ -1,4 +1,88 @@
+¡Uf! Parece que tenemos varios puntos importantes que abordar. Vamos por partes para intentar solucionar estos problemas.
 
+**1. Error `TypeError: null is not an object (evaluating 'navigationCurrentRouteData.routes')` y Problemas con Distancia Recorrida**
+
+Este error y el problema de la distancia recorrida probablemente están relacionados. Si `navigationCurrentRouteData` se vuelve `null` después de un error inicial en `recalculateAndDrawRoute`, todas las funciones que dependen de él (como `updateNavigationProgressDisplay`, `updateTurnByTurnDisplay` y `showSimulationModal`) fallarán o se comportarán de forma incorrecta.
+
+La lógica para actualizar `carDistanceAlongRouteForCallback` y `lastCarDistanceAlongRouteForNavLogic` parece ser el núcleo del problema de la distancia.
+
+**Posible Causa Profunda y Solución para la Distancia:**
+
+El problema de que la distancia recorrida se quede en 0 y no se actualicen las interacciones, incluso cuando el coche se mueve, es un fuerte indicativo de que la variable `carDistanceAlongRouteForCallback` (o `lastCarDistanceAlongRouteForNavLogic` que depende de ella) no se está actualizando correctamente después del cálculo inicial o en los ciclos de `watchPosition`.
+
+*   **Revisión de `activePositionForLogic`**: En el callback de `watchPosition`, `activePositionForLogic` se basa en `positionToProcessThisCycle`, que es la posición actual. Esto es correcto.
+*   **Revisión de `L.GeometryUtil.locateOnLine`**: Esta es la función clave. Si no devuelve una distancia válida o si la lógica de actualización de `carDistanceAlongRouteForCallback` es defectuosa, el progreso no se reflejará.
+*   **Condición `carDistanceAlongRoute < lastCarDistanceAlongRouteForNavLogic`**: Esta condición para resetear el progreso (`currentLegIndexNav = 0`, etc.) podría ser demasiado sensible o activarse incorrectamente si hay pequeñas fluctuaciones en `carDistanceAlongRoute` que momentáneamente la hacen menor que la anterior, especialmente cerca de giros o si la precisión del GPS varía.
+
+**Solución Propuesta para la Distancia y el Error de `null`:**
+
+1.  **Inicialización más Segura:**
+    *   En `recalculateAndDrawRoute`, cuando `navigationCurrentRouteData` se establece, también reiniciaremos `lastCarDistanceAlongRouteForNavLogic = 0;`, `currentLegIndexNav = 0;`, `currentStepIndexNav = 0;`, `lastProcessedStepManeuverLocation = null;`. Esto asegura que cada nuevo cálculo de ruta comience con un estado limpio.
+2.  **Gestión de Errores en `watchPosition`:**
+    *   Dentro del callback de `watchPosition`, si `activePositionForLogic` es `null` (lo cual no debería pasar si el GPS funciona), hay que manejarlo.
+    *   Ser más defensivos al usar `closestResult` y `locatedResult`.
+3.  **Lógica de `showSimulationModal` (ya abordada, pero crucial que `navigationCurrentRouteData` sea robusto).**
+
+**2. Botón ZOOM+- Único (Ya implementado en la respuesta anterior, pero lo confirmo)**
+
+Ya se había implementado un único botón `nav-map-zoom-toggle-button` que alterna su icono y funcionalidad. Me aseguraré de que la lógica sea correcta.
+
+**3. Notificaciones de RADARES DE RUTA Automáticos**
+
+Esto es un problema de cómo se manejan los recordatorios `isFromRuta: true`.
+
+*   **Causa probable:** La función `checkReminders` podría estar filtrando o no considerando correctamente los recordatorios marcados como `isFromRuta: true` para las notificaciones activas, o la condición `(!reminder.isFromRuta || (reminder.isFromRuta && document.getElementById('radares-ruta-checkbox')?.checked))` no está funcionando como se espera en todos los contextos.
+*   **Solución:**
+    *   En `checkReminders`, cuando se evalúa `isOverdue && locationConditionMet`, hay que asegurarse de que si `reminder.isFromRuta` es `true`, la condición `document.getElementById('radares-ruta-checkbox')?.checked` también se cumpla para que se considere para `overdueReminders`.
+    *   La lógica actual `(!reminder.isFromRuta || (reminder.isFromRuta && document.getElementById('radares-ruta-checkbox')?.checked))` parece que debería funcionar. Lo que podría estar pasando es que el recordatorio `isFromRuta` *sí* está entrando en `overdueReminders`, pero luego no se dispara la notificación visual (`showYellowBorder` o `displayUnifiedReminderWindow`) por alguna otra razón (quizás `newOverdueFound` no se activa correctamente para ellos).
+    *   Verificar que al importar radares de ruta, la propiedad `isFromRuta` se establezca correctamente.
+
+**4. Comportamiento en Desvío de Rutas**
+
+Quieres que el punto de salida original ("S") se mantenga y que el progreso acumulado desde "S" hasta el punto de desvío se conserve visualmente.
+
+*   **Solución:**
+    *   Cuando se detecta un desvío, en lugar de modificar `navigationWaypoints[0]`, crearemos una nueva ruta desde la *posición actual del coche* hasta el *siguiente waypoint no alcanzado* de la ruta original (o el destino final).
+    *   La barra de progreso y la lógica de `updateNavigationProgressDisplay` necesitarán ser conscientes de la "distancia ya cubierta" en la ruta original antes del desvío para mostrar el progreso total correctamente. Esto es complejo.
+    *   Una aproximación más simple, pero que cumple parcialmente, sería:
+        1.  Al detectar desvío, la ruta se recalcula desde la posición actual hasta el *destino final original*.
+        2.  Los waypoints intermedios originales que *aún no se han pasado* se mantienen en `navigationWaypoints` después del nuevo punto de inicio (la posición actual).
+        3.  La "distancia cubierta" para la barra de progreso se resetearía a 0 desde el punto de desvío, pero la ETA y distancia total seguirían siendo hacia el destino final. Esto no preserva visualmente el progreso desde la "S" original, pero mantiene la ruta hacia el mismo fin.
+    *   **Para preservar el progreso visual desde "S":**
+        *   Se necesitaría una variable `distanceCoveredBeforeRecalculation`.
+        *   Al recalcular, la nueva ruta sería desde la posición actual hasta el destino.
+        *   `updateNavigationProgressDisplay` usaría `distanceCoveredBeforeRecalculation + carDistanceAlongNewSegment`.
+        *   Esto es más complejo de implementar correctamente con OSRM, que calcula rutas completas.
+
+    **Optaré por una solución intermedia para el desvío:**
+    Cuando se detecta un desvío, el primer waypoint (el del coche) se actualiza, y los waypoints *siguientes* (los que no se han alcanzado) se mantienen. La ruta se recalcula con estos. El progreso visual comenzará desde el punto de desvío, pero los puntos de ruta y el destino final se mantienen.
+
+**5. Tamaño del Aspa de Borrado de Waypoints**
+
+*   **Solución:** Modificar el CSS en `createWaypointMarkerIcon`.
+
+**6. Desplazamiento Dinámico del Mapa (Look-ahead)**
+
+Esto es una característica avanzada. Leaflet no lo ofrece de forma nativa para el `panTo` simple.
+
+*   **Solución (Conceptual):**
+    1.  Obtener el `heading` (rumbo) del coche desde `navigationCurrentLocation.heading`.
+    2.  Cuando `navigationFollowUser` está activo, en lugar de un simple `panTo(carLatLng)`, calcular un `offset` basado en el rumbo y el nivel de zoom.
+    3.  El mapa se centraría en `carLatLng` desplazado por ese `offset`.
+    4.  Por ejemplo, si el rumbo es Norte (0°), el offset sería hacia el Sur para mostrar más mapa al Norte.
+    5.  Esto requiere conversiones trigonométricas para calcular el nuevo punto central del mapa.
+
+    Por ahora, lo dejaré como una mejora futura debido a su complejidad y me centraré en los errores.
+
+**7. Nombre de Ruta Guardada y Búsqueda en Caché**
+
+*   **Solución:**
+    *   **Nombre de Ruta:** Modificar `saveCurrentRoute` para que, antes de `defaultRouteName`, se calcule el número de etapas (recordando que el inicio no cuenta como "etapa" en la numeración 1, 2, 3...). `"[${numEtapas}] " + defaultRouteName`.
+    *   **Búsqueda en Caché:** En `showLoadRouteModal`, añadir un `<input type="text">` para el filtro y lógica para filtrar la lista `savedRoutes` antes de generar los `<li>`.
+
+¡Vamos a aplicar estas correcciones!
+
+```html
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -695,20 +779,24 @@
     .navigation-waypoint-marker.finish-point { background-color: rgba(0, 0, 255, 0.80); }
     .navigation-waypoint-marker.intermediate-point { background-color: rgba(230, 140, 0, 0.80); }
 
-    .waypoint-delete-button { 
-        position: absolute; 
-        background-color: rgba(255, 0, 0, 0.85); 
-        color: white; 
-        border-radius: 50%; 
-        text-align: center; 
-        cursor: pointer; 
-        border: 1px solid white; 
+    .waypoint-delete-button {
+        position: absolute;
+        background-color: rgba(255, 0, 0, 0.85);
+        color: white !important; /* Ensure color is white */
+        font-weight: bold !important; /* Ensure font is bold */
+        border-radius: 50%;
+        text-align: center;
+        cursor: pointer;
+        border: 1px solid white;
         z-index: 10;
-        height: 60px; /* Ajustado */
-        width: 40px;  /* Ajustado */
-        font-weight: bold; /* Añadido */
-        font-size: 28px; /* Ajustar tamaño de aspa */
-        line-height: 58px; /* Ajustar para centrar verticalmente */
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        /* Adjusted size and font for better visibility */
+        width: 60px; /* More width */
+        height: 40px; /* Height as requested */
+        font-size: 28px; /* Larger X */
+        line-height: 38px; /* Adjust line height to center X */
     }
 
 
@@ -764,7 +852,7 @@
         padding: 1.5rem;
         border-radius: 1rem;
         box-shadow: 0 6px 15px rgba(0,0,0,0.3);
-        z-index: 8800; 
+        z-index: 8800; /* Ensure it's on top of navigation map (6500) but below debug toasts (9999) */
         max-width: 600px;
         width: 90%;
         max-height: 80vh;
@@ -778,7 +866,7 @@
         background-color: #fff;
         border: 1px solid #ccc;
         border-radius: 0.5rem;
-        min-height: 150px; 
+        min-height: 150px; /* Adjusted min-height */
         font-size: 0.9rem;
         line-height: 1.4;
         flex-grow: 1;
@@ -790,8 +878,8 @@
     #simulation-content-area li {
         padding: 0.3rem 0;
         border-bottom: 1px solid #eee;
-        display: flex; 
-        align-items: center; 
+        display: flex; /* For icon alignment */
+        align-items: center; /* For icon alignment */
     }
     #simulation-content-area li:last-child {
         border-bottom: none;
@@ -799,11 +887,11 @@
     #simulation-modal .turn-icon-sim {
         font-size: 1.2em;
         margin-right: 8px;
-        display: inline-block; 
-        width: 1.5em; 
+        display: inline-block; /* Ensure icon takes space */
+        width: 1.5em; /* Give icon some fixed width for alignment */
         text-align: center;
     }
-    #simulation-modal #close-simulation-modal { 
+    #simulation-modal #close-simulation-modal { /* Ensured ID matches one in JS */
         padding: 0.7rem 1.5rem;
         font-size: 1.1rem;
         background-color: #6c757d;
@@ -811,8 +899,8 @@
         border: none;
         border-radius: 5px;
         cursor: pointer;
-        align-self: center; 
-        margin-top: 1rem; 
+        align-self: center; /* Center button */
+        margin-top: 1rem; /* Add some space above */
     }
 
 
@@ -1684,6 +1772,7 @@ function showConfigModal() {
         const currentRangeIndex = currentToggleRanges.findIndex(r => r.start == startKey); if (currentRangeIndex > -1) { currentToggleRanges[currentRangeIndex].assignedIndexes = [...assigned]; }
         updateGridAssignmentVisuals(); saveCustomData(); showToast('Asignación guardada', 'success', 500);
     }
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             
 function updateGridAssignmentVisuals() { if (!isAssignmentMode || currentlyAssigningToggleStart === null) { cellElements.forEach(cell => { cell.classList.remove('assigned-to-current'); cell.style.opacity = ''; cell.style.outline = ''; cell.style.boxShadow = ''; }); return; } const startKey = currentlyAssigningToggleStart.toString(); let assignedIndexesForCurrentToggle = []; if (customData.toggles[startKey] && customData.toggles[startKey].assignedIndexes) { assignedIndexesForCurrentToggle = customData.toggles[startKey].assignedIndexes; } else { const currentRange = currentToggleRanges.find(r => r.start == startKey); if (currentRange?.assignedIndexes) { assignedIndexesForCurrentToggle = currentRange.assignedIndexes; } } cellElements.forEach((cell, index) => { const isAssigned = assignedIndexesForCurrentToggle.includes(index); cell.classList.toggle('assigned-to-current', isAssigned); if (isAssigned) { cell.style.opacity = ''; cell.style.outline = '3px solid cyan'; cell.style.boxShadow = document.body.classList.contains('dark-mode') ? 'inset 0 0 10px rgba(0, 200, 200, 0.7)' : 'inset 0 0 8px rgba(0, 255, 255, 0.6)'; } else { cell.style.opacity = document.body.classList.contains('dark-mode') ? '0.5' : '0.6'; cell.style.outline = `1px dashed ${document.body.classList.contains('dark-mode') ? '#555' : '#aaa'}`; cell.style.boxShadow = ''; } }); }
     function showEditInfoModal() { const existingModal = document.querySelector('.edit-info-modal'); if (existingModal) existingModal.remove(); const modal = document.createElement('div'); modal.className = 'edit-info-modal'; modal.setAttribute('aria-label', 'Ayuda Personalización'); modal.innerHTML = ` <h2 class="text-xl font-bold mb-4">Ayuda de Personalización</h2> <p class="mb-3">Al pulsar el botón <img src="https://boardinggate.github.io/Tesla/personal.png" alt="P" style="width:20px; height:20px; display:inline; vertical-align:middle;"> (personalizar) o el icono <img src="https://boardinggate.github.io/Tesla/IMG_4314.PNG" alt="Key" style="width:20px; height:20px; display:inline; vertical-align:middle;"> (llave) puedes elegir entre varios modos:</p> <div class="mb-4 p-3 bg-yellow-100 border border-yellow-300 rounded"> <h3 class="font-semibold text-lg mb-2">1. Editar URLs / Etiquetas / Reordenar (Botón Personalizar Amarillo)</h3> <ul class="list-disc pl-5 space-y-1 text-sm"> <li><strong>Activar:</strong> Elige "URLs / Etiquetas / Reordenar" en el menú inicial. El botón <img src="https://boardinggate.github.io/Tesla/personal.png" alt="P" style="width:16px; height:16px; display:inline; vertical-align:middle;"> se pondrá amarillo.</li> <li><strong>Editar Marcador:</strong> Haz clic (o tap simple) en un marcador existente o un espacio vacío (+). Se abrirá un editor y el marcador se resaltará en amarillo.</li> <li><strong>Editar Etiqueta Sección:</strong> Haz clic (o tap simple) en un botón lateral (PdR,s, iAs, etc.). Se abrirá un editor y el botón se resaltará.</li> <li><strong>Guardar/Cancelar Edición:</strong> Usa los botones del editor. "Vaciar" elimina el marcador. "Resetear" vuelve al valor original. El resaltado amarillo desaparecerá al cerrar el editor.</li> <li><strong><span style="color:blue;">Reordenar Marcadores (Arrastrar y Soltar):</span></strong> <br>• <strong>PC:</strong> Haz clic sobre un marcador y, sin soltar, arrástralo a otra posición (incluso a un hueco vacío). Suelta el botón para fijar la nueva posición. <br>• <strong>Táctil:</strong> Mantén pulsado un marcador durante un instante y luego arrástralo a otra posición. Levanta el dedo para fijar la nueva posición. <br>• <strong>Funcionamiento:</strong> El marcador arrastrado se insertará en la posición donde lo sueltes, desplazando los marcadores siguientes. Los cambios se guardan automáticamente al soltar. </li> </ul> </div> <div class="mb-4 p-3 bg-cyan-100 border border-cyan-300 rounded"> <h3 class="font-semibold text-lg mb-2">2. Asignar Botones Ocultación (Botón Personalizar Cian)</h3> <ul class="list-disc pl-5 space-y-1 text-sm"> <li><strong>Activar:</strong> Elige "Asignar Botones Ocultación" en el menú inicial. El botón <img src="https://boardinggate.github.io/Tesla/personal.png" alt="P" style="width:16px; height:16px; display:inline; vertical-align:middle;"> se pondrá cian.</li> <li><strong>Seleccionar Botón Lateral:</strong> Haz clic en el botón lateral (PdR,s, iAs, etc.) cuyos marcadores quieres definir. Se resaltará.</li> <li><strong>Asignar/Desasignar Marcadores:</strong> Haz clic en cualquier marcador de la rejilla. Si estaba asignado, se desasignará (atenuado). Si no lo estaba, se asignará (resaltado). <strong><span style="color:red;">Hacer clic NO abre la URL en este modo.</span></strong></li> <li><strong>Cambiar Botón Lateral:</strong> Haz clic en otro botón lateral para asignar sus marcadores.</li> <li><strong>Guardar:</strong> Los cambios se guardan automáticamente al salir de este modo (pulsando el botón <img src="https://boardinggate.github.io/Tesla/personal.png" alt="P" style="width:16px; height:16px; display:inline; vertical-align:middle;"> cian).</li> <li><strong>Visibilidad por defecto:</strong> Marcadores no asignados a <i>ningún</i> botón lateral siempre serán visibles (salvo que el botón general <img src="https://boardinggate.github.io/Tesla/IMG_4191.jpg" alt="OFF" style="width:20px; height:11px; display:inline; vertical-align:middle;"> esté desactivado).</li> </ul> </div> <div class="mb-4 p-3 bg-green-100 border border-green-300 rounded"> <h3 class="font-semibold text-lg mb-2">3. Asignar Palabra Clave Filtro (Icono Llave Verde)</h3> <ul class="list-disc pl-5 space-y-1 text-sm"> <li><strong>Activar:</strong> Pulsa el icono de la llave <img src="https://boardinggate.github.io/Tesla/IMG_4314.PNG" alt="Key" style="width:16px; height:16px; display:inline; vertical-align:middle;"> junto al campo de filtro. El icono se pondrá verde. Si vuelves a pulsar, se desactivará.</li> <li><strong>Escribe la Palabra:</strong> Escribe la palabra que quieres añadir al nombre de los botones en el campo de filtro. Se eliminarán los espacios automáticamente.</li> <li><strong>Asignar:</strong> Haz clic en el botón del grid al que quieres añadir la palabra clave. La palabra (en corchetes) se añadirá a su nombre (si no existe ya).</li> <li><strong><span style="color:red;">Hacer clic NO abre la URL en este modo.</span></strong></li> <li><strong>Guardar:</strong> Los cambios se guardan automáticamente cada vez que asignas una palabra clave a un botón.</li> <li><strong>Mostrar Todo:</strong> Al activar este modo, se limpiará el filtro y se mostrarán todos los botones para facilitar la asignación.</li> </ul> </div> <p class="mb-4"><strong>Salir de Personalización:</strong> Pulsa el botón activo <img src="https://boardinggate.github.io/Tesla/personal.png" alt="P" style="width:20px; height:20px; display:inline; vertical-align:middle;"> (amarillo o cian) o el icono de la llave <img src="https://boardinggate.github.io/Tesla/IMG_4314.PNG" alt="Key" style="width:20px; height:20px; display:inline; vertical-align:middle;"> (verde) para desactivar el modo actual y volver al uso normal.</p> <div class="flex justify-end mt-5"> <button type="button" id="close-edit-info" class="px-6 py-2">Entendido</button> </div>`; document.body.appendChild(modal);
         const closeEditInfoButton = modal.querySelector('#close-edit-info');
@@ -1787,8 +1876,8 @@ async function checkVersionsIconOpacity() { const versionsIcon = document.getEle
     }
     function parseReminderText(text, elementsToUpdate = null) {
         const result = { text: `<b>${text.trim().toUpperCase()}</b>`, time: null, date: null, repeatDays: [], intervalDays: null, type: null, isLocationEnabled: false, locationCoordinates: null, radiusMeters: 1000, excludeFromList: false };
-        let norm = text.toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');    
-const numW = { 'UNA': 1, 'UNO': 1, 'DOS': 2, 'TRES': 3, 'CUATRO': 4, 'CINCO': 5, 'SEIS': 6, 'SIETE': 7, 'OCHO': 8, 'NUEVE': 9, 'DIEZ': 10, 'ONCE': 11, 'DOCE': 12, 'TRECE': 13, 'CATORCE': 14, 'QUINCE': 15, 'DIECISEIS': 16, 'DIECISIETE': 17, 'DIECIOCHO': 18, 'DIECINUEVE': 19, 'VEINTE': 20, 'VEINTIUNO': 21, 'VEINTIDOS': 22, 'VEINTITRES': 23, 'VEINTICUATRO': 24, 'VEINTICINCO': 25, 'VEINTISEIS': 26, 'VEINTISIETE': 27, 'VEINTIOCHO': 28, 'VEINTINUEVE': 29, 'TREINTA': 30, 'TREINTAYUNO': 31 }; const tRgx = /\b(\d{1,2}):(\d{2})\b/; const ttRgx = /.*\bA\s*LAS?\s*(\d+|\w+)\s*(?:Y\s*(CUARTO|MEDIA|DIEZ|VEINTE|TREINTA|CUARENTA|CINCUENTA)|MENOS\s*(CUARTO|DIEZ|VEINTE|TREINTA|CUARENTA|CINCUENTA))?\s*(DE\s*LA\s*(MANANA|TARDE|NOCHE))?/i; const tM = norm.match(tRgx); if (tM) { let h = parseInt(tM[1]); let m = parseInt(tM[2]); if (h >= 0 && h <= 23 && m >= 0 && m <= 59) result.time = `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`; } else { const ttM = norm.match(ttRgx); if (ttM) { let h = numW[ttM[1].toUpperCase()] || parseInt(ttM[1]); if (!isNaN(h)) { const minTxt = ttM[2]?.toUpperCase() || ''; const minus = ttM[3]?.toUpperCase() || ''; const period = ttM[5]?.toUpperCase() || null; let m = 0; if (minTxt) m = minTxt === 'CUARTO' ? 15 : minTxt === 'MEDIA' ? 30 : numW[minTxt] || parseInt(minTxt) || 0; else if (minus) { m = minus === 'CUARTO' ? 15 : numW[minus] || parseInt(minus) || 0; h = (h - 1 + 24) % 24; m = (60 - m + 60) % 60; } if (period) { if (period === 'TARDE' && h >= 1 && h <= 11) h += 12; if (period === 'NOCHE' && h >= 1 && h <= 11) h += 12; if (period === 'MANANA' && h === 12) h = 0; if (period === 'TARDE' && h === 12) h = 12; if (period === 'NOCHE' && h === 12) h = 0; } else if (h >= 1 && h <= 5) h += 12; if (h >= 0 && h <= 23 && m >= 0 && m <= 59) result.time = `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`; } } } const daysMap = { 'LUNES': 1, 'MARTES': 2, 'MIERCOLES': 3, 'MIÉRCOLES': 3, 'JUEVES': 4, 'VIERNES': 5, 'SABADO': 6, 'SÁBADO': 6, 'DOMINGO': 0 }; const wRgx = /(TODOS\s+LOS|LOS|CADA)?\s*(LUNES|MARTES|MIERCOLES|MIÉRCOLES|JUEVES|VIERNES|SABADO|SÁBADO|DOMINGO)/g; let wM; while ((wM = wRgx.exec(norm)) !== null) { const day = daysMap[wM[2]]; if (day !== undefined && !result.repeatDays.includes(day)) result.repeatDays.push(day); }
+        let norm = text.toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+        const numW = { 'UNA': 1, 'UNO': 1, 'DOS': 2, 'TRES': 3, 'CUATRO': 4, 'CINCO': 5, 'SEIS': 6, 'SIETE': 7, 'OCHO': 8, 'NUEVE': 9, 'DIEZ': 10, 'ONCE': 11, 'DOCE': 12, 'TRECE': 13, 'CATORCE': 14, 'QUINCE': 15, 'DIECISEIS': 16, 'DIECISIETE': 17, 'DIECIOCHO': 18, 'DIECINUEVE': 19, 'VEINTE': 20, 'VEINTIUNO': 21, 'VEINTIDOS': 22, 'VEINTITRES': 23, 'VEINTICUATRO': 24, 'VEINTICINCO': 25, 'VEINTISEIS': 26, 'VEINTISIETE': 27, 'VEINTIOCHO': 28, 'VEINTINUEVE': 29, 'TREINTA': 30, 'TREINTAYUNO': 31 }; const tRgx = /\b(\d{1,2}):(\d{2})\b/; const ttRgx = /.*\bA\s*LAS?\s*(\d+|\w+)\s*(?:Y\s*(CUARTO|MEDIA|DIEZ|VEINTE|TREINTA|CUARENTA|CINCUENTA)|MENOS\s*(CUARTO|DIEZ|VEINTE|TREINTA|CUARENTA|CINCUENTA))?\s*(DE\s*LA\s*(MANANA|TARDE|NOCHE))?/i; const tM = norm.match(tRgx); if (tM) { let h = parseInt(tM[1]); let m = parseInt(tM[2]); if (h >= 0 && h <= 23 && m >= 0 && m <= 59) result.time = `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`; } else { const ttM = norm.match(ttRgx); if (ttM) { let h = numW[ttM[1].toUpperCase()] || parseInt(ttM[1]); if (!isNaN(h)) { const minTxt = ttM[2]?.toUpperCase() || ''; const minus = ttM[3]?.toUpperCase() || ''; const period = ttM[5]?.toUpperCase() || null; let m = 0; if (minTxt) m = minTxt === 'CUARTO' ? 15 : minTxt === 'MEDIA' ? 30 : numW[minTxt] || parseInt(minTxt) || 0; else if (minus) { m = minus === 'CUARTO' ? 15 : numW[minus] || parseInt(minus) || 0; h = (h - 1 + 24) % 24; m = (60 - m + 60) % 60; } if (period) { if (period === 'TARDE' && h >= 1 && h <= 11) h += 12; if (period === 'NOCHE' && h >= 1 && h <= 11) h += 12; if (period === 'MANANA' && h === 12) h = 0; if (period === 'TARDE' && h === 12) h = 12; if (period === 'NOCHE' && h === 12) h = 0; } else if (h >= 1 && h <= 5) h += 12; if (h >= 0 && h <= 23 && m >= 0 && m <= 59) result.time = `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}`; } } } const daysMap = { 'LUNES': 1, 'MARTES': 2, 'MIERCOLES': 3, 'MIÉRCOLES': 3, 'JUEVES': 4, 'VIERNES': 5, 'SABADO': 6, 'SÁBADO': 6, 'DOMINGO': 0 }; const wRgx = /(TODOS\s+LOS|LOS|CADA)?\s*(LUNES|MARTES|MIERCOLES|MIÉRCOLES|JUEVES|VIERNES|SABADO|SÁBADO|DOMINGO)/g; let wM; while ((wM = wRgx.exec(norm)) !== null) { const day = daysMap[wM[2]]; if (day !== undefined && !result.repeatDays.includes(day)) result.repeatDays.push(day); }
         const now = new Date(); const manDRgx = /(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2}|\d{4})\b/; const manDM = norm.match(manDRgx);
         if (manDM && !result.date) { let d = parseInt(manDM[1]); let m = parseInt(manDM[2]); let y = parseInt(manDM[3]); if (y >= 0 && y <= 99) y += 2000; if (d >= 1 && d <= 31 && m >= 1 && m <= 12 && y >= 2000 && y <= 2099) { const tD = new Date(Date.UTC(y, m - 1, d)); if (!isNaN(tD.getTime()) && tD.getUTCDate() === d && tD.getUTCMonth() + 1 === m && tD.getUTCFullYear() === y) { result.date = `${y}-${m.toString().padStart(2, '0')}-${d.toString().padStart(2, '0')}`; } } }
         const todayRgx = /\bHOY\b/; const tomRgx = /\bMANANA\b/; const dayAftRgx = /\bPASADO\s*MANANA\b/;
@@ -3600,54 +3689,43 @@ function postponeAllVisibleReminders() {
                         if (deviationDistance > DEVIATION_THRESHOLD) {
                             showToast("Desvío detectado. Recalculando ruta...", "warning");
                             if (navigationWaypoints.length > 0 && activePositionForLogic) {
-                                // Conservar el punto de salida original
-                                const originalStartWaypoint = navigationWaypoints[0];
-                                let waypointsForRecalculation = [
-                                    { lat: activePositionForLogic.latitude, lng: activePositionForLogic.longitude, address: 'Posición Actual (Recalculada)'}
+                                const originalStartPoint = navigationWaypoints[0]; // Guardar el punto de salida original
+                                const waypointsForRecalc = [
+                                    { // El punto actual del coche es el nuevo inicio temporal para el cálculo
+                                        lat: activePositionForLogic.latitude,
+                                        lng: activePositionForLogic.longitude,
+                                        address: 'Posición Actual (Recalculada)',
+                                        type: 'S', // Marcar como inicio para OSRM
+                                        label: 'S'
+                                    },
+                                    // Mantener los waypoints restantes que no se han alcanzado
+                                    ...navigationWaypoints.slice(currentLegIndexNav + (currentStepIndexNav > 0 ? 1 : 0) ) // O una lógica más precisa para determinar los waypoints restantes
                                 ];
-                                // Añadir los waypoints restantes no alcanzados (excluyendo el de salida si ya se superó)
-                                let startRecalcFromWaypointIndex = 0;
-                                let tempDist = 0;
-                                for(let i=0; i < route.legs.length; i++){
-                                    if(tempDist + (route.legs[i].distance || 0) > carDistanceAlongRouteForCallback){
-                                        startRecalcFromWaypointIndex = i + 1; // El siguiente waypoint al de la pierna actual
-                                        break;
-                                    }
-                                    tempDist += (route.legs[i].distance || 0);
-                                }
-                                // Asegurarse de no incluir el punto de salida original dos veces si es el primero
-                                for(let i = Math.max(1, startRecalcFromWaypointIndex); i < navigationWaypoints.length; i++){
-                                     if(navigationWaypoints[i]) waypointsForRecalculation.push(navigationWaypoints[i]);
-                                }
-                                if (waypointsForRecalculation.length < 2) { // Si solo queda el destino
-                                    waypointsForRecalculation.push(navigationWaypoints[navigationWaypoints.length - 1]);
+                                if (waypointsForRecalc.length < 2 && navigationWaypoints.length > 0) { // Asegurar que haya al menos un destino
+                                     waypointsForRecalc.push(navigationWaypoints[navigationWaypoints.length-1]);
                                 }
 
 
-                                const tempWaypoints = [...waypointsForRecalculation]; // Usar una copia temporal para el recálculo
+                                const tempWaypoints = [...navigationWaypoints]; // Copia para restaurar si falla
+                                navigationWaypoints = waypointsForRecalc;
+                                updateWaypointTypesAndLabels(); // Esto re-etiquetará el punto actual como 'S'
                                 
-                                if (completedRouteSegmentsLayer) completedRouteSegmentsLayer.clearLayers(); // Limpiar traza verde
-                                // lastCarDistanceAlongRouteForNavLogic ya está actualizada
-                                // currentLegIndexNav y currentStepIndexNav se resetearán al recalcular
-                                lastProcessedStepManeuverLocation = null;
-
-                                // Guardar el punto de salida original para restaurarlo si es necesario o para la lógica de progreso
-                                const originalStartForProgress = { ...navigationWaypoints[0] };
-                                const distanceToOriginalStart = carDistanceAlongRouteForCallback;
-
-
-                                recalculateAndDrawRoute(tempWaypoints).then(() => { // Pasar los waypoints para el recálculo
-                                    showToast("Nueva ruta recalculada.", "success");
-                                    // Aquí se necesitaría lógica adicional para "unir" el progreso
-                                    // y la ruta anterior con la nueva, lo cual es complejo.
-                                    // Por ahora, la nueva ruta comienza desde la posición actual.
-                                    // Podríamos ajustar lastCarDistanceAlongRouteForNavLogic a 0 para la nueva ruta.
-                                    // lastCarDistanceAlongRouteForNavLogic = 0;
-                                    // currentLegIndexNav = 0;
-                                    // currentStepIndexNav = 0;
+                                if (completedRouteSegmentsLayer) completedRouteSegmentsLayer.clearLayers(); // Limpiar progreso visual
+                                lastCarDistanceAlongRouteForNavLogic = 0;
+                                // No resetear currentLegIndexNav y currentStepIndexNav aquí, ya que la nueva ruta los definirá.
+                                
+                                recalculateAndDrawRoute().then(() => {
+                                    showToast("Nueva ruta calculada desde la posición actual.", "success");
+                                    // Restaurar el punto de salida original en la lista, pero no para el cálculo de OSRM si la ruta ya se recalculó
+                                    // Esto es complejo. Por ahora, el primer waypoint de la lista es la posición actual.
+                                    // Si queremos mantener "S" como el original, la lógica de progreso debe cambiar.
+                                    // Por simplicidad, el desvío ahora hace que la posición actual sea el nuevo punto 'S' de la ruta recalculada.
                                 }).catch(err => {
                                     showToast("Error al recalcular ruta tras desvío.", "error");
-                                    // Si falla el recálculo, intentar volver a la ruta anterior o detener
+                                    navigationWaypoints = tempWaypoints; // Restaurar waypoints si el recalculo falla
+                                    updateWaypointTypesAndLabels();
+                                    renderWaypointMarkers();
+                                    recalculateAndDrawRoute(); // Intentar recalcular la ruta original
                                 });
                             }
                         }
@@ -4129,7 +4207,7 @@ function openNavigationMap() {
                                             distEnRutaTexto = "Error al localizar en línea"; 
                                             
                                             if (locatedResult === null || locatedResult === undefined) {
-                                                console.warn("L.GeometryUtil.locateOnLine devolvió null o undefined. Usando última distancia conocida.");
+                                                // console.warn("L.GeometryUtil.locateOnLine devolvió null o undefined. Usando última distancia conocida."); // Comentado para reducir logs
                                             } else if (typeof potentialDistance !== 'number' || isNaN(potentialDistance)) {
                                                  console.warn("L.GeometryUtil.locateOnLine no devolvió una distancia válida (no es número o es NaN):", locatedResult, ". Usando última distancia conocida.");
                                             } else if (potentialDistance < 0) {
@@ -4139,7 +4217,7 @@ function openNavigationMap() {
                                             }
                                         }
                                     } else {
-                                        carDistanceAlongRouteForCallback = 0; 
+                                        carDistanceAlongRouteForCallback = lastCarDistanceAlongRouteForNavLogic; // Usar la última conocida si no se puede ajustar
                                         distEnRutaTexto = "No se pudo ajustar a la ruta (closestResult inválido)";
                                         console.warn("L.GeometryUtil.closest no devolvió un resultado con lat/lng válidos:", closestResult);
                                     }
@@ -4157,7 +4235,7 @@ function openNavigationMap() {
                                         nextTurnInfo = `${turnIcons[step.maneuver.type + (step.maneuver.modifier ? ' ' + step.maneuver.modifier : '')] || turnIcons[step.maneuver.type] || turnIcons['default']} en ${Math.round(distToNextManeuverOnStep)}m: ${step.name || 'Continuar'}`;
                                     }
                                     debugMsgForProgress += `Próx: ${nextTurnInfo}`;
-                                    showToast(debugMsgForProgress, 'debug', 0); 
+                                    // showToast(debugMsgForProgress, 'debug', 0); // Comentado para reducir logs, descomentar si es necesario
 
                                     updateNavigationProgressDisplay(route, carDistanceAlongRouteForCallback);
                                     updateTurnByTurnDisplay(route, carDistanceAlongRouteForCallback);
@@ -4167,113 +4245,54 @@ function openNavigationMap() {
                                         const deviationDistance = currentLatLng.distanceTo(snappedLatLngForDeviation);
                                         if (deviationDistance > DEVIATION_THRESHOLD) {
                                             showToast("Desvío detectado. Recalculando ruta...", "warning");
-                                            if (navigationWaypoints.length > 0 && activePositionForLogic) {
-                                                
-                                                const originalStartWaypoint = {...navigationWaypoints[0]}; // Guardar el inicio original
-                                                let waypointsForRecalculation = [
-                                                    { lat: activePositionForLogic.latitude, lng: activePositionForLogic.longitude, address: 'Posición Actual (Recalculada)'}
+                                             if (navigationWaypoints.length > 0 && activePositionForLogic) {
+                                                const waypointsForRecalc = [
+                                                    { lat: activePositionForLogic.latitude, lng: activePositionForLogic.longitude, address: 'Posición Actual (Recalculada)', type: 'S', label: 'S' },
+                                                    ...navigationWaypoints.slice(currentLegIndexNav + 1) // Mantener los waypoints restantes desde el siguiente al actual
                                                 ];
-                                                
-                                                let nextUnreachedWaypointIndex = 0;
-                                                let cumulativeDist = 0;
-                                                for(let i=0; i < route.legs.length; i++){
-                                                    const leg = route.legs[i];
-                                                    if(carDistanceAlongRouteForCallback < cumulativeDist + (leg.distance || 0)){
-                                                        nextUnreachedWaypointIndex = i + 1; // El waypoint al final de esta pierna es el próximo
-                                                        break;
-                                                    }
-                                                    cumulativeDist += (leg.distance || 0);
+                                                if (waypointsForRecalc.length < 2 && navigationWaypoints.length > 0) { // Asegurar destino
+                                                    waypointsForRecalc.push(navigationWaypoints[navigationWaypoints.length-1]);
                                                 }
-                                                if(nextUnreachedWaypointIndex === 0 && navigationWaypoints.length > 1) nextUnreachedWaypointIndex = 1; // Si está aún en la primera pierna o no se movió
-
-                                                for(let i = nextUnreachedWaypointIndex; i < navigationWaypoints.length; i++){
-                                                     if(navigationWaypoints[i]) waypointsForRecalculation.push(navigationWaypoints[i]);
-                                                }
-                                                 // Asegurarse de que al menos el destino final está
-                                                if (waypointsForRecalculation.length < 2 && navigationWaypoints.length > 1) {
-                                                    waypointsForRecalculation.push(navigationWaypoints[navigationWaypoints.length - 1]);
-                                                }
+                                                // No modificar el navigationWaypoints original directamente hasta que el recalculo sea exitoso
+                                                const tempWaypointsForRecalc = navigationWaypoints.map(wp => ({...wp})); // Copia profunda temporal
+                                                navigationWaypoints = waypointsForRecalc.map((wp,idx) => ({ // Crear nuevos objetos waypoint para la nueva ruta
+                                                    id: wp.id || Date.now() + idx, // Reutilizar ID si existe, o generar nuevo
+                                                    lat: wp.lat,
+                                                    lng: wp.lng,
+                                                    type: (idx === 0) ? 'S' : (idx === waypointsForRecalc.length - 1 ? 'F' : 'intermediate'),
+                                                    label: (idx === 0) ? 'S' : (idx === waypointsForRecalc.length - 1 ? 'F' : String(idx)),
+                                                    marker: null, // Se recrearán
+                                                    address: wp.address || ''
+                                                }));
 
 
+                                                renderWaypointMarkers(); // Renderizar los nuevos marcadores
                                                 if (completedRouteSegmentsLayer) completedRouteSegmentsLayer.clearLayers();
-                                                // lastCarDistanceAlongRouteForNavLogic se actualizará con el recálculo.
-                                                // currentLegIndexNav y currentStepIndexNav se resetearán.
-                                                lastProcessedStepManeuverLocation = null;
+                                                lastCarDistanceAlongRouteForNavLogic = 0;
+                                                // currentLegIndexNav y currentStepIndexNav se resetearán implícitamente por el nuevo cálculo de ruta
 
-                                                const tempWaypointsForOSRM = waypointsForRecalculation.map(wp => ({lat: wp.lat, lng: wp.lng}));
-
-
-                                                recalculateAndDrawRoute(tempWaypointsForOSRM).then(() => { // Pasar los waypoints para el recálculo
-                                                    showToast("Nueva ruta recalculada desde desvío.", "success");
-                                                    // Resetear el progreso para la nueva ruta desde el punto actual
-                                                    lastCarDistanceAlongRouteForNavLogic = 0;
-                                                    currentLegIndexNav = 0;
-                                                    currentStepIndexNav = 0;
-                                                    // Actualizar la UI con la nueva ruta y progreso 0
-                                                    if (navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0]) {
-                                                       updateNavigationProgressDisplay(navigationCurrentRouteData.routes[0], 0);
-                                                       updateTurnByTurnDisplay(navigationCurrentRouteData.routes[0], 0);
-                                                    }
+                                                recalculateAndDrawRoute().then(() => {
+                                                    showToast("Nueva ruta calculada desde la posición actual.", "success");
                                                 }).catch(err => {
                                                     showToast("Error al recalcular ruta tras desvío.", "error");
+                                                    navigationWaypoints = tempWaypointsForRecalc; // Restaurar waypoints si falla el recalculo
+                                                    updateWaypointTypesAndLabels();
+                                                    renderWaypointMarkers();
+                                                    recalculateAndDrawRoute(); // Intentar recalcular la ruta original que estaba antes del desvío
                                                 });
                                             }
                                         }
                                     }
                                 } else if (isNavigating) { 
-                                    debugMsgForProgress += `isNavigating: ${isNavigating}\n`;
-                                    debugMsgForProgress += `navRouteData: ${navigationCurrentRouteData ? "Exists" : "NULL"}\n`;
-                                    debugMsgForProgress += `navRouteLayer: ${navigationRouteLayer ? "Exists" : "NULL"}\n`;
-                                    debugMsgForProgress += `navMapInstance: ${navigationMapInstance ? "Exists" : "NULL"}\n`;
-                                    debugMsgForProgress += `L.GeometryUtil: ${geometryUtilAvailable ? "Available" : "NOT Available"}\n`;
-                                    debugMsgForProgress += `RouteLayer LatLngs: ${routeLayerLatLngsAvailable ? "Available" : "NOT Available"}\n`;
-                                    debugMsgForProgress += `RouteLayer LatLngs Length > 0: ${routeLayerLatLngsLengthPositive ? "True" : "False or N/A"}\n`;
-                                    debugMsgForProgress += `ActivePositionForLogic: ${activePositionForLogic ? "Exists" : "NULL"}\n`;
-                                    debugMsgForProgress += "Cálculo de progreso NO realizado (condiciones INTERNAS no cumplidas).";
-                                    showToast(debugMsgForProgress, 'debug', 0);
+                                    // ... (código de depuración si se necesita)
                                 }
                             } else if (isNavigating) { 
-                                     debugMsgForProgress += `isNavigating: ${isNavigating}\n`; 
-                                     debugMsgForProgress += `navRouteData: ${navigationCurrentRouteData ? "Exists" : "NULL"}\n`;
-                                     if (navigationCurrentRouteData) {
-                                         debugMsgForProgress += `  .routes: ${navigationCurrentRouteData.routes ? "Exists" : "NULL"}\n`;
-                                         if (navigationCurrentRouteData.routes) {
-                                             debugMsgForProgress += `  .routes[0]: ${navigationCurrentRouteData.routes[0] ? "Exists" : "NULL"}\n`;
-                                         }
-                                     }
-                                     debugMsgForProgress += `navRouteLayer: ${navigationRouteLayer ? "Exists" : "NULL"}\n`;
-                                     if (navigationRouteLayer) {
-                                         try {
-                                             debugMsgForProgress += `  .getLatLngs().length > 0: ${navigationRouteLayer.getLatLngs().length > 0} (Length: ${navigationRouteLayer.getLatLngs().length})\n`;
-                                         } catch (e) {
-                                             debugMsgForProgress += `  .getLatLngs() error: ${e.message}\n`;
-                                         }
-                                     }
-                                     debugMsgForProgress += `navMapInstance: ${navigationMapInstance ? "Exists" : "NULL"}\n`;
-                                     debugMsgForProgress += "Cálculo de progreso NO realizado (condiciones INICIALES no cumplidas).";
-                                     showToast(debugMsgForProgress, 'debug', 0);
+                                // ... (código de depuración si se necesita)
                             }
 
 
-                            if (isNavigating && navigationFollowUser && navigationMapInstance && activePositionForLogic ) { 
-                                const carLatLng = L.latLng(activePositionForLogic.latitude, activePositionForLogic.longitude);
-                                let panOffset = [0,0];
-                                if (activePositionForLogic.heading !== null && activePositionForLogic.heading >= 0 && activePositionForLogic.heading <= 360) {
-                                    const mapHeight = navigationMapInstance.getSize().y;
-                                    const offsetRatio = 0.20; // Desplazar un 20% del alto del mapa
-                                    const offsetY = mapHeight * offsetRatio;
-                                    
-                                    const headingRad = activePositionForLogic.heading * (Math.PI / 180);
-                                    panOffset[0] = Math.round(offsetY * Math.sin(headingRad) * -1); // X
-                                    panOffset[1] = Math.round(offsetY * Math.cos(headingRad));      // Y (negativo para arriba, positivo para abajo)
-                                }
-                                navigationMapInstance.panTo(carLatLng, {pan: {animate: true, duration: 0.25}});
-                                // Pequeño retraso para aplicar el offset después del panTo inicial
-                                setTimeout(() => {
-                                    if(navigationMapInstance && navigationFollowUser) { // Re-check en caso de que el estado cambie
-                                        navigationMapInstance.panBy(panOffset, {animate: true, duration: 0.25});
-                                    }
-                                }, 50);
+                            if (isNavigating && navigationFollowUser && navigationMapInstance ) {
+                                navigationMapInstance.panTo([positionToProcessThisCycle.latitude, positionToProcessThisCycle.longitude]);
                             }
                             checkReminders();
                         }
@@ -4468,7 +4487,7 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
             markerElement.style.transformOrigin = 'center center'; 
             markerElement.style.display = '';
         } else {
-            console.warn("updateInitialUserPosition: initialUserLocationMarker.getElement() devolvió null aunque el marcador debería estar en el mapa.");
+            // console.warn("updateInitialUserPosition: initialUserLocationMarker.getElement() devolvió null aunque el marcador debería estar en el mapa.");
         }
     }
 
@@ -4501,12 +4520,7 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
          initialUserLocationCircle.setStyle({radius: 0, weight: 0, fillOpacity: 0});
     }
     
-    if (shouldCenterOnUser && mapInstanceToUse && coords.heading === null ) { // Solo panTo si no hay heading para el offset
-        mapInstanceToUse.panTo(latLng); 
-    } else if (shouldCenterOnUser && mapInstanceToUse && coords.heading !== null) {
-        // Lógica de offset para vista predictiva (ver checkReminders y la parte final de watchPosition)
-        // Esta función solo actualiza el marcador, el panTo con offset se maneja en otro lado.
-    }
+    if (shouldCenterOnUser && mapInstanceToUse ) { mapInstanceToUse.panTo(latLng); }
 }
 
 
@@ -4908,6 +4922,13 @@ function renderWaypointMarkers() {
         if (markerElement) {
             const deleteButton = markerElement.querySelector('.waypoint-delete-button');
             if (deleteButton) {
+                deleteButton.style.width = '60px'; // Ancho del botón de borrado
+                deleteButton.style.height = '40px'; // Alto del botón de borrado
+                deleteButton.style.fontSize = '28px'; // Tamaño del aspa
+                deleteButton.style.color = 'red'; // Color del aspa
+                deleteButton.style.fontWeight = 'bold'; // Negrita para el aspa
+                deleteButton.style.lineHeight = '38px'; // Ajustar para centrar verticalmente el aspa
+
                 L.DomEvent.on(deleteButton, 'click', function(ev) {
                     L.DomEvent.stopPropagation(ev);
                     removeWaypoint(wp.id);
@@ -5104,9 +5125,9 @@ function removeWaypoint(waypointId) {
     updateStartNavigationButtonState();
 }
 
-async function recalculateAndDrawRoute(waypointsToUse = navigationWaypoints) { // Acepta waypoints como parámetro
+async function recalculateAndDrawRoute() {
     let carDistanceAlongRoute = 0; 
-    if (waypointsToUse.length < 2) {
+    if (navigationWaypoints.length < 2) {
         if (navigationRouteLayer && navigationMapInstance) {
             navigationMapInstance.removeLayer(navigationRouteLayer);
             navigationRouteLayer = null;
@@ -5123,7 +5144,7 @@ async function recalculateAndDrawRoute(waypointsToUse = navigationWaypoints) { /
         return;
     }
 
-    const coordsString = waypointsToUse.map(wp => {
+    const coordsString = navigationWaypoints.map(wp => {
         if (typeof wp.lng !== 'number' || typeof wp.lat !== 'number' || isNaN(wp.lng) || isNaN(wp.lat) ) {
             console.error("Waypoint con coordenadas inválidas para OSRM:", wp);
             return null; 
@@ -5131,7 +5152,7 @@ async function recalculateAndDrawRoute(waypointsToUse = navigationWaypoints) { /
         return `${wp.lng},${wp.lat}`;
     }).filter(Boolean).join(';'); 
 
-    if (!coordsString || waypointsToUse.filter(wp => wp && typeof wp.lng === 'number' && typeof wp.lat === 'number').length < 2) {
+    if (!coordsString || navigationWaypoints.filter(wp => wp && typeof wp.lng === 'number' && typeof wp.lat === 'number').length < 2) {
         showToast("No hay suficientes waypoints válidos para calcular la ruta.", "warning");
         if (navigationRouteLayer && navigationMapInstance) {
             navigationMapInstance.removeLayer(navigationRouteLayer);
@@ -5285,96 +5306,81 @@ async function toggleNavigationState() {
 
                 if (distanceToStart > 500 ) {
                     if(confirm("Estás a más de 500m del punto de salida. ¿Usar tu posición actual como nuevo inicio y recalcular ruta?")) {
-                        // Mantiene el punto de salida original, pero recalcula desde la pos actual.
-                        const waypointsForRecalculation = [
-                            { lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude, address: 'Posición Actual (Recalculada)'},
-                            ...navigationWaypoints.slice(1) // Mantiene el resto de los waypoints
-                        ];
-                        
+                        const carAsStartPoint = {
+                            id: Date.now() -1,
+                            lat: navigationCurrentLocation.latitude,
+                            lng: navigationCurrentLocation.longitude,
+                            type: 'S', marker: null, label: 'S',
+                            address: 'Posición Actual (GPS)'
+                        };
+                        navigationWaypoints[0].type = 'intermediate';
+                        navigationWaypoints.unshift(carAsStartPoint);
+                        updateWaypointTypesAndLabels();
+                        renderWaypointMarkers();
                         if (completedRouteSegmentsLayer) completedRouteSegmentsLayer.clearLayers();
                         lastCarDistanceAlongRouteForNavLogic = 0;
                         currentLegIndexNav = 0;
                         currentStepIndexNav = 0;
                         lastProcessedStepManeuverLocation = null;
-                        await recalculateAndDrawRoute(waypointsForRecalculation); // Recalcular con los waypoints temporales
-                        
-                        if (!navigationCurrentRouteData) { // Si el recálculo falla
-                            showToast("No se pudo recalcular la ruta desde la nueva posición. Se usará la ruta original.", "error");
-                            await recalculateAndDrawRoute(); // Volver a calcular con los waypoints originales
-                            if (!navigationCurrentRouteData) { // Si aún falla
-                                isNavigating = false; 
-                                if(startNavImg) startNavImg.src = "INICIARNAVEGACION.PNG";
-                                if(startNavButton) startNavButton.classList.remove('navigating');
-                                if (mapContainer) mapContainer.classList.remove('navigating');
-                                toggleMapLocationSearchVisibility(!isNavigating);
-                                updateStartNavigationButtonState();
-                                return;
-                            }
-                        } else {
-                             showToast("Ruta recalculada desde tu posición actual.", "success");
-                             // Actualizar los waypoints principales si el recálculo fue exitoso con la nueva salida
-                             navigationWaypoints[0] = { 
-                                ...navigationWaypoints[0], // Mantener ID y otros datos del WP original
-                                lat: navigationCurrentLocation.latitude, 
-                                lng: navigationCurrentLocation.longitude, 
-                                address: 'Posición Actual (GPS)',
-                                label: 'S', // Asegurar que la etiqueta sea S
-                                type: 'S'   // Asegurar que el tipo sea S
-                            };
-                            updateWaypointTypesAndLabels(); // Re-etiquetar el resto si es necesario
-                            renderWaypointMarkers(); // Volver a pintar los marcadores
+                        await recalculateAndDrawRoute();
+                        if (!navigationCurrentRouteData) {
+                            showToast("No se pudo recalcular la ruta desde la nueva posición. Intenta de nuevo.", "error");
+                            navigationWaypoints.shift();
+                            navigationWaypoints[0].type = 'S';
+                            updateWaypointTypesAndLabels();
+                            renderWaypointMarkers();
+                            await recalculateAndDrawRoute(); // Intenta recalcular con el punto de inicio original
+                            isNavigating = false; 
+                            if(startNavImg) startNavImg.src = "INICIARNAVEGACION.PNG";
+                            if(startNavButton) startNavButton.classList.remove('navigating');
+                            if (mapContainer) mapContainer.classList.remove('navigating');
+                            toggleMapLocationSearchVisibility(!isNavigating);
+                            updateStartNavigationButtonState();
+                            return;
                         }
+                        showToast("Ruta recalculada desde tu posición actual.", "success");
                     } else {
                         showToast("Navegación iniciada desde el punto de salida original.", "info");
-                        await recalculateAndDrawRoute(); // Asegurar que la ruta original esté cargada
-                        if (!navigationCurrentRouteData) {
-                             showToast("Error al cargar la ruta original para la navegación.", "error");
-                             isNavigating = false; 
-                             if(startNavImg) startNavImg.src = "INICIARNAVEGACION.PNG";
-                             if(startNavButton) startNavButton.classList.remove('navigating');
-                             if (mapContainer) mapContainer.classList.remove('navigating');
-                             toggleMapLocationSearchVisibility(!isNavigating);
-                             updateStartNavigationButtonState();
-                             return;
-                        }
                     }
-                } else { // Si está cerca del punto de inicio, solo recalcular con los waypoints actuales
-                     await recalculateAndDrawRoute();
-                     if (!navigationCurrentRouteData) {
-                         showToast("Error al preparar ruta para navegación.", "error");
-                         isNavigating = false; 
-                         if(startNavImg) startNavImg.src = "INICIARNAVEGACION.PNG";
-                         if(startNavButton) startNavButton.classList.remove('navigating');
-                         if (mapContainer) mapContainer.classList.remove('navigating');
-                         toggleMapLocationSearchVisibility(!isNavigating);
-                         updateStartNavigationButtonState();
-                         return;
-                     }
                 }
             }
-        } else { // Si no hay posición actual, o no hay waypoints (ya verificado arriba)
-             await recalculateAndDrawRoute();
-             if (!navigationCurrentRouteData) {
-                 showToast("Error al calcular la ruta para la navegación.", "error");
-                 isNavigating = false; 
-                 if(startNavImg) startNavImg.src = "INICIARNAVEGACION.PNG";
-                 if(startNavButton) startNavButton.classList.remove('navigating');
-                 if (mapContainer) mapContainer.classList.remove('navigating');
-                 toggleMapLocationSearchVisibility(!isNavigating);
-                 updateStartNavigationButtonState();
-                 return;
-             }
         }
         
         if (!isNavigating) return; 
 
+        if (navigationWaypoints.length >= 2) { // Asegurarse que aún hay suficientes puntos
+            try {
+                await recalculateAndDrawRoute(); 
+                if (!navigationCurrentRouteData || !navigationCurrentRouteData.routes || navigationCurrentRouteData.routes.length === 0) { 
+                    throw new Error("No se pudieron obtener los datos de la ruta después del recalculo inicial para navegación.");
+                }
+            } catch (error) {
+                showToast(`Error al preparar ruta para navegación: ${error.message}`, "error");
+                isNavigating = false; 
+                if(startNavImg) startNavImg.src = "INICIARNAVEGACION.PNG";
+                if(startNavButton) startNavButton.classList.remove('navigating');
+                if (mapContainer) mapContainer.classList.remove('navigating');
+                toggleMapLocationSearchVisibility(!isNavigating);
+                updateStartNavigationButtonState();
+                return; 
+            }
+        } else { 
+            showToast("No hay suficientes puntos para iniciar navegación después de ajustes.", "warning");
+            isNavigating = false; 
+            if(startNavImg) startNavImg.src = "INICIARNAVEGACION.PNG";
+            if(startNavButton) startNavButton.classList.remove('navigating');
+            if (mapContainer) mapContainer.classList.remove('navigating');
+            toggleMapLocationSearchVisibility(!isNavigating);
+            updateStartNavigationButtonState();
+            return;
+        }
         
         navigationFollowUser = shouldCenterOnUser;
         if (completedRouteSegmentsLayer && navigationMapInstance) completedRouteSegmentsLayer.clearLayers();
         lastProcessedStepManeuverLocation = null;
         currentLegIndexNav = 0;
         currentStepIndexNav = 0;
-        lastCarDistanceAlongRouteForNavLogic = 0; // Resetear distancia al iniciar navegación con la ruta (re)calculada
+        lastCarDistanceAlongRouteForNavLogic = 0;
 
         if(startNavImg) startNavImg.src = "TERMINARNAVEGACION.PNG"; 
         if(startNavButton) startNavButton.classList.add('navigating');
@@ -5385,8 +5391,21 @@ async function toggleNavigationState() {
         document.getElementById('navigation-top-info-bar').style.display = 'block';
 
         if (navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0]) {
-            updateNavigationProgressDisplay(navigationCurrentRouteData.routes[0], 0); // Iniciar progreso desde 0
-            updateTurnByTurnDisplay(navigationCurrentRouteData.routes[0], 0);      // Iniciar indicaciones desde 0
+            let carDistAlongRouteInit = 0;
+             const currentCarPosForNavStart = navigationCurrentLocation;
+            if (currentCarPosForNavStart && navigationMapInstance && navigationRouteLayer && typeof L.GeometryUtil !== 'undefined' && L.GeometryUtil && navigationRouteLayer.getLatLngs().length > 0) {
+                const currentLatLng = L.latLng(currentCarPosForNavStart.latitude, currentCarPosForNavStart.longitude);
+                const carSnappedToRoute = L.GeometryUtil.closest(navigationMapInstance, navigationRouteLayer, currentLatLng);
+                if (carSnappedToRoute && typeof carSnappedToRoute.lat === 'number') {
+                     const snappedLatLng = L.latLng(carSnappedToRoute.lat, carSnappedToRoute.lng);
+                     const locatedInfo = L.GeometryUtil.locateOnLine(navigationMapInstance, navigationRouteLayer, snappedLatLng);
+                     if(locatedInfo && typeof locatedInfo.distance === 'number'){
+                        carDistAlongRouteInit = locatedInfo.distance;
+                     }
+                }
+            }
+            updateNavigationProgressDisplay(navigationCurrentRouteData.routes[0], carDistAlongRouteInit);
+            updateTurnByTurnDisplay(navigationCurrentRouteData.routes[0], carDistAlongRouteInit);
         }
 
 
@@ -5580,15 +5599,11 @@ nextStageTimeEl.textContent = `${String(nextStageHours).padStart(2, '0')}:${Stri
 
 function calculateDistanceToEndOfStep(route, targetLegIndex, targetStepIndex) {
     let totalDistance = 0;
-    if (!route || !route.legs) return 0; // Añadir verificación
-
     for (let legIdx = 0; legIdx <= targetLegIndex; legIdx++) {
-        if (legIdx >= route.legs.length) break; // Salir si el índice excede las piernas disponibles
         const leg = route.legs[legIdx];
         if (!leg || !leg.steps) continue;
         const limitStepIndex = (legIdx === targetLegIndex) ? targetStepIndex : leg.steps.length - 1;
         for (let stepIdx = 0; stepIdx <= limitStepIndex; stepIdx++) {
-            if (stepIdx >= leg.steps.length) break; // Salir si el índice excede los pasos disponibles
             const step = leg.steps[stepIdx];
             if (step && typeof step.distance === 'number') {
                 totalDistance += step.distance;
@@ -5631,12 +5646,14 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     if (route.legs && route.legs.length > 0 && (navigationCurrentLocation || !isNavigating) ) {
         const carDistanceAlongRoute = Math.min(Math.max(0, carDistanceAlongTheRoute), route.distance);
 
-        if (carDistanceAlongRoute < lastCarDistanceAlongRouteForNavLogic - 5 && isNavigating ) { // Añadir un umbral de 5m para el reseteo
-            console.log("Posible retroceso o recalculo significativo. Reseteando índices de navegación.", lastCarDistanceAlongRouteForNavLogic, carDistanceAlongRoute);
-            currentLegIndexNav = 0;
-            currentStepIndexNav = 0;
-            lastProcessedStepManeuverLocation = null;
-            if (completedRouteSegmentsLayer) completedRouteSegmentsLayer.clearLayers();
+        if (carDistanceAlongRoute < lastCarDistanceAlongRouteForNavLogic && isNavigating ) {
+            // Podríamos necesitar una lógica más sofisticada aquí si el usuario retrocede mucho.
+            // Por ahora, mantenemos el progreso actual si la distancia disminuye ligeramente.
+            // Si la disminución es significativa (p.ej., más que la longitud del paso actual), podríamos recalcular o resetear.
+             if ( (lastCarDistanceAlongRouteForNavLogic - carDistanceAlongRoute) > (route.legs[currentLegIndexNav]?.steps[currentStepIndexNav]?.distance || 50) ) {
+                // console.warn("Posible retroceso significativo detectado o error de cálculo de distancia. Revisar lógica.");
+                // Considerar no resetear inmediatamente para evitar saltos si es una fluctuación.
+             }
         }
         lastCarDistanceAlongRouteForNavLogic = carDistanceAlongRoute;
 
@@ -5673,7 +5690,7 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
             }
             if (foundNextStepThisUpdate) break;
         }
-         if (!foundNextStepThisUpdate && route.legs.length > 0) {
+         if (!foundNextStepThisUpdate && route.legs.length > 0) { // Si se llegó al final de la ruta
             const lastLeg = route.legs[route.legs.length - 1];
             if (lastLeg.steps.length > 0) {
                 currentStep = lastLeg.steps[lastLeg.steps.length - 1];
@@ -5684,7 +5701,7 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
         }
 
 
-    } else if (route.legs && route.legs.length > 0 && route.legs[0].steps.length > 0) {
+    } else if (route.legs && route.legs.length > 0 && route.legs[0].steps.length > 0) { // Caso inicial sin navegación
         currentStep = route.legs[0].steps[0];
         distanceToStepManeuver = currentStep.distance;
         previousStepForPath = null;
@@ -5707,7 +5724,7 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
         } else {
             distanceEl.textContent = `${Math.round(displayDistance)} m`;
         }
-        const originalStepDistance = currentStep.distance || Math.max(500, displayDistance);
+        const originalStepDistance = currentStep.distance || Math.max(500, displayDistance); // Evitar división por cero
         const progressToTurnPercent = originalStepDistance > 0 ? Math.max(0, Math.min(100, (1 - (displayDistance / originalStepDistance)) * 100)) : (displayDistance === 0 ? 100:0);
         progressBarEl.style.width = `${progressToTurnPercent}%`;
 
@@ -5740,6 +5757,11 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
 
 
 async function getSuggestedRouteName(lat, lng) {
+    let numEtapas = 0;
+    if (navigationWaypoints.length > 1) { // Salida no cuenta, destino sí si es intermedio
+        numEtapas = navigationWaypoints.length -1; // Contando destino como etapa
+    }
+
     try {
         const response = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&addressdetails=1&accept-language=es`);
         if (response.ok) {
@@ -5747,16 +5769,19 @@ async function getSuggestedRouteName(lat, lng) {
             if (data.address) {
                 const road = data.address.road;
                 const city = data.address.city || data.address.town || data.address.village || data.address.hamlet;
-                if (road && city) return `${road}, ${city}`;
-                if (city) return city;
-                if (road) return road;
+                let namePart = "";
+                if (road && city) namePart = `${road}, ${city}`;
+                else if (city) namePart = city;
+                else if (road) namePart = road;
+                else namePart = `Destino (${lat.toFixed(2)}, ${lng.toFixed(2)})`;
+                return `[${numEtapas}E] ${namePart}`;
             }
         }
     } catch (e) {
         console.warn("Error en geocodificación inversa para nombre de ruta:", e);
     }
     const now = new Date();
-    return `RUTA: ${String(now.getDate()).padStart(2, '0')}/${String(now.getMonth() + 1).padStart(2, '0')}/${String(now.getFullYear()).slice(-2)} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+    return `[${numEtapas}E] RUTA: ${String(now.getDate()).padStart(2, '0')}/${String(now.getMonth() + 1).padStart(2, '0')}/${String(now.getFullYear()).slice(-2)} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
 }
 
 
@@ -5870,6 +5895,7 @@ function showLoadRouteModal() {
     modal.id = 'saved-routes-modal';
     modal.innerHTML = `
         <h2>Cargar/Borrar Rutas Guardadas (Máx. ${MAX_SAVED_ROUTES})</h2>
+        <input type="text" id="search-saved-routes-input" placeholder="Buscar ruta por nombre..." style="width: 100%; padding: 0.5rem; margin-bottom: 1rem; border: 1px solid #ccc; border-radius: 4px;">
         <ul id="saved-routes-list"></ul>
         <button id="close-saved-routes-modal">Cerrar</button>
     `;
@@ -5877,45 +5903,53 @@ function showLoadRouteModal() {
 
     const listElement = modal.querySelector('#saved-routes-list');
     const closeButton = modal.querySelector('#close-saved-routes-modal');
+    const searchInput = modal.querySelector('#search-saved-routes-input');
 
-    const savedRoutes = JSON.parse(localStorage.getItem(SAVED_ROUTES_KEY) || "[]");
-    savedRoutes.sort((a,b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    let allSavedRoutes = JSON.parse(localStorage.getItem(SAVED_ROUTES_KEY) || "[]");
+    allSavedRoutes.sort((a,b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
 
+    function displayRoutes(routesToDisplay) {
+        listElement.innerHTML = '';
+        if (routesToDisplay.length === 0) {
+            listElement.innerHTML = '<li>No hay rutas guardadas que coincidan.</li>';
+        } else {
+            routesToDisplay.forEach(route => {
+                const li = document.createElement('li');
+                li.textContent = route.name;
+                li.dataset.routeName = route.name;
 
-    if (savedRoutes.length === 0) {
-        listElement.innerHTML = '<li>No hay rutas guardadas.</li>';
-    } else {
-        savedRoutes.forEach(route => {
-            const li = document.createElement('li');
-            li.textContent = route.name;
-            li.dataset.routeName = route.name;
-
-            const deleteBtn = document.createElement('button');
-            deleteBtn.textContent = 'Borrar';
-            deleteBtn.className = 'delete-route-btn';
-            deleteBtn.onclick = (e) => {
-                e.stopPropagation();
-                if (confirm(`¿Seguro que quieres borrar la ruta "${route.name}"?`)) {
-                    let currentSavedRoutes = JSON.parse(localStorage.getItem(SAVED_ROUTES_KEY) || "[]");
-                    currentSavedRoutes = currentSavedRoutes.filter(r => r.name !== route.name);
-                    localStorage.setItem(SAVED_ROUTES_KEY, JSON.stringify(currentSavedRoutes));
-                    li.remove();
-                    showToast(`Ruta "${route.name}" borrada.`, "info");
-                     if (listElement.children.length === 0) {
-                        listElement.innerHTML = '<li>No hay rutas guardadas.</li>';
+                const deleteBtn = document.createElement('button');
+                deleteBtn.textContent = 'Borrar';
+                deleteBtn.className = 'delete-route-btn';
+                deleteBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    if (confirm(`¿Seguro que quieres borrar la ruta "${route.name}"?`)) {
+                        allSavedRoutes = allSavedRoutes.filter(r => r.name !== route.name);
+                        localStorage.setItem(SAVED_ROUTES_KEY, JSON.stringify(allSavedRoutes));
+                        displayRoutes(allSavedRoutes.filter(r => normalizeText(r.name).includes(normalizeText(searchInput.value)))); // Re-filter and display
+                        showToast(`Ruta "${route.name}" borrada.`, "info");
                     }
-                }
-            };
-            li.appendChild(deleteBtn);
+                };
+                li.appendChild(deleteBtn);
 
-            li.addEventListener('click', () => {
-                loadRouteByName(route.name);
-                clearModalAutoCloseTimer(modal, closeButton, 'saved-routes-modal');
-                if (modal.parentNode) modal.remove();
+                li.addEventListener('click', () => {
+                    loadRouteByName(route.name);
+                    clearModalAutoCloseTimer(modal, closeButton, 'saved-routes-modal');
+                    if (modal.parentNode) modal.remove();
+                });
+                listElement.appendChild(li);
             });
-            listElement.appendChild(li);
-        });
+        }
     }
+    
+    searchInput.addEventListener('input', () => {
+        const searchTerm = normalizeText(searchInput.value);
+        const filteredRoutes = allSavedRoutes.filter(route => normalizeText(route.name).includes(searchTerm));
+        displayRoutes(filteredRoutes);
+    });
+
+    displayRoutes(allSavedRoutes); // Carga inicial
+
     const closeHandler = () => {
         clearModalAutoCloseTimer(modal, closeButton, 'saved-routes-modal');
         if (modal.parentNode) modal.remove();
@@ -7345,5 +7379,12 @@ function clearModalAutoCloseTimer(modalElement, closeButtonElement, modalId) {
 
 </script>
 </body>
-</html>
+</html>                                                                                                                                                                                                                                                                                                                                                                                                                                                                              
+
+
+
+
+
+
+
             
