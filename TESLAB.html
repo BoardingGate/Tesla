@@ -4014,9 +4014,7 @@ function openNavigationMap() {
             localStorage.setItem(ACTIVE_MAP_LAYER_KEY, e.name);
         });
 
-
         completedRouteSegmentsLayer = L.layerGroup().addTo(navigationMapInstance);
-
 
         orientationAltitudeControl = L.control.orientationAltitude({ position: 'bottomleft' });
         if(navigationMapInstance && orientationAltitudeControl) {
@@ -4028,12 +4026,7 @@ function openNavigationMap() {
             }
             renderWaypointMarkers();
         });
-        plotRemindersOnNavigationMap();
-        const remindersWithLocation = (JSON.parse(localStorage.getItem('reminders') || '[]')).navigationMapInstance.on('zoomend', () => {
-            if (initialUserLocationCircle && initialUserLocationMarkerLat && initialUserLocationMarkerLng && navigationMapInstance) {
-            }
-            renderWaypointMarkers();
-        });
+        
         plotRemindersOnNavigationMap();
         const remindersWithLocation = (JSON.parse(localStorage.getItem('reminders') || '[]')).filter(r => r.isLocationEnabled && r.locationCoordinates?.latitude && r.locationCoordinates?.longitude);
         if (remindersWithLocation.length > 0) { const bounds = L.latLngBounds(remindersWithLocation.map(r => [r.locationCoordinates.latitude, r.locationCoordinates.longitude])); if (bounds.isValid()) { navigationMapInstance.fitBounds(bounds.pad(0.15)); } else { navigationMapInstance.setView([40.416775, -3.703790], 6); } }
@@ -4041,6 +4034,3262 @@ function openNavigationMap() {
         
         getCurrentLocation( (currentPos) => { 
             navigationCurrentLocation = currentPos;
+            updateInitialUserPosition(currentPos, navigationMapInstance);
+
+            if (locationWatchId === null && 'geolocation' in navigator && 'watchPosition' in navigator.geolocation) {
+                 locationWatchId = navigator.geolocation.watchPosition(
+                    (position) => {
+                        const coordsForUpdate = {
+                            latitude: position.coords.latitude,
+                            longitude: position.coords.longitude,
+                            accuracy: position.coords.accuracy,
+                            heading: position.coords.heading,
+                            altitude: position.coords.altitude
+                        };
+
+                        navigationCurrentLocation = coordsForUpdate;
+                        updateInitialUserPosition(coordsForUpdate, navigationMapInstance);
+
+                        pendingPositionToProcess = coordsForUpdate;
+                        const nowTime = Date.now();
+
+                        if (nowTime - lastPositionProcessTime > POSITION_PROCESS_INTERVAL) {
+                            lastPositionProcessTime = nowTime;
+                            const positionToProcessThisCycle = pendingPositionToProcess;
+                            pendingPositionToProcess = null;
+                            
+                            const activePositionForLogic = positionToProcessThisCycle;
+                            
+                            let carDistanceAlongRouteForCallback = 0;
+                            let debugMsgForProgress = "";
+                            if (activePositionForLogic) {
+                                debugMsgForProgress = `PosGPS: ${activePositionForLogic.latitude.toFixed(5)}, ${activePositionForLogic.longitude.toFixed(5)}\n`;
+                            } else {
+                                debugMsgForProgress = `PosGPS: No disponible (activePositionForLogic es null)\n`;
+                            }
+                            debugMsgForProgress += `isNavigating: ${isNavigating}\n`;
+
+
+                            if (isNavigating && navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0] && navigationRouteLayer && navigationMapInstance) {
+                                let geometryUtilAvailable = false;
+                                let routeLayerLatLngsAvailable = false;
+                                let routeLayerLatLngsLengthPositive = false;
+
+                                try {
+                                    geometryUtilAvailable = typeof L !== 'undefined' && L.GeometryUtil && typeof L.GeometryUtil.closest === 'function';
+                                    if (geometryUtilAvailable && navigationRouteLayer) {
+                                         const latLngs = navigationRouteLayer.getLatLngs();
+                                         routeLayerLatLngsAvailable = Array.isArray(latLngs);
+                                         if(routeLayerLatLngsAvailable) {
+                                            routeLayerLatLngsLengthPositive = latLngs.length > 0;
+                                         }
+                                    }
+                                } catch (geomError) {
+                                    console.error("Error checking GeometryUtil or getLatLngs:", geomError);
+                                }
+
+                                if (geometryUtilAvailable && routeLayerLatLngsAvailable && routeLayerLatLngsLengthPositive && activePositionForLogic) {
+                                    debugMsgForProgress += `RouteData: Exists, RouteLayer: Exists (L.GeoUtil OK)\n`;
+                                    const currentLatLng = L.latLng(activePositionForLogic.latitude, activePositionForLogic.longitude);
+                                    const closestResult = L.GeometryUtil.closest(navigationMapInstance, navigationRouteLayer, currentLatLng);
+                                    
+                                    let distEnRutaTexto = "No calculada";
+                                    if (closestResult && typeof closestResult.lat === 'number' && typeof closestResult.lng === 'number') { 
+                                        const snappedLatLng = L.latLng(closestResult.lat, closestResult.lng); 
+                                        const locatedResult = L.GeometryUtil.locateOnLine(navigationMapInstance, navigationRouteLayer, snappedLatLng);
+                                    
+                                        let potentialDistance = null;
+
+                                        if (locatedResult !== null && locatedResult !== undefined) {
+                                            if (typeof locatedResult === 'number') {
+                                                potentialDistance = locatedResult; 
+                                            } else if (typeof locatedResult.distance === 'number') {
+                                                potentialDistance = locatedResult.distance; 
+                                            }
+                                        }
+
+                                        if (potentialDistance !== null && !isNaN(potentialDistance) && potentialDistance >= 0) {
+                                            carDistanceAlongRouteForCallback = potentialDistance;
+                                            distEnRutaTexto = `${carDistanceAlongRouteForCallback.toFixed(0)}m`;
+                                        } else {
+                                            carDistanceAlongRouteForCallback = lastCarDistanceAlongRouteForNavLogic; 
+                                            distEnRutaTexto = "Error al localizar en línea"; 
+                                            
+                                            if (locatedResult === null || locatedResult === undefined) {
+                                                // console.warn("L.GeometryUtil.locateOnLine devolvió null o undefined. Usando última distancia conocida."); // Comentado para reducir logs
+                                            } else if (typeof potentialDistance !== 'number' || isNaN(potentialDistance)) {
+                                                 console.warn("L.GeometryUtil.locateOnLine no devolvió una distancia válida (no es número o es NaN):", locatedResult, ". Usando última distancia conocida.");
+                                            } else if (potentialDistance < 0) {
+                                                 console.warn("L.GeometryUtil.locateOnLine devolvió una distancia negativa. Resultado:", locatedResult, ". Usando última distancia conocida.");
+                                            } else {
+                                                 console.warn("L.GeometryUtil.locateOnLine: Fallo no especificado al obtener distancia. Resultado:", locatedResult, ". Usando última distancia conocida.");
+                                            }
+                                        }
+                                    } else {
+                                        carDistanceAlongRouteForCallback = lastCarDistanceAlongRouteForNavLogic; // Usar la última conocida si no se puede ajustar
+                                        distEnRutaTexto = "No se pudo ajustar a la ruta (closestResult inválido)";
+                                        console.warn("L.GeometryUtil.closest no devolvió un resultado con lat/lng válidos:", closestResult);
+                                    }
+                                    debugMsgForProgress += `DistEnRuta: ${distEnRutaTexto}\n`;
+                                    
+
+                                    const route = navigationCurrentRouteData.routes[0];
+                                    const remainingDist = route.distance - carDistanceAlongRouteForCallback; 
+                                    debugMsgForProgress += `FaltaDest: ${(remainingDist / 1000).toFixed(1)}km\n`; 
+                                    
+                                    let nextTurnInfo = "N/A";
+                                     if(route.legs && route.legs[currentLegIndexNav] && route.legs[currentLegIndexNav].steps[currentStepIndexNav]){
+                                        const step = route.legs[currentLegIndexNav].steps[currentStepIndexNav];
+                                        const distToNextManeuverOnStep = calculateDistanceToEndOfStep(route, currentLegIndexNav, currentStepIndexNav) - carDistanceAlongRouteForCallback;
+                                        nextTurnInfo = `${turnIcons[step.maneuver.type + (step.maneuver.modifier ? ' ' + step.maneuver.modifier : '')] || turnIcons[step.maneuver.type] || turnIcons['default']} en ${Math.round(distToNextManeuverOnStep)}m: ${step.name || 'Continuar'}`;
+                                    }
+                                    debugMsgForProgress += `Próx: ${nextTurnInfo}`;
+                                    // showToast(debugMsgForProgress, 'debug', 0); // Comentado para reducir logs, descomentar si es necesario
+
+                                    updateNavigationProgressDisplay(route, carDistanceAlongRouteForCallback);
+                                    updateTurnByTurnDisplay(route, carDistanceAlongRouteForCallback);
+
+                                    if (navigationRouteLayer && navigationMapInstance && typeof L.GeometryUtil !== 'undefined' && L.GeometryUtil && closestResult && typeof closestResult.lat === 'number') {
+                                        const snappedLatLngForDeviation = L.latLng(closestResult.lat, closestResult.lng);
+                                        const deviationDistance = currentLatLng.distanceTo(snappedLatLngForDeviation);
+                                        if (deviationDistance > DEVIATION_THRESHOLD) {
+                                            showToast("Desvío detectado. Recalculando ruta...", "warning");
+                                             if (navigationWaypoints.length > 0 && activePositionForLogic) {
+                                                const waypointsForRecalc = [
+                                                    { lat: activePositionForLogic.latitude, lng: activePositionForLogic.longitude, address: 'Posición Actual (Recalculada)', type: 'S', label: 'S' },
+                                                    ...navigationWaypoints.slice(currentLegIndexNav + 1) // Mantener los waypoints restantes desde el siguiente al actual
+                                                ];
+                                                if (waypointsForRecalc.length < 2 && navigationWaypoints.length > 0) { // Asegurar destino
+                                                    waypointsForRecalc.push(navigationWaypoints[navigationWaypoints.length-1]);
+                                                }
+                                                // No modificar el navigationWaypoints original directamente hasta que el recalculo sea exitoso
+                                                const tempWaypointsForRecalc = navigationWaypoints.map(wp => ({...wp})); // Copia profunda temporal
+                                                navigationWaypoints = waypointsForRecalc.map((wp,idx) => ({ // Crear nuevos objetos waypoint para la nueva ruta
+                                                    id: wp.id || Date.now() + idx, // Reutilizar ID si existe, o generar nuevo
+                                                    lat: wp.lat,
+                                                    lng: wp.lng,
+                                                    type: (idx === 0) ? 'S' : (idx === waypointsForRecalc.length - 1 ? 'F' : 'intermediate'),
+                                                    label: (idx === 0) ? 'S' : (idx === waypointsForRecalc.length - 1 ? 'F' : String(idx)),
+                                                    marker: null, // Se recrearán
+                                                    address: wp.address || ''
+                                                }));
+
+
+                                                renderWaypointMarkers(); // Renderizar los nuevos marcadores
+                                                if (completedRouteSegmentsLayer) completedRouteSegmentsLayer.clearLayers();
+                                                lastCarDistanceAlongRouteForNavLogic = 0;
+                                                // currentLegIndexNav y currentStepIndexNav se resetearán implícitamente por el nuevo cálculo de ruta
+
+                                                recalculateAndDrawRoute().then(() => {
+                                                    showToast("Nueva ruta calculada desde la posición actual.", "success");
+                                                }).catch(err => {
+                                                    showToast("Error al recalcular ruta tras desvío.", "error");
+                                                    navigationWaypoints = tempWaypointsForRecalc; // Restaurar waypoints si falla el recalculo
+                                                    updateWaypointTypesAndLabels();
+                                                    renderWaypointMarkers();
+                                                    recalculateAndDrawRoute(); // Intentar recalcular la ruta original que estaba antes del desvío
+                                                });
+                                            }
+                                        }
+                                    }
+                                } else if (isNavigating) { 
+                                    // ... (código de depuración si se necesita)
+                                }
+                            } else if (isNavigating) { 
+                                // ... (código de depuración si se necesita)
+                            }
+
+
+                            if (isNavigating && navigationFollowUser && navigationMapInstance ) {
+                                navigationMapInstance.panTo([positionToProcessThisCycle.latitude, positionToProcessThisCycle.longitude]);
+                            }
+                            checkReminders();
+                        }
+                    },
+                    (error) => { showToast(`Error seguimiento GPS: ${error.message}`, "warning"); if (locationWatchId !== null) { navigator.geolocation.clearWatch(locationWatchId); locationWatchId = null; } if (isNavigating && currentCheckIntervalDuration < 60000) { currentCheckIntervalDuration = 60000; if (reminderCheckIntervalId) clearInterval(reminderCheckIntervalId); reminderCheckIntervalId = setInterval(checkReminders, currentCheckIntervalDuration); } },
+                    { enableHighAccuracy: true, timeout: 15000, maximumAge: 5000, distanceFilter: 3 } 
+                );
+            }
+        },
+            () => { showToast("No se pudo obtener tu ubicación actual. Algunas funciones pueden estar limitadas.", "warning"); if (orientationAltitudeControl) { orientationAltitudeControl.updateOrientation(null); orientationAltitudeControl.updateAltitude(null); } } 
+        );
+        mapContainer.classList.remove('navigating');
+        setNavigationMapClickHandler();
+        setTimeout(() => { if (navigationMapInstance) { navigationMapInstance.invalidateSize(); } }, 150);
+    } catch (error) { mapContainer.innerHTML = `<p style="color:red; text-align:center; padding:20px;">Error al cargar el mapa: ${error.message}</p>`; }
+
+    clearMapSearchInputButton.addEventListener('click', () => {
+        mapLocationSearchInput.value = '';
+        clearMapSearchInputButton.style.display = 'none';
+        mapLocationSearchButton.style.display = 'none';
+        mapLocationSearchInput.focus();
+    });
+
+    mapLocationSearchInput.dispatchEvent(new Event('input')); 
+    
+    updateStartNavigationButtonState();
+    toggleMapLocationSearchVisibility(!isNavigating);
+}
+
+    
+ 
+
+function setNavigationMapClickHandler() {
+    if (navigationMapClickHandler && navigationMapInstance) {
+        navigationMapInstance.off('click', navigationMapClickHandler);
+    }
+    if (isAddReminderAtLocationModeActive) {
+        navigationMapClickHandler = handleMapClickToAddReminder;
+    } else { 
+        navigationMapClickHandler = (e) => { if (isNavigating) return; addWaypoint(e.latlng); };
+    }
+    if (navigationMapInstance) {
+        navigationMapInstance.on('click', navigationMapClickHandler);
+    }
+}
+
+function toggleAddReminderAtLocationMode() {
+    isAddReminderAtLocationModeActive = !isAddReminderAtLocationModeActive;
+    const mapDiv = document.getElementById('reminders-location-map-div');
+
+    if (addReminderAtLocationButton) {
+        if (isAddReminderAtLocationModeActive) {
+            addReminderAtLocationButton.style.backgroundColor = '#EF4444 !important'; 
+            addReminderAtLocationButton.classList.add('active-reminder-mode');
+            if(mapDiv) mapDiv.classList.add('add-reminder-mode');
+            showToast("Modo 'Añadir Recordatorio en Mapa' ACTIVADO. Pulsa en el mapa para crear un recordatorio en esa ubicación.", "info", 5000);
+        } else {
+            addReminderAtLocationButton.style.backgroundColor = '#FFA500 !important'; 
+            addReminderAtLocationButton.classList.remove('active-reminder-mode');
+            if(mapDiv) mapDiv.classList.remove('add-reminder-mode');
+            showToast("Modo 'Añadir Recordatorio en Mapa' DESACTIVADO.", "info");
+        }
+    }
+    setNavigationMapClickHandler();
+}
+
+function handleMapClickToAddReminder(e) {
+    if (!isAddReminderAtLocationModeActive || !navigationMapInstance) return;
+    const latlng = e.latlng;
+    toggleAddReminderAtLocationMode(); 
+
+    const mapContextBeforeModal = sessionStorage.getItem('mapContext');
+    closeNavigationMap(true); 
+
+    sessionStorage.setItem('boardinggate_map_should_reopen_after_form', 'true');
+    if (mapContextBeforeModal) {
+      sessionStorage.setItem('mapContext', mapContextBeforeModal);
+    }
+
+    showReminderModal({
+        isLocationEnabled: true,
+        locationCoordinates: { latitude: latlng.lat, longitude: latlng.lng },
+        radiusMeters: 1000,
+        text: 'Recordatorio en mapa: ',
+        excludeFromList: false
+    });
+}
+
+
+function closeNavigationMap(force = false) {
+    if (!isNavigationMapActive && !force) return; isNavigationMapActive = false;
+    sessionStorage.removeItem('mapContext');
+
+    if (locationWatchId !== null && !isRemindersLocationMapActive) { navigator.geolocation.clearWatch(locationWatchId); locationWatchId = null; }
+
+    const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+    if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
+        localStorage.setItem(RADARES_RUTA_CHECKED_KEY, 'true');
+        eliminarRadaresDeRuta();
+    } else {
+        localStorage.setItem(RADARES_RUTA_CHECKED_KEY, 'false');
+    }
+
+    if (isAddReminderAtLocationModeActive) {
+        toggleAddReminderAtLocationMode(); 
+    }
+    
+    if (navigationMapInstance) {
+        if (orientationAltitudeControl && navigationMapInstance._controlContainer && navigationMapInstance._controlContainer.contains(orientationAltitudeControl.getContainer())) { try { navigationMapInstance.removeControl(orientationAltitudeControl); } catch(e) {console.warn("Error removing orientation control:", e)} }
+        if (mapLayersControl && navigationMapInstance._controlContainer && navigationMapInstance._controlContainer.contains(mapLayersControl.getContainer())) { try { navigationMapInstance.removeControl(mapLayersControl); mapLayersControl = null; } catch(e) {console.warn("Error removing layers control:", e)} }
+        if (navigationMapClickHandler) { navigationMapInstance.off('click', navigationMapClickHandler); navigationMapClickHandler = null; }
+        if (completedRouteSegmentsLayer) { completedRouteSegmentsLayer.clearLayers(); completedRouteSegmentsLayer.remove(); completedRouteSegmentsLayer = null; }
+        try { navigationMapInstance.remove(); } catch (e) { console.warn("Error removing navigationMapInstance on close:", e); } navigationMapInstance = null; }
+    navigationWaypoints.forEach(wp => { if(wp.marker && typeof wp.marker.remove === 'function') wp.marker.remove(); });
+    navigationWaypoints = [];
+    if (navigationRouteLayer && typeof navigationRouteLayer.remove === 'function') navigationRouteLayer.remove(); 
+    navigationRouteLayer = null; 
+    navigationCurrentRouteData = null; isNavigating = false; navigationFollowUser = false;
+    if (!isRemindersLocationMapActive) {
+         initialUserLocationMarker = null; initialUserLocationMarkerLat = null; initialUserLocationMarkerLng = null;
+         if (initialUserLocationCircle) { initialUserLocationCircle.remove(); initialUserLocationCircle = null; }
+         navigationCurrentLocation = null;
+    }
+    orientationAltitudeControl = null;
+    const mapModalElement = document.getElementById('reminders-location-map-modal'); if (mapModalElement) { mapModalElement.remove(); }
+    const helpModalInstance = document.getElementById('reminders-map-help-modal-instance'); if (helpModalInstance) { const helpCloseButton = helpModalInstance.querySelector('#close-reminders-map-help-instance'); if(helpCloseButton) clearModalAutoCloseTimer(helpModalInstance, helpCloseButton, 'reminders-map-help-modal-instance'); helpModalInstance.remove(); }
+    const savedRoutesModal = document.getElementById('saved-routes-modal'); if (savedRoutesModal) { const closeBtnSRM = savedRoutesModal.querySelector('#close-saved-routes-modal'); if(closeBtnSRM) clearModalAutoCloseTimer(savedRoutesModal, closeBtnSRM, 'saved-routes-modal'); savedRoutesModal.remove(); }
+    const saveRoutePromptModal = document.getElementById('save-route-prompt-modal'); if (saveRoutePromptModal) { const closeBtnSRPM = saveRoutePromptModal.querySelector('#cancel-save-route'); if(closeBtnSRPM) clearModalAutoCloseTimer(saveRoutePromptModal, closeBtnSRPM, 'save-route-prompt-modal'); saveRoutePromptModal.remove(); }
+    const reorderStagesModalElement = document.getElementById('reorder-stages-modal'); if (reorderStagesModalElement && !reorderStagesModalElement.classList.contains('hidden')) {
+        const cancelBtnReorder = reorderStagesModalElement.querySelector('#cancel-reorder-stages');
+        if(cancelBtnReorder) clearModalAutoCloseTimer(reorderStagesModalElement, cancelBtnReorder, 'reorder-stages-modal');
+        reorderStagesModalElement.classList.add('hidden');
+        const listElement = reorderStagesModalElement.querySelector('#sortable-stages-list');
+        if (listElement) {
+            listElement.removeEventListener('dragstart', handleDragStartReorder);
+            listElement.removeEventListener('dragend', handleDragEndReorder);
+            listElement.removeEventListener('dragover', handleDragOverReorder);
+            listElement.removeEventListener('touchstart', handleStageTouchStart);
+            listElement.removeEventListener('touchmove', handleStageTouchMove);
+            listElement.removeEventListener('touchend', handleStageTouchEnd);
+            listElement.removeEventListener('touchcancel', handleStageTouchEnd);
+        }
+        if (draggedStageLi) {
+            draggedStageLi.classList.remove('dragging');
+            draggedStageLi = null;
+        }
+        clearTimeout(stageScrollTimeout);
+        document.body.style.overflow = '';
+    }
+    const simModal = document.getElementById('simulation-modal');
+    if (simModal) {
+        if (simulationModalTimer) clearTimeout(simulationModalTimer);
+        const simCloseBtn = simModal.querySelector('#close-simulation-modal');
+        if (simCloseBtn) clearModalAutoCloseTimer(simModal, simCloseBtn, 'simulation-modal');
+        simModal.remove();
+    }
+
+
+    sessionStorage.removeItem('boardinggate_map_should_reopen_after_form'); sessionStorage.removeItem('boardinggate_map_should_reopen_when_unified_closes'); sessionStorage.removeItem('boardinggate_map_was_open_before_table'); sessionStorage.removeItem('boardinggate_map_should_reopen_after_config');
+    hideUnifiedReminderWindow(); updateStartNavigationButtonState(); checkReminders();
+}
+
+function updateInitialUserPosition(coords, mapInstanceToUse) {
+    if (!mapInstanceToUse) return;
+    const latLng = L.latLng(coords.latitude, coords.longitude);
+    
+    initialUserLocationMarkerLat = coords.latitude;
+    initialUserLocationMarkerLng = coords.longitude;
+
+    let currentIconToDisplay = carIcon;
+    let showCarCircle = true;
+
+
+    if (initialUserLocationMarker && initialUserLocationMarker._map) {
+        if (initialUserLocationMarker._map !== mapInstanceToUse) {
+            initialUserLocationMarker.remove(); initialUserLocationMarker = null;
+        } else { 
+            initialUserLocationMarker.setLatLng(latLng);
+            initialUserLocationMarker.setIcon(currentIconToDisplay);
+        }
+    }
+    if (!initialUserLocationMarker) {
+        initialUserLocationMarker = L.marker(latLng, { icon: currentIconToDisplay, zIndexOffset: 1000, interactive: false });
+        if (mapInstanceToUse) {
+             initialUserLocationMarker.addTo(mapInstanceToUse);
+        }
+    }
+    
+    if (initialUserLocationMarker && navigationMapInstance.hasLayer(initialUserLocationMarker)) {
+        const markerElement = initialUserLocationMarker.getElement(); 
+        if (markerElement) { 
+            markerElement.style.transformOrigin = 'center center'; 
+            markerElement.style.display = '';
+        } else {
+            // console.warn("updateInitialUserPosition: initialUserLocationMarker.getElement() devolvió null aunque el marcador debería estar en el mapa.");
+        }
+    }
+
+
+    if (orientationAltitudeControl) { 
+        orientationAltitudeControl.updateOrientation(coords.heading); 
+        orientationAltitudeControl.updateAltitude(coords.altitude); 
+    }
+
+    const circleStyle = { 
+        radius: (showCarCircle ? 28 : 0), 
+        color: '#FFC300', 
+        weight: (showCarCircle ? 1 : 0), 
+        fillColor: '#FFC300', 
+        fillOpacity: (showCarCircle ? 0.4 : 0), 
+        interactive: false, 
+        pane: 'markerPane' 
+    };
+
+    if (initialUserLocationCircle && initialUserLocationCircle._map) {
+        if (initialUserLocationCircle._map !== mapInstanceToUse) {
+            initialUserLocationCircle.remove(); initialUserLocationCircle = null;
+        } else { 
+            initialUserLocationCircle.setLatLng(latLng).setRadius(circleStyle.radius).setStyle(circleStyle); 
+        }
+    }
+    if (!initialUserLocationCircle && showCarCircle) { 
+         initialUserLocationCircle = L.circle(latLng, circleStyle).addTo(mapInstanceToUse);
+    } else if (initialUserLocationCircle && !showCarCircle) { 
+         initialUserLocationCircle.setStyle({radius: 0, weight: 0, fillOpacity: 0});
+    }
+    
+    if (shouldCenterOnUser && mapInstanceToUse ) { mapInstanceToUse.panTo(latLng); }
+}
+
+
+function plotRemindersOnNavigationMap() {
+    if (!navigationMapInstance) return;
+    reminderMapObjects.forEach(obj => {
+        if (obj.marker && navigationMapInstance.hasLayer(obj.marker)) obj.marker.remove();
+        if (obj.circle && navigationMapInstance.hasLayer(obj.circle)) obj.circle.remove();
+    });
+    reminderMapObjects = [];
+
+    const reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
+    const remindersWithLocation = reminders.filter(r => r.isLocationEnabled && r.locationCoordinates?.latitude && r.locationCoordinates?.longitude);
+    remindersWithLocation.forEach(reminder => {
+        const mapObject = plotSingleReminderOnMap(reminder, navigationMapInstance);
+        if (mapObject) reminderMapObjects.push(mapObject);
+    });
+}
+
+function plotSingleReminderOnMap(reminder, mapInstance) {
+    if (!mapInstance || !reminder.isLocationEnabled || !reminder.locationCoordinates) return null;
+    const latLng = [reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude];
+    const isRadarType = reminder.text.toUpperCase().includes("RADAR:") || reminder.excludeFromList;
+
+    let markerIconToUse;
+    let circleColor, circleFillColor, circleFillOpacity, circleWeight;
+
+    if (isRadarType) {
+        markerIconToUse = smallRadarMarkerIcon;
+        circleColor = '#800080'; 
+        circleFillColor = '#DA70D6'; 
+        circleFillOpacity = 0.20;
+        circleWeight = 0;
+    } else {
+        markerIconToUse = largeGreenLocationMarkerIcon;
+        circleColor = '#FFF380';
+        circleFillColor = '#FFF380';
+        circleFillOpacity = 0.40;
+        circleWeight = 1;
+    }
+
+    const marker = L.marker(latLng, { icon: markerIconToUse, title: reminder.text.replace(/<[^>]*>/g, '').substring(0, 50) }).addTo(mapInstance);
+    const circle = L.circle(latLng, { radius: reminder.radiusMeters || 1000, color: circleColor, fillColor: circleFillColor, weight: circleWeight, fillOpacity: circleFillOpacity }).addTo(mapInstance);
+
+    let popupContent = ` <div style="max-width: 250px; font-family: sans-serif; font-size: 0.9rem;"> <strong style="font-size: 1rem; color: #333; display: block; margin-bottom: 5px;">${reminder.text.replace(/<b>|<\/b>/gi,'')}</strong> <hr style="margin: 4px 0;"> ${reminder.time ? `<p style="margin: 3px 0;"><strong>Hora:</strong> ${formatTimeWithPeriod(reminder.time)}</p>` : ''} ${reminder.date ? `<p style="margin: 3px 0;"><strong>Fecha:</strong> ${formatDateDetailed(reminder.date)}</p>` : ''} <p style="margin: 3px 0;"><strong>Radio:</strong> ${reminder.radiusMeters || 1000}m</p> <button data-reminder-id="${reminder.id}" class="modify-reminder-from-map" style="margin-top: 8px; padding: 4px 8px; font-size: 0.8rem; background-color: #10B981; color: white; border: none; border-radius: 3px; cursor: pointer;">Modificar</button> </div>`;
+    marker.bindPopup(popupContent);
+    marker.on('popupopen', () => {
+        const modifyButton = marker.getPopup().getElement().querySelector('.modify-reminder-from-map');
+        if (modifyButton) {
+            const newModifyButton = modifyButton.cloneNode(true); modifyButton.parentNode.replaceChild(newModifyButton, modifyButton);
+            newModifyButton.addEventListener('click', (e) => {
+                const id = parseInt(e.target.dataset.reminderId);
+                let remToMod = null;
+                if (!isNaN(id)) {
+                    const rems = JSON.parse(localStorage.getItem('reminders') || '[]');
+                    remToMod = rems.find(r => r.id === id);
+                }
+                if (!remToMod && reminder) {
+                    remToMod = {...reminder};
+                    if (typeof remToMod.id !== 'number') remToMod.id = null;
+                }
+
+                if (remToMod) {
+                    const mapContextBeforeModal = sessionStorage.getItem('mapContext');
+                    closeNavigationMap(true);
+                    sessionStorage.setItem('boardinggate_map_should_reopen_after_form', 'true');
+                    if (mapContextBeforeModal) {
+                        sessionStorage.setItem('mapContext', mapContextBeforeModal);
+                    }
+                    showReminderModal(remToMod);
+                } else {
+                    showToast("Error: No se pudo encontrar el recordatorio para modificar.", "error");
+                }
+            });
+        }
+    });
+    return { reminderId: reminder.id, marker, circle, isFromRuta: reminder.isFromRuta || false };
+}
+
+    function showNavigationMapHelpModal() {
+    const existingHelpModal = document.getElementById('reminders-map-help-modal-instance');
+    if (existingHelpModal) { clearModalAutoCloseTimer(existingHelpModal, existingHelpModal.querySelector('#close-reminders-map-help-instance'), 'reminders-map-help-modal-instance'); existingHelpModal.remove(); }
+    const helpModal = document.createElement('div'); helpModal.id = 'reminders-map-help-modal-instance'; helpModal.className = 'help-modal'; helpModal.setAttribute('aria-label', 'Ayuda Mapa de Navegación/Radares');
+    helpModal.innerHTML = `
+            <h2 class="text-xl font-bold mb-4">Ayuda del Mapa de Navegaci&oacute;n y Ubicaciones</h2>
+            <p class="mb-2">Este mapa permite ver recordatorios con ubicaci&oacute;n y planificar/seguir rutas GPS.</p>
+            <h3 class="font-semibold text-lg mt-3 mb-1">Planificaci&oacute;n de Ruta:</h3>
+            <ul class="list-disc pl-5 space-y-1 text-sm">
+                <li><strong>A&ntilde;adir Puntos Manualmente:</strong> Pulsa en el mapa para a&ntilde;adir puntos de ruta.
+                    <ul>
+                        <li>El primer punto es la Salida (S - Verde).</li>
+                        <li>El &uacute;ltimo punto es el Fin (F - Azul).</li>
+                        <li>Puntos intermedios son Etapas (1, 2... - Naranja).</li>
+                    </ul>
+                </li>
+                <li><strong>A&ntilde;adir Puntos por B&uacute;squeda:</strong> Utiliza el campo de texto <img src="./IMG_4400.png" alt="Campo búsqueda" style="height:1.2em; display:inline; vertical-align:middle;">. Escribe una direcci&oacute;n y pulsa el bot&oacute;n <img src="./ANADIRPUNTO.PNG" alt="Añadir punto" style="height:1.2em; display:inline; vertical-align:middle;"> (visible si hay texto en el campo).</li>
+                <li><strong>Reordenar Etapas:</strong> Pulsa el bot&oacute;n <img src="./ORDENAR.PNG" alt="Ordenar etapas" style="height:1.2em; display:inline; vertical-align:middle;">. Se abrir&aacute; una ventana donde podr&aacute;s arrastrar y soltar las etapas para cambiar su orden. Pulsa "Aceptar" para aplicar los cambios.</li>
+                <li><strong>Eliminar Punto:</strong> Pulsa el aspa (X) roja en un marcador de etapa.</li>
+                <li><strong>Punto de Salida:</strong> Por defecto es tu ubicaci&oacute;n actual (si est&aacute; disponible al a&ntilde;adir el primer punto). Puedes arrastrarlo para cambiarlo.</li>
+                <li><strong>Rec&aacute;lculo:</strong> La ruta se recalcula autom&aacute;ticamente al a&ntilde;adir, mover, reordenar o eliminar puntos.</li>
+                <li><strong>Botones de Ruta:</strong>
+                    <ul>
+                        <li><strong>Iniciar/Terminar Navegaci&oacute;n <img src="./INICIARNAVEGACION.PNG" alt="Iniciar Navegación" style="height:1.2em; display:inline; vertical-align:middle;"> / <img src="./TERMINARNAVEGACION.PNG" alt="Terminar Navegación" style="height:1.2em; display:inline; vertical-align:middle;"> :</strong> Comienza/Finaliza el seguimiento de la ruta.</li>
+                        <li><strong>Guardar Ruta <img src="./GUARDARRUTA.PNG" alt="Guardar Ruta" style="height:1.2em; display:inline; vertical-align:middle;"> :</strong> Guarda la ruta actual en la cach&eacute; del navegador para usarla despu&eacute;s. Se te pedir&aacute; un nombre.</li>
+                        <li><strong>Cargar <img src="./CARGARRUTA.PNG" alt="Cargar Ruta" style="height:1.2em; display:inline; vertical-align:middle;"> / Borrar Ruta del Mapa <img src="./BORRARRUTA.PNG" alt="Borrar Ruta" style="height:1.2em; display:inline; vertical-align:middle;"> :</strong> Abre una lista de rutas guardadas para cargar una o borrarla. Al pulsar "Cargar", se borrará la ruta actual del mapa.</li>
+                    </ul>
+                </li>
+            </ul>
+            <h3 class="font-semibold text-lg mt-3 mb-1">Durante la Navegaci&oacute;n:</h3>
+             <ul class="list-disc pl-5 space-y-1 text-sm">
+                <li><strong>Barra de Progreso (superior izquierda):</strong> Muestra indicaciones de giro, progreso total, kilometraje, tiempo y ETA.</li>
+                <li><strong>Seguimiento:</strong> El mapa te sigue si "EST&Aacute;S AQU&Iacute;" <img src="ESTASAQUI.PNG" alt="Estás Aquí" style="height:1.2em; display:inline; vertical-align:middle;"> est&aacute; activado (bot&oacute;n cambia a "DEJAR DE SEGUIR" <img src="DEJARSEGUIR.PNG" alt="Dejar de Seguir" style="height:1.2em; display:inline; vertical-align:middle;">). Tu icono de coche (<img src="Coche.PNG" alt="Coche" style="width:1.2em; height:1.2em; display:inline; vertical-align:middle;">) se mueve en el mapa.</li>
+                <li><strong>Rec&aacute;lculo Autom&aacute;tico:</strong> Si te desv&iacute;as de la ruta, el sistema intentar&aacute; recalcular una nueva ruta.</li>
+                <li><strong>Radares Ruta (Checkbox <input type="checkbox" checked disabled style="transform: scale(0.8); vertical-align: middle;">):</strong> Si est&aacute; activado y hay una ruta cargada, busca y muestra en el mapa los radares que est&aacute;n en el trazado de la ruta.</li>
+                <li><strong>Recordatorios:</strong> El sistema de aviso de recordatorios y radares cercanos sigue activo.</li>
+            </ul>
+            <h3 class="font-semibold text-lg mt-3 mb-1">Controles Generales del Mapa:</h3>
+            <ul class="list-disc pl-5 space-y-1 text-sm">
+                 <li><strong>"AQU&Iacute; HAY RADAR" <img src="RADARAQUI.PNG" alt="Radar Aquí" style="height:1.2em; display:inline; vertical-align:middle;">:</strong> Crea un recordatorio tipo RADAR en tu ubicaci&oacute;n actual.</li>
+                 <li><strong>"A&Ntilde;ADIR RECORDATORIO AQU&Iacute;" (icono chincheta verde <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="green" stroke="white" stroke-width="1" style="vertical-align:middle; display:inline;"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path><circle cx="12" cy="10" r="3"></circle></svg>):</strong> Pulsa para activar el modo (botón rojo). Pulsa en el mapa para crear un recordatorio.</li>
+                 <li><strong>Orientaci&oacute;n y Altitud:</strong> Panel inferior izquierdo (Brújula <img src="ROSA.PNG" alt="Brújula" style="height:1.2em; display:inline; vertical-align:middle;">) muestra rumbo y altitud.</li>
+                <li><strong>Capas de Mapa:</strong> Control en la esquina superior derecha <img src="https://unpkg.com/leaflet@1.9.4/dist/images/layers.png" alt="Capas" style="height:1.2em; display:inline; vertical-align:middle; border: 1px solid grey;"> para cambiar entre Mapa Normal y Satélite.</li>
+                <li><strong>Zoom:</strong> Botones +/- en la esquina superior derecha.</li>
+                <li><strong>Ver Recordatorios:</strong> Los recordatorios con ubicaci&oacute;n se muestran como chinchetas. Pulsa para ver detalles y modificar.</li>
+            </ul>
+            <div class="flex justify-end mt-6"> <button type="button" id="close-reminders-map-help-instance">Entendido</button> </div>`;
+    document.body.appendChild(helpModal); const closeButtonHelp = helpModal.querySelector('#close-reminders-map-help-instance');
+    const closeHandlerHelp = () => { clearModalAutoCloseTimer(helpModal, closeButtonHelp, 'reminders-map-help-modal-instance'); if (helpModal.parentNode) helpModal.parentNode.removeChild(helpModal); };
+    closeButtonHelp.addEventListener('click', closeHandlerHelp); addModalAutoCloseTimer(helpModal, closeButtonHelp, 'reminders-map-help-modal-instance', 90000);
+}
+
+function addWaypoint(latlng, labelOverride = null, typeOverride = null) {
+    if (!navigationMapInstance || isNavigating) return;
+
+    const newWaypoint = {
+        id: Date.now(),
+        lat: latlng.lat,
+        lng: latlng.lng,
+        type: typeOverride || '',
+        marker: null,
+        label: labelOverride || '',
+        address: ''
+    };
+
+    if (navigationWaypoints.length === 0 && navigationCurrentLocation && !typeOverride ) {
+        const startPoint = {
+            id: Date.now() -1,
+            lat: navigationCurrentLocation.latitude,
+            lng: navigationCurrentLocation.longitude,
+            type: 'S',
+            marker: null,
+            label: 'S',
+            address: 'Posición Actual (GPS)'
+        };
+        navigationWaypoints.push(startPoint);
+    }
+
+    navigationWaypoints.push(newWaypoint);
+    updateWaypointTypesAndLabels();
+    renderWaypointMarkers();
+    recalculateAndDrawRoute().then(() => {
+        const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+        if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
+            toggleRadaresRuta(true);
+        }
+    });
+    updateStartNavigationButtonState();
+}
+
+async function searchAndAddWaypoint() {
+    const searchInput = document.getElementById('map-location-search-input');
+    const address = searchInput.value.trim();
+    if (!address) {
+        showToast("Por favor, introduce una dirección para buscar.", "warning");
+        return;
+    }
+
+    const searchButton = document.getElementById('map-location-search-button');
+    searchButton.disabled = true;
+    searchButton.innerHTML = `<img src="BUSCANDO.PNG" alt="Buscando...">`;
+
+
+    try {
+        const response = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(address)}&limit=1&accept-language=es`);
+        if (!response.ok) {
+            throw new Error(`Error de red: ${response.status}`);
+        }
+        const data = await response.json();
+        if (data && data.length > 0) {
+            const result = data[0];
+            const lat = parseFloat(result.lat);
+            const lng = parseFloat(result.lon);
+            if (!isNaN(lat) && !isNaN(lng)) {
+                const latlng = L.latLng(lat, lng);
+                addWaypoint(latlng, result.display_name.substring(0,30));
+                if(navigationMapInstance) navigationMapInstance.setView(latlng, 15);
+                searchInput.value = '';
+                searchInput.dispatchEvent(new Event('input'));
+                showToast("Ubicación añadida como etapa.", "success");
+            } else {
+                showToast("No se pudieron obtener coordenadas válidas para la dirección.", "error", 4000, true);
+            }
+        } else {
+            showToast("Dirección no encontrada.", "warning", 4000, true);
+        }
+    } catch (error) {
+        console.error("Error buscando dirección:", error);
+        showToast(`Error al buscar: ${error.message}`, "error", 4000, true);
+    } finally {
+        searchButton.disabled = false;
+        searchButton.innerHTML = `<img src="ANADIRPUNTO.PNG" alt="Añadir Punto Ruta">`;
+         if (searchInput.value.trim() === '') {
+            searchButton.style.display = 'none';
+            document.getElementById('clear-map-search-input-button').style.display = 'none';
+        }
+    }
+}
+
+function toggleMapLocationSearchVisibility(show) {
+    const reorderButton = document.getElementById('reorder-route-stages-button');
+    const searchInput = document.getElementById('map-location-search-input');
+    const searchButton = document.getElementById('map-location-search-button');
+    const clearSearchButton = document.getElementById('clear-map-search-input-button');
+
+    if (show) { 
+        if (searchInput) searchInput.style.display = 'flex';
+        if (searchButton) searchButton.style.display = searchInput && searchInput.value.trim() !== '' ? 'inline-flex' : 'none';
+        if (clearSearchButton) clearSearchButton.style.display = searchInput && searchInput.value.trim() !== '' ? 'inline-flex' : 'none';
+        if (reorderButton && navigationWaypoints.length >= 2) reorderButton.style.display = 'inline-flex'; else if (reorderButton) reorderButton.style.display = 'none';
+    } else { 
+        if (searchInput) searchInput.style.display = 'none';
+        if (searchButton) searchButton.style.display = 'none';
+        if (clearSearchButton) clearSearchButton.style.display = 'none';
+        if (reorderButton) reorderButton.style.display = 'none';
+    }
+}
+
+
+async function getAddressForWaypoint(lat, lng) {
+    if (typeof lat !== 'number' || typeof lng !== 'number' || isNaN(lat) || isNaN(lng)) {
+        console.warn(`getAddressForWaypoint recibió lat/lng inválidos: lat=${lat}, lng=${lng}. Stack:`, new Error().stack);
+        return "Ubicación Desconocida"; 
+    }
+
+    try {
+        const response = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&addressdetails=0&accept-language=es`);
+        if (response.ok) {
+            const data = await response.json();
+            return data.display_name || `(${lat.toFixed(3)}, ${lng.toFixed(3)})`;
+        } else {
+             console.warn(`Error de Nominatim API: ${response.status} para lat=${lat}, lng=${lng}`);
+            return `Etapa (${lat.toFixed(3)}, ${lng.toFixed(3)})`;
+        }
+    } catch (err) {
+        console.warn("Error en fetch o parseo JSON en getAddressForWaypoint:", err, `para lat=${lat}, lng=${lng}`);
+        return `Etapa (${lat.toFixed(3)}, ${lng.toFixed(3)})`;
+    }
+}
+
+function updateWaypointTypesAndLabels() {
+    if (navigationWaypoints.length === 0) return;
+
+    navigationWaypoints.forEach(async (wp, index) => {
+        if (!wp) return;
+        if (index === 0) {
+            wp.type = 'S';
+            wp.label = 'S';
+        } else if (index === navigationWaypoints.length - 1) {
+            wp.type = 'F';
+            wp.label = 'F';
+        } else {
+            wp.type = 'intermediate';
+            wp.label = String(index);
+        }
+        if (!wp.address) {
+            if (typeof wp.lat === 'number' && typeof wp.lng === 'number') {
+                wp.address = await getAddressForWaypoint(wp.lat, wp.lng);
+            } else {
+                wp.address = "Coordenadas no disponibles";
+            }
+        }
+    });
+
+    if (navigationWaypoints.length === 1 && navigationWaypoints[0]) {
+        navigationWaypoints[0].type = 'S';
+        navigationWaypoints[0].label = 'S';
+    }
+}
+
+
+function createWaypointMarkerIcon(label, type, currentZoomLevel = null) {
+    let className = 'navigation-waypoint-marker';
+
+    let baseIconSize = [55, 55]; 
+    let baseFontSize = 24;    
+    let baseDeleteButtonSize = [30, 30];
+    let baseDeleteButtonFontSize = 23;
+    let baseDeleteButtonOffset = [-14, -14];
+
+
+    let scale = 1;
+    if (currentZoomLevel !== null && navigationMapInstance) {
+        const minMapZoom = navigationMapInstance.getMinZoom() || 5;
+        const maxMapZoom = navigationMapInstance.getMaxZoom() || 18;
+        const zoomRange = maxMapZoom - minMapZoom;
+
+        if (zoomRange > 0) {
+            if (currentZoomLevel === maxMapZoom) {
+                scale = 1.5;
+            } else {
+                const normalizedZoom = (currentZoomLevel - minMapZoom) / zoomRange;
+                scale = 0.5 + (1.0 * normalizedZoom);
+                scale = Math.max(0.5, Math.min(1.0, scale));
+                 if (currentZoomLevel === maxMapZoom) scale = 1.5;
+            }
+        }
+    }
+
+
+    let iconSize = [Math.round(baseIconSize[0] * scale), Math.round(baseIconSize[1] * scale)];
+    let fontSize = Math.round((baseFontSize * scale) * 10) / 10;
+    let deleteButtonSize = [Math.round(baseDeleteButtonSize[0] * scale), Math.round(baseDeleteButtonSize[1] * scale)];
+    let deleteButtonFontSize = Math.round(baseDeleteButtonFontSize * scale);
+    let deleteButtonOffsetTop = Math.round(baseDeleteButtonOffset[0] * scale);
+    let deleteButtonOffsetRight = Math.round(baseDeleteButtonOffset[1] * scale);
+
+
+    if (type === 'S') {
+        className += ' start-point';
+    } else if (type === 'F') {
+        className += ' finish-point';
+    } else {
+        className += ' intermediate-point';
+    }
+
+    let iconAnchor = [iconSize[0] / 2, iconSize[1] / 2];
+
+
+    const iconHtml = `
+        <div class="${className}" style="width: ${iconSize[0]}px; height: ${iconSize[1]}px; font-size: ${fontSize}px; line-height: ${iconSize[1]}px;">
+            ${label}
+            <div class="waypoint-delete-button" title="Eliminar este punto" style="width: ${deleteButtonSize[0]}px; height: ${deleteButtonSize[1]}px; font-size: ${deleteButtonFontSize}px; line-height: ${deleteButtonSize[1]}px; top: ${deleteButtonOffsetTop}px; right: ${deleteButtonOffsetRight}px;">×</div>
+        </div>`;
+
+    return L.divIcon({
+        html: iconHtml,
+        className: '',
+        iconSize: iconSize,
+        iconAnchor: iconAnchor
+    });
+}
+
+async function getRouteForSingleLeg(lon1, lat1, lon2, lat2) {
+    const url = `${OSRM_SERVICE_URL}/driving/${lon1},${lat1};${lon2},${lat2}?overview=false&alternatives=false&steps=false`;
+    try {
+        const response = await fetch(url);
+        if (!response.ok) {
+            console.error(`Error en getRouteForSingleLeg: ${response.statusText}`);
+            return { distance: 0, duration: 0 }; 
+        }
+        const data = await response.json();
+        if (data.routes && data.routes.length > 0 && data.routes[0]) {
+            return {
+                distance: data.routes[0].distance || 0, 
+                duration: data.routes[0].duration || 0  
+            };
+        }
+        console.warn("getRouteForSingleLeg: No se encontraron rutas en la respuesta de OSRM.");
+        return { distance: 0, duration: 0 }; 
+    } catch (error) {
+        console.error("Error en getRouteForSingleLeg:", error);
+        return { distance: 0, duration: 0 }; 
+    }
+}
+
+        
+function renderWaypointMarkers() {
+    if (!navigationMapInstance) return;
+    const currentZoom = navigationMapInstance.getZoom();
+
+    navigationWaypoints.forEach(wp => {
+        if (wp && wp.marker) {
+            navigationMapInstance.removeLayer(wp.marker);
+            wp.marker = null;
+        }
+    });
+
+    navigationWaypoints.forEach(async (wp, index) => {
+        if (!wp) return;
+
+        const waypointIcon = createWaypointMarkerIcon(wp.label, wp.type, currentZoom);
+        wp.marker = L.marker([wp.lat, wp.lng], {
+            icon: waypointIcon,
+            draggable: !isNavigating, 
+            zIndexOffset: 1001
+        }).addTo(navigationMapInstance);
+
+        const markerElement = wp.marker.getElement();
+        if (markerElement) {
+            const deleteButton = markerElement.querySelector('.waypoint-delete-button');
+            if (deleteButton) {
+                deleteButton.style.width = '60px'; // Ancho del botón de borrado
+                deleteButton.style.height = '40px'; // Alto del botón de borrado
+                deleteButton.style.fontSize = '28px'; // Tamaño del aspa
+                deleteButton.style.color = 'red'; // Color del aspa
+                deleteButton.style.fontWeight = 'bold'; // Negrita para el aspa
+                deleteButton.style.lineHeight = '38px'; // Ajustar para centrar verticalmente el aspa
+
+                L.DomEvent.on(deleteButton, 'click', function(ev) {
+                    L.DomEvent.stopPropagation(ev);
+                    removeWaypoint(wp.id);
+                });
+            }
+        }
+
+        let popupContent = `<strong>Punto ${wp.label}</strong><br>Cargando datos...`;
+        const popup = L.popup({ maxWidth: 250, autoPanPadding: L.point(50, 50), closeButton: true }).setContent(popupContent);
+        wp.marker.bindPopup(popup);
+
+        wp.marker.on('click', async (e) => {
+            if (!navigationMapInstance) return;
+            const waypoint = navigationWaypoints.find(w => w && w.id === wp.id);
+            if (!waypoint) return;
+
+            let address = waypoint.address || "Calculando dirección...";
+            if (!waypoint.address) {
+                 if (typeof waypoint.lat === 'number' && typeof waypoint.lng === 'number') {
+                    waypoint.address = await getAddressForWaypoint(waypoint.lat, waypoint.lng);
+                 } else {
+                    waypoint.address = "Coordenadas no disponibles para dirección";
+                 }
+                 address = waypoint.address;
+            }
+
+            let distanceToWaypoint = 0; 
+            let timeToWaypoint = 0;   
+            let etaToWaypoint = "--:--";
+            const currentCarPosForPopup = navigationCurrentLocation;
+
+            if (currentCarPosForPopup && navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0]) {
+                const route = navigationCurrentRouteData.routes[0];
+                let cumulativeDistanceToThisWp = 0;
+                let cumulativeDurationToThisWp = 0;
+
+                if (index === 0) {
+                    if (isNavigating) {
+                        distanceToWaypoint = 0;
+                        timeToWaypoint = 0;
+                    } else {
+                         if (typeof waypoint.lat === 'number' && typeof waypoint.lng === 'number') {
+                            const tempRouteToS = await getRouteForSingleLeg(currentCarPosForPopup.longitude, currentCarPosForPopup.latitude, waypoint.lng, waypoint.lat);
+                            if (tempRouteToS) { 
+                                distanceToWaypoint = tempRouteToS.distance;
+                                timeToWaypoint = tempRouteToS.duration;
+                            }
+                        }
+                    }
+                } else {
+                    for (let i = 0; i < index && i < route.legs.length; i++) {
+                        if (route.legs[i]) {
+                           cumulativeDistanceToThisWp += (route.legs[i].distance || 0); 
+                           cumulativeDurationToThisWp += (route.legs[i].duration || 0); 
+                        }
+                    }
+                    distanceToWaypoint = cumulativeDistanceToThisWp;
+                    timeToWaypoint = cumulativeDurationToThisWp;
+
+                    if (isNavigating && navigationMapInstance && typeof L.GeometryUtil !== 'undefined' && L.GeometryUtil) {
+                        let distanceCoveredOnRoute = 0;
+                        const currentCarLoc = L.latLng(currentCarPosForPopup.latitude, currentCarPosForPopup.longitude);
+                        if (navigationRouteLayer) {
+                             const snapped = L.GeometryUtil.closest(navigationMapInstance, navigationRouteLayer, currentCarLoc);
+                             if(snapped && typeof snapped.lat === 'number') { 
+                                 const snappedLatLng = L.latLng(snapped.lat, snapped.lng);
+                                 const locatedInfo = L.GeometryUtil.locateOnLine(navigationMapInstance, navigationRouteLayer, snappedLatLng);
+                                 if(locatedInfo && typeof locatedInfo.distance === 'number'){
+                                     distanceCoveredOnRoute = locatedInfo.distance;
+                                 }
+                             }
+                        }
+                        distanceToWaypoint = Math.max(0, cumulativeDistanceToThisWp - distanceCoveredOnRoute);
+                        if (route.distance && route.distance > 0) { 
+                            timeToWaypoint = route.duration * (distanceToWaypoint / route.distance);
+                        } else {
+                            timeToWaypoint = 0; 
+                        }
+                    }
+                }
+                 if (typeof timeToWaypoint === 'number' && !isNaN(timeToWaypoint)) {
+                    etaToWaypoint = new Date(Date.now() + timeToWaypoint * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                }
+
+
+            } else if (currentCarPosForPopup) {
+                 if (typeof waypoint.lat === 'number' && typeof waypoint.lng === 'number') {
+                    const tempRoute = await getRouteForSingleLeg(currentCarPosForPopup.longitude, currentCarPosForPopup.latitude, waypoint.lng, waypoint.lat);
+                    if (tempRoute) { 
+                        distanceToWaypoint = tempRoute.distance;
+                        timeToWaypoint = tempRoute.duration;
+                        if (typeof timeToWaypoint === 'number' && !isNaN(timeToWaypoint)) {
+                           etaToWaypoint = new Date(Date.now() + timeToWaypoint * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                        }
+                    }
+                }
+            }
+
+            let distanciaTexto = "-- km";
+            if (typeof distanceToWaypoint === 'number' && !isNaN(distanceToWaypoint)) { 
+                distanciaTexto = `${(distanceToWaypoint / 1000).toFixed(1)} km`;
+            }
+
+            let tiempoTexto = "--:--";
+            if (typeof timeToWaypoint === 'number' && !isNaN(timeToWaypoint)) {
+                const waypointTotalMinutes = Math.round(timeToWaypoint / 60);
+                const waypointHours = Math.floor(waypointTotalMinutes / 60);
+                const waypointMinutes = waypointTotalMinutes % 60;
+                tiempoTexto = `${String(waypointHours).padStart(2, '0')}:${String(waypointMinutes).padStart(2, '0')}`;
+            }
+            
+            const finalPopupContent = `
+                <div style="font-family: sans-serif; font-size: 0.9rem; max-width: 230px;">
+                    <strong style="font-size: 1rem; color: #333; display: block; margin-bottom: 3px;">Punto ${waypoint.label}: ${address || 'Dirección no disponible'}</strong>
+                    <hr style="margin: 3px 0;">
+                    <p style="margin: 2px 0;"><strong>Distancia:</strong> ${distanciaTexto}</p>
+                    <p style="margin: 2px 0;"><strong>Tiempo:</strong> ${tiempoTexto}</p> 
+                    <p style="margin: 2px 0;"><strong>Llegada (ETA):</strong> ${etaToWaypoint || '--:--'}</p>
+                    <button data-waypoint-id="${waypoint.id}" class="delete-waypoint-from-popup" style="margin-top: 8px; padding: 4px 8px; font-size: 0.8rem; background-color: #EF4444; color: white; border: none; border-radius: 3px; cursor: pointer;">BORRAR ETAPA</button>
+                </div>`;
+            popup.setContent(finalPopupContent).update();
+
+            const deleteButtonPopup = popup.getElement().querySelector('.delete-waypoint-from-popup');
+            if (deleteButtonPopup) {
+                L.DomEvent.on(deleteButtonPopup, 'click', function(ev) {
+                    L.DomEvent.stopPropagation(ev);
+                    const wpIdToDelete = parseInt(this.dataset.waypointId);
+                    if (!isNaN(wpIdToDelete)) {
+                         if(popup.isOpen()) popup.remove();
+                         removeWaypoint(wpIdToDelete);
+                    }
+                });
+            }
+        });
+
+
+        wp.marker.on('dragstart', function() {
+            if (isNavigating) return;
+            if(this.isPopupOpen()) this.closePopup();
+        });
+
+        wp.marker.on('dragend', function(event) {
+            if (isNavigating) return;
+            const newLatLng = event.target.getLatLng();
+            wp.lat = newLatLng.lat;
+            wp.lng = newLatLng.lng;
+            wp.address = '';
+            recalculateAndDrawRoute().then(() => {
+                const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+                if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
+                    toggleRadaresRuta(true);
+                }
+            });
+        });
+    });
+}
+
+            
+            
+            
+
+function removeWaypoint(waypointId) {
+    if (isNavigating) return;
+    const indexToRemove = navigationWaypoints.findIndex(wp => wp && wp.id === waypointId);
+    if (indexToRemove !== -1) {
+        const removedWp = navigationWaypoints.splice(indexToRemove, 1)[0];
+        if (removedWp && removedWp.marker && navigationMapInstance) {
+            navigationMapInstance.removeLayer(removedWp.marker);
+        }
+        updateWaypointTypesAndLabels();
+        renderWaypointMarkers();
+        if (navigationWaypoints.length < 2) {
+            if (navigationRouteLayer && navigationMapInstance) {
+                navigationMapInstance.removeLayer(navigationRouteLayer);
+                navigationRouteLayer = null;
+            }
+             if (completedRouteSegmentsLayer && navigationMapInstance) completedRouteSegmentsLayer.clearLayers();
+            navigationCurrentRouteData = null;
+            hideNavigationUI();
+            const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+            if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
+                eliminarRadaresDeRuta();
+                radaresRutaCheckbox.checked = false;
+            }
+        } else {
+            recalculateAndDrawRoute().then(() => {
+                const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+                if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
+                    toggleRadaresRuta(true);
+                }
+            });
+        }
+    }
+    updateStartNavigationButtonState();
+}
+
+async function recalculateAndDrawRoute() {
+    let carDistanceAlongRoute = 0; 
+    if (navigationWaypoints.length < 2) {
+        if (navigationRouteLayer && navigationMapInstance) {
+            navigationMapInstance.removeLayer(navigationRouteLayer);
+            navigationRouteLayer = null;
+        }
+        if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
+        navigationCurrentRouteData = null; 
+        hideNavigationUIElementsForPlanning();
+        const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+        if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
+            eliminarRadaresDeRuta();
+            radaresRutaCheckbox.checked = false;
+        }
+        updateStartNavigationButtonState(); 
+        return;
+    }
+
+    const coordsString = navigationWaypoints.map(wp => {
+        if (typeof wp.lng !== 'number' || typeof wp.lat !== 'number' || isNaN(wp.lng) || isNaN(wp.lat) ) {
+            console.error("Waypoint con coordenadas inválidas para OSRM:", wp);
+            return null; 
+        }
+        return `${wp.lng},${wp.lat}`;
+    }).filter(Boolean).join(';'); 
+
+    if (!coordsString || navigationWaypoints.filter(wp => wp && typeof wp.lng === 'number' && typeof wp.lat === 'number').length < 2) {
+        showToast("No hay suficientes waypoints válidos para calcular la ruta.", "warning");
+        if (navigationRouteLayer && navigationMapInstance) {
+            navigationMapInstance.removeLayer(navigationRouteLayer);
+            navigationRouteLayer = null;
+        }
+        if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
+        navigationCurrentRouteData = null; 
+        hideNavigationUIElementsForPlanning();
+        updateStartNavigationButtonState(); 
+        return;
+    }
+
+    const url = `${OSRM_SERVICE_URL}/driving/${coordsString}?overview=full&geometries=geojson&steps=true&alternatives=false&annotations=true`;
+    console.log("OSRM URL:", url); 
+
+    try {
+        const response = await fetch(url);
+        if (!response.ok) {
+            navigationCurrentRouteData = null; 
+            let errorData = { message: `HTTP error ${response.status}` };
+            try {
+                errorData = await response.json(); 
+            } catch (e) {
+                errorData.message = response.statusText || errorData.message;
+            }
+            throw new Error(`OSRM Error: ${errorData.code || errorData.message || response.statusText}`);
+        }
+        const data = await response.json();
+
+        if (data.routes && data.routes.length > 0) {
+            navigationCurrentRouteData = data; 
+            console.log("recalculateAndDrawRoute - navigationCurrentRouteData SET:", JSON.parse(JSON.stringify(navigationCurrentRouteData)));
+             if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
+            drawRouteOnMap(data.routes[0]); 
+            console.log("recalculateAndDrawRoute - navigationRouteLayer:", navigationRouteLayer ? "Exists" : "NULL");
+
+            if (data.routes[0]) {
+                 const currentCarPosForRecalc = navigationCurrentLocation; 
+                 if (currentCarPosForRecalc && navigationMapInstance && navigationRouteLayer && typeof L.GeometryUtil !== 'undefined' && L.GeometryUtil && navigationRouteLayer.getLatLngs().length > 0) {
+                    const currentLatLng = L.latLng(currentCarPosForRecalc.latitude, currentCarPosForRecalc.longitude);
+                    const carSnappedToRoute = L.GeometryUtil.closest(navigationMapInstance, navigationRouteLayer, currentLatLng);
+                    if (carSnappedToRoute && typeof carSnappedToRoute.lat === 'number') { 
+                        const snappedLatLng = L.latLng(carSnappedToRoute.lat, carSnappedToRoute.lng);
+                        const locatedInfo = L.GeometryUtil.locateOnLine(navigationMapInstance, navigationRouteLayer, snappedLatLng);
+                        if(locatedInfo && typeof locatedInfo.distance === 'number'){
+                           carDistanceAlongRoute = locatedInfo.distance;
+                        }
+                    }
+                 }
+                 updateNavigationProgressDisplay(data.routes[0], carDistanceAlongRoute);
+                 updateTurnByTurnDisplay(data.routes[0], carDistanceAlongRoute);
+            }
+            showNavigationUIElementsForPlanning();
+        } else {
+            navigationCurrentRouteData = null; 
+            throw new Error("No se encontraron rutas.");
+        }
+    } catch (error) {
+        console.error("Error fetching route from OSRM:", error); 
+        showToast(`Error al calcular ruta: ${error.message || 'Error desconocido de OSRM'}`, "error");
+        if (navigationRouteLayer && navigationMapInstance) {
+            navigationMapInstance.removeLayer(navigationRouteLayer);
+            navigationRouteLayer = null;
+        }
+        if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
+        navigationCurrentRouteData = null; 
+        hideNavigationUIElementsForPlanning();
+        const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+        if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
+            eliminarRadaresDeRuta();
+            radaresRutaCheckbox.checked = false;
+        }
+    }
+    updateStartNavigationButtonState(); 
+}
+
+function drawRouteOnMap(route) {
+    if (!navigationMapInstance) return;
+    if (navigationRouteLayer) {
+        navigationMapInstance.removeLayer(navigationRouteLayer);
+    }
+    if (!route || !route.geometry || !route.geometry.coordinates) {
+        console.warn("drawRouteOnMap: No se proporcionó geometría de ruta válida.");
+        return;
+    }
+
+    const routeCoords = route.geometry.coordinates.map(coord => [coord[1], coord[0]]);
+
+    navigationRouteLayer = L.polyline(routeCoords, {
+        color: 'blue',
+        weight: 5,
+        opacity: 0.7
+    }).addTo(navigationMapInstance);
+
+    if (navigationMapInstance.attributionControl) {
+         navigationMapInstance.attributionControl.addAttribution('Rutas © <a href="http://project-osrm.org/">OSRM</a>');
+    }
+}
+
+async function toggleNavigationState() {
+    const startNavButton = document.getElementById('start-navigation-button');
+    const mapContainer = document.getElementById('reminders-location-map-div');
+    const startNavImg = startNavButton ? startNavButton.querySelector('img') : null;
+
+
+    if (isNavigating) {
+        isNavigating = false; 
+        navigationFollowUser = false;
+        if(startNavImg) startNavImg.src = "INICIARNAVEGACION.PNG";
+        if(startNavButton) startNavButton.classList.remove('navigating');
+        if (mapContainer) mapContainer.classList.remove('navigating');
+        setNavigationMapClickHandler();
+
+        document.getElementById('navigation-bottom-progress-bar').style.display = navigationCurrentRouteData ? 'flex' : 'none';
+        document.getElementById('navigation-top-info-bar').style.display = navigationCurrentRouteData ? 'block' : 'none';
+        if(navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0]) {
+            let carDistAlongRouteFinal = 0;
+            const currentCarPosForToggle = navigationCurrentLocation;
+            if (currentCarPosForToggle && navigationMapInstance && navigationRouteLayer && typeof L.GeometryUtil !== 'undefined' && L.GeometryUtil && navigationRouteLayer.getLatLngs().length > 0) {
+                const currentLatLng = L.latLng(currentCarPosForToggle.latitude, currentCarPosForToggle.longitude);
+                const carSnappedToRoute = L.GeometryUtil.closest(navigationMapInstance, navigationRouteLayer, currentLatLng);
+                if (carSnappedToRoute && typeof carSnappedToRoute.lat === 'number') {
+                    const snappedLatLng = L.latLng(carSnappedToRoute.lat, carSnappedToRoute.lng);
+                    const locatedInfo = L.GeometryUtil.locateOnLine(navigationMapInstance, navigationRouteLayer, snappedLatLng);
+                    if(locatedInfo && typeof locatedInfo.distance === 'number'){
+                        carDistAlongRouteFinal = locatedInfo.distance;
+                    }
+                }
+            }
+            updateTurnByTurnDisplay(navigationCurrentRouteData.routes[0], carDistAlongRouteFinal);
+        }
+
+        navigationWaypoints.forEach(wp => { if (wp && wp.marker && wp.marker.dragging) wp.marker.dragging.enable(); });
+        showToast("Navegación finalizada.", "info", 5000);
+    } else { 
+        if (navigationWaypoints.length < 2) { 
+            showToast("No hay ruta calculada para iniciar la navegación (se necesitan al menos 2 puntos).", "warning");
+            return;
+        }
+            
+        isNavigating = true; 
+        console.log("NAVEGACIÓN INICIADA, isNavigating:", isNavigating);
+
+        if (navigationWaypoints.length > 0 && navigationCurrentLocation) {
+            const startPoint = navigationWaypoints[0];
+            if (startPoint) {
+                const distanceToStart = calculateDistance(
+                    navigationCurrentLocation.latitude, navigationCurrentLocation.longitude,
+                    startPoint.lat, startPoint.lng
+                );
+
+                if (distanceToStart > 500 ) {
+                    if(confirm("Estás a más de 500m del punto de salida. ¿Usar tu posición actual como nuevo inicio y recalcular ruta?")) {
+                        const carAsStartPoint = {
+                            id: Date.now() -1,
+                            lat: navigationCurrentLocation.latitude,
+                            lng: navigationCurrentLocation.longitude,
+                            type: 'S', marker: null, label: 'S',
+                            address: 'Posición Actual (GPS)'
+                        };
+                        navigationWaypoints[0].type = 'intermediate';
+                        navigationWaypoints.unshift(carAsStartPoint);
+                        updateWaypointTypesAndLabels();
+                        renderWaypointMarkers();
+                        if (completedRouteSegmentsLayer) completedRouteSegmentsLayer.clearLayers();
+                        lastCarDistanceAlongRouteForNavLogic = 0;
+                        currentLegIndexNav = 0;
+                        currentStepIndexNav = 0;
+                        lastProcessedStepManeuverLocation = null;
+                        await recalculateAndDrawRoute();
+                        if (!navigationCurrentRouteData) {
+                            showToast("No se pudo recalcular la ruta desde la nueva posición. Intenta de nuevo.", "error");
+                            navigationWaypoints.shift();
+                            navigationWaypoints[0].type = 'S';
+                            updateWaypointTypesAndLabels();
+                            renderWaypointMarkers();
+                            await recalculateAndDrawRoute(); // Intenta recalcular con el punto de inicio original
+                            isNavigating = false; 
+                            if(startNavImg) startNavImg.src = "INICIARNAVEGACION.PNG";
+                            if(startNavButton) startNavButton.classList.remove('navigating');
+                            if (mapContainer) mapContainer.classList.remove('navigating');
+                            toggleMapLocationSearchVisibility(!isNavigating);
+                            updateStartNavigationButtonState();
+                            return;
+                        }
+                        showToast("Ruta recalculada desde tu posición actual.", "success");
+                    } else {
+                        showToast("Navegación iniciada desde el punto de salida original.", "info");
+                    }
+                }
+            }
+        }
+        
+        if (!isNavigating) return; 
+
+        if (navigationWaypoints.length >= 2) { // Asegurarse que aún hay suficientes puntos
+            try {
+                await recalculateAndDrawRoute(); 
+                if (!navigationCurrentRouteData || !navigationCurrentRouteData.routes || navigationCurrentRouteData.routes.length === 0) { 
+                    throw new Error("No se pudieron obtener los datos de la ruta después del recalculo inicial para navegación.");
+                }
+            } catch (error) {
+                showToast(`Error al preparar ruta para navegación: ${error.message}`, "error");
+                isNavigating = false; 
+                if(startNavImg) startNavImg.src = "INICIARNAVEGACION.PNG";
+                if(startNavButton) startNavButton.classList.remove('navigating');
+                if (mapContainer) mapContainer.classList.remove('navigating');
+                toggleMapLocationSearchVisibility(!isNavigating);
+                updateStartNavigationButtonState();
+                return; 
+            }
+        } else { 
+            showToast("No hay suficientes puntos para iniciar navegación después de ajustes.", "warning");
+            isNavigating = false; 
+            if(startNavImg) startNavImg.src = "INICIARNAVEGACION.PNG";
+            if(startNavButton) startNavButton.classList.remove('navigating');
+            if (mapContainer) mapContainer.classList.remove('navigating');
+            toggleMapLocationSearchVisibility(!isNavigating);
+            updateStartNavigationButtonState();
+            return;
+        }
+        
+        navigationFollowUser = shouldCenterOnUser;
+        if (completedRouteSegmentsLayer && navigationMapInstance) completedRouteSegmentsLayer.clearLayers();
+        lastProcessedStepManeuverLocation = null;
+        currentLegIndexNav = 0;
+        currentStepIndexNav = 0;
+        lastCarDistanceAlongRouteForNavLogic = 0;
+
+        if(startNavImg) startNavImg.src = "TERMINARNAVEGACION.PNG"; 
+        if(startNavButton) startNavButton.classList.add('navigating');
+        if (mapContainer) mapContainer.classList.add('navigating');
+        if (navigationMapClickHandler && navigationMapInstance) navigationMapInstance.off('click', navigationMapClickHandler);
+
+        document.getElementById('navigation-bottom-progress-bar').style.display = 'flex';
+        document.getElementById('navigation-top-info-bar').style.display = 'block';
+
+        if (navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0]) {
+            let carDistAlongRouteInit = 0;
+             const currentCarPosForNavStart = navigationCurrentLocation;
+            if (currentCarPosForNavStart && navigationMapInstance && navigationRouteLayer && typeof L.GeometryUtil !== 'undefined' && L.GeometryUtil && navigationRouteLayer.getLatLngs().length > 0) {
+                const currentLatLng = L.latLng(currentCarPosForNavStart.latitude, currentCarPosForNavStart.longitude);
+                const carSnappedToRoute = L.GeometryUtil.closest(navigationMapInstance, navigationRouteLayer, currentLatLng);
+                if (carSnappedToRoute && typeof carSnappedToRoute.lat === 'number') {
+                     const snappedLatLng = L.latLng(carSnappedToRoute.lat, carSnappedToRoute.lng);
+                     const locatedInfo = L.GeometryUtil.locateOnLine(navigationMapInstance, navigationRouteLayer, snappedLatLng);
+                     if(locatedInfo && typeof locatedInfo.distance === 'number'){
+                        carDistAlongRouteInit = locatedInfo.distance;
+                     }
+                }
+            }
+            updateNavigationProgressDisplay(navigationCurrentRouteData.routes[0], carDistAlongRouteInit);
+            updateTurnByTurnDisplay(navigationCurrentRouteData.routes[0], carDistAlongRouteInit);
+        }
+
+
+        navigationWaypoints.forEach(wp => { if (wp && wp.marker && wp.marker.dragging) wp.marker.dragging.disable(); });
+
+        showToast("Navegación iniciada.", "info", 5000);
+        if (navigationFollowUser && navigationCurrentLocation && navigationMapInstance ) {
+            navigationMapInstance.setView([navigationCurrentLocation.latitude, navigationCurrentLocation.longitude], 17);
+        }
+    }
+    toggleMapLocationSearchVisibility(!isNavigating);
+    updateStartNavigationButtonState();
+}
+
+function updateStartNavigationButtonState() {
+    const startNavButton = document.getElementById('start-navigation-button');
+    const saveRouteButton = document.getElementById('save-route-button');
+    const reorderBtn = document.getElementById('reorder-route-stages-button');
+    const startNavImg = startNavButton ? startNavButton.querySelector('img') : null;
+    const simulateBtn = document.getElementById('simulate-route-button');
+
+    if (!startNavButton || !saveRouteButton || !reorderBtn || !simulateBtn) return;
+
+    const hasEnoughWaypoints = navigationWaypoints.length >= 2;
+    const hasValidRouteData = navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes.length > 0;
+
+
+    if (hasEnoughWaypoints || isNavigating) {
+        startNavButton.classList.remove('hidden');
+    } else {
+        startNavButton.classList.add('hidden');
+    }
+
+    if (hasEnoughWaypoints && !isNavigating) {
+        saveRouteButton.classList.remove('hidden');
+        reorderBtn.style.display = 'inline-flex'; 
+    } else {
+        saveRouteButton.classList.add('hidden');
+        reorderBtn.style.display = 'none';
+    }
+    
+    simulateBtn.style.display = (isNavigating && hasValidRouteData) ? 'inline-flex' : 'none';
+
+
+    if (isNavigating) {
+         reorderBtn.style.display = 'none';
+         if(startNavImg) startNavImg.src = "TERMINARNAVEGACION.PNG";
+    } else if (navigationWaypoints.length >=2) {
+        startNavButton.classList.remove('hidden');
+        if(startNavImg) startNavImg.src = "INICIARNAVEGACION.PNG";
+    } else {
+        startNavButton.classList.add('hidden');
+        if (navigationRouteLayer && navigationMapInstance) navigationRouteLayer.remove();
+        if (completedRouteSegmentsLayer && navigationMapInstance) completedRouteSegmentsLayer.clearLayers();
+        navigationWaypoints.forEach(wp => { if(wp && wp.marker && navigationMapInstance) wp.marker.remove();});
+        navigationWaypoints = [];
+        navigationCurrentRouteData = null;
+        hideNavigationUI();
+    }
+}
+
+function hideNavigationUI() {
+    document.getElementById('navigation-top-info-bar').style.display = 'none';
+    document.getElementById('navigation-bottom-progress-bar').style.display = 'none';
+    const startNavButton = document.getElementById('start-navigation-button');
+    if(startNavButton) startNavButton.classList.add('hidden');
+    const saveRouteButton = document.getElementById('save-route-button');
+    if(saveRouteButton) saveRouteButton.classList.add('hidden');
+    const reorderBtn = document.getElementById('reorder-route-stages-button');
+    if(reorderBtn) reorderBtn.style.display = 'none';
+    const simulateBtn = document.getElementById('simulate-route-button');
+    if(simulateBtn) simulateBtn.style.display = 'none';
+}
+function hideNavigationUIElementsForPlanning() {
+    if (!navigationCurrentRouteData || !navigationCurrentRouteData.routes || navigationCurrentRouteData.routes.length === 0 || navigationWaypoints.length < 2) {
+        document.getElementById('navigation-bottom-progress-bar').style.display = 'none';
+        document.getElementById('navigation-top-info-bar').style.display = 'none';
+    }
+}
+function showNavigationUIElementsForPlanning() {
+    if (navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0] && navigationWaypoints.length >=2 ) {
+        document.getElementById('navigation-bottom-progress-bar').style.display = 'flex';
+        document.getElementById('navigation-top-info-bar').style.display = 'block';
+        let carDistAlongRoutePlan = 0;
+        const currentCarPosForShowUI = navigationCurrentLocation;
+        if (currentCarPosForShowUI && navigationMapInstance && navigationRouteLayer && typeof L.GeometryUtil !== 'undefined' && L.GeometryUtil && navigationRouteLayer.getLatLngs().length > 0) {
+            const currentLatLng = L.latLng(currentCarPosForShowUI.latitude, currentCarPosForShowUI.longitude);
+            const carSnappedToRoute = L.GeometryUtil.closest(navigationMapInstance, navigationRouteLayer, currentLatLng);
+            if (carSnappedToRoute && typeof carSnappedToRoute.lat === 'number') {
+                const snappedLatLng = L.latLng(carSnappedToRoute.lat, carSnappedToRoute.lng);
+                const locatedInfo = L.GeometryUtil.locateOnLine(navigationMapInstance, navigationRouteLayer, snappedLatLng);
+                if(locatedInfo && typeof locatedInfo.distance === 'number'){
+                    carDistAlongRoutePlan = locatedInfo.distance;
+                }
+            }
+         }
+        updateTurnByTurnDisplay(navigationCurrentRouteData.routes[0], carDistAlongRoutePlan);
+    }
+}
+
+
+function updateNavigationProgressDisplay(route, carDistanceAlongTheRoute = 0) {
+    const progressBarContainer = document.getElementById('navigation-bottom-progress-bar');
+    if (!route || typeof route.distance !== 'number' || typeof route.duration !== 'number' || !progressBarContainer || (progressBarContainer.style.display === 'none' && !isNavigating)) {
+        if (progressBarContainer && (!navigationCurrentRouteData || !navigationCurrentRouteData.routes || navigationCurrentRouteData.routes.length === 0 || navigationWaypoints.length < 2)) {
+            progressBarContainer.style.display = 'none';
+        }
+        return;
+    }
+
+
+    const overallProgressFill = document.getElementById('route-overall-progress');
+    const overallProgressContainer = document.getElementById('route-overall-progress-container');
+
+    const nextStageDistEl = document.getElementById('next-stage-distance');
+    const nextStageTimeEl = document.getElementById('next-stage-time');
+    const nextStageEtaEl = document.getElementById('next-stage-eta');
+    const finalDestDistEl = document.getElementById('final-destination-distance');
+    const finalDestTimeEl = document.getElementById('final-destination-time');
+    const finalDestEtaEl = document.getElementById('final-destination-eta');
+
+    const totalDistance = route.distance;
+    const totalDuration = route.duration;
+    const distanceCovered = Math.min(Math.max(0, carDistanceAlongTheRoute), totalDistance);
+
+    const progressPercent = totalDistance > 0 ? (distanceCovered / totalDistance) * 100 : 0;
+    overallProgressFill.style.width = `${progressPercent}%`;
+
+    const remainingDistance = totalDistance - distanceCovered;
+    const remainingDuration = totalDistance > 0 ? totalDuration * (remainingDistance / totalDistance) : 0;
+
+    finalDestDistEl.textContent = `${(remainingDistance / 1000).toFixed(1)} km`;
+   const finalDestTotalMinutes = Math.round(remainingDuration / 60);
+const finalDestHours = Math.floor(finalDestTotalMinutes / 60);
+const finalDestMinutes = finalDestTotalMinutes % 60;
+finalDestTimeEl.textContent = `${String(finalDestHours).padStart(2, '0')}:${String(finalDestMinutes).padStart(2, '0')}`; 
+    finalDestEtaEl.textContent = new Date(Date.now() + remainingDuration * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+    let currentLegIndexForNextStageDisplay = 0;
+    let cumulativeDistanceForLegsDisplay = 0;
+    if (route.legs) {
+        for (let i = 0; i < route.legs.length; i++) {
+            const legDistance = route.legs[i].distance || 0;
+            if (distanceCovered < cumulativeDistanceForLegsDisplay + legDistance || i === route.legs.length -1 ) {
+                currentLegIndexForNextStageDisplay = i;
+                break;
+            }
+            cumulativeDistanceForLegsDisplay += legDistance;
+        }
+    }
+
+
+    if (route.legs && currentLegIndexForNextStageDisplay < route.legs.length && (route.legs[currentLegIndexForNextStageDisplay].distance > 0 || currentLegIndexForNextStageDisplay === route.legs.length -1) ) {
+        const distanceIntoCurrentLegDisplay = Math.max(0, distanceCovered - cumulativeDistanceForLegsDisplay);
+        const legForDisplay = route.legs[currentLegIndexForNextStageDisplay];
+        const remainingDistanceThisLegDisplay = Math.max(0, legForDisplay.distance - distanceIntoCurrentLegDisplay);
+        const remainingDurationThisLegDisplay = (legForDisplay.distance > 0) ? legForDisplay.duration * (remainingDistanceThisLegDisplay / legForDisplay.distance) : 0;
+
+
+        nextStageDistEl.textContent = `${(remainingDistanceThisLegDisplay / 1000).toFixed(1)} km`;
+      const nextStageTotalMinutes = Math.round(remainingDurationThisLegDisplay / 60);
+const nextStageHours = Math.floor(nextStageTotalMinutes / 60);
+const nextStageMinutes = nextStageTotalMinutes % 60;
+nextStageTimeEl.textContent = `${String(nextStageHours).padStart(2, '0')}:${String(nextStageMinutes).padStart(2, '0')}`;  
+        nextStageEtaEl.textContent = new Date(Date.now() + remainingDurationThisLegDisplay * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    } else {
+        nextStageDistEl.textContent = `0.0 km`;
+        nextStageTimeEl.textContent = `0 min`;
+        nextStageEtaEl.textContent = finalDestEtaEl.textContent;
+    }
+
+    overallProgressContainer.querySelectorAll('.waypoint-dot-on-progress-bar').forEach(dot => dot.remove());
+
+    if (navigationWaypoints.length > 2 && totalDistance > 0 && route.legs) {
+        let accumulatedDistance = 0;
+        for (let i = 1; i < navigationWaypoints.length - 1; i++) {
+            if (i <= route.legs.length && route.legs[i-1]) {
+                accumulatedDistance += route.legs[i-1].distance;
+                const percent = (accumulatedDistance / totalDistance) * 100;
+                if (percent < 100) {
+                    const dot = document.createElement('div');
+                    dot.className = 'waypoint-dot-on-progress-bar';
+                    dot.style.left = `calc(${percent}% - 4px)`;
+                    dot.title = `Etapa ${navigationWaypoints[i] ? navigationWaypoints[i].label : 'Desconocida'}`;
+                    overallProgressContainer.appendChild(dot);
+                }
+            }
+        }
+    }
+}
+
+function calculateDistanceToEndOfStep(route, targetLegIndex, targetStepIndex) {
+    let totalDistance = 0;
+    for (let legIdx = 0; legIdx <= targetLegIndex; legIdx++) {
+        const leg = route.legs[legIdx];
+        if (!leg || !leg.steps) continue;
+        const limitStepIndex = (legIdx === targetLegIndex) ? targetStepIndex : leg.steps.length - 1;
+        for (let stepIdx = 0; stepIdx <= limitStepIndex; stepIdx++) {
+            const step = leg.steps[stepIdx];
+            if (step && typeof step.distance === 'number') {
+                totalDistance += step.distance;
+            }
+        }
+    }
+    return totalDistance;
+}
+
+
+function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
+    const topInfoBar = document.getElementById('navigation-top-info-bar');
+    if (!route || !topInfoBar ) {
+        if(topInfoBar) topInfoBar.style.display = 'none';
+        return;
+    }
+    if (!route.legs || route.legs.length === 0) {
+        if(topInfoBar) topInfoBar.style.display = 'none';
+        console.warn("updateTurnByTurnDisplay: No legs in route data.");
+        return;
+    }
+
+    if (!isNavigating && (!navigationCurrentRouteData || !navigationCurrentRouteData.routes || navigationCurrentRouteData.routes.length === 0 || navigationWaypoints.length < 2)) {
+         if(topInfoBar) topInfoBar.style.display = 'none';
+         return;
+    }
+    topInfoBar.style.display = 'block';
+
+
+    const turnIconEl = document.getElementById('turn-icon-display');
+    const distanceEl = document.getElementById('distance-to-turn-display');
+    const streetEl = document.getElementById('street-name-display');
+    const progressBarEl = document.getElementById('distance-progress-bar-to-turn');
+
+    let currentStep = null;
+    let distanceToStepManeuver = Infinity;
+    let previousStepForPath = null;
+
+
+    if (route.legs && route.legs.length > 0 && (navigationCurrentLocation || !isNavigating) ) {
+        const carDistanceAlongRoute = Math.min(Math.max(0, carDistanceAlongTheRoute), route.distance);
+
+        if (carDistanceAlongRoute < lastCarDistanceAlongRouteForNavLogic && isNavigating ) {
+            // Podríamos necesitar una lógica más sofisticada aquí si el usuario retrocede mucho.
+            // Por ahora, mantenemos el progreso actual si la distancia disminuye ligeramente.
+            // Si la disminución es significativa (p.ej., más que la longitud del paso actual), podríamos recalcular o resetear.
+             if ( (lastCarDistanceAlongRouteForNavLogic - carDistanceAlongRoute) > (route.legs[currentLegIndexNav]?.steps[currentStepIndexNav]?.distance || 50) ) {
+                // console.warn("Posible retroceso significativo detectado o error de cálculo de distancia. Revisar lógica.");
+                // Considerar no resetear inmediatamente para evitar saltos si es una fluctuación.
+             }
+        }
+        lastCarDistanceAlongRouteForNavLogic = carDistanceAlongRoute;
+
+        let foundNextStepThisUpdate = false;
+        for (let legIdx = currentLegIndexNav; legIdx < route.legs.length; legIdx++) {
+            const leg = route.legs[legIdx];
+            if (!leg || !leg.steps) continue;
+
+            let startStepThisLegLoop = (legIdx === currentLegIndexNav) ? currentStepIndexNav : 0;
+
+            for (let stepIdx = startStepThisLegLoop; stepIdx < leg.steps.length; stepIdx++) {
+                const step = leg.steps[stepIdx];
+                if (!step || !step.maneuver || !step.maneuver.location) continue;
+
+                const distanceToEndOfThisStep = calculateDistanceToEndOfStep(route, legIdx, stepIdx);
+
+                if (carDistanceAlongRoute < distanceToEndOfThisStep || (legIdx === route.legs.length - 1 && stepIdx === leg.steps.length - 1) ) {
+                    currentStep = step;
+                    distanceToStepManeuver = Math.max(0, distanceToEndOfThisStep - carDistanceAlongRoute);
+
+                    if (stepIdx > 0) {
+                        previousStepForPath = leg.steps[stepIdx - 1];
+                    } else if (legIdx > 0 && route.legs[legIdx - 1].steps.length > 0) {
+                        previousStepForPath = route.legs[legIdx - 1].steps[route.legs[legIdx - 1].steps.length - 1];
+                    } else {
+                        previousStepForPath = null;
+                    }
+                    
+                    currentLegIndexNav = legIdx;
+                    currentStepIndexNav = stepIdx;
+                    foundNextStepThisUpdate = true;
+                    break;
+                }
+            }
+            if (foundNextStepThisUpdate) break;
+        }
+         if (!foundNextStepThisUpdate && route.legs.length > 0) { // Si se llegó al final de la ruta
+            const lastLeg = route.legs[route.legs.length - 1];
+            if (lastLeg.steps.length > 0) {
+                currentStep = lastLeg.steps[lastLeg.steps.length - 1];
+                distanceToStepManeuver = 0;
+                 previousStepForPath = lastLeg.steps.length > 1 ? lastLeg.steps[lastLeg.steps.length - 2] : ((route.legs.length > 1 && route.legs[route.legs.length-2].steps.length > 0) ? route.legs[route.legs.length-2].steps[route.legs[route.legs.length-2].steps.length-1] : null);
+
+            }
+        }
+
+
+    } else if (route.legs && route.legs.length > 0 && route.legs[0].steps.length > 0) { // Caso inicial sin navegación
+        currentStep = route.legs[0].steps[0];
+        distanceToStepManeuver = currentStep.distance;
+        previousStepForPath = null;
+        currentLegIndexNav = 0;
+        currentStepIndexNav = 0;
+    }
+
+
+    if (currentStep && currentStep.maneuver) {
+        const maneuver = currentStep.maneuver;
+        const type = maneuver.type;
+        const modifier = maneuver.modifier || ''; 
+        turnIconEl.textContent = turnIcons[type + (modifier ? ' ' + modifier : '')] || turnIcons[type] || turnIcons['default'];
+        streetEl.textContent = currentStep.name || (type === 'arrive' ? 'Has llegado a tu destino' : 'Continuar en la ruta');
+
+        let displayDistance = distanceToStepManeuver;
+
+        if (displayDistance >= 1000) {
+            distanceEl.textContent = `${(displayDistance / 1000).toFixed(1)} km`;
+        } else {
+            distanceEl.textContent = `${Math.round(displayDistance)} m`;
+        }
+        const originalStepDistance = currentStep.distance || Math.max(500, displayDistance); // Evitar división por cero
+        const progressToTurnPercent = originalStepDistance > 0 ? Math.max(0, Math.min(100, (1 - (displayDistance / originalStepDistance)) * 100)) : (displayDistance === 0 ? 100:0);
+        progressBarEl.style.width = `${progressToTurnPercent}%`;
+
+        if (isNavigating && previousStepForPath && completedRouteSegmentsLayer && navigationCurrentLocation ) {
+             if (previousStepForPath.maneuver && previousStepForPath.maneuver.location && previousStepForPath.maneuver.location.length === 2) {
+                const prevManeuverLocLatLng = L.latLng(previousStepForPath.maneuver.location[1], previousStepForPath.maneuver.location[0]);
+                 if (!lastProcessedStepManeuverLocation || (lastProcessedStepManeuverLocation.lat.toFixed(5) !== prevManeuverLocLatLng.lat.toFixed(5) || lastProcessedStepManeuverLocation.lng.toFixed(5) !== prevManeuverLocLatLng.lng.toFixed(5))) {
+                    if (previousStepForPath.geometry && previousStepForPath.geometry.coordinates) {
+                        const segmentCoords = previousStepForPath.geometry.coordinates.map(c => [c[1], c[0]]);
+                        if (segmentCoords.length >= 2) {
+                            const layerToAdd = completedRouteSegmentsLayer;
+                            if (layerToAdd) { 
+                                L.polyline(segmentCoords, { color: 'green', weight: 6, opacity: 0.8 }).addTo(layerToAdd);
+                                lastProcessedStepManeuverLocation = prevManeuverLocLatLng;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+
+    } else {
+        turnIconEl.textContent = '🏁';
+        distanceEl.textContent = '0 m';
+        streetEl.textContent = 'Calculando... o destino alcanzado.';
+        progressBarEl.style.width = '100%';
+    }
+}
+
+
+async function getSuggestedRouteName(lat, lng) {
+    let numEtapas = 0;
+    if (navigationWaypoints.length > 1) { // Salida no cuenta, destino sí si es intermedio
+        numEtapas = navigationWaypoints.length -1; // Contando destino como etapa
+    }
+
+    try {
+        const response = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&addressdetails=1&accept-language=es`);
+        if (response.ok) {
+            const data = await response.json();
+            if (data.address) {
+                const road = data.address.road;
+                const city = data.address.city || data.address.town || data.address.village || data.address.hamlet;
+                let namePart = "";
+                if (road && city) namePart = `${road}, ${city}`;
+                else if (city) namePart = city;
+                else if (road) namePart = road;
+                else namePart = `Destino (${lat.toFixed(2)}, ${lng.toFixed(2)})`;
+                return `[${numEtapas}E] ${namePart}`;
+            }
+        }
+    } catch (e) {
+        console.warn("Error en geocodificación inversa para nombre de ruta:", e);
+    }
+    const now = new Date();
+    return `[${numEtapas}E] RUTA: ${String(now.getDate()).padStart(2, '0')}/${String(now.getMonth() + 1).padStart(2, '0')}/${String(now.getFullYear()).slice(-2)} ${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
+}
+
+
+async function saveCurrentRoute() {
+    if (navigationWaypoints.length < 2) {
+        showToast("No hay ruta activa para guardar (se necesitan al menos 2 puntos).", "warning");
+        return;
+    }
+
+    let defaultRouteName = `Ruta ${new Date().toLocaleDateString()} ${new Date().toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}`;
+    if (navigationWaypoints.length > 0) {
+        const lastWp = navigationWaypoints[navigationWaypoints.length - 1];
+        if (lastWp) defaultRouteName = await getSuggestedRouteName(lastWp.lat, lastWp.lng);
+    }
+    currentRouteNameForSaving = null;
+
+    const existingModal = document.getElementById('save-route-prompt-modal');
+    if (existingModal) existingModal.remove();
+
+    const modal = document.createElement('div');
+    modal.id = 'save-route-prompt-modal';
+    modal.innerHTML = `
+        <h2>Guardar Ruta</h2>
+        <label for="route-name-input">Nombre de la Ruta:</label>
+        <input type="text" id="route-name-input" value="${defaultRouteName}">
+        <div>
+            <button id="confirm-save-route">Guardar <span class="button-countdown-timer"></span></button>
+            <button id="cancel-save-route">Cancelar</button>
+        </div>
+    `;
+    document.body.appendChild(modal);
+
+    const nameInput = modal.querySelector('#route-name-input');
+    const confirmButton = modal.querySelector('#confirm-save-route');
+    const cancelButton = modal.querySelector('#cancel-save-route');
+    nameInput.focus();
+    nameInput.select();
+
+    const closePrompt = () => {
+        clearModalAutoCloseTimer(modal, confirmButton, 'save-route-prompt-modal');
+        if (modal.parentNode) modal.remove();
+    };
+
+    const saveAction = () => {
+        let routeName = nameInput.value.trim();
+        if (!routeName) {
+            showToast("El nombre de la ruta no puede estar vacío.", "warning");
+            addModalAutoCloseTimer(modal, confirmButton, 'save-route-prompt-modal', 15000);
+            return;
+        }
+        currentRouteNameForSaving = routeName;
+
+        const routeToSave = {
+            name: routeName,
+            waypoints: navigationWaypoints.map(wp => (wp ? { id: wp.id, lat: wp.lat, lng: wp.lng, label:wp.label, type:wp.type, address: wp.address || '' } : null)).filter(Boolean),
+            createdAt: new Date().toISOString()
+        };
+
+        let savedRoutes = JSON.parse(localStorage.getItem(SAVED_ROUTES_KEY) || "[]");
+        const existingRouteIndex = savedRoutes.findIndex(r => r.name === routeName);
+        if (existingRouteIndex !== -1) {
+            if (!confirm(`Ya existe una ruta llamada "${routeName}". ¿Sobreescribir?`)) {
+                showToast("Guardado cancelado.", "info");
+                addModalAutoCloseTimer(modal, confirmButton, 'save-route-prompt-modal', 15000);
+                return;
+            }
+            savedRoutes[existingRouteIndex] = routeToSave;
+        } else {
+            savedRoutes.push(routeToSave);
+        }
+
+        if (savedRoutes.length > MAX_SAVED_ROUTES) {
+            savedRoutes.sort((a,b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+            savedRoutes = savedRoutes.slice(0, MAX_SAVED_ROUTES);
+        }
+
+        localStorage.setItem(SAVED_ROUTES_KEY, JSON.stringify(savedRoutes));
+        showToast(`Ruta "${routeName}" (solo waypoints) guardada.`, "success");
+        closePrompt();
+    };
+
+
+    confirmButton.addEventListener('click', saveAction);
+    cancelButton.addEventListener('click', () => {
+        showToast("Guardado cancelado.", "info");
+        closePrompt();
+    });
+    addModalAutoCloseTimer(modal, confirmButton, 'save-route-prompt-modal', 15000);
+}
+
+function showLoadRouteModal() {
+    if (navigationMapInstance) {
+        navigationWaypoints.forEach(wp => { if (wp && wp.marker) navigationMapInstance.removeLayer(wp.marker); });
+        if (navigationRouteLayer) navigationMapInstance.removeLayer(navigationRouteLayer);
+        if (completedRouteSegmentsLayer) completedRouteSegmentsLayer.clearLayers();
+    }
+    navigationWaypoints = [];
+    navigationRouteLayer = null;
+    navigationCurrentRouteData = null;
+    isNavigating = false;
+    
+    updateStartNavigationButtonState();
+    hideNavigationUI();
+
+    eliminarRadaresDeRuta();
+
+    const existingModal = document.getElementById('saved-routes-modal');
+    if (existingModal) existingModal.remove();
+
+    const modal = document.createElement('div');
+    modal.id = 'saved-routes-modal';
+    modal.innerHTML = `
+        <h2>Cargar/Borrar Rutas Guardadas (Máx. ${MAX_SAVED_ROUTES})</h2>
+        <input type="text" id="search-saved-routes-input" placeholder="Buscar ruta por nombre..." style="width: 100%; padding: 0.5rem; margin-bottom: 1rem; border: 1px solid #ccc; border-radius: 4px;">
+        <ul id="saved-routes-list"></ul>
+        <button id="close-saved-routes-modal">Cerrar</button>
+    `;
+    document.body.appendChild(modal);
+
+    const listElement = modal.querySelector('#saved-routes-list');
+    const closeButton = modal.querySelector('#close-saved-routes-modal');
+    const searchInput = modal.querySelector('#search-saved-routes-input');
+
+    let allSavedRoutes = JSON.parse(localStorage.getItem(SAVED_ROUTES_KEY) || "[]");
+    allSavedRoutes.sort((a,b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+    function displayRoutes(routesToDisplay) {
+        listElement.innerHTML = '';
+        if (routesToDisplay.length === 0) {
+            listElement.innerHTML = '<li>No hay rutas guardadas que coincidan.</li>';
+        } else {
+            routesToDisplay.forEach(route => {
+                const li = document.createElement('li');
+                li.textContent = route.name;
+                li.dataset.routeName = route.name;
+
+                const deleteBtn = document.createElement('button');
+                deleteBtn.textContent = 'Borrar';
+                deleteBtn.className = 'delete-route-btn';
+                deleteBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    if (confirm(`¿Seguro que quieres borrar la ruta "${route.name}"?`)) {
+                        allSavedRoutes = allSavedRoutes.filter(r => r.name !== route.name);
+                        localStorage.setItem(SAVED_ROUTES_KEY, JSON.stringify(allSavedRoutes));
+                        displayRoutes(allSavedRoutes.filter(r => normalizeText(r.name).includes(normalizeText(searchInput.value)))); // Re-filter and display
+                        showToast(`Ruta "${route.name}" borrada.`, "info");
+                    }
+                };
+                li.appendChild(deleteBtn);
+
+                li.addEventListener('click', () => {
+                    loadRouteByName(route.name);
+                    clearModalAutoCloseTimer(modal, closeButton, 'saved-routes-modal');
+                    if (modal.parentNode) modal.remove();
+                });
+                listElement.appendChild(li);
+            });
+        }
+    }
+    
+    searchInput.addEventListener('input', () => {
+        const searchTerm = normalizeText(searchInput.value);
+        const filteredRoutes = allSavedRoutes.filter(route => normalizeText(route.name).includes(searchTerm));
+        displayRoutes(filteredRoutes);
+    });
+
+    displayRoutes(allSavedRoutes); // Carga inicial
+
+    const closeHandler = () => {
+        clearModalAutoCloseTimer(modal, closeButton, 'saved-routes-modal');
+        if (modal.parentNode) modal.remove();
+    };
+    closeButton.addEventListener('click', closeHandler);
+    addModalAutoCloseTimer(modal, closeButton, 'saved-routes-modal', 30000);
+}
+
+function loadRouteByName(routeName) {
+    const savedRoutes = JSON.parse(localStorage.getItem(SAVED_ROUTES_KEY) || "[]");
+    const routeToLoad = savedRoutes.find(r => r.name === routeName);
+
+    if (!routeToLoad) {
+        showToast(`No se pudo cargar la ruta "${routeName}".`, "error");
+        return;
+    }
+    currentRouteNameForSaving = routeName;
+
+    if (navigationMapInstance) {
+        navigationWaypoints.forEach(wp => { if (wp && wp.marker) navigationMapInstance.removeLayer(wp.marker); });
+        if (navigationRouteLayer) navigationMapInstance.removeLayer(navigationRouteLayer);
+        if (completedRouteSegmentsLayer) completedRouteSegmentsLayer.clearLayers();
+    }
+    navigationWaypoints = [];
+    navigationRouteLayer = null;
+    navigationCurrentRouteData = null;
+    isNavigating = false;
+
+
+    routeToLoad.waypoints.forEach(wpData => {
+        if (wpData) {
+            navigationWaypoints.push({
+                id: wpData.id || Date.now() + Math.random(),
+                lat: wpData.lat,
+                lng: wpData.lng,
+                type: wpData.type,
+                label: wpData.label,
+                marker: null,
+                address: wpData.address || ''
+            });
+        }
+    });
+
+    updateWaypointTypesAndLabels();
+    renderWaypointMarkers();
+
+    if (navigationWaypoints.length >= 2) {
+        recalculateAndDrawRoute().then(() => {
+            showToast(`Ruta "${routeName}" cargada y recalculada.`, "success");
+            if (navigationMapInstance && navigationRouteLayer) {
+                navigationMapInstance.fitBounds(navigationRouteLayer.getBounds().pad(0.1));
+            }
+             if (navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0]) {
+                let carDistAlongRouteLoad = 0;
+                const currentCarPosForLoad = navigationCurrentLocation;
+                 if (currentCarPosForLoad && navigationMapInstance && navigationRouteLayer && typeof L.GeometryUtil !== 'undefined' && L.GeometryUtil && navigationRouteLayer.getLatLngs().length > 0) {
+                    const currentLatLng = L.latLng(currentCarPosForLoad.latitude, currentCarPosForLoad.longitude);
+                    const carSnappedToRoute = L.GeometryUtil.closest(navigationMapInstance, navigationRouteLayer, currentLatLng);
+                    if (carSnappedToRoute && typeof carSnappedToRoute.lat === 'number') {
+                        const snappedLatLng = L.latLng(carSnappedToRoute.lat, carSnappedToRoute.lng);
+                        const locatedInfo = L.GeometryUtil.locateOnLine(navigationMapInstance, navigationRouteLayer, snappedLatLng);
+                        if(locatedInfo && typeof locatedInfo.distance === 'number'){
+                            carDistAlongRouteLoad = locatedInfo.distance;
+                        }
+                    }
+                 }
+                updateNavigationProgressDisplay(navigationCurrentRouteData.routes[0], carDistAlongRouteLoad);
+                updateTurnByTurnDisplay(navigationCurrentRouteData.routes[0], carDistAlongRouteLoad);
+                showNavigationUIElementsForPlanning();
+            }
+        }).catch(error => {
+            showToast(`Error al recalcular la ruta "${routeName}": ${error.message}`, "error");
+        });
+    } else {
+        showToast(`Ruta "${routeName}" cargada (solo waypoints, no hay suficientes para una ruta).`, "info");
+        hideNavigationUI();
+    }
+
+    updateStartNavigationButtonState();
+
+    const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+    if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
+        toggleRadaresRuta(true);
+    } else if (radaresRutaCheckbox && !radaresRutaCheckbox.checked) {
+        eliminarRadaresDeRuta();
+    }
+}
+
+    function handleDragStartReorder(e) {
+        if (e.target.tagName === 'LI') {
+            draggedStageLi = e.target;
+            setTimeout(() => e.target.classList.add('dragging'), e.type === 'touchstart' ? 100 : 0);
+            if (e.dataTransfer) {
+                e.dataTransfer.effectAllowed = 'move';
+                e.dataTransfer.setData('text/plain', e.target.dataset.id);
+            }
+        }
+    }
+    function handleDragEndReorder(e) {
+        if (draggedStageLi) {
+            draggedStageLi.classList.remove('dragging');
+        }
+        draggedStageLi = null;
+    }
+
+    function handleDragOverReorder(e) {
+        e.preventDefault();
+        if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+
+        const listElement = document.getElementById('sortable-stages-list');
+        if (!listElement || !draggedStageLi) return;
+
+        const afterElement = getDragAfterElement(listElement, e.clientY);
+        const currentLi = e.target.closest('li');
+        if (draggedStageLi && currentLi && draggedStageLi !== currentLi) {
+            if (afterElement == null) {
+                listElement.appendChild(draggedStageLi);
+            } else {
+                listElement.insertBefore(draggedStageLi, afterElement);
+            }
+        } else if (draggedStageLi && !currentLi && afterElement == null) {
+             listElement.appendChild(draggedStageLi);
+        } else if (draggedStageLi && !currentLi && afterElement) {
+             listElement.insertBefore(draggedStageLi, afterElement);
+        }
+    }
+
+    let stageTouchStartX, stageTouchStartY, stageScrollTimeout;
+
+    function handleStageTouchStart(e) {
+        if (e.touches.length === 1 && e.target.closest('li')) {
+            draggedStageLi = e.target.closest('li');
+            const touch = e.touches[0];
+            stageTouchStartX = touch.clientX;
+            stageTouchStartY = touch.clientY;
+
+            clearTimeout(stageScrollTimeout);
+            stageScrollTimeout = setTimeout(() => {
+                if (draggedStageLi) {
+                    draggedStageLi.classList.add('dragging');
+                    document.body.style.overflow = 'hidden';
+                }
+            }, 150);
+        }
+    }
+
+    function handleStageTouchMove(e) {
+        if (!draggedStageLi || e.touches.length !== 1) return;
+        e.preventDefault();
+
+        clearTimeout(stageScrollTimeout);
+        if (!draggedStageLi.classList.contains('dragging')) {
+            draggedStageLi.classList.add('dragging');
+             document.body.style.overflow = 'hidden';
+        }
+
+        const touch = e.touches[0];
+        const listElement = document.getElementById('sortable-stages-list');
+        if (!listElement) return;
+
+        const afterElement = getDragAfterElement(listElement, touch.clientY);
+         if (afterElement == null) {
+            listElement.appendChild(draggedStageLi);
+        } else {
+            listElement.insertBefore(draggedStageLi, afterElement);
+        }
+    }
+
+    function handleStageTouchEnd(e) {
+        clearTimeout(stageScrollTimeout);
+        if (draggedStageLi) {
+            draggedStageLi.classList.remove('dragging');
+            draggedStageLi = null;
+        }
+        document.body.style.overflow = '';
+    }
+
+
+    function showReorderStagesModal() {
+        if (isNavigating) {
+            showToast("No se puede reordenar etapas mientras se navega.", "warning");
+            return;
+        }
+        if (navigationWaypoints.length < 2) {
+            showToast("Se necesitan al menos 2 puntos para reordenar.", "warning");
+            return;
+        }
+
+        const modal = document.getElementById('reorder-stages-modal');
+        if (!modal) {
+            console.error("Error: Modal de reordenamiento no encontrado en el DOM.");
+            showToast("Error interno: No se pudo mostrar el modal de reordenamiento.", "error");
+            return;
+        }
+
+        const listElement = modal.querySelector('#sortable-stages-list');
+        if (!listElement) {
+             console.error("Error: Lista de etapas no encontrada en el modal de reordenamiento.");
+             showToast("Error interno: No se pudo encontrar la lista de etapas.", "error");
+             return;
+        }
+        listElement.innerHTML = '';
+
+        navigationWaypoints.forEach(async (wp, index) => {
+            if (!wp) return;
+            const li = document.createElement('li');
+            li.dataset.originalIndex = index;
+            li.dataset.id = wp.id;
+            li.draggable = true;
+
+            const badge = document.createElement('span');
+            badge.className = 'stage-label-badge';
+            badge.textContent = wp.label;
+
+            const nameSpan = document.createElement('span');
+            nameSpan.className = 'stage-name-text';
+            nameSpan.textContent = wp.address || `Cargando dirección para (${wp.lat.toFixed(3)}, ${wp.lng.toFixed(3)})...`;
+            if (!wp.address) {
+                 wp.address = await getAddressForWaypoint(wp.lat, wp.lng);
+                 nameSpan.textContent = wp.address;
+            }
+
+            li.appendChild(badge);
+            li.appendChild(nameSpan);
+            listElement.appendChild(li);
+        });
+
+        modal.classList.remove('hidden');
+
+        const confirmButton = modal.querySelector('#confirm-reorder-stages');
+        const cancelButton = modal.querySelector('#cancel-reorder-stages');
+
+        const newConfirmButton = confirmButton.cloneNode(true);
+        confirmButton.parentNode.replaceChild(newConfirmButton, confirmButton);
+        const newCancelButton = cancelButton.cloneNode(true);
+        cancelButton.parentNode.replaceChild(newCancelButton, cancelButton);
+
+
+        const closeReorderModal = () => {
+            clearModalAutoCloseTimer(modal, newConfirmButton, 'reorder-stages-modal');
+            modal.classList.add('hidden');
+            listElement.removeEventListener('dragstart', handleDragStartReorder);
+            listElement.removeEventListener('dragend', handleDragEndReorder);
+            listElement.removeEventListener('dragover', handleDragOverReorder);
+            listElement.removeEventListener('touchstart', handleStageTouchStart);
+            listElement.removeEventListener('touchmove', handleStageTouchMove);
+            listElement.removeEventListener('touchend', handleStageTouchEnd);
+            listElement.removeEventListener('touchcancel', handleStageTouchEnd);
+            document.body.style.overflow = '';
+        };
+
+        newConfirmButton.addEventListener('click', async () => {
+            try {
+                const newOrderIds = Array.from(listElement.children).map(li => parseInt(li.dataset.id));
+                const newWaypointsOrdered = [];
+                let allFound = true;
+                for (const id of newOrderIds) {
+                    const foundWp = navigationWaypoints.find(wp => wp && wp.id === id);
+                    if (foundWp) {
+                        newWaypointsOrdered.push(foundWp);
+                    } else {
+                        allFound = false;
+                        console.error(`Error: Waypoint con ID ${id} no encontrado en la lista original.`);
+                        break;
+                    }
+                }
+
+                if (!allFound || newWaypointsOrdered.length !== navigationWaypoints.length) {
+                    console.error("Error: Discrepancia en el número de waypoints después de reordenar o ID no encontrado.");
+                    showToast("Error interno al reordenar las etapas. No se aplicaron los cambios.", "error");
+                    closeReorderModal();
+                    return;
+                }
+
+                navigationWaypoints = newWaypointsOrdered;
+                updateWaypointTypesAndLabels();
+                renderWaypointMarkers();
+                await recalculateAndDrawRoute();
+                const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+                if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
+                    toggleRadaresRuta(true);
+                }
+                showToast("Etapas reordenadas y ruta recalculada.", "success");
+            } catch (error) {
+                console.error("Error al recalcular la ruta después de reordenar:", error);
+                showToast("Error recalculando ruta tras reordenar.", "error");
+            } finally {
+                 closeReorderModal();
+            }
+        });
+
+
+        newCancelButton.addEventListener('click', () => {
+            showToast("Reordenación cancelada.", "info");
+            closeReorderModal();
+        });
+
+        addModalAutoCloseTimer(modal, newConfirmButton, 'reorder-stages-modal', 60000);
+
+        listElement.addEventListener('dragstart', handleDragStartReorder);
+        listElement.addEventListener('dragend', handleDragEndReorder);
+        listElement.addEventListener('dragover', handleDragOverReorder);
+        listElement.addEventListener('touchstart', handleStageTouchStart, { passive: false });
+        listElement.addEventListener('touchmove', handleStageTouchMove, { passive: false });
+        listElement.addEventListener('touchend', handleStageTouchEnd);
+        listElement.addEventListener('touchcancel', handleStageTouchEnd);
+    }
+
+    function getDragAfterElement(container, y) {
+        const draggableElements = [...container.querySelectorAll('li:not(.dragging)')];
+        return draggableElements.reduce((closest, child) => {
+            const box = child.getBoundingClientRect();
+            const offset = y - box.top - box.height / 2;
+            if (offset < 0 && offset > closest.offset) {
+                return { offset: offset, element: child };
+            } else {
+                return closest;
+            }
+        }, { offset: Number.NEGATIVE_INFINITY }).element;
+    }
+
+
+    function showToast(message, type = 'info', duration = 3000, isErrorNotFound = false) {
+        const existingToast = document.getElementById('toast-notification-element' + (type === 'debug' ? '-debug' : ''));
+        if (existingToast && type !== 'debug') { 
+            existingToast.remove(); 
+        } else if (existingToast && type === 'debug') { 
+            existingToast.remove();
+        }
+        
+        const toast = document.createElement('div');
+        toast.id = 'toast-notification-element' + (type === 'debug' ? '-debug' : '');
+        toast.className = `toast-notification toast-${type}`;
+        if (isErrorNotFound && type === 'error') {
+            toast.classList.add('not-found');
+        }
+        
+        const messageSpan = document.createElement('span');
+        messageSpan.innerHTML = message.replace(/\n/g, '<br>');
+        toast.appendChild(messageSpan);
+
+        if (type === 'debug') {
+            toast.style.top = 'auto'; 
+            toast.style.bottom = '20px'; 
+            toast.style.right = '20px';
+            toast.style.left = 'auto'; 
+            toast.style.transform = 'none';
+            toast.style.maxWidth = 'calc(100% - 40px)'; 
+            const closeButtonToast = document.createElement('button');
+            closeButtonToast.textContent = 'Cerrar Info Debug';
+            closeButtonToast.style.cssText = "display: block; margin-top: 10px; padding: 5px 10px; background-color: rgba(255,255,255,0.2); color: white; border: 1px solid white; border-radius: 3px; cursor: pointer;";
+            closeButtonToast.onclick = () => {
+                if (toast.parentNode) toast.parentNode.removeChild(toast);
+            };
+            toast.appendChild(closeButtonToast);
+        }
+        
+        document.body.appendChild(toast);
+
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+                toast.classList.add('show');
+            });
+        });
+
+        if (duration > 0 && type !== 'debug') {
+            setTimeout(() => {
+                toast.classList.remove('show');
+                toast.addEventListener('transitionend', () => {
+                     if (toast.parentNode) { toast.parentNode.removeChild(toast); }
+                }, { once: true });
+            }, duration);
+        }
+    }
+
+
+    function formatDateToDDMMMYY(dateString) {
+         if (!dateString) return '-';
+         try {
+             const [year, month, day] = dateString.split('-').map(Number);
+             const date = new Date(Date.UTC(year, month - 1, day));
+             if (isNaN(date.getTime())) return '-';
+
+             const dayOfMonth = String(date.getUTCDate()).padStart(2, '0');
+             const monthNames = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic'];
+             const monthName = monthNames[date.getUTCMonth()];
+             const yearShort = String(date.getUTCFullYear()).slice(-2);
+
+             return `${dayOfMonth} ${monthName} ${yearShort}`;
+         } catch (e) {
+             return '-';
+         }
+    }
+    function formatDateDetailed(dateString) {
+        if (!dateString || !dateString.match(/^\d{4}-\d{2}-\d{2}$/)) return '-';
+        try {
+            const [year, month, day] = dateString.split('-').map(Number);
+            const date = new Date(Date.UTC(year, month - 1, day));
+            if (isNaN(date.getTime())) return dateString;
+
+            const dayOfMonth = String(date.getUTCDate()).padStart(2, '0');
+            const monthNames = ['Enero', 'Febrero', 'Marzo', 'Abril', 'Mayo', 'Junio', 'Julio', 'Agosto', 'Septiembre', 'Octubre', 'Noviembre', 'Diciembre'];
+            const monthName = monthNames[date.getUTCMonth()];
+            const fullYear = date.getUTCFullYear();
+
+            return `${dayOfMonth}-${monthName}-${fullYear}`;
+        } catch (e) {
+            return dateString;
+        }
+    }
+    function formatTimeWithPeriod(timeString) {
+         if (!timeString || !timeString.match(/^\d{2}:\d{2}$/)) return '-';
+         try {
+             const [hourStr, minuteStr] = timeString.split(':');
+             const hour = parseInt(hourStr);
+             const minute = parseInt(minuteStr);
+             if (isNaN(hour) || isNaN(minute) || hour < 0 || hour > 23 || minute < 0 || minute > 59) {
+                 return timeString;
+             }
+             let period = '';
+             if (hour >= 22 || hour < 5) { period = 'de la Noche'; }
+             else if (hour >= 5 && hour < 12) { period = 'de la Mañana'; }
+             else if (hour >= 12 && hour < 14) { period = 'del Mediodía'; }
+             else { period = 'de la Tarde'; }
+
+             return `${hourStr}:${minuteStr} (${period})`;
+         } catch (e) {
+             return timeString;
+         }
+    }
+
+let globalModalTimers = {};
+
+function addModalAutoCloseTimer(modalElement, closeButtonElement, modalId, duration = 60000) {
+    if (!modalElement || !closeButtonElement || !modalId) {
+        return;
+    }
+    modalElement.dataset.modalTimerId = modalId;
+
+    clearModalAutoCloseTimer(modalElement, closeButtonElement, modalId);
+
+    let countdown = duration / 1000;
+    const originalButtonText = closeButtonElement.textContent.split(' (')[0];
+    const countdownSpanId = `modal-countdown-${modalId}`;
+    let countdownSpan = closeButtonElement.querySelector(`.button-countdown-timer`);
+
+    if (!countdownSpan) {
+        countdownSpan = document.createElement('span');
+        countdownSpan.className = 'button-countdown-timer';
+        countdownSpan.style.marginLeft = '5px';
+        countdownSpan.style.fontWeight = 'normal';
+        closeButtonElement.appendChild(countdownSpan);
+    }
+    countdownSpan.textContent = ` (${countdown})`;
+
+    const intervalId = setInterval(() => {
+        countdown--;
+        if (countdownSpan && document.body.contains(countdownSpan)) {
+          countdownSpan.textContent = ` (${countdown})`;
+        }
+        if (countdown <= 0) {
+            if (globalModalTimers[modalId]) {
+                clearInterval(globalModalTimers[modalId].intervalId);
+                delete globalModalTimers[modalId];
+            }
+            if (closeButtonElement && document.body.contains(closeButtonElement)) {
+                closeButtonElement.click();
+            } else if (modalElement && modalElement.parentNode) {
+                 if (!STATIC_MODAL_IDS.includes(modalElement.id)) {
+                    modalElement.parentNode.removeChild(modalElement);
+                 } else {
+                    modalElement.classList.add('hidden');
+                 }
+            }
+        }
+    }, 1000);
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          
+    const resetTimerHandler = () => {
+        if (!globalModalTimers[modalId] || !globalModalTimers[modalId].intervalId) return;
+        clearInterval(globalModalTimers[modalId].intervalId);
+        countdown = duration / 1000;
+        if (countdownSpan && document.body.contains(countdownSpan)) {
+           countdownSpan.textContent = ` (${countdown})`;
+        }
+        const newIntervalId = setInterval(() => {
+            countdown--;
+            if (countdownSpan && document.body.contains(countdownSpan)) {
+                countdownSpan.textContent = ` (${countdown})`;
+            }
+            if (countdown <= 0) {
+                if (globalModalTimers[modalId]) {
+                    clearInterval(globalModalTimers[modalId].intervalId);
+                    delete globalModalTimers[modalId];
+                }
+                if (closeButtonElement && document.body.contains(closeButtonElement)) {
+                    closeButtonElement.click();
+                } else if (modalElement && modalElement.parentNode) {
+                    if (!STATIC_MODAL_IDS.includes(modalElement.id)) {
+                       modalElement.parentNode.removeChild(modalElement);
+                    } else {
+                       modalElement.classList.add('hidden');
+                    }
+                }
+            }
+        }, 1000);
+        globalModalTimers[modalId].intervalId = newIntervalId;
+    };
+
+    modalElement.addEventListener('click', resetTimerHandler);
+    modalElement.addEventListener('touchstart', resetTimerHandler, { passive: true });
+    modalElement.addEventListener('input', resetTimerHandler);
+    modalElement.addEventListener('scroll', resetTimerHandler, { passive: true });
+
+    globalModalTimers[modalId] = {
+        intervalId: intervalId,
+        resetHandler: resetTimerHandler,
+        modalElement: modalElement,
+        closeButtonElement: closeButtonElement,
+        countdownSpan: countdownSpan
+    };
+}
+
+function clearModalAutoCloseTimer(modalElement, closeButtonElement, modalId) {
+    const timerIdToClear = modalId || (modalElement ? modalElement.dataset.modalTimerId : null);
+
+    if (timerIdToClear && globalModalTimers[timerIdToClear]) {
+        clearInterval(globalModalTimers[timerIdToClear].intervalId);
+        const timerData = globalModalTimers[timerIdToClear];
+        if (timerData.modalElement && timerData.resetHandler) {
+            timerData.modalElement.removeEventListener('click', timerData.resetHandler);
+            timerData.modalElement.removeEventListener('touchstart', timerData.resetHandler);
+            timerData.modalElement.removeEventListener('input', timerData.resetHandler);
+            timerData.modalElement.removeEventListener('scroll', timerData.resetHandler);
+        }
+        if (timerData.countdownSpan && timerData.countdownSpan.parentNode) {
+            timerData.countdownSpan.remove();
+        }
+        delete globalModalTimers[timerIdToClear];
+    }
+    if(closeButtonElement){
+        const orphanSpans = closeButtonElement.querySelectorAll('.button-countdown-timer');
+        orphanSpans.forEach(s => s.remove());
+    }
+     if(modalElement && modalElement.dataset.modalTimerId) {
+        delete modalElement.dataset.modalTimerId;
+    }
+}
+
+    function saveUserData() {
+        const userId = document.getElementById('user-id').value.trim();
+        const teslaModel = document.getElementById('tesla-model').value.trim();
+        const teslaYear = document.getElementById('tesla-year').value.trim();
+        const teslaProvince = document.getElementById('tesla-province').value.trim();
+        const allowDMs = document.getElementById('allow-dms').checked;
+        const statusEl = document.getElementById('config-user-status');
+
+        if (!userId) {
+            statusEl.textContent = 'El ID de Usuario (Apodo) es obligatorio.';
+            statusEl.style.color = '#EF4444';
+            return;
+        }
+
+        localStorage.setItem('userData_userId', userId);
+        localStorage.setItem('userData_teslaModel', teslaModel);
+        localStorage.setItem('userData_teslaYear', teslaYear);
+        localStorage.setItem('userData_teslaProvince', teslaProvince);
+        localStorage.setItem('userData_allowDMs', JSON.stringify(allowDMs));
+
+        updateUserIdDisplay();
+        statusEl.textContent = 'Datos de usuario guardados localmente.';
+        statusEl.style.color = '#28a745';
+        showToast('Datos de usuario guardados.', 'success');
+    }
+
+    function resetUserData() {
+        if (confirm('¿Estás seguro de que deseas resetear tus datos de usuario compartidos (los eliminará de la caché local y deberías eliminarlos manualmente de la hoja de cálculo si los enviaste)?')) {
+            document.getElementById('user-id').value = '';
+            document.getElementById('tesla-model').value = '';
+            document.getElementById('tesla-year').value = '';
+            document.getElementById('tesla-province').value = '';
+            document.getElementById('allow-dms').checked = false;
+            localStorage.removeItem('userData_userId');
+            localStorage.removeItem('userData_teslaModel');
+            localStorage.removeItem('userData_teslaYear');
+            localStorage.removeItem('userData_teslaProvince');
+            localStorage.removeItem('userData_allowDMs');
+            updateUserIdDisplay();
+            const statusEl = document.getElementById('config-user-status');
+            statusEl.textContent = 'Datos de usuario reseteados.';
+            statusEl.style.color = '#17a2b8';
+            showToast('Datos de usuario reseteados.', 'info');
+        }
+    }
+
+    function generateBackup() {
+        const backupData = {};
+        managedKeys.forEach(key => {
+            const value = localStorage.getItem(key);
+            if (value !== null) {
+                backupData[key] = value;
+            }
+        });
+        const backupString = JSON.stringify(backupData);
+        const backupDisplay = document.getElementById('config-backup-display');
+        backupDisplay.value = btoa(unescape(encodeURIComponent(backupString)));
+        backupDisplay.style.display = 'block';
+        backupDisplay.select();
+        try {
+            document.execCommand('copy');
+            showToast('Backup copiado al portapapeles.', 'success');
+             document.getElementById('config-backup-status').textContent = '¡Copiado! Guarda este código en un lugar seguro.';
+             document.getElementById('config-backup-status').style.color = '#28a745';
+        } catch (err) {
+            showToast('Error al copiar. Por favor, copia manualmente.', 'warning');
+            document.getElementById('config-backup-status').textContent = 'Copia este código manualmente y guárdalo.';
+            document.getElementById('config-backup-status').style.color = '#ffc107';
+        }
+    }
+
+    function restoreBackup() {
+        const restoreInput = document.getElementById('config-restore-input');
+        const backupStringBase64 = restoreInput.value.trim();
+        const statusEl = document.getElementById('config-restore-status');
+        statusEl.textContent = '';
+
+        if (!backupStringBase64) {
+            statusEl.textContent = 'Pega el código de backup primero.';
+            statusEl.style.color = '#EF4444';
+            return;
+        }
+
+        try {
+            const backupString = decodeURIComponent(escape(atob(backupStringBase64)));
+            const backupData = JSON.parse(backupString);
+            let restoredCount = 0;
+            let incompatibleCount = 0;
+
+            if (confirm('Esto sobreescribirá tus datos actuales con los del backup. ¿Estás seguro?')) {
+                Object.keys(backupData).forEach(key => {
+                    if (managedKeys.includes(key)) {
+                        localStorage.setItem(key, backupData[key]);
+                        restoredCount++;
+                    } else {
+                        incompatibleCount++;
+                    }
+                });
+
+                loadCustomData();
+                loadSavedSettings();
+                updateUserIdDisplay();
+                checkReminders();
+
+                statusEl.textContent = `Restauración completada. ${restoredCount} claves restauradas. ${incompatibleCount} claves ignoradas (incompatibles). La página se recargará.`;
+                statusEl.style.color = '#28a745';
+                showToast('Restauración completada. Recargando...', 'success');
+                setTimeout(() => location.reload(), 2500);
+            } else {
+                 statusEl.textContent = 'Restauración cancelada.';
+                 statusEl.style.color = '#6c757d';
+            }
+        } catch (e) {
+            statusEl.textContent = 'Error: Código de backup inválido o corrupto.';
+            statusEl.style.color = '#EF4444';
+            showToast('Error en el código de backup.', 'error');
+        }
+    }
+
+    function restoreOriginalGrid() {
+        if (confirm('¿Restaurar el grid de botones a su estado original? Perderás tu personalización del grid (URLs, nombres, orden).')) {
+            localStorage.removeItem('customGridData');
+            localStorage.removeItem('gridFilterValue');
+            loadCustomData();
+            renderGrid();
+            renderToggleButtons();
+            loadSavedSettings();
+            filterGridItems();
+            document.getElementById('config-restore-grid-status').textContent = 'Grid restaurado al original. Recargando...';
+            document.getElementById('config-restore-grid-status').style.color = '#28a745';
+            showToast('Grid restaurado. Recargando...', 'success');
+            setTimeout(() => location.reload(), 1500);
+        }
+    }
+
+    function clearAllLocalData() {
+        if (confirm('¡ATENCIÓN! Esto borrará TODOS los datos locales (marcadores personalizados, recordatorios, configuración de usuario, PIN, etc.). Esta acción NO SE PUEDE DESHACER. ¿Estás seguro?')) {
+            if (confirm('DE VERDAD, ¿ESTÁS COMPLETAMENTE SEGURO? SE BORRARÁ TODO.')) {
+                managedKeys.forEach(key => localStorage.removeItem(key));
+                localStorage.removeItem('personalizationHelpShown');
+                localStorage.removeItem('gridFilterValue');
+                showToast('Todos los datos locales borrados. Recargando...', 'success');
+                setTimeout(() => location.reload(), 1500);
+            } else {
+                showToast('Borrado cancelado.', 'info');
+            }
+        } else {
+            showToast('Borrado cancelado.', 'info');
+        }
+    }
+
+    async function importRadars() {
+        const latFilterValue = document.getElementById('radar-filter-lat').value.trim();
+        const lonFilterValue = document.getElementById('radar-filter-lon').value.trim();
+        const keywordsFilterRaw = document.getElementById('radar-filter-keywords').value.trim().toUpperCase();
+        const keywordsFilter = keywordsFilterRaw ? keywordsFilterRaw.split(/\s+/).filter(k => k) : [];
+        const importExtra = document.getElementById('import-extra-radars-checkbox').checked;
+
+        const progressBar = document.getElementById('radar-import-progress-bar');
+        const statusMessage = document.getElementById('radar-import-status');
+        const progressContainer = document.getElementById('radar-import-progress-container');
+
+        progressContainer.style.display = 'block';
+        progressBar.value = 0;
+        statusMessage.textContent = 'Iniciando importación...';
+        statusMessage.style.color = '';
+
+        try {
+            let filesToProcess = await fetchKMLFilesList(KML_FILES_LIST_STANDARD);
+            if (importExtra) {
+                const extraFiles = await fetchKMLFilesList(KML_FILES_LIST_EXTRA);
+                filesToProcess = filesToProcess.concat(extraFiles.filter(f => !filesToProcess.includes(f)));
+            }
+
+            if (filesToProcess.length === 0) {
+                statusMessage.textContent = 'No se encontraron listas de archivos KML para procesar.';
+                progressBar.value = 100;
+                showToast('No hay archivos KML en las listas.', 'warning');
+                setTimeout(() => { progressContainer.style.display = 'none'; }, 3000);
+                return;
+            }
+
+            statusMessage.textContent = `Encontrados ${filesToProcess.length} archivos KML. Procesando...`;
+            let reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
+            let newRadarsCount = 0;
+            let totalFilesProcessed = 0;
+
+            for (const kmlFileName of filesToProcess) {
+                try {
+                    statusMessage.textContent = `Procesando ${kmlFileName}... (${totalFilesProcessed + 1}/${filesToProcess.length})`;
+                    const placemarks = await fetchAndParseKML(KML_BASE_PATH + kmlFileName);
+
+                    placemarks.forEach(placemark => {
+                        const name = placemark.name.toUpperCase();
+                        const coords = placemark.coordinates;
+
+                        const matchesKeywords = keywordsFilter.length === 0 || keywordsFilter.some(kw => name.includes(kw));
+
+                        if (coords && matchesKeywords) {
+                            const [lonStr, latStr] = coords.split(',');
+                            const lon = parseFloat(lonStr);
+                            const lat = parseFloat(latStr);
+
+                            if (isNaN(lat) || isNaN(lon)) return;
+                            const matchesLat = parseCoordinateFilter(latFilterValue, lat);
+                            const matchesLon = parseCoordinateFilter(lonFilterValue, lon);
+
+                            if (matchesLat && matchesLon) {
+                                const existingRadar = reminders.find(r =>
+                                    r.isLocationEnabled &&
+                                    r.locationCoordinates &&
+                                    Math.abs(r.locationCoordinates.latitude - lat) < COORD_EPSILON &&
+                                    Math.abs(r.locationCoordinates.longitude - lon) < COORD_EPSILON &&
+                                    (r.text.toUpperCase().includes("RADAR:") || r.excludeFromList)
+                                );
+
+                                if (!existingRadar) {
+                                    const now = new Date();
+                                    const newRadar = {
+                                        id: Date.now() + Math.random() + newRadarsCount,
+                                        text: `<b>RADAR: ${placemark.name}</b>`,
+                                        type: 'simple',
+                                        time: '00:01',
+                                        date: `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`,
+                                        createdAt: now.toISOString(),
+                                        managedByUser: false,
+                                        isLocationEnabled: true,
+                                        locationCoordinates: { latitude: lat, longitude: lon },
+                                        radiusMeters: 400,
+                                        excludeFromList: true
+                                    };
+                                    reminders.push(newRadar);
+                                    newRadarsCount++;
+                                }
+                            }
+                        }
+                    });
+                } catch (fileError) {
+                    console.error(`Error procesando el archivo ${kmlFileName}:`, fileError);
+                    statusMessage.textContent = `Error en ${kmlFileName}: ${fileError.message}. Continuando...`;
+                    statusMessage.style.color = 'orange';
+                    await new Promise(resolve => setTimeout(resolve, 1500));
+                }
+                totalFilesProcessed++;
+                progressBar.value = (totalFilesProcessed / filesToProcess.length) * 100;
+            }
+
+            localStorage.setItem('reminders', JSON.stringify(reminders));
+            statusMessage.textContent = `Importación completa. ${newRadarsCount} nuevos radares/POIs añadidos.`;
+            statusMessage.style.color = '#28a745';
+            showToast(`${newRadarsCount} nuevos radares/POIs añadidos.`, 'success');
+            updateReminderCount();
+            updateButtonStyles();
+            checkReminders();
+
+        } catch (error) {
+            console.error("Error en la importación de radares:", error);
+            statusMessage.textContent = `Error general: ${error.message}`;
+            statusMessage.style.color = 'red';
+            showToast('Error durante la importación.', 'error');
+        } finally {
+             setTimeout(() => {
+                progressContainer.style.display = 'none';
+                statusMessage.style.color = '';
+            }, 5000);
+        }
+    }
+
+    async function fetchKMLFilesList(listUrl) {
+        try {
+            const response = await fetch(listUrl, { cache: 'no-cache' });
+            if (!response.ok) throw new Error(`Error HTTP ${response.status} obteniendo lista KML: ${listUrl}`);
+            const text = await response.text();
+            return text.split('\n').map(f => f.trim()).filter(f => f.length > 0 && f.toLowerCase().endsWith('.kml'));
+        } catch (error) {
+            console.error(`Error al obtener la lista de archivos KML desde ${listUrl}:`, error);
+            showToast(`Error cargando lista ${listUrl.split('/').pop()}`, 'error');
+            return [];
+        }
+    }
+
+    async function fetchAndParseKML(kmlFileUrl) {
+        try {
+            const response = await fetch(kmlFileUrl, { cache: 'no-cache' });
+            if (!response.ok) throw new Error(`Error HTTP ${response.status} obteniendo KML: ${kmlFileUrl}`);
+
+            const buffer = await response.arrayBuffer();
+            const decoder = new TextDecoder('iso-8859-1');
+            const kmlText = decoder.decode(buffer);
+
+            return parseKML(kmlText);
+        } catch (error) {
+            console.error(`Error al obtener o parsear KML ${kmlFileUrl}:`, error);
+            throw error;
+        }
+    }
+
+    function parseKML(kmlText) {
+        const placemarks = [];
+        const parser = new DOMParser();
+        const xmlDoc = parser.parseFromString(kmlText, "application/xml");
+
+        const parserErrorNode = xmlDoc.querySelector("parsererror");
+        if (parserErrorNode) {
+            let errorMessage = "Error de parseo XML desconocido.";
+            if (parserErrorNode.textContent) {
+                const match = parserErrorNode.textContent.match(/error on line \d+ at column \d+: ([^\n]+)/);
+                if (match && match[1]) {
+                    errorMessage = match[1];
+                } else {
+                    errorMessage = parserErrorNode.textContent.split('\n')[0] || parserErrorNode.textContent;
+                }
+            } else if (parserErrorNode.innerText) {
+                 errorMessage = parserErrorNode.innerText.split('\n')[0] || parserErrorNode.innerText;
+            }
+            console.error("Error de parseo XML en el KML:", errorMessage, parserErrorNode);
+            throw new Error("KML parsing error: " + errorMessage);
+        }
+
+        const KML_NS_GOOGLE = "http://earth.google.com/kml/2.0";
+        const KML_NS_OGC = "http://www.opengis.net/kml/2.2";
+
+        let placemarkNodes = xmlDoc.getElementsByTagNameNS(KML_NS_GOOGLE, 'Placemark');
+        if (placemarkNodes.length === 0) {
+            placemarkNodes = xmlDoc.getElementsByTagNameNS(KML_NS_OGC, 'Placemark');
+        }
+         if (placemarkNodes.length === 0) {
+            placemarkNodes = xmlDoc.getElementsByTagName('Placemark');
+        }
+
+        for (let i = 0; i < placemarkNodes.length; i++) {
+            const node = placemarkNodes[i];
+            let nameNode, coordinatesNode;
+
+            nameNode = node.getElementsByTagNameNS(KML_NS_GOOGLE, 'name')[0] || node.getElementsByTagNameNS(KML_NS_OGC, 'name')[0] || node.getElementsByTagName('name')[0];
+            coordinatesNode = node.getElementsByTagNameNS(KML_NS_GOOGLE, 'coordinates')[0] || node.getElementsByTagNameNS(KML_NS_OGC, 'coordinates')[0] || node.getElementsByTagName('coordinates')[0];
+
+            if (nameNode && coordinatesNode) {
+                const name = nameNode.textContent.trim();
+                const coordinatesRaw = coordinatesNode.textContent.trim();
+
+                const coordPartsMatch = coordinatesRaw.match(/^(-?\d+\.?\d*)[,\s]+(-?\d+\.?\d*)/);
+
+                if (name && coordPartsMatch && coordPartsMatch.length >= 3) {
+                    const lonStr = coordPartsMatch[1];
+                    const latStr = coordPartsMatch[2];
+                    const coordinates = `${lonStr},${latStr}`;
+
+                    const lon = parseFloat(lonStr);
+                    const lat = parseFloat(latStr);
+
+                    if (!isNaN(lon) && !isNaN(lat)) {
+                        if (name.startsWith("Radares BBS www.laradiobbs.net") && lon === 0 && lat === 0) {
+                            continue;
+                        }
+                        placemarks.push({ name, coordinates });
+                    }
+                }
+            }
+        }
+        return placemarks;
+    }
+
+    async function deleteFilteredRadars() {
+        const latFilterValue = document.getElementById('radar-filter-lat').value.trim();
+        const lonFilterValue = document.getElementById('radar-filter-lon').value.trim();
+        const keywordsFilterRaw = document.getElementById('radar-filter-keywords').value.trim().toUpperCase();
+        const keywordsFilter = keywordsFilterRaw ? keywordsFilterRaw.split(/\s+/).filter(k => k) : [];
+
+        const statusMessage = document.getElementById('radar-import-status');
+        const progressContainer = document.getElementById('radar-import-progress-container');
+
+        const noFiltersProvided = !latFilterValue && !lonFilterValue && keywordsFilter.length === 0;
+        let confirmationMessage = "";
+
+        if (noFiltersProvided) {
+            confirmationMessage = "¿Estás seguro de que quieres borrar TODOS los recordatorios tipo RADAR/POI (ya que no has especificado ningún filtro)? Esta acción no se puede deshacer.";
+        } else {
+            confirmationMessage = "¿Estás seguro de que quieres borrar los recordatorios tipo RADAR/POI que coincidan con los filtros actuales? Esta acción no se puede deshacer.";
+        }
+
+        if (!confirm(confirmationMessage)) {
+            showToast("Borrado cancelado.", "info");
+            return;
+        }
+
+        progressContainer.style.display = 'block';
+        const progressBar = document.getElementById('radar-import-progress-bar');
+        if(progressBar) progressBar.style.display = 'none';
+        statusMessage.textContent = 'Borrando recordatorios...';
+        statusMessage.style.color = '';
+
+        try {
+            let reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
+            let originalLength = reminders.length;
+
+            reminders = reminders.filter(r => {
+                const isRadarType = r.isLocationEnabled && (r.text.toUpperCase().includes("RADAR:") || r.excludeFromList);
+                if (!isRadarType) return true;
+
+                if (noFiltersProvided) {
+                    return false;
+                }
+
+                let matchesKeywords = true;
+                if (keywordsFilter.length > 0) {
+                    matchesKeywords = keywordsFilter.some(kw => r.text.toUpperCase().includes(kw));
+                }
+
+                let matchesLat = true;
+                if (latFilterValue) {
+                    if (r.locationCoordinates) {
+                        matchesLat = parseCoordinateFilter(latFilterValue, r.locationCoordinates.latitude);
+                    } else {
+                        matchesLat = false;
+                    }
+                }
+
+                let matchesLon = true;
+                if (lonFilterValue) {
+                    if (r.locationCoordinates) {
+                        matchesLon = parseCoordinateFilter(lonFilterValue, r.locationCoordinates.longitude);
+                    } else {
+                        matchesLon = false;
+                    }
+                }
+
+                return !(matchesKeywords && matchesLat && matchesLon);
+            });
+
+            localStorage.setItem('reminders', JSON.stringify(reminders));
+            const numDeleted = originalLength - reminders.length;
+            statusMessage.textContent = `Borrado completo. ${numDeleted} recordatorios eliminados.`;
+            statusMessage.style.color = '#28a745';
+            showToast(`${numDeleted} recordatorios eliminados.`, 'success');
+            updateReminderCount();
+            updateButtonStyles();
+            checkReminders();
+
+        } catch (error) {
+            console.error("Error al borrar radares:", error);
+            statusMessage.textContent = `Error: ${error.message}`;
+            statusMessage.style.color = 'red';
+            showToast('Error durante el borrado.', 'error');
+        } finally {
+            setTimeout(() => {
+                progressContainer.style.display = 'none';
+                if(progressBar) progressBar.style.display = 'block';
+                statusMessage.style.color = '';
+            }, 3000);
+        }
+    }
+
+    async function toggleRadaresRuta(activo) {
+        if (!navigationMapInstance || !navigationRouteLayer) {
+            if (activo) showToast("Primero carga o crea una ruta para ver sus radares.", "warning");
+            const checkbox = document.getElementById('radares-ruta-checkbox');
+            if (checkbox) checkbox.checked = false;
+            localStorage.setItem(RADARES_RUTA_CHECKED_KEY, 'false');
+            return;
+        }
+
+        eliminarRadaresDeRuta();
+
+        if (activo) {
+            showToast("Buscando radares en la ruta...", "info");
+            try {
+                const routeLineString = turf.lineString(navigationRouteLayer.getLatLngs().map(latlng => [latlng.lng, latlng.lat]));
+
+                let filesToProcess = await fetchKMLFilesList(KML_FILES_LIST_STANDARD);
+                const extraFiles = await fetchKMLFilesList(KML_FILES_LIST_EXTRA);
+                filesToProcess = filesToProcess.concat(extraFiles.filter(f => !filesToProcess.includes(f)));
+
+                let currentReminders = JSON.parse(localStorage.getItem('reminders') || '[]');
+                let radaresImportadosEnRuta = 0;
+
+                for (const kmlFileName of filesToProcess) {
+                    const placemarks = await fetchAndParseKML(KML_BASE_PATH + kmlFileName);
+                    placemarks.forEach(placemark => {
+                        const coords = placemark.coordinates;
+                        if (coords) {
+                            const [lonStr, latStr] = coords.split(',');
+                            const lon = parseFloat(lonStr);
+                            const lat = parseFloat(latStr);
+                            if (isNaN(lat) || isNaN(lon)) return;
+
+                            const radarPoint = turf.point([lon, lat]);
+                            const nearestPointOnRoute = turf.nearestPointOnLine(routeLineString, radarPoint, { units: 'meters' });
+
+                            if (nearestPointOnRoute && nearestPointOnRoute.properties.dist !== undefined && nearestPointOnRoute.properties.dist <= RUTA_RADAR_PROXIMITY_THRESHOLD) {
+                                const existingReminder = currentReminders.find(r =>
+                                    r.isLocationEnabled && r.locationCoordinates &&
+                                    Math.abs(r.locationCoordinates.latitude - lat) < COORD_EPSILON &&
+                                    Math.abs(r.locationCoordinates.longitude - lon) < COORD_EPSILON &&
+                                    (r.text.toUpperCase().includes("RADAR:") || r.excludeFromList)
+                                );
+
+                                if (!existingReminder) {
+                                    const now = new Date();
+                                    const newRadar = {
+                                        id: Date.now() + Math.random() + radaresImportadosEnRuta,
+                                        text: `<b>RADAR RUTA: ${placemark.name}</b>`,
+                                        type: 'simple', time: '00:01',
+                                        date: `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`,
+                                        createdAt: now.toISOString(),
+                                        managedByUser: false, isLocationEnabled: true,
+                                        locationCoordinates: { latitude: lat, longitude: lon },
+                                        radiusMeters: 600, excludeFromList: true,
+                                        isFromRuta: true
+                                    };
+                                    currentReminders.push(newRadar);
+                                    const mapObject = plotSingleReminderOnMap(newRadar, navigationMapInstance);
+                                    if (mapObject) reminderMapObjects.push(mapObject);
+                                    radaresImportadosEnRuta++;
+                                } else if (!reminderMapObjects.some(obj => obj.reminderId === existingReminder.id)) {
+                                     const mapObject = plotSingleReminderOnMap(existingReminder, navigationMapInstance);
+                                     if (mapObject) reminderMapObjects.push(mapObject);
+                                }
+                            }
+                        }
+                    });
+                }
+                localStorage.setItem('reminders', JSON.stringify(currentReminders));
+                if (radaresImportadosEnRuta > 0) {
+                    showToast(`${radaresImportadosEnRuta} nuevos radares encontrados e importados en la ruta.`, "success");
+                } else {
+                    showToast("No se encontraron nuevos radares para importar en la ruta. Se muestran los existentes si los hay.", "info");
+                }
+                updateReminderCount();
+            } catch (error) {
+                console.error("Error buscando radares en ruta:", error);
+                showToast("Error al buscar radares en ruta.", "error");
+            }
+        }
+    }
+
+    function eliminarRadaresDeRuta() {
+        let currentReminders = JSON.parse(localStorage.getItem('reminders') || '[]');
+        const radaresDeRutaIds = [];
+
+        reminderMapObjects = reminderMapObjects.filter(obj => {
+            if (obj.isFromRuta) {
+                if (obj.marker && navigationMapInstance && navigationMapInstance.hasLayer(obj.marker)) obj.marker.remove();
+                if (obj.circle && navigationMapInstance && navigationMapInstance.hasLayer(obj.circle)) obj.circle.remove();
+                radaresDeRutaIds.push(obj.reminderId);
+                return false;
+            }
+            return true;
+        });
+
+        if (radaresDeRutaIds.length > 0) {
+            currentReminders = currentReminders.filter(r => !radaresDeRutaIds.includes(r.id));
+            localStorage.setItem('reminders', JSON.stringify(currentReminders));
+            showToast(`${radaresDeRutaIds.length} radares de ruta eliminados del mapa y de la lista.`, "info");
+            updateReminderCount();
+        }
+    }
+
+    function showSimulationModal() {
+        if (!isNavigating || 
+            !navigationCurrentRouteData || 
+            !navigationCurrentRouteData.routes || 
+            navigationCurrentRouteData.routes.length === 0 ||
+            !navigationCurrentRouteData.routes[0] ||
+            !navigationCurrentRouteData.routes[0].legs ||
+            navigationCurrentRouteData.routes[0].legs.length === 0) {
+            showToast("La simulación solo está disponible durante la navegación activa con una ruta válida y calculada.", "warning");
+            return;
+        }
+        closeOtherModals('simulation-modal');
+
+        const route = navigationCurrentRouteData.routes[0];
+        let carDist = lastCarDistanceAlongRouteForNavLogic; 
+
+        let simulationContent = "<ul>";
+        let stepsShown = 0;
+
+        let startingLegIndex = 0;
+        let startingStepIndex = 0;
+        let accumulatedDistanceSoFar = 0;
+
+        for (let legIdx = 0; legIdx < route.legs.length; legIdx++) {
+            const leg = route.legs[legIdx];
+            if (!leg || !leg.steps) continue;
+            let distanceInThisLeg = 0;
+            for (let stepIdx = 0; stepIdx < leg.steps.length; stepIdx++) {
+                const step = leg.steps[stepIdx];
+                if (!step) continue;
+                const stepDistance = step.distance || 0;
+                if (carDist < accumulatedDistanceSoFar + distanceInThisLeg + stepDistance) {
+                    startingLegIndex = legIdx;
+                    startingStepIndex = stepIdx;
+                    break; 
+                }
+                distanceInThisLeg += stepDistance;
+            }
+            if (startingLegIndex === legIdx) break; 
+            accumulatedDistanceSoFar += leg.distance || 0;
+        }
+
+
+        accumulatedDistanceSoFar = 0; 
+        for (let legIdx = startingLegIndex; legIdx < route.legs.length; legIdx++) {
+            const leg = route.legs[legIdx];
+            if (!leg || !leg.steps) continue;
+            
+            let startStepForDisplay = (legIdx === startingLegIndex) ? startingStepIndex : 0;
+
+            for (let stepIdx = startStepForDisplay; stepIdx < leg.steps.length; stepIdx++) {
+                const step = leg.steps[stepIdx];
+                if (!step || !step.maneuver) continue;
+                
+                const distanceToEndOfThisStep = calculateDistanceToEndOfStep(route, legIdx, stepIdx);
+
+                if (distanceToEndOfThisStep > carDist || (legIdx === route.legs.length - 1 && stepIdx === leg.steps.length - 1 && Math.abs(distanceToEndOfThisStep - carDist) <= 10 ) ) {
+                    const maneuver = step.maneuver;
+                    const type = maneuver.type;
+                    const modifier = maneuver.modifier || '';
+                    const icon = turnIcons[type + (modifier ? ' ' + modifier : '')] || turnIcons[type] || turnIcons['default'];
+                    
+                    const distanceToThisStepManeuverPoint = Math.max(0, distanceToEndOfThisStep - carDist);
+                    const streetName = step.name || (type === 'arrive' ? 'Llegada al destino' : 'Continuar');
+                    
+                    let distanceText;
+                    if (distanceToThisStepManeuverPoint >= 1000) {
+                        distanceText = `${(distanceToThisStepManeuverPoint / 1000).toFixed(1)} km`;
+                    } else {
+                        distanceText = `${Math.round(distanceToThisStepManeuverPoint)} m`;
+                    }
+
+                    simulationContent += `<li><span class="turn-icon-sim">${icon}</span> ${streetName} (en ${distanceText})</li>`;
+                    stepsShown++;
+                    if (stepsShown >= 15) break; 
+                }
+            }
+            if (stepsShown >= 15) break;
+        }
+        simulationContent += "</ul>";
+
+        if (stepsShown === 0) {
+            simulationContent = "<p>No hay más interacciones futuras en la ruta o estás muy cerca del final.</p>";
+        }
+
+
+        const existingModal = document.getElementById('simulation-modal');
+        if (existingModal) {
+            if (simulationModalTimer) clearTimeout(simulationModalTimer);
+            const simCloseBtn = existingModal.querySelector('#close-simulation-modal');
+            if (simCloseBtn) clearModalAutoCloseTimer(existingModal, simCloseBtn, 'simulation-modal');
+            existingModal.remove();
+        }
+
+        const modal = document.createElement('div');
+        modal.id = 'simulation-modal';
+        modal.innerHTML = `
+            <h2>Próximas Interacciones de Ruta</h2>
+            <div id="simulation-content-area">${simulationContent}</div>
+            <button id="close-simulation-modal">Salir <span class="button-countdown-timer"></span></button>
+        `;
+        document.body.appendChild(modal);
+
+        const closeButton = modal.querySelector('#close-simulation-modal');
+        const closeHandler = () => {
+            if (simulationModalTimer) clearTimeout(simulationModalTimer);
+            clearModalAutoCloseTimer(modal, closeButton, 'simulation-modal');
+            if (modal.parentNode) modal.remove();
+        };
+        closeButton.addEventListener('click', closeHandler);
+
+        addModalAutoCloseTimer(modal, closeButton, 'simulation-modal', 25000); 
+
+        if (simulationModalTimer) clearTimeout(simulationModalTimer); 
+        simulationModalTimer = setTimeout(() => {
+            if (document.getElementById('simulation-modal')) { 
+                closeHandler();
+            }
+        }, 25000);
+    }
+    
+
+    function initializeConfigModalListeners() {
+        document.getElementById('config-save-user')?.addEventListener('click', saveUserData);
+        document.getElementById('config-reset-user')?.addEventListener('click', resetUserData);
+        document.getElementById('config-save-pin')?.addEventListener('click', savePinSettings);
+        document.getElementById('config-remove-pin')?.addEventListener('click', removePinSettings);
+        document.getElementById('config-generate-backup')?.addEventListener('click', generateBackup);
+        document.getElementById('config-restore-backup')?.addEventListener('click', restoreBackup);
+        document.getElementById('config-restore-grid-button')?.addEventListener('click', restoreOriginalGrid);
+        document.getElementById('config-clear-cache')?.addEventListener('click', clearAllLocalData);
+
+        const importBtn = document.getElementById('import-radars-button');
+        if(importBtn && !importBtn.dataset.listenerAttached){
+            importBtn.addEventListener('click', importRadars);
+            importBtn.dataset.listenerAttached = "true";
+        }
+        const deleteBtn = document.getElementById('delete-filtered-radars-button');
+        if(deleteBtn && !deleteBtn.dataset.listenerAttached){
+            deleteBtn.addEventListener('click', deleteFilteredRadars);
+            deleteBtn.dataset.listenerAttached = "true";
+        }
+    }
+
+
+    async function initializeApp() {
+        isNavigationMapActive = false;
+        renderGrid();
+        createOtherButtons();
+        renderToggleButtons();
+        initializeConfigModalListeners();
+        try { await updateVersion(); } catch (e) { console.error("Error updating version:", e); }
+        loadSavedSettings();
+        try { await loadNotices(); startNoticeRotation(); } catch (e) { console.error("Error loading notices:", e); }
+        if (reminderCheckIntervalId) { clearInterval(reminderCheckIntervalId); }
+        checkReminders();
+        reminderCheckIntervalId = setInterval(checkReminders, currentCheckIntervalDuration);
+
+
+        const noticeToggleIcon = document.getElementById('notice-toggle-icon');
+        if (noticeToggleIcon) noticeToggleIcon.addEventListener('click', toggleNotices);
+
+        const countEl = document.getElementById('reminder-count-globe');
+        if (countEl) {
+             const openTable = (e) => {
+                 if (isEditMode || isAssignmentMode || isKeywordAssignmentMode) return;
+                 e.preventDefault(); e.stopPropagation();
+                 showAllReminders();
+             };
+             countEl.addEventListener('click', openTable);
+             countEl.style.cursor = 'pointer';
+        }
+
+        const filterInput = document.getElementById('grid-filter-input');
+        const clearButton = document.getElementById('clear-filter-button');
+        if (filterInput) {
+            filterInput.addEventListener('input', () => {
+                 localStorage.setItem('gridFilterValue', filterInput.value);
+                 filterGridItems();
+                 if(isKeywordAssignmentMode) applyInitialKeywordHighlights();
+            });
+        }
+        if (clearButton) {
+            clearButton.addEventListener('click', () => {
+                 if (filterInput) filterInput.value = '';
+                 localStorage.removeItem('gridFilterValue');
+                 filterGridItems();
+                 if(isKeywordAssignmentMode) applyInitialKeywordHighlights();
+            });
+        }
+
+        adjustButtonPositions();
+        window.addEventListener('resize', adjustButtonPositions);
+        checkVersionsIconOpacity();
+    }
+
+
+    document.addEventListener('DOMContentLoaded', async () => {
+         loadCustomData();
+         storedPin = localStorage.getItem('password_pin');
+         const savedPasswordActive = localStorage.getItem('password_active');
+         isPasswordActive = savedPasswordActive ? JSON.parse(savedPasswordActive) : false;
+
+         if (isPasswordActive && storedPin) {
+             promptForPin();
+         } else {
+             await initializeApp();
+         }
+
+         window.addEventListener('beforeunload', () => {
+             if (reminderCheckIntervalId) { clearInterval(reminderCheckIntervalId); }
+             if (locationWatchId !== null) { navigator.geolocation.clearWatch(locationWatchId); locationWatchId = null; }
+             if (editingTargetElement) { editingTargetElement.classList.remove('editing-target'); editingTargetElement = null; }
+             const openReminderModal = document.querySelector('.reminder-modal');
+             if (openReminderModal && typeof openReminderModal.cleanUpModalTimers === 'function') { openReminderModal.cleanUpModalTimers(true); }
+
+             Object.keys(globalModalTimers).forEach(modalId => {
+                const timerData = globalModalTimers[modalId];
+                if (timerData) {
+                    clearModalAutoCloseTimer(timerData.modalElement, timerData.closeButtonElement, modalId);
+                }
+             });
+             globalModalTimers = {};
+
+             const openTableModal = document.querySelector('.reminder-table-modal');
+             if(openTableModal && openTableModal.autoCloseInterval) { clearInterval(openTableModal.autoCloseInterval); }
+             const openPostponeModal = document.getElementById('postpone-options-modal');
+             if(openPostponeModal && openPostponeModal.autoPostponeInterval) { clearInterval(openPostponeModal.autoPostponeInterval); }
+             const openSavedLocationsModal = document.querySelector('.saved-locations-modal');
+             if (openSavedLocationsModal && locationPickerMap) { try { locationPickerMap.remove(); } catch(e){} locationPickerMap = null; locationPickerMarker = null; }
+             const simModalUnload = document.getElementById('simulation-modal');
+             if (simModalUnload && simulationModalTimer) clearTimeout(simulationModalTimer);
+
+
+             if (isNavigationMapActive || navigationMapInstance) {
+                closeNavigationMap(true);
+             }
+
+
+             if (isAssignmentMode || isEditMode || isKeywordAssignmentMode) { saveCustomData(); }
+
+             const filterInput = document.getElementById('grid-filter-input');
+             if (filterInput && filterInput.value.trim()) {
+                  localStorage.setItem('gridFilterValue', filterInput.value);
+             } else {
+                  localStorage.removeItem('gridFilterValue');
+             }
+              saveSettings();
+
+              if (reminderModalMap) try {reminderModalMap.remove();} catch(e){}
+              Object.values(previewMaps).forEach(map => {try {map?.remove();} catch(e){}});
+         });
+
+        document.body.addEventListener('click', function(event) {
+            const target = event.target;
+            const targetId = target.id || (target.closest('[id]') ? target.closest('[id]').id : null);
+
+
+            if (targetId === 'config-close-modal') {
+                const modal = document.getElementById('config-modal');
+                if (modal && !modal.classList.contains('hidden')) {
+                    clearModalAutoCloseTimer(modal, target, 'config-modal');
+                    modal.classList.add('hidden');
+                     const mapWasOpenBeforeConfig = sessionStorage.getItem('boardinggate_map_should_reopen_after_config') === 'true';
+                     const mapContextToReopen = sessionStorage.getItem('mapContextToReopenAfterConfig');
+                     sessionStorage.removeItem('boardinggate_map_should_reopen_after_config');
+                     sessionStorage.removeItem('mapContextToReopenAfterConfig');
+
+                     if (mapWasOpenBeforeConfig && !document.getElementById('unified-reminder-window')?.classList.contains('visible') && !document.getElementById('reminders-location-map-modal')) {
+                        if (mapContextToReopen === 'navigation') openNavigationMap();
+                        else if (mapContextToReopen === 'reminders') showAllRemindersLocationMap();
+                    }
+                }
+            }
+            if (target.matches('.config-tab-button')) {
+                const modal = document.getElementById('config-modal');
+                if(modal && modal.classList.contains('hidden') === false) {
+                    const tabTarget = target.dataset.tabTarget;
+                    modal.querySelectorAll('.config-tab-button').forEach(btn => btn.classList.remove('active'));
+                    modal.querySelectorAll('.config-tab-content').forEach(content => content.classList.remove('active'));
+                    target.classList.add('active');
+                    if (modal.querySelector(tabTarget)) {
+                        modal.querySelector(tabTarget).classList.add('active');
+                    }
+                }
+            }
+
+            if (targetId === 'close-reminders' || targetId === 'close-reminders-top') {
+                const modalTable = document.querySelector('.reminder-table-modal');
+                if (modalTable) {
+                    if (modalTable.autoCloseInterval) clearInterval(modalTable.autoCloseInterval);
+                    modalTable.remove();
+                    const mapShouldReopen = sessionStorage.getItem('boardinggate_map_was_open_before_table') === 'true';
+                    const mapContext = sessionStorage.getItem('mapContext');
+
+                    sessionStorage.removeItem('boardinggate_map_was_open_before_table');
+                    sessionStorage.removeItem('mapContext');
+
+                    if (fromReminderModal) {
+                        fromReminderModal = false;
+                        if (mapShouldReopen) {
+                            sessionStorage.setItem('boardinggate_map_should_reopen_after_form', 'true');
+                            sessionStorage.setItem('mapContext', mapContext);
+                        }
+                        showReminderModal();
+                    } else if (mapShouldReopen) {
+                         if (mapContext === 'navigation') openNavigationMap();
+                         else if (mapContext === 'reminders') showAllRemindersLocationMap();
+                    }
+                }
+            }
+            if (targetId === 'view-all-locations-map') {
+                const modalTable = document.querySelector('.reminder-table-modal');
+                 if (modalTable && modalTable.autoCloseInterval) clearInterval(modalTable.autoCloseInterval);
+                 if (modalTable) modalTable.remove();
+                openNavigationMap();
+            }
+        });
+
+    });
+
+</script>
+</body>
+</html>
+``` = currentPos;
             updateInitialUserPosition(currentPos, navigationMapInstance);
 
             if (locationWatchId === null && 'geolocation' in navigator && 'watchPosition' in navigator.geolocation) {
