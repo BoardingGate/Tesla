@@ -5136,7 +5136,243 @@ if (!isCyclic) { buttonHtml += ` <button data-minutes="1440" class="postpone-opt
             }
         });
     }
+    
+async function toggleNavigationState() {
+    const startNavButton = document.getElementById('start-navigation-button');
+    const mapContainer = document.getElementById('reminders-location-map-div');
+    const startNavImg = startNavButton ? startNavButton.querySelector('img') : null;
+    const mapHeaderButtonRows = document.querySelectorAll('#reminders-location-map-header .button-row');
 
+
+    if (isNavigating) {
+        isNavigating = false;
+        routeStartTime = null;
+        navigationFollowUser = false;
+        if(startNavImg) startNavImg.src = "INICIARNAVEGACION.PNG";
+        if(startNavButton) startNavButton.classList.remove('navigating');
+        if (mapContainer) mapContainer.classList.remove('navigating');
+        setNavigationMapClickHandler();
+
+        document.getElementById('navigation-bottom-progress-bar').style.display = navigationCurrentRouteData ? 'flex' : 'none';
+        document.getElementById('navigation-top-info-bar').style.display = navigationCurrentRouteData ? 'flex' : 'none';
+        if(navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0]) {
+            let carDistAlongRouteFinal = 0;
+            const currentCarPosForToggle = navigationCurrentLocation;
+            if (currentCarPosForToggle && navigationMapInstance && navigationRouteLayer && typeof L.GeometryUtil !== 'undefined' && L.GeometryUtil && navigationRouteLayer.getLatLngs().length > 0) {
+                const currentLatLng = L.latLng(currentCarPosForToggle.latitude, currentCarPosForToggle.longitude);
+                const carSnappedToRoute = L.GeometryUtil.closest(navigationMapInstance, navigationRouteLayer, currentLatLng);
+                if (carSnappedToRoute && typeof carSnappedToRoute.lat === 'number') {
+                    const snappedLatLng = L.latLng(carSnappedToRoute.lat, carSnappedToRoute.lng);
+                    const locatedInfo = L.GeometryUtil.locateOnLine(navigationMapInstance, navigationRouteLayer, snappedLatLng);
+                    if(locatedInfo && typeof locatedInfo.distance === 'number'){
+                        carDistAlongRouteFinal = locatedInfo.distance;
+                    }
+                }
+            }
+            updateTurnByTurnDisplay(navigationCurrentRouteData.routes[0], carDistAlongRouteFinal);
+        }
+
+        navigationWaypoints.forEach(wp => { if (wp && wp.marker && wp.marker.dragging) wp.marker.dragging.enable(); });
+        showToast("Navegación finalizada", "info", 5000);
+        toggleMapLocationSearchVisibility(true);
+        hideMapInfoOverlay();
+        hideIntersectionPreviewMap();
+
+        mapHeaderButtonsVisible = true;
+        mapHeaderButtonRows.forEach(row => {
+            row.classList.remove('hidden-map-header');
+             row.style.paddingTop = '';
+             row.style.paddingBottom = '';
+             row.style.marginBottom = '';
+             row.style.marginTop = '';
+             row.style.height = '';
+        });
+        if (navigationMapInstance && navigationRouteLayer) {
+            navigationMapInstance.fitBounds(navigationRouteLayer.getBounds().pad(0.1));
+        }
+
+
+    } else {
+        if (!navigationCurrentRouteData || navigationWaypoints.length < 2) {
+            showToast("No hay ruta calculada para iniciar la navegación", "warning");
+            return;
+        }
+        routeStartTime = new Date();
+
+        if (navigationWaypoints.length > 0 && navigationCurrentLocation) {
+            const startPoint = navigationWaypoints[0];
+            if (startPoint) {
+                const distanceToStart = calculateDistance(
+                    navigationCurrentLocation.latitude, navigationCurrentLocation.longitude,
+                    startPoint.lat, startPoint.lng
+                );
+
+                if (distanceToStart > 15000) { // Más de 15km
+                     const originalStartWp = {...navigationWaypoints.shift()}; // Guardar y quitar el original
+                     originalStartWp.type = 'intermediate'; // Convertirlo a intermedio
+                     originalStartWp.visited = false;
+                     originalStartWp.label = '1'; // Asignarle un número de etapa
+
+                     // Crear nuevo punto de inicio desde la posición actual del coche
+                     const carAsStartPoint = {
+                        id: Date.now() -1, // ID único
+                        lat: navigationCurrentLocation.latitude,
+                        lng: navigationCurrentLocation.longitude,
+                        type: 'S', marker: null, label: 'S',
+                        address: 'Posición Actual (GPS)',
+                        visited: true, isCriticalForRecalc: true,
+                        isRecalculatedStart: false
+                     };
+                     navigationWaypoints.unshift(originalStartWp); // Añadir el original como primer waypoint intermedio
+                     navigationWaypoints.unshift(carAsStartPoint); // Añadir la posición actual como nuevo inicio
+                } else if (distanceToStart > 500) { // Entre 500m y 15km
+                    showToast(`Estás a ${distanceToStart.toFixed(0)}m del punto de salida original (<15km). Se usará tu posición actual como nueva salida y se eliminará la salida original`, "info", 6000);
+                    navigationWaypoints.shift(); // Eliminar el punto de salida original
+                    const carAsStartPoint = {
+                        id: Date.now() -1,
+                        lat: navigationCurrentLocation.latitude,
+                        lng: navigationCurrentLocation.longitude,
+                        type: 'S', marker: null, label: 'S',
+                        address: 'Posición Actual (GPS)',
+                        visited: true, isCriticalForRecalc: true,
+                        isRecalculatedStart: false
+                    };
+                    navigationWaypoints.unshift(carAsStartPoint); // Añadir la posición actual como nuevo inicio
+                } else { // Menos de 500m, considerar que está en el inicio
+                     navigationWaypoints.forEach(wp => { if(wp) wp.visited = false; }); // Resetear visitados
+                     if (navigationWaypoints[0]) navigationWaypoints[0].visited = true; // Marcar el inicio como visitado
+                }
+
+                updateWaypointTypesAndLabels();
+                renderWaypointMarkers();
+                if (completedRouteSegmentsLayer) completedRouteSegmentsLayer.clearLayers();
+                lastCarDistanceAlongRouteForNavLogic = 0;
+                currentLegIndexNav = 0;
+                currentStepIndexNav = 0;
+                lastProcessedStepManeuverLocation = null;
+                await recalculateAndDrawRoute();
+
+                if (!navigationCurrentRouteData) {
+                    showToast("No se pudo recalcular la ruta desde la nueva posición. Se usará la ruta original", "error");
+                    isNavigating = false; routeStartTime = null;
+                    if(startNavImg) startNavImg.src = "INICIARNAVEGACION.PNG";
+                    if(startNavButton) startNavButton.classList.remove('navigating');
+                    if (mapContainer) mapContainer.classList.remove('navigating');
+                    toggleMapLocationSearchVisibility(!isNavigating);
+                    updateStartNavigationButtonState();
+                    return;
+                }
+                showToast("Ruta recalculada y lista para navegación", "success");
+            }
+        } else {
+             // Si no hay ubicación actual o no hay waypoints, simplemente resetear visitados
+             navigationWaypoints.forEach(wp => { if(wp) wp.visited = false; });
+        }
+
+        isNavigating = true;
+
+        if (navigationWaypoints.length >= 2) {
+            try {
+                await recalculateAndDrawRoute();
+                if (!navigationCurrentRouteData) {
+                    throw new Error("No se pudieron obtener los datos de la ruta después del recalculo.");
+                }
+            } catch (error) {
+                showToast(`Error al preparar ruta para navegación: ${error.message}`, "error");
+                isNavigating = false;
+                routeStartTime = null;
+                if(startNavImg) startNavImg.src = "INICIARNAVEGACION.PNG";
+                if(startNavButton) startNavButton.classList.remove('navigating');
+                if (mapContainer) mapContainer.classList.remove('navigating');
+                toggleMapLocationSearchVisibility(!isNavigating);
+                updateStartNavigationButtonState();
+                return;
+            }
+        } else {
+            showToast("No hay suficientes puntos para iniciar navegación", "warning");
+            isNavigating = false;
+            routeStartTime = null;
+            if(startNavImg) startNavImg.src = "INICIARNAVEGACION.PNG";
+            if(startNavButton) startNavButton.classList.remove('navigating');
+            if (mapContainer) mapContainer.classList.remove('navigating');
+            toggleMapLocationSearchVisibility(!isNavigating);
+            updateStartNavigationButtonState();
+            return;
+        }
+
+        navigationFollowUser = true;
+        shouldCenterOnUser = true;
+
+        if (completedRouteSegmentsLayer && navigationMapInstance) completedRouteSegmentsLayer.clearLayers();
+        lastProcessedStepManeuverLocation = null;
+        currentLegIndexNav = 0;
+        currentStepIndexNav = 0;
+        lastCarDistanceAlongRouteForNavLogic = 0;
+
+        if(startNavImg) startNavImg.src = "TERMINARNAVEGACION.PNG";
+        if(startNavButton) startNavButton.classList.add('navigating');
+        
+  if (mapContainer) mapContainer.classList.add('navigating');
+        if (navigationMapClickHandler && navigationMapInstance) navigationMapInstance.off('click', navigationMapClickHandler);
+
+        document.getElementById('navigation-bottom-progress-bar').style.display = 'flex';
+        document.getElementById('navigation-top-info-bar').style.display = 'flex';
+
+        if (navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0]) {
+            let carDistAlongRouteInit = 0;
+             const currentCarPosForNavStart = navigationCurrentLocation;
+            if (currentCarPosForNavStart && navigationMapInstance && navigationRouteLayer && typeof L.GeometryUtil !== 'undefined' && L.GeometryUtil && navigationRouteLayer.getLatLngs().length > 0) {
+                const currentLatLng = L.latLng(currentCarPosForNavStart.latitude, currentCarPosForNavStart.longitude);
+                const carSnappedToRoute = L.GeometryUtil.closest(navigationMapInstance, navigationRouteLayer, currentLatLng);
+                if (carSnappedToRoute && typeof carSnappedToRoute.lat === 'number') {
+                     const snappedLatLng = L.latLng(carSnappedToRoute.lat, carSnappedToRoute.lng);
+                     const locatedInfo = L.GeometryUtil.locateOnLine(navigationMapInstance, navigationRouteLayer, snappedLatLng);
+                     if(locatedInfo && typeof locatedInfo.distance === 'number'){
+                        carDistAlongRouteInit = locatedInfo.distance;
+                     }
+                }
+            }
+            updateNavigationProgressDisplay(navigationCurrentRouteData.routes[0], carDistAlongRouteInit);
+            updateTurnByTurnDisplay(navigationCurrentRouteData.routes[0], carDistAlongRouteInit);
+            showDestinationName();
+        }
+
+
+        navigationWaypoints.forEach(wp => { if (wp && wp.marker && wp.marker.dragging) wp.marker.dragging.disable(); });
+
+        showToast("Navegación iniciada", "info", 3000);
+
+        if (navigationMapInstance && navigationCurrentLocation ) {
+            const targetNavStartZoom = MIN_MANEUVER_ZOOM_LEVEL;
+            navigationMapInstance.setView([navigationCurrentLocation.latitude, navigationCurrentLocation.longitude], targetNavStartZoom);
+
+            const locateMeButton = document.getElementById('locate-me-on-reminders-map');
+            const locateMeImg = locateMeButton ? locateMeButton.querySelector('img') : null;
+            if(locateMeButton && locateMeImg && locateMeButton.title.includes("Mostrar mi posición")){
+                if(locateMeImg) locateMeImg.src = "DEJARSEGUIR.PNG";
+                locateMeButton.title = "Dejar de centrar el mapa automáticamente en mi posición";
+            }
+        } else if (isZoomedForManeuver && mapPreviousZoomLevel !== null && navigationMapInstance) {
+            navigationMapInstance.setZoom(mapPreviousZoomLevel);
+            mapPreviousZoomLevel = null;
+            isZoomedForManeuver = false;
+        }
+
+        toggleMapLocationSearchVisibility(false);
+        mapHeaderButtonsVisible = false;
+        mapHeaderButtonRows.forEach(row => {
+            row.classList.add('hidden-map-header');
+            row.style.paddingTop = '0';
+            row.style.paddingBottom = '0';
+            row.style.marginBottom = '0';
+            row.style.marginTop = '0';
+            row.style.height = '0';
+        });
+    }
+    updateStartNavigationButtonState();
+}
+
+    
     function getSavedLocations() { try { const locations = localStorage.getItem(SAVED_LOCATIONS_KEY); return locations ? JSON.parse(locations) : Array(MAX_SAVED_LOCATIONS).fill(null); } catch (e) { return Array(MAX_SAVED_LOCATIONS).fill(null); } }
     function saveLocationsToCache(locationsArray) { try { localStorage.setItem(SAVED_LOCATIONS_KEY, JSON.stringify(locationsArray)); } catch (e) { showToast("Error al guardar ubicaciones.", "error"); } }
     function showSavedLocationsModal(callbackOnClose, callbackOnSelectLocation) {
