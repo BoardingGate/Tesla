@@ -1,4 +1,4 @@
-14
+
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -1934,13 +1934,6 @@
     let mapLayersControl = null;
     let searchToastShown = false;
 
-    let lastPositionProcessTime = 0;
-    const POSITION_PROCESS_INTERVAL = 3000;
-    let pendingPositionToProcess = null;
-    const MIN_HEADING_CHANGE_FOR_TILT_UPDATE = 5;
-    const TILT_UPDATE_INTERVAL = 500;
-    let lastTiltUpdateTime = 0;
-
     const GAS_URL = 'AKfycbx_3pvCCHM0bxq0yqwgafj_hnXe3CDJy0HPyqbqHfDFpDKX529sxZl4kpxpl78h_bi5';
     const managedKeys = ['reminders','darkMode','toggleStates','zoomState','onOffState','noticesActive','footerVisible','teslaHtmlLastModified','teslaHtmlLastModifiedTimestamp','userData_userId','userData_teslaModel','userData_teslaYear','userData_teslaProvince','userData_allowDMs', 'customGridData', 'personalizationHelpShown', 'gridFilterValue', 'password_pin', 'password_active', 'lastUpdatesCheckDate', SAVED_LOCATIONS_KEY, SHOW_EXCLUDED_REMINDERS_KEY, SAVED_ROUTES_KEY, RADARES_RUTA_CHECKED_KEY, ACTIVE_MAP_LAYER_KEY, DIRECT_TO_NAVIGATION_KEY ];
     const KML_FILES_LIST_STANDARD = './KLM/KLMFILES.TXT';
@@ -3451,7 +3444,7 @@ if(dateParts.length === 3) { elementsToUpdate.dateInput.value = `${dateParts[2]}
             <p class="mb-4">Ejemplos:</p>
             <ul class="list-disc pl-6 mb-4">
                 <li><strong>Texto:</strong> "Recordar cita", "Llamar mamá"</li>
-                <li><strong>Hora:</strong> "A LAS DIEZ Y CUARTO" &rarr; 10:15, "A LAS CINCO Y MEDIA TARDE" &rarr; 17:30</li>
+                <li><strong>Hora:</strong> "A LAS DIEZ Y CUARTO" &rarr; 10:15, "A LAS CINCO E MEDIA TARDE" &rarr; 17:30</li>
                 <li><strong>Fecha:</strong> "HOY", "MAÑANA", "DENTRO DE 15 DÍAS", "EL DÍA 22", "PRÓXIMO LUNES", "25/05/2025"</li>
                 <li><strong>Repetición:</strong> "CADA LUNES", "TODOS LOS VIERNES Y SÁBADOS"</li>
                 <li><strong>Intervalo:</strong> "CADA 7 DÍAS"</li>
@@ -5336,13 +5329,168 @@ if (!isCyclic) { buttonHtml += ` <button data-minutes="1440" class="postpone-opt
 
             updateReminderCount(); updateButtonStyles();
 
-            let newInterval = isNavigating ? POSITION_PROCESS_INTERVAL : 3000;
+            const nowTimeForInterval = Date.now();
+            let carDistanceAlongRouteForCallback = lastCarDistanceAlongRouteForNavLogic;
+            let totalRouteDistance = 0;
+
+            if (isNavigating && navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0] && currentCoords) { // Asegurarse que currentCoords existe
+                const route = navigationCurrentRouteData.routes[0];
+                totalRouteDistance = route.distance;
+                navigationWaypoints.forEach(wp => {
+                    if (wp && !wp.visited && typeof wp.lat === 'number' && typeof wp.lng === 'number') {
+                        const distToWp = calculateDistance(currentCoords.latitude, currentCoords.longitude, wp.lat, wp.lng);
+                        if (distToWp < WAYPOINT_VISITED_THRESHOLD_METERS) {
+                            wp.visited = true;
+                        }
+                    }
+                });
+
+
+                let shouldUsePreciseRecalcForETA = (nowTimeForInterval - lastPreciseRecalcTime > PRECISE_RECALC_INTERVAL);
+
+                if (shouldUsePreciseRecalcForETA || distanceToNextManeuverOSRM < 500) {
+                    try {
+                        let waypointsForPreciseRecalc = [{ lng: currentCoords.longitude, lat: currentCoords.latitude }];
+                        const unvisitedWaypoints = navigationWaypoints.filter(wp => wp && !wp.visited && wp.isCriticalForRecalc && typeof wp.lng === 'number' && typeof wp.lat === 'number');
+
+                        if (unvisitedWaypoints.length > 0) {
+                            unvisitedWaypoints.forEach(wp => { waypointsForPreciseRecalc.push({ lng: wp.lng, lat: wp.lat }); });
+
+                            const coordsStringPrecise = waypointsForPreciseRecalc.map(wp => `${wp.lng},${wp.lat}`).join(';');
+                            const urlPrecise = `${OSRM_SERVICE_URL}/driving/${coordsStringPrecise}?overview=false&alternatives=false&steps=false&annotations=false`;
+                            const responsePrecise = await fetch(urlPrecise);
+                            if (!responsePrecise.ok) throw new Error(`Error OSRM para ruta precisa (ETA): ${responsePrecise.statusText}`);
+                            const dataPrecise = await responsePrecise.json();
+
+                            if (dataPrecise.routes && dataPrecise.routes.length > 0 && dataPrecise.routes[0]) {
+                                const preciseRemainingDistance = dataPrecise.routes[0].distance || 0;
+                                const preciseRemainingDuration = dataPrecise.routes[0].duration || 0;
+
+                                carDistanceAlongRouteForCallback = Math.max(0, totalRouteDistance - preciseRemainingDistance);
+                                // Lógica anti-regresión para lastCarDistanceAlongRouteForNavLogic
+                                if (carDistanceAlongRouteForCallback >= lastCarDistanceAlongRouteForNavLogic || Math.abs(carDistanceAlongRouteForCallback - lastCarDistanceAlongRouteForNavLogic) > 500 || carDistanceAlongRouteForCallback === 0) {
+                                   lastCarDistanceAlongRouteForNavLogic = carDistanceAlongRouteForCallback;
+                                } else if (carDistanceAlongRouteForCallback < lastCarDistanceAlongRouteForNavLogic && (lastCarDistanceAlongRouteForNavLogic - carDistanceAlongRouteForCallback) < 50 ) {
+                                    // Pequeña regresión (menos de 50m), no actualizamos lastCarDistanceAlongRouteForNavLogic
+                                    // para la lógica de avance de maniobras, pero carDistanceAlongRouteForCallback (el valor de Turf)
+                                    // sí podría usarse para actualizar el progreso visual si se desea más reactividad.
+                                    // Para el cálculo de la distancia a la maniobra, es mejor ser conservador.
+                                    console.log("Nav LOG (Turf): Pequeña regresión de ETA precisa ignorada para lógica de avance. Actual:", lastCarDistanceAlongRouteForNavLogic, "Nuevo ETA:", carDistanceAlongRouteForCallback);
+                                } else {
+                                     lastCarDistanceAlongRouteForNavLogic = carDistanceAlongRouteForCallback; // Avance normal
+                                }
+
+
+                                lastPreciseRecalcTime = nowTimeForInterval;
+
+                                const finalDestDistEl = document.getElementById('final-destination-distance');
+                                const finalDestTimeEl = document.getElementById('final-destination-time');
+                                const finalDestEtaEl = document.getElementById('final-destination-eta');
+                                if(finalDestDistEl) finalDestDistEl.textContent = `${(preciseRemainingDistance / 1000).toFixed(1)} km`;
+                                if(finalDestTimeEl) {
+                                    const finalDestTotalMinutes = Math.round(preciseRemainingDuration / 60);
+                                    const finalDestHours = Math.floor(finalDestTotalMinutes / 60);
+                                    const finalDestMinutes = finalDestTotalMinutes % 60;
+                                    finalDestTimeEl.textContent = `${String(finalDestHours).padStart(2, '0')}:${String(finalDestMinutes).padStart(2, '0')}`;
+                                }
+                                if(finalDestEtaEl) finalDestEtaEl.textContent = new Date(Date.now() + preciseRemainingDuration * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                            }
+                        } else if (navigationWaypoints.length > 0 && navigationWaypoints[navigationWaypoints.length - 1].visited) {
+                                carDistanceAlongRouteForCallback = totalRouteDistance;
+                                lastCarDistanceAlongRouteForNavLogic = carDistanceAlongRouteForCallback;
+                        }
+                    } catch (error) {
+                         console.error("Nav LOG (Turf): Error en recálculo preciso de ETA:", error);
+                    }
+                }
+
+
+                if (navigationRouteLayer && navigationRouteLayer.getLatLngs().length > 0) {
+                    const currentLatLng = L.latLng(currentCoords.latitude, currentCoords.longitude);
+                    let deviationDistance = 0;
+                    let deviationCalculationSuccessful = false;
+                    let carDistTurfForDeviationCheck = 0;
+
+                    if (typeof L.GeometryUtil !== 'undefined' && typeof L.GeometryUtil.closest === 'function') {
+                        const closestResultForDeviation = L.GeometryUtil.closest(navigationMapInstance, navigationRouteLayer, currentLatLng);
+                        if (closestResultForDeviation && typeof closestResultForDeviation.lat === 'number') {
+                            const snappedLatLngForDeviation = L.latLng(closestResultForDeviation.lat, closestResultForDeviation.lng);
+                            deviationDistance = currentLatLng.distanceTo(snappedLatLngForDeviation);
+                            deviationCalculationSuccessful = true;
+
+                            // Calcular carDistTurf para el punto más cercano en la ruta
+                            const routeLineStringTurf = turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat]));
+                            const lineSegmentToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), turf.point([snappedLatLngForDeviation.lng, snappedLatLngForDeviation.lat]), routeLineStringTurf);
+                            carDistTurfForDeviationCheck = turf.length(lineSegmentToNearestTurf, { units: 'meters' });
+                        }
+                    } else if (typeof turf !== 'undefined' && typeof turf.pointToLineDistance === 'function') {
+                        try {
+                            const carPoint = turf.point([currentCoords.longitude, currentCoords.latitude]);
+                            const routeLineCoords = navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat]);
+                            if (routeLineCoords.length >= 2) {
+                                const routeLineString = turf.lineString(routeLineCoords);
+                                deviationDistance = turf.pointToLineDistance(carPoint, routeLineString, { units: 'meters' });
+                                deviationCalculationSuccessful = true;
+
+                                const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineString, carPoint, { units: 'meters' });
+                                const lineSegmentToNearestTurf = turf.lineSlice(turf.point(routeLineString.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineString);
+                                carDistTurfForDeviationCheck = turf.length(lineSegmentToNearestTurf, { units: 'meters' });
+
+                            }
+                        } catch (turfError) { console.error("Nav LOG (Turf): Error en cálculo de distancia (desvío) con Turf:", turfError); }
+                    } else {
+                        showToast("Error: Detección de desvío deshabilitada (falta librería).", "error", 10000);
+                    }
+
+                    if (deviationCalculationSuccessful) {
+                         // Aplicar lógica anti-regresión a lastCarDistanceAlongRouteForNavLogic
+                        if (carDistTurfForDeviationCheck >= lastCarDistanceAlongRouteForNavLogic || Math.abs(carDistTurfForDeviationCheck - lastCarDistanceAlongRouteForNavLogic) > 500 || carDistTurfForDeviationCheck === 0) {
+                           lastCarDistanceAlongRouteForNavLogic = carDistTurfForDeviationCheck;
+                        } else if (carDistTurfForDeviationCheck < lastCarDistanceAlongRouteForNavLogic && (lastCarDistanceAlongRouteForNavLogic - carDistTurfForDeviationCheck < 50) ) {
+                            // Pequeña regresión, no actualizamos.
+                            console.log("Nav LOG (Turf): Pequeña regresión de Turf para chequeo de desvío, se mantiene el valor anterior de lastCarDistanceAlongRouteForNavLogic.");
+                        } else {
+                             lastCarDistanceAlongRouteForNavLogic = carDistTurfForDeviationCheck; // Avance normal
+                        }
+
+                        if (deviationDistance > DEVIATION_THRESHOLD_METERS) {
+                            if (deviationStartTime === 0) {
+                                deviationStartTime = Date.now();
+                            } else if (Date.now() - deviationStartTime > (DEVIATION_MIN_TIME_SECONDS * 1000) && !isRecalculatingRoute && !isDeviationModalActive) {
+                                showDeviationModal();
+                            }
+                        } else {
+                            deviationStartTime = 0;
+                            updateNavigationProgressDisplay(route, lastCarDistanceAlongRouteForNavLogic);
+                            updateTurnByTurnDisplay(route, lastCarDistanceAlongRouteForNavLogic);
+                        }
+                    }
+                } else { // Si no hay capa de ruta (raro si se está navegando)
+                    updateNavigationProgressDisplay(route, lastCarDistanceAlongRouteForNavLogic);
+                    updateTurnByTurnDisplay(route, lastCarDistanceAlongRouteForNavLogic);
+                }
+
+                const remainingDistanceForArrivalCheck = totalRouteDistance - lastCarDistanceAlongRouteForNavLogic;
+                 if (remainingDistanceForArrivalCheck < WAYPOINT_VISITED_THRESHOLD_METERS) {
+                    showArrivalStatsModal();
+                 }
+
+            } else if (isNavigating) {
+                // No hay currentCoords pero se está navegando (error de GPS?)
+                 console.warn("Nav LOG: Navegando pero sin currentCoords en checkReminders.");
+                 updateNavigationProgressDisplay(navigationCurrentRouteData.routes[0], lastCarDistanceAlongRouteForNavLogic); // Mostrar con la última distancia conocida
+                 updateTurnByTurnDisplay(navigationCurrentRouteData.routes[0], lastCarDistanceAlongRouteForNavLogic);
+            }
+
+            let newInterval = isNavigating ? 1000 : 3000;
             if (isNavigating) {
                 const distToNextManeuver = distanceToNextManeuverOSRM || Infinity;
                  if (distToNextManeuver < 500 && distToNextManeuver > 0) {
-                    newInterval = Math.min(POSITION_PROCESS_INTERVAL, 1000);
+                    newInterval = 1000;
                 } else if (distToNextManeuver < 1000 && distToNextManeuver > 0) {
-                    newInterval = Math.min(POSITION_PROCESS_INTERVAL, 1500);
+                    newInterval = 1500;
+                } else {
+                    newInterval = 3000;
                 }
             } else if (isAnyReminderNearby) {
                  newInterval = 5000;
@@ -6117,58 +6265,41 @@ function openNavigationMap() {
                                 altitude: position.coords.altitude,
                                 speed: position.coords.speed
                             };
-                            console.log("Nav LOG (Turf): Posición GPS Recibida:", coordsForUpdate);
 
                             navigationCurrentLocation = coordsForUpdate;
                             updateInitialUserPosition(coordsForUpdate, navigationMapInstance);
 
-                            pendingPositionToProcess = coordsForUpdate;
-                            const nowTime = Date.now();
-
-                            if (nowTime - lastPositionProcessTime >= POSITION_PROCESS_INTERVAL) {
-                                lastPositionProcessTime = nowTime;
-                                const positionToProcessThisCycle = pendingPositionToProcess;
-                                pendingPositionToProcess = null;
-
-                                if(isNavigating && navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0] && positionToProcessThisCycle) {
-                                    const routeForDistCalc = navigationCurrentRouteData.routes[0];
-                                    let carDistTurf = 0;
-                                    if (navigationRouteLayer && typeof turf !== 'undefined' && navigationRouteLayer.getLatLngs().length > 0) {
-                                        try {
-                                            const carPointTurf = turf.point([positionToProcessThisCycle.longitude, positionToProcessThisCycle.latitude]);
-                                            const routeLineStringTurf = turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat]));
-                                            const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
-                                            const lineSegmentToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
-                                            carDistTurf = turf.length(lineSegmentToNearestTurf, { units: 'meters' });
-                                            console.log("Nav LOG (Turf): Distancia Recorrida (Turf):", carDistTurf);
-                                        } catch (turfError) {
-                                            console.error("Nav LOG (Turf): Error en cálculo de distancia con Turf:", turfError);
-                                        }
-                                     }
-
-                                    const previousDistance = lastCarDistanceAlongRouteForNavLogic;
-                                    const totalRouteLength = routeForDistCalc.distance;
-
-                                    if ( (carDistTurf === 0 && previousDistance > 0 && carDistTurf < totalRouteLength - 10) ||
-                                         (carDistTurf > previousDistance + 5000 && carDistTurf < totalRouteLength -10) ||
-                                         (carDistTurf < previousDistance - 500 && previousDistance > 0 && Math.abs(carDistTurf - previousDistance) > 50) // Solo si es un retroceso significativo
-                                    ) {
-                                        // Posible error de snap o recalculo, no actualizamos lastCarDistanceAlongRouteForNavLogic
-                                        // pero sí podemos actualizar la UI con el valor de Turf si es necesario
-                                        console.log("Nav LOG (Turf): Posible error de snap o retroceso grande de Turf, no se actualiza lastCarDistanceAlongRouteForNavLogic.");
-
-                                    } else if (carDistTurf < lastCarDistanceAlongRouteForNavLogic && (lastCarDistanceAlongRouteForNavLogic - carDistTurf < 50) ) {
-                                        // Pequeña regresión, se ignora para la lógica pero la UI puede usar el valor de Turf
-                                        console.log("Nav LOG (Turf): Pequeña regresión detectada en Turf. Se mantiene lastCarDistanceAlongRouteForNavLogic anterior:", lastCarDistanceAlongRouteForNavLogic, "Nuevo Turf:", carDistTurf);
-                                    } else if (carDistTurf > totalRouteLength + 500) {
-                                        // Demasiado lejos, posible error
-                                         console.log("Nav LOG (Turf): Distancia Turf excede longitud de ruta. No se actualiza lastCarDistanceAlongRouteForNavLogic.");
-                                    } else {
-                                        lastCarDistanceAlongRouteForNavLogic = carDistTurf;
+                            if(isNavigating && navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0] && coordsForUpdate) {
+                                const routeForDistCalc = navigationCurrentRouteData.routes[0];
+                                let carDistTurf = 0;
+                                if (navigationRouteLayer && typeof turf !== 'undefined' && navigationRouteLayer.getLatLngs().length > 0) {
+                                    try {
+                                        const carPointTurf = turf.point([coordsForUpdate.longitude, coordsForUpdate.latitude]);
+                                        const routeLineStringTurf = turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat]));
+                                        const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
+                                        const lineSegmentToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
+                                        carDistTurf = turf.length(lineSegmentToNearestTurf, { units: 'meters' });
+                                    } catch (turfError) {
+                                        console.error("Nav LOG (Turf): Error en cálculo de distancia con Turf:", turfError);
+                                    }
                                     }
 
-                                    updateTurnByTurnDisplay(routeForDistCalc, lastCarDistanceAlongRouteForNavLogic);
+                                const previousDistance = lastCarDistanceAlongRouteForNavLogic;
+                                const totalRouteLength = routeForDistCalc.distance;
+
+                                if ( (carDistTurf === 0 && previousDistance > 0 && carDistTurf < totalRouteLength - 10) ||
+                                        (carDistTurf > previousDistance + 5000 && carDistTurf < totalRouteLength -10) ||
+                                        (carDistTurf < previousDistance - 50 && previousDistance > 0 && Math.abs(carDistTurf - previousDistance) > 50) 
+                                ) {
+                                    console.log("Nav LOG (Turf): Posible error de snap o retroceso grande de Turf, no se actualiza lastCarDistanceAlongRouteForNavLogic.");
+                                } else if (carDistTurf < lastCarDistanceAlongRouteForNavLogic && (lastCarDistanceAlongRouteForNavLogic - carDistTurf < 50) ) {
+                                    console.log("Nav LOG (Turf): Pequeña regresión detectada en Turf. Se mantiene lastCarDistanceAlongRouteForNavLogic anterior:", lastCarDistanceAlongRouteForNavLogic, "Nuevo Turf:", carDistTurf);
+                                } else if (carDistTurf > totalRouteLength + 500) {
+                                        console.log("Nav LOG (Turf): Distancia Turf excede longitud de ruta. No se actualiza lastCarDistanceAlongRouteForNavLogic.");
+                                } else {
+                                    lastCarDistanceAlongRouteForNavLogic = carDistTurf;
                                 }
+                                updateTurnByTurnDisplay(routeForDistCalc, lastCarDistanceAlongRouteForNavLogic);
                             }
                         },
                         (error) => { showToast(`Error seguimiento GPS: ${error.message}`, "warning"); if (locationWatchId !== null) { navigator.geolocation.clearWatch(locationWatchId); locationWatchId = null; } if (isNavigating && currentCheckIntervalDuration < 15000) { currentCheckIntervalDuration = 15000; if (reminderCheckIntervalId) clearInterval(reminderCheckIntervalId); reminderCheckIntervalId = setInterval(checkReminders, currentCheckIntervalDuration); } },
@@ -11294,4 +11425,4 @@ const bookmarkGrid = document.getElementById('bookmark-grid');
 </script>
 </body>
 </html>
-                                     
+        
