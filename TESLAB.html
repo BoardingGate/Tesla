@@ -1,4 +1,4 @@
-..
+YY
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -1246,6 +1246,9 @@
     #navigation-eta-info #next-stage-distance, #navigation-eta-info #final-destination-distance { margin-right: 3px; }
     #navigation-eta-info #next-stage-time, #navigation-eta-info #final-destination-time { margin-left: 3px; margin-right: 3px; }
     #navigation-eta-info #next-stage-eta, #navigation-eta-info #final-destination-eta { margin-left: 3px; }
+    .eta-deviation { font-size: 0.8em; font-weight: bold; margin-left: 4px; }
+    .eta-deviation.positive { color: #EF4444; } /* Rojo */
+    .eta-deviation.negative { color: #10B981; } /* Verde */
 
 
     #simulation-modal .modal-top-buttons { margin-bottom: 1rem; }
@@ -1488,7 +1491,7 @@
     position: absolute;
     height: 480px;
     background-color: rgba(0, 0, 0, 0.75);
-    border: 6px solid #AF7AC5; /* Modificado de 4px a 6px */
+    border: 6px solid #AF7AC5;
     border-radius: 7px;
     z-index: 8950;
     box-shadow: 0 4px 12px rgba(0,0,0,0.5);
@@ -1884,6 +1887,10 @@
     let navigationStartTimeForStats = null;
     let totalDistanceTravelledForStats = 0;
     let lastPositionForStats = null;
+
+    let tripInitialOverallEtaTime = null;
+    let currentStageInitialExpectedEtaTime = null;
+    let accumulatedDeviationMs = 0;
 
 
     window.lastPositionForSpeedCalc = null;
@@ -5374,7 +5381,19 @@ if (!isCyclic) { buttonHtml += ` <button data-minutes="1440" class="postpone-opt
     }
 
 
-    
+    function formatDeviation(milliseconds) {
+        if (typeof milliseconds !== 'number' || isNaN(milliseconds)) {
+            return '';
+        }
+        const totalSeconds = Math.abs(Math.round(milliseconds / 1000));
+        const hours = Math.floor(totalSeconds / 3600);
+        const minutes = Math.floor((totalSeconds % 3600) / 60);
+        const sign = milliseconds >= 0 ? '+' : '-';
+        const color = milliseconds >= 0 ? 'positive' : 'negative';
+
+        const formattedTime = `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
+        return `<span class="eta-deviation ${color}">[${sign}${formattedTime}]</span>`;
+    }
 
 
 
@@ -5649,7 +5668,22 @@ function openNavigationMap() {
                              </div>
                              <span id="route-progress-text"></span>
                         </div>
-                        <div id="navigation-eta-info"> <div id="next-stage-info"> <strong>Próxima Etapa</strong> <span id="next-stage-distance">-- km</span> &nbsp;|&nbsp; <span id="next-stage-time">-- min</span> &nbsp;|&nbsp; ETA: <span id="next-stage-eta">--:--</span> </div> <div id="final-destination-info"> <strong>Destino Final</strong> <span id="final-destination-distance">-- km</span> &nbsp;|&nbsp; <span id="final-destination-time">-- min</span> &nbsp;|&nbsp; ETA: <span id="final-destination-eta">--:--</span> </div> </div>
+                        <div id="navigation-eta-info">
+                            <div id="next-stage-info">
+                                <strong>Próxima Etapa</strong>
+                                <span id="next-stage-distance">-- km</span> &nbsp;|&nbsp;
+                                <span id="next-stage-time">-- min</span> &nbsp;|&nbsp; ETA:
+                                <span id="next-stage-eta">--:--</span>
+                                <span id="next-stage-eta-deviation" class="eta-deviation"></span>
+                            </div>
+                            <div id="final-destination-info">
+                                <strong>Destino Final</strong>
+                                <span id="final-destination-distance">-- km</span> &nbsp;|&nbsp;
+                                <span id="final-destination-time">-- min</span> &nbsp;|&nbsp; ETA:
+                                <span id="final-destination-eta">--:--</span>
+                                <span id="final-destination-eta-deviation" class="eta-deviation"></span>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -6683,6 +6717,7 @@ function closeNavigationMap(force = false) {
     navigationRouteLayer = null;
     navigationCurrentRouteData = null; isNavigating = false; navigationFollowUser = false;
     routeStartTime = null; navigationStartTimeForStats = null; totalDistanceTravelledForStats = 0; lastPositionForStats = null;
+    tripInitialOverallEtaTime = null; currentStageInitialExpectedEtaTime = null; accumulatedDeviationMs = 0;
     currentMapRotationAngle = 0; lastValidCarDistanceForDisplay = 0;
     initialUserLocationMarker = null; initialUserLocationMarkerLat = null; initialUserLocationMarkerLng = null;
     if (initialUserLocationCircle) { try {initialUserLocationCircle.remove();} catch(e){} initialUserLocationCircle = null; }
@@ -7648,6 +7683,9 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
         totalDistanceTravelledForStats = 0;
         lastPositionForStats = null;
         if (isNavigating) navigationStartTimeForStats = new Date();
+        tripInitialOverallEtaTime = null;
+        currentStageInitialExpectedEtaTime = null;
+        accumulatedDeviationMs = 0;
     }
 
 
@@ -7864,6 +7902,10 @@ async function toggleNavigationState() {
         toggleMapLocationSearchVisibility(true);
         hideMapInfoOverlay();
         hideIntersectionPreviewMap();
+        tripInitialOverallEtaTime = null;
+        currentStageInitialExpectedEtaTime = null;
+        accumulatedDeviationMs = 0;
+
 
         mapHeaderButtonsVisible = true;
         mapHeaderButtonRows.forEach(row => {
@@ -7889,6 +7931,21 @@ async function toggleNavigationState() {
         totalDistanceTravelledForStats = 0;
         lastPositionForStats = navigationCurrentLocation ? { ...navigationCurrentLocation } : null;
         lastValidCarDistanceForDisplay = 0;
+        accumulatedDeviationMs = 0;
+
+        // Calcular ETAs iniciales
+        const now = new Date();
+        if (navigationCurrentRouteData && navigationCurrentRouteData.routes[0]) {
+            const route = navigationCurrentRouteData.routes[0];
+            tripInitialOverallEtaTime = new Date(now.getTime() + (route.duration * 1000));
+
+            if (route.legs && route.legs.length > 0) {
+                currentStageInitialExpectedEtaTime = new Date(now.getTime() + (route.legs[0].duration * 1000));
+            } else {
+                currentStageInitialExpectedEtaTime = new Date(tripInitialOverallEtaTime); // Si no hay etapas, es el ETA final
+            }
+        }
+
 
         if (navigationWaypoints.length > 0 && navigationCurrentLocation) {
             const startPoint = navigationWaypoints[0];
@@ -8074,13 +8131,17 @@ function updateNavigationProgressDisplay(route, carDistanceAlongTheRoute = 0) {
         const nextStageDistEl = document.getElementById('next-stage-distance');
         const nextStageTimeEl = document.getElementById('next-stage-time');
         const nextStageEtaEl = document.getElementById('next-stage-eta');
+        const finalDestDeviationEl = document.getElementById('final-destination-eta-deviation');
+        const nextStageDeviationEl = document.getElementById('next-stage-eta-deviation');
 
         if(finalDestDistEl) finalDestDistEl.textContent = "-- km";
         if(finalDestTimeEl) finalDestTimeEl.textContent = "--:--";
         if(finalDestEtaEl) finalDestEtaEl.textContent = "--:--";
+        if(finalDestDeviationEl) finalDestDeviationEl.innerHTML = "";
         if(nextStageDistEl) nextStageDistEl.textContent = "-- km";
         if(nextStageTimeEl) nextStageTimeEl.textContent = "--:--";
         if(nextStageEtaEl) nextStageEtaEl.textContent = "--:--";
+        if(nextStageDeviationEl) nextStageDeviationEl.innerHTML = "";
         return;
     }
     
@@ -8092,9 +8153,11 @@ function updateNavigationProgressDisplay(route, carDistanceAlongTheRoute = 0) {
     const nextStageDistEl = document.getElementById('next-stage-distance');
     const nextStageTimeEl = document.getElementById('next-stage-time');
     const nextStageEtaEl = document.getElementById('next-stage-eta');
+    const nextStageDeviationEl = document.getElementById('next-stage-eta-deviation');
     const finalDestDistEl = document.getElementById('final-destination-distance');
     const finalDestTimeEl = document.getElementById('final-destination-time');
     const finalDestEtaEl = document.getElementById('final-destination-eta');
+    const finalDestDeviationEl = document.getElementById('final-destination-eta-deviation');
     const nextStageInfoDiv = document.getElementById('next-stage-info');
     const finalDestInfoDiv = document.getElementById('final-destination-info');
     const etaInfoContainer = document.getElementById('navigation-eta-info');
@@ -8151,7 +8214,15 @@ function updateNavigationProgressDisplay(route, carDistanceAlongTheRoute = 0) {
 const finalDestHours = Math.floor(finalDestTotalMinutes / 60);
 const finalDestMinutes = finalDestTotalMinutes % 60;
 finalDestTimeEl.textContent = `${String(finalDestHours).padStart(2, '0')}:${String(finalDestMinutes).padStart(2, '0')}`;
-    finalDestEtaEl.textContent = new Date(Date.now() + remainingDuration * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    const currentFinalEta = new Date(Date.now() + remainingDuration * 1000);
+    finalDestEtaEl.textContent = currentFinalEta.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    
+    if (tripInitialOverallEtaTime && isNavigating) {
+        const deviationFinalMs = currentFinalEta.getTime() - tripInitialOverallEtaTime.getTime();
+        finalDestDeviationEl.innerHTML = formatDeviation(deviationFinalMs);
+    } else {
+        finalDestDeviationEl.innerHTML = "";
+    }
     console.log("Nav LOG (Turf): ETA Final (UI):", finalDestEtaEl.textContent, "Dist. Final (UI):", finalDestDistEl.textContent);
 
     let currentLegIndexForNextStageDisplay = 0;
@@ -8182,7 +8253,16 @@ finalDestTimeEl.textContent = `${String(finalDestHours).padStart(2, '0')}:${Stri
        const nextStageTotalMinutes = Math.round(remainingDurationThisLegDisplay / 60);
        const nextStageHours = Math.floor(nextStageTotalMinutes / 60);
        const nextStageMinutes = nextStageTotalMinutes % 60;
-       nextStageTimeEl.textContent = `${String(nextStageHours).padStart(2, '0')}:${String(nextStageMinutes).padStart(2, '0')}`;       nextStageEtaEl.textContent = new Date(Date.now() + remainingDurationThisLegDisplay * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+       nextStageTimeEl.textContent = `${String(nextStageHours).padStart(2, '0')}:${String(nextStageMinutes).padStart(2, '0')}`;
+       const currentNextStageEta = new Date(Date.now() + remainingDurationThisLegDisplay * 1000);
+       nextStageEtaEl.textContent = currentNextStageEta.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+       
+       if (currentStageInitialExpectedEtaTime && isNavigating) {
+           const deviationStageMs = currentNextStageEta.getTime() - currentStageInitialExpectedEtaTime.getTime();
+           nextStageDeviationEl.innerHTML = formatDeviation(accumulatedDeviationMs + deviationStageMs);
+       } else {
+           nextStageDeviationEl.innerHTML = "";
+       }
        console.log("Nav LOG (Turf): ETA Próx. Etapa (UI):", nextStageEtaEl.textContent, "Dist. Próx. Etapa (UI):", nextStageDistEl.textContent);
     } else {
         etaInfoContainer.classList.add('single-destination');
@@ -8299,6 +8379,8 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
 
 
         let foundNextStepThisUpdate = false;
+        let oldLegIndexNav = currentLegIndexNav;
+
         for (let legIdx = currentLegIndexNav; legIdx < route.legs.length; legIdx++) {
             const leg = route.legs[legIdx];
             if (!leg || !leg.steps) continue;
@@ -8331,6 +8413,19 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
                     currentStepIndexNav = stepIdx;
                     foundNextStepThisUpdate = true;
                     console.log(`Nav LOG (Turf): Maniobra encontrada: Leg ${legIdx}, Step ${stepIdx}. Dist. al final del Step: ${distanceToEndOfThisStep}m. Dist. coche: ${lastCarDistanceAlongRouteForNavLogic}m. Dist. a maniobra: ${distanceToStepManeuver}m`);
+                    
+                    if (isNavigating && currentLegIndexNav > oldLegIndexNav && currentStageInitialExpectedEtaTime) { // Se completó una etapa
+                        const nowTime = new Date();
+                        const deviationOfCompletedStageMs = nowTime.getTime() - currentStageInitialExpectedEtaTime.getTime();
+                        accumulatedDeviationMs += deviationOfCompletedStageMs;
+                        
+                        if (currentLegIndexNav < route.legs.length) { // Si no es la última etapa
+                             const nextLegDurationMs = (route.legs[currentLegIndexNav].duration || 0) * 1000;
+                             currentStageInitialExpectedEtaTime = new Date(nowTime.getTime() + nextLegDurationMs);
+                        } else { // Última etapa, ya no hay "próxima etapa"
+                             currentStageInitialExpectedEtaTime = null;
+                        }
+                    }
                     break;
                 }
             }
@@ -8961,6 +9056,7 @@ function loadRouteByName(routeName, autoStartNavigation = false) {
     navigationCurrentRouteData = null;
     isNavigating = false;
     routeStartTime = null; navigationStartTimeForStats = null; totalDistanceTravelledForStats = 0; lastPositionForStats = null;
+    tripInitialOverallEtaTime = null; currentStageInitialExpectedEtaTime = null; accumulatedDeviationMs = 0;
     lastValidCarDistanceForDisplay = 0;
 
     const isSavedLocationRoute = routeToLoad.name.startsWith("UBICACIÓN: ");
@@ -11000,6 +11096,12 @@ const DEFAULT_LOCATION_RADIUS = 600;
         }
         const velocidadMedia = window.averageSpeedKmh.toFixed(1);
 
+        let deviationHtml = "";
+        if (tripInitialOverallEtaTime) {
+            const finalDeviationMs = arrivalTime.getTime() - tripInitialOverallEtaTime.getTime();
+            deviationHtml = formatDeviation(finalDeviationMs);
+        }
+
         modal.innerHTML = `
             <h2 style="font-size: 1.6rem; color: #006400; font-weight: bold; margin-bottom: 15px; display: flex; align-items: center; justify-content: center;">
                 <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="currentColor" style="margin-right: 8px;"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z"></path></svg>
@@ -11022,6 +11124,7 @@ const DEFAULT_LOCATION_RADIUS = 600;
             <div style="text-align: center; margin-bottom: 20px;">
                 <span style="font-size: 0.9rem; color: black; font-weight: bold; display: block;">Tiempo Viaje</span>
                 <span style="font-size: 1.3rem; color: #0000CD; font-weight: bold;">${String(durationHours).padStart(2,'0')}:${String(durationMinutes).padStart(2,'0')}:${String(durationSeconds).padStart(2,'0')} horas</span>
+                ${deviationHtml}
             </div>
             <div style="display: flex; justify-content: space-around; margin-bottom: 20px; font-size: 1.1rem;">
                 <div>
@@ -11248,4 +11351,5 @@ const bookmarkGrid = document.getElementById('bookmark-grid');
     });
 </script>
 </body>
-</html>                                         
+</html>
+    
