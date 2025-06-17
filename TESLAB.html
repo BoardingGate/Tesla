@@ -6643,7 +6643,6 @@ if(navigationMapInstance) navigationMapInstance.panTo(navigationMapInstance.getC
     });
 }
 
-
 // 1. handleSimulateGpsPositionClick se mantiene como la definimos antes,
 //    para que acepte forceExactPosition.
 function handleSimulateGpsPositionClick(e, forceExactPosition = false) {
@@ -6691,6 +6690,197 @@ function stopAutomatedRouteSimulationInternal() { // Renombrada para uso interno
     // No reactivar GPS real aquí, eso se maneja en toggleGpsSimulationMode
     setNavigationMapClickHandler(); // Reconfigurar handler
 }
+
+// 4. Nueva función para manejar el botón GPS principal y los modos de simulación
+function toggleGpsSimulationMode() {
+    const simulateButton = document.getElementById('toggle-simulate-gps-button'); // Botón principal de GPS
+    const mapDiv = document.getElementById('reminders-location-map-div');
+
+    if (isSimulatingGpsLocation) {
+        // Si está en cualquier modo de simulación (automática o manual por clic)
+        if (automatedSimulationIntervalId) {
+            // Si la automática está corriendo, el primer clic en el botón la detiene y pasa a manual por clic
+            stopAutomatedRouteSimulationInternal();
+            isSimulatingGpsLocation = true; // Mantener modo simulación GPS activo
+            if (mapDiv) mapDiv.classList.add('simulating-gps-click-mode'); // Poner cursor de chincheta
+            if (simulateButton) {
+                 simulateButton.title = "Desactivar Simulación GPS (Volver a GPS Real)";
+                 // Aquí podrías cambiar el icono del botón si quieres diferenciar entre "iniciar auto" y "desactivar manual"
+            }
+            showToast("Simulación automática detenida. Modo simulación por clic activo.", "info");
+        } else {
+            // Si está en manual por clic, el clic en el botón desactiva toda la simulación
+            isSimulatingGpsLocation = false;
+            stopAutomatedRouteSimulationInternal(); // Asegura que cualquier residuo se limpie
+            reactivateRealGpsAfterSimulation();
+            if (mapDiv) mapDiv.classList.remove('simulating-gps-click-mode');
+            if (simulateButton) simulateButton.title = "Simular Recorrido de Ruta / Simular posición por clic";
+            showToast("Modo simulación GPS desactivado. Volviendo a GPS real.", "info");
+        }
+    } else {
+        // No está en ningún modo de simulación. El primer clic activa el modo de simulación por clic.
+        isSimulatingGpsLocation = true;
+        if (locationWatchId !== null && navigator.geolocation) { // Detener GPS real si estaba activo
+            navigator.geolocation.clearWatch(locationWatchId);
+            locationWatchId = null;
+        }
+        if (mapDiv) mapDiv.classList.add('simulating-gps-click-mode'); // Poner cursor de chincheta
+        if (simulateButton) {
+            simulateButton.title = "Iniciar Sim. Automática / Desactivar Sim. GPS";
+            // Aquí podrías cambiar el icono a algo que indique "simulación manual activa, clic para auto o desactivar"
+        }
+        showToast("Modo simulación GPS por clic ACTIVADO. Toca el mapa para mover el coche. Pulsa de nuevo el botón GPS para simulación automática o para desactivar.", "info", 6000);
+    }
+    setNavigationMapClickHandler(); // Actualizar siempre el handler del mapa
+}
+
+// 5. startAutomatedRouteSimulation ahora asume que isSimulatingGpsLocation ya es true
+function startAutomatedRouteSimulation(speedKmph) {
+    if (!isSimulatingGpsLocation) { // Seguridad: si no estamos en modo simulación, no iniciar.
+        showToast("Primero activa el modo de simulación GPS.", "warning");
+        return;
+    }
+    if (!navigationRouteLayer || !navigationCurrentRouteData || !navigationCurrentRouteData.routes[0]) {
+        showToast("No hay ruta cargada para simular.", "warning");
+        return;
+    }
+    if (navigationWaypoints.length < 2) {
+        showToast("Se necesitan al menos 2 puntos de ruta para la simulación.", "warning");
+        return;
+    }
+    // ... (resto de la lógica de startAutomatedRouteSimulation como la tenías,
+    //      asegurándote que pone isSimulatingGpsLocation = true si no lo estaba,
+    //      y establece automatedSimulationIntervalId)
+
+    // Ejemplo de cómo podría quedar el inicio de startAutomatedRouteSimulation:
+    isSimulatingGpsLocation = true; // Confirmar que está activo
+    if (automatedSimulationIntervalId) clearInterval(automatedSimulationIntervalId); // Limpiar anterior si existe
+
+    // Si no estamos en navegación activa, entrar en ella para que la UI se muestre
+    if (!isNavigating) {
+        // Es importante que toggleNavigationState() no interfiera con isSimulatingGpsLocation
+        // o que se llame a setNavigationMapClickHandler() después de toggleNavigationState()
+        // para restaurar el comportamiento de clic de simulación.
+        // Considera si es mejor solo mostrar la UI de navegación sin cambiar isNavigating globalmente
+        // si la simulación es "pura" y no una "navegación simulada".
+        // Por ahora, vamos a asumir que queremos la UI de navegación completa:
+        const wasNavigatingBeforeSim = isNavigating;
+        if (!wasNavigatingBeforeSim) {
+            toggleNavigationState(); // Esto pondrá isNavigating a true y mostrará UI
+        }
+    }
+
+
+    const routeLine = navigationRouteLayer.getLatLngs();
+    const startWaypoint = navigationWaypoints[0];
+    let initialHeading = 0;
+    if (routeLine.length >= 2) {
+        const firstPoint = turf.point([routeLine[0].lng, routeLine[0].lat]);
+        const secondPoint = turf.point([routeLine[1].lng, routeLine[1].lat]);
+        initialHeading = turf.bearing(firstPoint, secondPoint);
+        if (initialHeading < 0) initialHeading += 360;
+    }
+
+    simulatedGpsLocation = {
+        latitude: startWaypoint.lat,
+        longitude: startWaypoint.lng,
+        accuracy: 5,
+        heading: initialHeading,
+        altitude: (navigationCurrentLocation?.altitude) ?? 0,
+        speed: 0
+    };
+    simulatedDistanceAlongRoute = 0;
+    lastCarDistanceAlongRouteForNavLogic = 0;
+    lastValidCarDistanceForDisplay = 0;
+    totalDistanceTravelledForStats = 0;
+    if (!navigationStartTimeForStats || !isNavigating) { // Solo resetear si no era una navegación real continuada
+        navigationStartTimeForStats = new Date();
+    }
+
+
+    processSimulatedGpsPosition(true); // true para que la posición inicial no se ajuste a la ruta
+
+    const totalRouteDistance = navigationCurrentRouteData.routes[0].distance;
+    const speedMps = (speedKmph * 1000) / 3600;
+
+    showToast(`Simulación AUT. iniciada a ${speedKmph.toFixed(0)} km/h.`, "info");
+    console.log(`Nav LOG: Iniciando simulación automática a ${speedKmph} km/h.`);
+
+    if (locationWatchId !== null && navigator.geolocation) {
+        navigator.geolocation.clearWatch(locationWatchId);
+        locationWatchId = null;
+    }
+
+    const simulateButton = document.getElementById('toggle-simulate-gps-button');
+    if (simulateButton) simulateButton.classList.add('active-simulate-gps-mode'); // Botón rojo
+
+    setNavigationMapClickHandler(); // Reconfigurar handler para clic durante auto-sim
+
+    automatedSimulationIntervalId = setInterval(() => {
+        // ... (resto de la lógica del intervalo como estaba)
+        const distanceIncrement = speedMps * (SIMULATION_TICK_INTERVAL_MS / 1000);
+        simulatedDistanceAlongRoute += distanceIncrement;
+        totalDistanceTravelledForStats = simulatedDistanceAlongRoute;
+
+        if (simulatedDistanceAlongRoute >= totalRouteDistance) {
+            // ... (lógica de llegada)
+            stopAutomatedRouteSimulationInternal(); // Detener solo el intervalo
+            // isSimulatingGpsLocation sigue true, para que el usuario pueda hacer clic o desactivar
+            const endPointCoords = routeLine[routeLine.length -1];
+            simulatedGpsLocation = {
+                ...simulatedGpsLocation,
+                latitude: endPointCoords.lat,
+                longitude: endPointCoords.lng,
+                speed: 0
+            };
+            processSimulatedGpsPosition(true); // Mostrar la posición final exacta
+            showToast("Simulación de ruta completada. Modo simulación por clic activo.", "success");
+             if (simulateButton) simulateButton.classList.remove('active-simulate-gps-mode'); // Ya no está "automático"
+            if (isNavigating || (!isNavigating && navigationWaypoints.length > 0)) {
+                 showArrivalStatsModal();
+            }
+            setNavigationMapClickHandler(); // Asegurar que el clic manual funciona
+            return;
+        }
+        // ... (cálculo de punto en línea y heading)
+        const turfLine = turf.lineString(routeLine.map(p => [p.lng, p.lat]));
+        const pointOnLine = turf.along(turfLine, simulatedDistanceAlongRoute / 1000, { units: 'kilometers' });
+
+        if (pointOnLine && pointOnLine.geometry && pointOnLine.geometry.coordinates) {
+            const [lng, lat] = pointOnLine.geometry.coordinates;
+            let headingSim = 0;
+            const lookAheadDistance = Math.min(distanceIncrement * 2, totalRouteDistance - simulatedDistanceAlongRoute);
+            if (simulatedDistanceAlongRoute + lookAheadDistance <= totalRouteDistance && lookAheadDistance > 0) {
+                const nextPointOnLine = turf.along(turfLine, (simulatedDistanceAlongRoute + lookAheadDistance) / 1000, { units: 'kilometers' });
+                if (nextPointOnLine && nextPointOnLine.geometry && nextPointOnLine.geometry.coordinates) {
+                    headingSim = turf.bearing(pointOnLine, nextPointOnLine);
+                    if (headingSim < 0) headingSim += 360;
+                }
+            } else {
+                if (simulatedGpsLocation && typeof simulatedGpsLocation.heading === 'number' && simulatedGpsLocation.heading !== null) {
+                    headingSim = simulatedGpsLocation.heading;
+                }
+            }
+            simulatedGpsLocation = {
+                latitude: lat,
+                longitude: lng,
+                accuracy: 5,
+                heading: headingSim,
+                altitude: (navigationCurrentLocation?.altitude) ?? 0,
+                speed: speedMps
+            };
+            processSimulatedGpsPosition(false); // false porque ya está en la ruta
+        }
+    }, SIMULATION_TICK_INTERVAL_MS);
+}
+
+
+// 6. Asegúrate de que el botón GPS en el HTML llama a toggleGpsSimulationMode()
+//    y su title inicial sea "Simular Recorrido de Ruta / Simular posición por clic"
+// <button id="toggle-simulate-gps-button" class="reminders-map-button-action" title="Simular Recorrido de Ruta / Simular posición por clic">...</button>
+// Y en openNavigationMap(), el listener para este botón:
+// if(toggleSimulateGpsButton) toggleSimulateGpsButton.addEventListener('click', toggleGpsSimulationMode);
+
 
 function processSimulatedGpsPosition() {
     if (!isSimulatingGpsLocation || !simulatedGpsLocation) return;
