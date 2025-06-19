@@ -1,4 +1,4 @@
-..
+...
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -8220,185 +8220,6 @@ function handleDeleteWaypointClick(waypointId) {
     updateNavigationButtonColor();
 }
 
-
-function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
-    return new Promise(async (resolve, reject) => {
-        isRecalculatingRoute = true;
-        recalculationAttempts++; 
-        let carDistanceAlongRouteForInternalUse = 0;
-        const recalculateToastId = "recalculating-route-toast";
-
-        if (!preserveAccumulatedStats) {
-            totalDistanceTravelledForStats = 0;
-            accumulatedDistanceBeforeCurrentSegment = 0;
-            lastPositionForStats = null;
-            if (isNavigating) navigationStartTimeForStats = new Date();
-            tripInitialOverallEtaTime = null;
-            currentStageInitialExpectedEtaTime = null;
-            accumulatedDeviationMs = 0;
-            maxSpeedDuringTrip = 0;
-            maxAltitudeDuringTrip = -Infinity;
-            minAltitudeDuringTrip = Infinity;
-        } else {
-            accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
-        }
-        lastCarDistanceAlongRouteForNavLogic = 0;
-        lastValidCarDistanceForDisplay = 0;
-
-        const waypointsForRouteCalculation = navigationWaypoints.filter(wp => wp && !wp.isInternal);
-
-        if (waypointsForRouteCalculation.length < 2) {
-            const existingToast = document.getElementById(recalculateToastId);
-            if (existingToast) existingToast.remove();
-            activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
-
-            if (navigationRouteLayer && navigationMapInstance) {
-                try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {}
-            }
-            navigationRouteLayer = null; 
-            if (completedRouteSegmentsLayer && navigationMapInstance) completedRouteSegmentsLayer.clearLayers();
-            
-            const oldRouteData = navigationCurrentRouteData; 
-            navigationCurrentRouteData = null; 
-            hideNavigationUIElementsForPlanning();
-            hideMapInfoOverlay();
-            const radaresCheckbox = document.getElementById('radares-ruta-checkbox');
-            if (radaresCheckbox) {
-                eliminarRadaresDeRuta();
-                actualizarContadorRadares(0);
-                localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresCheckbox.checked));
-            }
-            isRecalculatingRoute = false;
-            recalculationAttempts = 0;
-            deviationStartTime = 0;
-            updateStartNavigationButtonState();
-            reject(new Error("No hay suficientes waypoints válidos para calcular la ruta"));
-            return;
-        }
-
-        const coordsString = waypointsForRouteCalculation.map(wp => {
-            if (typeof wp.lng !== 'number' || typeof wp.lat !== 'number' || isNaN(wp.lng) || isNaN(wp.lat)) {
-                return null;
-            }
-            return `${wp.lng},${wp.lat}`;
-        }).filter(Boolean).join(';');
-
-        if (!coordsString || waypointsForRouteCalculation.filter(wp => wp && typeof wp.lng === 'number' && typeof wp.lat === 'number').length < 2) {
-            const existingToast = document.getElementById(recalculateToastId);
-            if (existingToast) existingToast.remove();
-            activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
-            
-            if (navigationRouteLayer && navigationMapInstance) {
-                try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {}
-            }
-            navigationRouteLayer = null; 
-            if (completedRouteSegmentsLayer && navigationMapInstance) completedRouteSegmentsLayer.clearLayers();
-            navigationCurrentRouteData = null;
-            hideNavigationUIElementsForPlanning();
-            hideMapInfoOverlay();
-            isRecalculatingRoute = false;
-            recalculationAttempts = 0;
-            deviationStartTime = 0;
-            updateStartNavigationButtonState();
-            reject(new Error("No hay suficientes waypoints válidos para calcular la ruta"));
-            return;
-        }
-
-        const url = `${OSRM_SERVICE_URL}/driving/${coordsString}?overview=full&geometries=geojson&steps=true&alternatives=false&annotations=true`;
-
-        for (let attempt = 1; attempt <= MAX_RECALCULATION_ATTEMPTS + 1; attempt++) {
-            try {
-                const response = await fetch(url);
-                if (!response.ok) {
-                    let errorData = { message: `HTTP error ${response.status}` };
-                    try { errorData = await response.json(); } catch (e) { errorData.message = response.statusText || errorData.message; }
-                    throw new Error(`OSRM Error: ${errorData.code || errorData.message || response.statusText}`);
-                }
-                const data = await response.json();
-
-                const existingToastSuccess = document.getElementById(recalculateToastId);
-                if (existingToastSuccess) existingToastSuccess.remove();
-                activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
-
-                if (data.routes && data.routes.length > 0) {
-                    navigationCurrentRouteData = data;
-                    if (completedRouteSegmentsLayer && navigationMapInstance) completedRouteSegmentsLayer.clearLayers();
-                    
-                    try {
-                        drawRouteOnMap(data.routes[0]);
-                    } catch (drawError) {
-                        console.error("Error al dibujar la ruta: ", drawError);
-                        showToast("Error al visualizar la nueva ruta. Inténtalo de nuevo.", "error");
-                        throw drawError; 
-                    }
-                    
-                    if (data.routes[0]) {
-                        const currentCarPosForRecalc = navigationCurrentLocation;
-                        if (currentCarPosForRecalc && navigationMapInstance && navigationRouteLayer && typeof turf !== 'undefined' && navigationRouteLayer.getLatLngs().length > 0) {
-                            try {
-                                const carPointTurf = turf.point([currentCarPosForRecalc.longitude, currentCarPosForRecalc.latitude]);
-                                const routeLineStringTurf = turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat]));
-                                const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
-                                const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
-                                carDistanceAlongRouteForInternalUse = turf.length(lineSliceToNearestTurf, { units: 'meters' });
-                            } catch (turfError) { console.error("Nav LOG (Turf): Error en cálculo de distancia con Turf (Recalculando Ruta):", turfError); }
-                        }
-                        lastCarDistanceAlongRouteForNavLogic = carDistanceAlongRouteForInternalUse;
-                        updateNavigationProgressDisplay(data.routes[0], carDistanceAlongRouteForInternalUse);
-                        updateTurnByTurnDisplay(data.routes[0], carDistanceAlongRouteForInternalUse);
-                        showDestinationName();
-                    }
-                    showNavigationUIElementsForPlanning();
-                    recalculationAttempts = 0; 
-                    isRecalculatingRoute = false;
-                    deviationStartTime = 0;
-                    if (recalculationRetryTimeoutId) clearTimeout(recalculationRetryTimeoutId); 
-                    recalculationRetryTimeoutId = null;
-                    resolve(); 
-                    return; 
-                } else {
-                    throw new Error("No se encontraron rutas.");
-                }
-            } catch (error) {
-                console.error(`Error en recalculo (intento ${attempt}):`, error);
-                if (attempt > MAX_RECALCULATION_ATTEMPTS) {
-                    const existingToastError = document.getElementById(recalculateToastId);
-                    if (existingToastError) existingToastError.remove();
-                    activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
-                    
-                    let errorMessageForToast = "Error al calcular ruta (OSRM)";
-                    if (error && error.message) errorMessageForToast = `Error al calcular ruta: ${error.message}`;
-                    
-                    if (navigationRouteLayer && navigationMapInstance) { } 
-                    const oldRouteData = navigationCurrentRouteData; 
-                    navigationCurrentRouteData = null; 
-                    lastValidCarDistanceForDisplay = 0;
-                    hideMapInfoOverlay();
-                    const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
-                    if (radaresRutaCheckbox) {
-                        eliminarRadaresDeRuta();
-                        actualizarContadorRadares(0);
-                        localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresRutaCheckbox.checked));
-                    }
-                    isRecalculatingRoute = false;
-                    recalculationAttempts = 0;
-                    deviationStartTime = 0;
-                    if (recalculationRetryTimeoutId) clearTimeout(recalculationRetryTimeoutId); 
-                    recalculationRetryTimeoutId = null;
-                    reject(new Error(errorMessageForToast)); 
-                    return; 
-                } else {
-                    showToast(`Reintento de recalculo ${attempt}/${MAX_RECALCULATION_ATTEMPTS}...`, "warning", 2000);
-                    await new Promise(res => setTimeout(res, 2000 * attempt)); 
-                }
-            }
-        }
-        updateStartNavigationButtonState();
-        updateNavigationButtonColor();
-    });
-}
-
-
 function drawRouteOnMap(route) {
     if (!navigationMapInstance) return;
     if (navigationRouteLayer) {
@@ -11030,93 +10851,285 @@ localStorage.setItem('reminders', JSON.stringify(reminders));
         }
     }
 
-    async function toggleRadaresRuta(activo) {
-        const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
-        const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
+async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
+    return new Promise(async (resolve, reject) => {
+        isRecalculatingRoute = true;
+        // recalculationAttempts se incrementa al inicio de cada intento en el bucle
+        let carDistanceAlongRouteForInternalUse = 0;
 
-        localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(activo));
+        const recalculateToastId = "recalculating-route-toast";
+        // No mostramos el toast aquí, lo hará proceedWithRecalculation una vez.
 
-        if (actualWaypoints.length < 2) {
-            if (activo) {
-                showToast("Ruta inválida o inexistente. No se pueden buscar radares.", "warning");
+        if (!preserveAccumulatedStats) {
+            totalDistanceTravelledForStats = 0;
+            accumulatedDistanceBeforeCurrentSegment = 0;
+            lastPositionForStats = null;
+            if (isNavigating) navigationStartTimeForStats = new Date();
+            tripInitialOverallEtaTime = null;
+            currentStageInitialExpectedEtaTime = null;
+            accumulatedDeviationMs = 0;
+            maxSpeedDuringTrip = 0;
+            maxAltitudeDuringTrip = -Infinity;
+            minAltitudeDuringTrip = Infinity;
+        } else {
+            accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
+        }
+        lastCarDistanceAlongRouteForNavLogic = 0;
+        lastValidCarDistanceForDisplay = 0;
+
+        const waypointsForRouteCalculation = navigationWaypoints.filter(wp => wp && !wp.isInternal);
+
+        if (waypointsForRouteCalculation.length < 2) {
+            const existingToast = document.getElementById(recalculateToastId);
+            if (existingToast) existingToast.remove();
+            activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
+
+            if (navigationRouteLayer && navigationMapInstance) {
+                try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {}
             }
-            eliminarRadaresDeRuta();
-            actualizarContadorRadares(0);
+            navigationRouteLayer = null;
+            if (completedRouteSegmentsLayer && navigationMapInstance) completedRouteSegmentsLayer.clearLayers();
+            
+            navigationCurrentRouteData = null; 
+            hideNavigationUIElementsForPlanning();
+            hideMapInfoOverlay();
+            const radaresCheckbox = document.getElementById('radares-ruta-checkbox');
+            if (radaresCheckbox) {
+                eliminarRadaresDeRuta();
+                actualizarContadorRadares(0);
+                localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresCheckbox.checked));
+            }
+            isRecalculatingRoute = false;
+            recalculationAttempts = 0;
+            deviationStartTime = 0;
+            if (recalculationRetryTimeoutId) { // Asegurar que se limpia si existe
+                clearTimeout(recalculationRetryTimeoutId);
+                recalculationRetryTimeoutId = null;
+            }
+            updateStartNavigationButtonState();
+            reject(new Error("No hay suficientes waypoints válidos para calcular la ruta"));
             return;
         }
 
-        eliminarRadaresDeRuta();
-        radaresEnRutaActual = [];
+        const coordsString = waypointsForRouteCalculation.map(wp => {
+            if (typeof wp.lng !== 'number' || typeof wp.lat !== 'number' || isNaN(wp.lng) || isNaN(wp.lat) ) {
+                return null;
+            }
+            return `${wp.lng},${wp.lat}`;
+        }).filter(Boolean).join(';');
 
-        if (activo && navigationMapInstance && navigationRouteLayer) {
+        if (!coordsString || waypointsForRouteCalculation.filter(wp => wp && typeof wp.lng === 'number' && typeof wp.lat === 'number').length < 2) {
+            const existingToast = document.getElementById(recalculateToastId);
+            if (existingToast) existingToast.remove();
+            activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
+            
+            if (navigationRouteLayer && navigationMapInstance) {
+                try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {}
+            }
+            navigationRouteLayer = null; 
+            if (completedRouteSegmentsLayer && navigationMapInstance) completedRouteSegmentsLayer.clearLayers();
+            navigationCurrentRouteData = null;
+            hideNavigationUIElementsForPlanning();
+            hideMapInfoOverlay();
+            isRecalculatingRoute = false;
+            recalculationAttempts = 0;
+            deviationStartTime = 0;
+             if (recalculationRetryTimeoutId) { // Asegurar que se limpia si existe
+                clearTimeout(recalculationRetryTimeoutId);
+                recalculationRetryTimeoutId = null;
+            }
+            updateStartNavigationButtonState();
+            reject(new Error("No hay suficientes waypoints válidos para calcular la ruta"));
+            return;
+        }
+
+        const url = `${OSRM_SERVICE_URL}/driving/${coordsString}?overview=full&geometries=geojson&steps=true&alternatives=false&annotations=true`;
+        
+        let currentAttempt = 0; // Movido fuera para que se incremente correctamente en cada iteración
+        recalculationAttempts = 0; // Asegurar que se resetea al inicio de la secuencia de recalculo
+
+        async function tryFetchRoute() {
+            currentAttempt++;
+            recalculationAttempts = currentAttempt; // Actualizar el contador global de intentos
             try {
-                const routeLineString = turf.lineString(navigationRouteLayer.getLatLngs().map(latlng => [latlng.lng, latlng.lat]));
-                let filesToProcess = await fetchKMLFilesList(KML_FILES_LIST_STANDARD);
-                const extraFiles = await fetchKMLFilesList(KML_FILES_LIST_EXTRA);
-                filesToProcess = filesToProcess.concat(extraFiles.filter(f => !filesToProcess.includes(f)));
+                const response = await fetch(url);
+                if (!response.ok) {
+                    let errorData = { message: `HTTP error ${response.status}` };
+                    try { errorData = await response.json(); } catch (e) { errorData.message = response.statusText || errorData.message; }
+                    throw new Error(`OSRM Error (intento ${currentAttempt}): ${errorData.code || errorData.message || response.statusText}`);
+                }
+                const data = await response.json();
 
-                for (const kmlFileName of filesToProcess) {
-                    const placemarks = await fetchAndParseKML(KML_BASE_PATH + kmlFileName);
-                    placemarks.forEach(placemark => {
-                        const coords = placemark.coordinates;
-                        if (coords) {
-                            const [lonStr, latStr] = coords.split(',');
-                            const lon = parseFloat(lonStr);
-                            const lat = parseFloat(latStr);
-                            if (isNaN(lat) || isNaN(lon)) return;
+                const existingToastSuccess = document.getElementById(recalculateToastId);
+                if (existingToastSuccess) existingToastSuccess.remove();
+                activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
 
-                            const radarPoint = turf.point([lon, lat]);
-                            const nearestPointOnRoute = turf.nearestPointOnLine(routeLineString, radarPoint, { units: 'meters' });
+                if (data.routes && data.routes.length > 0) {
+                    navigationCurrentRouteData = data;
+                    if (completedRouteSegmentsLayer && navigationMapInstance) completedRouteSegmentsLayer.clearLayers();
+                    
+                    try {
+                        drawRouteOnMap(data.routes[0]);
+                    } catch (drawError) {
+                        console.error("Error al dibujar la ruta: ", drawError);
+                        throw drawError; 
+                    }
+                    
+                    if (data.routes[0]) {
+                        const currentCarPosForRecalc = navigationCurrentLocation;
+                        if (currentCarPosForRecalc && navigationMapInstance && navigationRouteLayer && typeof turf !== 'undefined' && navigationRouteLayer.getLatLngs().length > 0) {
+                            try {
+                                const carPointTurf = turf.point([currentCarPosForRecalc.longitude, currentCarPosForRecalc.latitude]);
+                                const routeLineStringTurf = turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat]));
+                                const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
+                                const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
+                                carDistanceAlongRouteForInternalUse = turf.length(lineSliceToNearestTurf, { units: 'meters' });
+                            } catch (turfError) { console.error("Nav LOG (Turf): Error en cálculo de distancia con Turf (Recalculando Ruta):", turfError); }
+                        }
+                        lastCarDistanceAlongRouteForNavLogic = carDistanceAlongRouteForInternalUse;
+                        updateNavigationProgressDisplay(data.routes[0], carDistanceAlongRouteForInternalUse);
+                        updateTurnByTurnDisplay(data.routes[0], carDistanceAlongRouteForInternalUse);
+                        showDestinationName();
+                    }
+                    showNavigationUIElementsForPlanning();
+                    recalculationAttempts = 0; 
+                    isRecalculatingRoute = false;
+                    deviationStartTime = 0; 
+                    if (recalculationRetryTimeoutId) { clearTimeout(recalculationRetryTimeoutId); recalculationRetryTimeoutId = null;}
+                    resolve(); 
+                    return; 
+                } else {
+                    throw new Error("No se encontraron rutas.");
+                }
+            } catch (error) {
+                console.error(`Error en recalculo (intento ${currentAttempt}):`, error);
+                if (currentAttempt > MAX_RECALCULATION_ATTEMPTS) {
+                    const existingToastError = document.getElementById(recalculateToastId);
+                    if (existingToastError) existingToastError.remove();
+                    activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
+                    
+                    let errorMessageForToast = "Error al calcular ruta (OSRM)";
+                    if (error && error.message) errorMessageForToast = `Error al calcular ruta: ${error.message}`;
+                    
+                    const oldRouteData = navigationCurrentRouteData; 
+                    navigationCurrentRouteData = null; 
+                    lastValidCarDistanceForDisplay = 0;
+                    hideMapInfoOverlay();
+                    const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+                    if (radaresRutaCheckbox) {
+                        eliminarRadaresDeRuta();
+                        actualizarContadorRadares(0);
+                        localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresRutaCheckbox.checked));
+                    }
+                    isRecalculatingRoute = false;
+                    recalculationAttempts = 0;
+                    deviationStartTime = 0; 
+                    if (recalculationRetryTimeoutId) { clearTimeout(recalculationRetryTimeoutId); recalculationRetryTimeoutId = null;}
+                    reject(new Error(errorMessageForToast)); 
+                    return; 
+                } else {
+                    showToast(`Reintento de recalculo ${currentAttempt}/${MAX_RECALCULATION_ATTEMPTS}...`, "warning", 2000);
+                    if (recalculationRetryTimeoutId) clearTimeout(recalculationRetryTimeoutId); // Limpiar anterior si existe
+                    recalculationRetryTimeoutId = setTimeout(tryFetchRoute, 2000 * currentAttempt); 
+                }
+            }
+        }
 
-                            if (nearestPointOnRoute && nearestPointOnRoute.properties.dist !== undefined && nearestPointOnRoute.properties.dist <= RUTA_RADAR_PROXIMITY_THRESHOLD) {
-                                const existingMapObject = reminderMapObjects.find(obj =>
-                                    obj.isFromRuta &&
-                                    Math.abs(obj.marker.getLatLng().lat - lat) < COORD_EPSILON &&
-                                    Math.abs(obj.marker.getLatLng().lng - lon) < COORD_EPSILON
-                                );
+        tryFetchRoute(); // Iniciar el primer intento
 
-                                if (!existingMapObject) {
-                                    const now = new Date();
-                                    const radarData = {
-                                        id: Date.now() + Math.random() + radaresEnRutaActual.length,
-                                        text: `<b>RADAR RUTA: ${placemark.name}</b>`,
-                                        type: 'simple', time: '00:00',
-                                        date: `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`,
-                                        createdAt: now.toISOString(),
-                                        managedByUser: false, isLocationEnabled: true,
-                                        locationCoordinates: { latitude: lat, longitude: lon },
-                                        radiusMeters: 600, excludeFromList: true,
-                                        isFromRuta: true,
-                                        distanceOnRoute: nearestPointOnRoute.properties.location
-                                    };
-                                    const mapObject = plotSingleReminderOnMap(radarData, navigationMapInstance);
-                                    if (mapObject) {
-                                        reminderMapObjects.push(mapObject);
-                                        radaresEnRutaActual.push(radarData);
-                                    }
+        updateStartNavigationButtonState();
+        updateNavigationButtonColor();
+    });
+}
+
+async function toggleRadaresRuta(activo) {
+    const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+    const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
+
+    localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(activo));
+
+    if (actualWaypoints.length < 2) {
+        if (activo) {
+            showToast("Ruta inválida o inexistente. No se pueden buscar radares.", "warning");
+        }
+        eliminarRadaresDeRuta();
+        actualizarContadorRadares(0);
+        return;
+    }
+
+    eliminarRadaresDeRuta();
+    radaresEnRutaActual = [];
+
+    if (activo && navigationMapInstance && navigationRouteLayer && navigationRouteLayer.getLatLngs().length > 0) { // Añadida comprobación de getLatLngs
+        try {
+            const routeLineString = turf.lineString(navigationRouteLayer.getLatLngs().map(latlng => [latlng.lng, latlng.lat]));
+            let filesToProcess = await fetchKMLFilesList(KML_FILES_LIST_STANDARD);
+            const extraFiles = await fetchKMLFilesList(KML_FILES_LIST_EXTRA);
+            filesToProcess = filesToProcess.concat(extraFiles.filter(f => !filesToProcess.includes(f)));
+
+            for (const kmlFileName of filesToProcess) {
+                const placemarks = await fetchAndParseKML(KML_BASE_PATH + kmlFileName);
+                placemarks.forEach(placemark => {
+                    const coords = placemark.coordinates;
+                    if (coords) {
+                        const [lonStr, latStr] = coords.split(',');
+                        const lon = parseFloat(lonStr);
+                        const lat = parseFloat(latStr);
+                        if (isNaN(lat) || isNaN(lon)) return;
+
+                        const radarPoint = turf.point([lon, lat]);
+                        const nearestPointOnRoute = turf.nearestPointOnLine(routeLineString, radarPoint, { units: 'meters' });
+
+                        if (nearestPointOnRoute && nearestPointOnRoute.properties.dist !== undefined && nearestPointOnRoute.properties.dist <= RUTA_RADAR_PROXIMITY_THRESHOLD) {
+                            const existingMapObject = reminderMapObjects.find(obj =>
+                                obj.isFromRuta &&
+                                Math.abs(obj.marker.getLatLng().lat - lat) < COORD_EPSILON &&
+                                Math.abs(obj.marker.getLatLng().lng - lon) < COORD_EPSILON
+                            );
+
+                            if (!existingMapObject) {
+                                const now = new Date();
+                                const radarData = {
+                                    id: Date.now() + Math.random() + radaresEnRutaActual.length,
+                                    text: `<b>RADAR RUTA: ${placemark.name}</b>`,
+                                    type: 'simple', time: '00:00',
+                                    date: `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`,
+                                    createdAt: now.toISOString(),
+                                    managedByUser: false, isLocationEnabled: true,
+                                    locationCoordinates: { latitude: lat, longitude: lon },
+                                    radiusMeters: 600, excludeFromList: true,
+                                    isFromRuta: true,
+                                    distanceOnRoute: nearestPointOnRoute.properties.location
+                                };
+                                const mapObject = plotSingleReminderOnMap(radarData, navigationMapInstance);
+                                if (mapObject) {
+                                    reminderMapObjects.push(mapObject);
+                                    radaresEnRutaActual.push(radarData);
                                 }
                             }
                         }
-                    });
-                }
-
-                if (radaresEnRutaActual.length === 0 && activo) {
-                     showToast("No se encontraron radares en la ruta actual.", "info");
-                }
-            } catch (error) {
-                showToast("Error al buscar radares en ruta", "error");
-                console.error("Error en toggleRadaresRuta:", error);
+                    }
+                });
             }
-        }
-        actualizarContadorRadares(radaresEnRutaActual.length);
-        if (navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0]) {
-            updateNavigationProgressDisplay(navigationCurrentRouteData.routes[0], lastCarDistanceAlongRouteForNavLogic);
-        }
-        if (radaresRutaCheckbox) {
-            radaresRutaCheckbox.checked = activo;
+
+            if (radaresEnRutaActual.length === 0 && activo) {
+                 showToast("No se encontraron radares en la ruta actual.", "info");
+            }
+        } catch (error) {
+            showToast("Error al buscar radares en ruta: " + error.message, "error");
+            console.error("Error en toggleRadaresRuta:", error);
         }
     }
+    actualizarContadorRadares(radaresEnRutaActual.length);
+    if (navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0]) {
+        updateNavigationProgressDisplay(navigationCurrentRouteData.routes[0], lastCarDistanceAlongRouteForNavLogic);
+    }
+    if (radaresRutaCheckbox) {
+        radaresRutaCheckbox.checked = activo;
+    }
+}
 
+    
     function eliminarRadaresDeRuta() {
         reminderMapObjects = reminderMapObjects.filter(obj => {
             if (obj.isFromRuta) {
@@ -11176,7 +11189,7 @@ localStorage.setItem('reminders', JSON.stringify(reminders));
                 const distanceToEndOfThisStep = calculateDistanceToEndOfStep(route, legIdx, stepIdx);
 
 
-const distanceToThisStepManeuver = Math.max(0, distanceToEndOfThisStep - carDist);
+                 const distanceToThisStepManeuver = Math.max(0, distanceToEndOfThisStep - carDist);
                  if (distanceToEndOfThisStep > carDist || (legIdx === route.legs.length - 1 && stepIdx === leg.steps.length - 1 && distanceToThisStepManeuver <= 10) ) {
                     const maneuver = step.maneuver;
                     const type = maneuver.type || '';
