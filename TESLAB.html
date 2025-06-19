@@ -10850,15 +10850,20 @@ localStorage.setItem('reminders', JSON.stringify(reminders));
             contadorElement.classList.toggle('hidden', count === 0 && (!checkbox || !checkbox.checked));
         }
     }
-
 async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
+    // recalculationRetryTimeoutId ya está declarada globalmente y se espera que sea null o un ID válido.
+
     return new Promise(async (resolve, reject) => {
         isRecalculatingRoute = true;
-        // recalculationAttempts se incrementa al inicio de cada intento en el bucle
         let carDistanceAlongRouteForInternalUse = 0;
+        const recalculateToastId = "recalculating-route-toast-" + Date.now();
 
-        const recalculateToastId = "recalculating-route-toast";
-        // No mostramos el toast aquí, lo hará proceedWithRecalculation una vez.
+        // Limpiar cualquier timeout *existente* de una ejecución anterior o reintento fallido.
+        if (recalculationRetryTimeoutId) {
+            clearTimeout(recalculationRetryTimeoutId);
+            recalculationRetryTimeoutId = null; // Poner a null después de limpiar
+        }
+        recalculationAttempts = 0; // Resetear contador de intentos para esta nueva secuencia de recalculo.
 
         if (!preserveAccumulatedStats) {
             totalDistanceTravelledForStats = 0;
@@ -10879,19 +10884,16 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
 
         const waypointsForRouteCalculation = navigationWaypoints.filter(wp => wp && !wp.isInternal);
 
-        if (waypointsForRouteCalculation.length < 2) {
+        const rejectSequence = (errorMessage) => {
             const existingToast = document.getElementById(recalculateToastId);
             if (existingToast) existingToast.remove();
             activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
 
             if (navigationRouteLayer && navigationMapInstance) {
-                try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {}
+                // No se elimina la capa de ruta si el recalculo falla, para mantener la última ruta válida.
             }
-            navigationRouteLayer = null;
-            if (completedRouteSegmentsLayer && navigationMapInstance) completedRouteSegmentsLayer.clearLayers();
-            
-            navigationCurrentRouteData = null; 
-            hideNavigationUIElementsForPlanning();
+            // navigationCurrentRouteData se deja como estaba antes del intento de recalculo si este falla.
+            hideNavigationUIElementsForPlanning(); // Se podría comentar si queremos que la UI de la ruta antigua persista.
             hideMapInfoOverlay();
             const radaresCheckbox = document.getElementById('radares-ruta-checkbox');
             if (radaresCheckbox) {
@@ -10902,12 +10904,14 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
             isRecalculatingRoute = false;
             recalculationAttempts = 0;
             deviationStartTime = 0;
-            if (recalculationRetryTimeoutId) { // Asegurar que se limpia si existe
-                clearTimeout(recalculationRetryTimeoutId);
-                recalculationRetryTimeoutId = null;
-            }
+            if (recalculationRetryTimeoutId) { clearTimeout(recalculationRetryTimeoutId); recalculationRetryTimeoutId = null; }
             updateStartNavigationButtonState();
-            reject(new Error("No hay suficientes waypoints válidos para calcular la ruta"));
+            reject(new Error(errorMessage));
+        };
+
+
+        if (waypointsForRouteCalculation.length < 2) {
+            rejectSequence("No hay suficientes waypoints válidos para calcular la ruta");
             return;
         }
 
@@ -10919,44 +10923,24 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
         }).filter(Boolean).join(';');
 
         if (!coordsString || waypointsForRouteCalculation.filter(wp => wp && typeof wp.lng === 'number' && typeof wp.lat === 'number').length < 2) {
-            const existingToast = document.getElementById(recalculateToastId);
-            if (existingToast) existingToast.remove();
-            activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
-            
-            if (navigationRouteLayer && navigationMapInstance) {
-                try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {}
-            }
-            navigationRouteLayer = null; 
-            if (completedRouteSegmentsLayer && navigationMapInstance) completedRouteSegmentsLayer.clearLayers();
-            navigationCurrentRouteData = null;
-            hideNavigationUIElementsForPlanning();
-            hideMapInfoOverlay();
-            isRecalculatingRoute = false;
-            recalculationAttempts = 0;
-            deviationStartTime = 0;
-             if (recalculationRetryTimeoutId) { // Asegurar que se limpia si existe
-                clearTimeout(recalculationRetryTimeoutId);
-                recalculationRetryTimeoutId = null;
-            }
-            updateStartNavigationButtonState();
-            reject(new Error("No hay suficientes waypoints válidos para calcular la ruta"));
+            rejectSequence("No hay suficientes waypoints válidos para calcular la ruta (coordenadas inválidas)");
             return;
         }
 
         const url = `${OSRM_SERVICE_URL}/driving/${coordsString}?overview=full&geometries=geojson&steps=true&alternatives=false&annotations=true`;
         
-        let currentAttempt = 0; // Movido fuera para que se incremente correctamente en cada iteración
-        recalculationAttempts = 0; // Asegurar que se resetea al inicio de la secuencia de recalculo
+        let currentAttemptForThisSequence = 0; 
 
-        async function tryFetchRoute() {
-            currentAttempt++;
-            recalculationAttempts = currentAttempt; // Actualizar el contador global de intentos
+        async function tryFetchRouteInternal() {
+            currentAttemptForThisSequence++;
+            recalculationAttempts = currentAttemptForThisSequence; 
+
             try {
                 const response = await fetch(url);
                 if (!response.ok) {
                     let errorData = { message: `HTTP error ${response.status}` };
                     try { errorData = await response.json(); } catch (e) { errorData.message = response.statusText || errorData.message; }
-                    throw new Error(`OSRM Error (intento ${currentAttempt}): ${errorData.code || errorData.message || response.statusText}`);
+                    throw new Error(`OSRM Error (intento ${currentAttemptForThisSequence}): ${errorData.code || errorData.message || response.statusText}`);
                 }
                 const data = await response.json();
 
@@ -10965,7 +10949,7 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
                 activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
 
                 if (data.routes && data.routes.length > 0) {
-                    navigationCurrentRouteData = data;
+                    navigationCurrentRouteData = data; 
                     if (completedRouteSegmentsLayer && navigationMapInstance) completedRouteSegmentsLayer.clearLayers();
                     
                     try {
@@ -10996,49 +10980,42 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
                     isRecalculatingRoute = false;
                     deviationStartTime = 0; 
                     if (recalculationRetryTimeoutId) { clearTimeout(recalculationRetryTimeoutId); recalculationRetryTimeoutId = null;}
+                    updateStartNavigationButtonState(); 
                     resolve(); 
                     return; 
                 } else {
-                    throw new Error("No se encontraron rutas.");
+                    throw new Error("No se encontraron rutas desde OSRM.");
                 }
             } catch (error) {
-                console.error(`Error en recalculo (intento ${currentAttempt}):`, error);
-                if (currentAttempt > MAX_RECALCULATION_ATTEMPTS) {
+                console.error(`Error en recalculo (intento ${currentAttemptForThisSequence}):`, error);
+                if (currentAttemptForThisSequence > MAX_RECALCULATION_ATTEMPTS) {
                     const existingToastError = document.getElementById(recalculateToastId);
                     if (existingToastError) existingToastError.remove();
                     activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
                     
-                    let errorMessageForToast = "Error al calcular ruta (OSRM)";
+                    let errorMessageForToast = "Error al calcular ruta (OSRM tras varios intentos)";
                     if (error && error.message) errorMessageForToast = `Error al calcular ruta: ${error.message}`;
                     
-                    const oldRouteData = navigationCurrentRouteData; 
-                    navigationCurrentRouteData = null; 
-                    lastValidCarDistanceForDisplay = 0;
-                    hideMapInfoOverlay();
-                    const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
-                    if (radaresRutaCheckbox) {
-                        eliminarRadaresDeRuta();
-                        actualizarContadorRadares(0);
-                        localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresRutaCheckbox.checked));
-                    }
                     isRecalculatingRoute = false;
                     recalculationAttempts = 0;
                     deviationStartTime = 0; 
                     if (recalculationRetryTimeoutId) { clearTimeout(recalculationRetryTimeoutId); recalculationRetryTimeoutId = null;}
+                    updateStartNavigationButtonState(); 
                     reject(new Error(errorMessageForToast)); 
                     return; 
                 } else {
-                    showToast(`Reintento de recalculo ${currentAttempt}/${MAX_RECALCULATION_ATTEMPTS}...`, "warning", 2000);
-                    if (recalculationRetryTimeoutId) clearTimeout(recalculationRetryTimeoutId); // Limpiar anterior si existe
-                    recalculationRetryTimeoutId = setTimeout(tryFetchRoute, 2000 * currentAttempt); 
+                    showToast(`Reintento de recalculo ${currentAttemptForThisSequence}/${MAX_RECALCULATION_ATTEMPTS}...`, "warning", 2000);
+                    // Limpiar el timeout anterior ANTES de establecer uno nuevo
+                    if (recalculationRetryTimeoutId) {
+                        clearTimeout(recalculationRetryTimeoutId);
+                        recalculationRetryTimeoutId = null;
+                    }
+                    recalculationRetryTimeoutId = setTimeout(tryFetchRouteInternal, 2000 * currentAttemptForThisSequence); 
                 }
             }
         }
 
-        tryFetchRoute(); // Iniciar el primer intento
-
-        updateStartNavigationButtonState();
-        updateNavigationButtonColor();
+        tryFetchRouteInternal(); 
     });
 }
 
