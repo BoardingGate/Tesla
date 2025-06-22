@@ -11213,6 +11213,161 @@ const distanceToThisStepManeuver = Math.max(0, distanceToEndOfThisStep - carDist
 
 let locationsPreviewMap = null;
 
+function initializeNavigationGraph() {
+    const graphCard = document.getElementById('navigation-graph-card');
+    const graphContainer = document.getElementById('navigation-graph-container');
+
+    if (!graphCard || !graphContainer || !isNavigating || currentGraphMode === 'Gráfica off') {
+        if (graphCard) graphCard.classList.add('hidden');
+        return;
+    }
+
+    graphCard.classList.remove('hidden');
+    graphContainer.style.height = '100%';
+
+    graphDataPoints = { speed: [], altitude: [] };
+    graphLabels = [];
+    graphDataAccumulator = { speedSum: 0, altitudeSum: 0, count: 0 };
+
+    if (navigationChart) {
+        navigationChart.destroy();
+        navigationChart = null;
+    }
+
+    const ctx = document.getElementById('navigation-chart')?.getContext('2d');
+    if (!ctx) {
+        showToast("Error: No se pudo obtener el contexto del canvas para la gráfica.", "error");
+        return;
+    }
+
+    const initialRouteDuration = navigationCurrentRouteData?.routes?.[0]?.duration || 0;
+    graphIntervalDuration = initialRouteDuration > 0 ? (initialRouteDuration / GRAPH_TARGET_POINTS) * 1000 : 4 * 60 * 1000;
+
+    if (initialRouteDuration > 0 && navigationCurrentRouteData.routes[0].distance > 0) {
+        graphExpectedAvgSpeed = (navigationCurrentRouteData.routes[0].distance / initialRouteDuration) * 3.6;
+    } else {
+        graphExpectedAvgSpeed = 0;
+    }
+
+    navigationChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: [],
+            datasets: [
+                {
+                    label: '', // Leyenda del dataset vacía
+                    data: [],
+                    borderColor: 'rgba(75, 192, 192, 1)',
+                    backgroundColor: 'rgba(75, 192, 192, 0.2)',
+                    tension: 0.1,
+                    yAxisID: 'yPrimary'
+                },
+                {
+                    label: '', // Leyenda del dataset vacía
+                    data: [],
+                    borderColor: 'rgba(255, 99, 132, 0.7)',
+                    borderDash: [5, 5],
+                    fill: false,
+                    pointRadius: 0,
+                    yAxisID: 'yPrimary',
+                    hidden: currentGraphMode !== 'Velocidad'
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            scales: {
+                x: {
+                    type: 'category',
+                    ticks: { display: false, color: 'white', autoSkip: true, maxTicksLimit: Math.min(10, GRAPH_TARGET_POINTS / 2) },
+                    grid: { color: 'rgba(255,255,255,0.1)', drawOnChartArea: false }
+                },
+                yPrimary: {
+                    type: 'linear',
+                    position: 'left',
+                    ticks: { color: 'white', callback: function(value) { return value.toFixed(0); } },
+                    grid: { color: 'rgba(255,255,255,0.1)' },
+                    title: {
+                        display: true,
+                        text: currentGraphMode === 'Velocidad' ? 'Km/h' : 'm (Metros)',
+                        color: 'white',
+                        align: 'start',
+                        font: {
+                            weight: 'bold'
+                        }
+                    }
+                }
+            },
+            plugins: {
+                legend: { // Se asegura que la leyenda esté visible, pero sin texto en los datasets
+                    display: true, 
+                    labels: {
+                        // Si quieres que las cajas de color se muestren pero sin texto, 
+                        // esto es suficiente. Si Chart.js no muestra cajas sin label, 
+                        // podrías necesitar un generador de etiquetas personalizado aquí,
+                        // pero usualmente `label: ''` en el dataset es suficiente.
+                        generateLabels: function(chart) {
+                            const datasets = chart.data.datasets;
+                            return datasets.map(function(dataset, i) {
+                                return {
+                                    text: '', // No mostrar texto para la leyenda
+                                    fillStyle: dataset.backgroundColor,
+                                    strokeStyle: dataset.borderColor,
+                                    lineWidth: dataset.borderWidth,
+                                    hidden: !chart.isDatasetVisible(i),
+                                    datasetIndex: i
+                                };
+                            });
+                        }
+                    },
+                    position: 'top', 
+                    align: 'end' 
+                },
+                tooltip: {
+                    callbacks: {
+                        label: function(context) {
+                            // El tooltip seguirá mostrando el nombre original si lo necesitas,
+                            // o puedes personalizarlo aquí también.
+                            // Para que el tooltip no muestre la etiqueta del dataset (que ahora está vacía):
+                            let datasetLabel = (currentGraphMode === 'Velocidad' && context.datasetIndex === 0) ? 'Velocidad Media' :
+                                             (currentGraphMode === 'Velocidad' && context.datasetIndex === 1) ? 'Velocidad ETA' :
+                                             (currentGraphMode === 'Altitud' && context.datasetIndex === 0) ? 'Altitud Media' : '';
+                            let label = datasetLabel || '';
+                            if (label) label += ': ';
+                            if (context.parsed.y !== null) {
+                                label += context.parsed.y.toFixed(1) + (currentGraphMode === 'Velocidad' ? ' Km/h' : ' m');
+                            }
+                            return label;
+                        }
+                    }
+                }
+            },
+            animation: { duration: 200 }
+        }
+    });
+    startGraphIntervalTimer();
+}
+
+function updateChartData() {
+    if (!navigationChart) return;
+
+    if (currentGraphMode === 'Velocidad') {
+        navigationChart.data.datasets[0].data = [...graphDataPoints.speed];
+        // navigationChart.data.datasets[0].label = ''; // Ya está vacío desde la inicialización
+        navigationChart.options.scales.yPrimary.ticks.callback = function(value) { return value.toFixed(0); };
+        navigationChart.options.scales.yPrimary.title.text = 'Km/h';
+        navigationChart.data.datasets[1].hidden = false;
+        navigationChart.data.datasets[1].data = graphLabels.map(() => graphExpectedAvgSpeed);
+    } else if (currentGraphMode === 'Altitud') {
+        navigationChart.data.datasets[0].data = [...graphDataPoints.altitude];
+        // navigationChart.data.datasets[0].label = ''; // Ya está vacío
+        navigationChart.options.scales.yPrimary.ticks.callback = function(value) { return value.toFixed(0); };
+        navigationChart.options.scales.yPrimary.title.text = 'm (Metros)';
+        navigationChart.data.datasets[1].hidden = true;
+    }
+    navigationChart.update();
+}    
 
 async function initializeApp() {
         loadCustomData();
