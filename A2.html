@@ -5377,6 +5377,185 @@ const row = e.target.closest('tr[data-id]');
          modalTable.querySelector('#close-reminders-bottom').addEventListener('click', closeClean);
          setupReminderTableListeners(modalTable);
      }
+
+function updateInitialUserPosition(coords, mapInstanceToUse) {
+    if (!mapInstanceToUse || !coords || typeof coords.latitude !== 'number' || typeof coords.longitude !== 'number') {
+        return;
+    }
+    const latLng = L.latLng(coords.latitude, coords.longitude);
+
+    initialUserLocationMarkerLat = coords.latitude;
+    initialUserLocationMarkerLng = coords.longitude;
+
+    if (!initialUserLocationMarker) {
+        initialUserLocationMarker = L.marker(latLng, { icon: vehicleIcon, zIndexOffset: 1000, interactive: false });
+        if (mapInstanceToUse && mapInstanceToUse.getPane) {
+             try { initialUserLocationMarker.addTo(mapInstanceToUse); } catch(e) {  return; }
+        } else { return; }
+    } else {
+        initialUserLocationMarker.setLatLng(latLng);
+    }
+
+    const currentHeading = (coords && typeof coords.heading === 'number' && coords.heading !== null) ? coords.heading : (currentMapBearing || 0);
+    const vehicleWrapper = initialUserLocationMarker.getElement()?.querySelector('#vehicle-icon-wrapper');
+    if (vehicleWrapper) {
+        let iconRotationAngle = currentHeading - 90;
+        vehicleWrapper.style.transform = `rotate(${iconRotationAngle}deg)`;
+    }
+
+    if (compassAndModeControl) {
+        compassAndModeControl.updateOrientation(currentHeading);
+        compassAndModeControl.updateAltitude(coords.altitude);
+
+        if (window.lastPositionForSpeedCalc && typeof coords.latitude === 'number' && typeof coords.longitude === 'number' && typeof coords.speed === 'number' && coords.speed !== null) {
+            const distM = calculateDistance(window.lastPositionForSpeedCalc.latitude, window.lastPositionForSpeedCalc.longitude, coords.latitude, coords.longitude);
+            const timeS = (Date.now() - window.lastPositionForSpeedCalc.time) / 1000;
+            if (timeS > 0 && distM >= 0) {
+                let speedMs = coords.speed;
+                if (typeof speedMs !== 'number' || speedMs === null || speedMs < 0) { speedMs = distM / timeS; }
+                window.currentSpeedKmh = speedMs * 3.6;
+            } else { window.currentSpeedKmh = 0; }
+        } else {
+             if (typeof coords.speed === 'number' && coords.speed !== null && coords.speed >= 0) { window.currentSpeedKmh = coords.speed * 3.6; }
+             else { window.currentSpeedKmh = 0; }
+        }
+        window.lastPositionForSpeedCalc = { latitude: coords.latitude, longitude: coords.longitude, time: Date.now() };
+
+        if (isNavigating || (isSimulatingGpsLocation && automatedSimulationIntervalId)) {
+             maxSpeedDuringTrip = Math.max(maxSpeedDuringTrip, window.currentSpeedKmh);
+             if (coords.altitude !== null && !isNaN(coords.altitude)) {
+                maxAltitudeDuringTrip = Math.max(maxAltitudeDuringTrip, coords.altitude);
+                minAltitudeDuringTrip = Math.min(minAltitudeDuringTrip, coords.altitude);
+             }
+        }
+
+        if (isNavigating && navigationStartTimeForStats && typeof totalDistanceTravelledForStats === 'number') {
+             if (lastPositionForStats && coords) {
+                const distanceIncrement = calculateDistance(lastPositionForStats.latitude, lastPositionForStats.longitude, coords.latitude, coords.longitude);
+                 if (distanceIncrement > 0 && distanceIncrement < 5000) { totalDistanceTravelledForStats += distanceIncrement; }
+             }
+             lastPositionForStats = {...coords};
+
+            const timeElapsedS = (Date.now() - navigationStartTimeForStats.getTime()) / 1000;
+            if (timeElapsedS > 0 && totalDistanceTravelledForStats > 0) {
+                const avgSpeedMs = totalDistanceTravelledForStats / timeElapsedS;
+                window.averageSpeedKmh = avgSpeedMs * 3.6;
+            } else { window.averageSpeedKmh = 0; }
+        } else if (isSimulatingGpsLocation && automatedSimulationIntervalId && navigationStartTimeForStats && typeof simulatedDistanceAlongRoute === 'number') {
+            const timeElapsedS = (Date.now() - navigationStartTimeForStats.getTime()) / 1000;
+            if (timeElapsedS > 0 && simulatedDistanceAlongRoute > 0) {
+                const avgSpeedMs = simulatedDistanceAlongRoute / timeElapsedS;
+                window.averageSpeedKmh = avgSpeedMs * 3.6;
+            } else { window.averageSpeedKmh = 0; }
+        } else { window.averageSpeedKmh = 0; }
+
+        compassAndModeControl.updateCurrentSpeed(window.currentSpeedKmh);
+        compassAndModeControl.updateAverageSpeed(window.averageSpeedKmh);
+    }
+
+    if (navigationMapInstance && currentMapRotationAngle !== 0 && typeof navigationMapInstance.setBearing === 'function') {
+        try { navigationMapInstance.setBearing(0); currentMapRotationAngle = 0; } catch (e) {  }
+    }
+
+    // initialUserLocationCircle ya no se gestiona aquí
+
+    if ((shouldCenterOnUser || navigationFollowUser) && mapInstanceToUse && coords && !isZoomedForManeuver) {
+        const effectiveHeading = (coords && typeof coords.heading === 'number' && coords.heading !== null) ? coords.heading : (currentMapBearing || 0);
+        const mapSize = mapInstanceToUse.getSize();
+        const progressBar = document.getElementById('navigation-bottom-progress-bar');
+        let progressBarHeight = 0;
+        if (progressBar && progressBar.offsetParent !== null && progressBar.style.display !== 'none') {
+            progressBarHeight = progressBar.offsetHeight;
+        }
+
+        const offsetFactor = 0.33;
+        const minMapDimension = Math.min(mapSize.x, mapSize.y);
+        const offsetDistance = minMapDimension * offsetFactor;
+        const headingRad = (effectiveHeading % 360) * Math.PI / 180;
+
+        let calculatedTargetMapCenterOffset = { x: 0, y: 0 };
+        calculatedTargetMapCenterOffset.x = -offsetDistance * Math.sin(headingRad);
+        calculatedTargetMapCenterOffset.y = offsetDistance * Math.cos(headingRad);
+
+        const isGoingNorth = (effectiveHeading <= 60 || effectiveHeading >= 300);
+        const isGoingSouth = effectiveHeading > 120 && effectiveHeading < 240;
+
+        if (miniMapOffsetActive.y === 0 && progressBarHeight > 0) {
+            if (isGoingNorth) {
+                calculatedTargetMapCenterOffset.y -= progressBarHeight * 0.2;
+            } else if (isGoingSouth) {
+                calculatedTargetMapCenterOffset.y += progressBarHeight * 0.5;
+            }
+        }
+        
+        calculatedTargetMapCenterOffset.x += miniMapOffsetActive.x;
+        calculatedTargetMapCenterOffset.y += miniMapOffsetActive.y;
+
+        targetMapCenterOffset = { ...calculatedTargetMapCenterOffset };
+
+
+        const animatePanFrame = () => {
+            if (!shouldCenterOnUser && !navigationFollowUser) {
+                mapOffsetAnimationId = null;
+                currentSmoothedMapCenter = null;
+                currentMapCenterOffset = {x:0, y:0};
+                return;
+            }
+            
+            const currentCoordsForPan = navigationCurrentLocation;
+            if (!currentCoordsForPan || !mapInstanceToUse || !mapInstanceToUse.project || !mapInstanceToUse._loaded) {
+                mapOffsetAnimationId = requestAnimationFrame(animatePanFrame);
+                return;
+            }
+
+            const currentVehicleLatLng = L.latLng(currentCoordsForPan.latitude, currentCoordsForPan.longitude);
+            const vehicleScreenPos = mapInstanceToUse.project(currentVehicleLatLng);
+
+            const idealMapCenterScreenPos = L.point(
+                vehicleScreenPos.x - targetMapCenterOffset.x,
+                vehicleScreenPos.y - targetMapCenterOffset.y
+            );
+            const idealMapCenterLatLng = mapInstanceToUse.unproject(idealMapCenterScreenPos);
+
+            const SMOOTHING_FACTOR = 0.1;
+
+            if (!currentSmoothedMapCenter) {
+                currentSmoothedMapCenter = idealMapCenterLatLng;
+            } else {
+                currentSmoothedMapCenter = L.latLng(
+                    currentSmoothedMapCenter.lat + (idealMapCenterLatLng.lat - currentSmoothedMapCenter.lat) * SMOOTHING_FACTOR,
+                    currentSmoothedMapCenter.lng + (idealMapCenterLatLng.lng - currentSmoothedMapCenter.lng) * SMOOTHING_FACTOR
+                );
+            }
+
+            if (!mapInstanceToUse._panAnim || !mapInstanceToUse._panAnim._inProgress) {
+                mapInstanceToUse.setView(currentSmoothedMapCenter, mapInstanceToUse.getZoom(), {
+                    animate: false,
+                    noMoveStart: true,
+                });
+            }
+            
+            mapOffsetAnimationId = requestAnimationFrame(animatePanFrame);
+        };
+
+        if (!mapOffsetAnimationId) {
+            currentSmoothedMapCenter = null;
+            mapOffsetAnimationId = requestAnimationFrame(animatePanFrame);
+        }
+    } else {
+        if (mapOffsetAnimationId) {
+            cancelAnimationFrame(mapOffsetAnimationId);
+            mapOffsetAnimationId = null;
+        }
+        currentSmoothedMapCenter = null;
+        currentMapCenterOffset = { x: 0, y: 0 };
+        targetMapCenterOffset = { x: 0, y: 0 };
+    }
+    updateDirectionWarningCardsVisibility();
+}
+
+
+    
      function updateReminderCount() {
          let reminders = []; try { reminders = JSON.parse(localStorage.getItem('reminders') || '[]'); } catch (e) { reminders = []; }
          const showExcludedInTable = JSON.parse(localStorage.getItem(SHOW_EXCLUDED_REMINDERS_KEY)) || false; let remindersForCount = reminders;
@@ -5384,8 +5563,8 @@ const row = e.target.closest('tr[data-id]');
          const totalCount = remindersForCount.length; const nonCyclicReminders = remindersForCount.filter(r => r.type !== 'weekly' && r.type !== 'interval'); const nonCyclicCount = nonCyclicReminders.length;
          const countElGlobe = document.getElementById('reminder-count-globe'); if (countElGlobe) { countElGlobe.textContent = nonCyclicCount > 0 ? nonCyclicCount : ''; countElGlobe.style.display = nonCyclicCount > 0 ? 'flex' : 'none'; }
 
-  const reminderButtonElem = document.getElementById('reminder-button'); if (reminderButtonElem) { let countSpanSide = reminderButtonElem.querySelector('.reminder-count'); if (totalCount > 0) { if (!countSpanSide) { countSpanSide = document.createElement('span'); countSpanSide.className = 'reminder-count'; reminderButtonElem.appendChild(countSpanSide); } countSpanSide.textContent = totalCount; } else { if (countSpanSide) { countSpanSide.remove(); } } } }
-     function calculateNextOccurrence(reminder, referenceDate) {
+         const reminderButtonElem = document.getElementById('reminder-button'); if (reminderButtonElem) { let countSpanSide = reminderButtonElem.querySelector('.reminder-count'); if (totalCount > 0) { if (!countSpanSide) { countSpanSide = document.createElement('span'); countSpanSide.className = 'reminder-count'; reminderButtonElem.appendChild(countSpanSide); } countSpanSide.textContent = totalCount; } else { if (countSpanSide) { countSpanSide.remove(); } } } }
+    function calculateNextOccurrence(reminder, referenceDate) {
           if (!reminder || !reminder.type || !reminder.time || !reminder.date) { return null; } try {
               let [year, month, day] = reminder.date.split('-').map(Number); let [hour, minute] = reminder.time.split(':').map(Number);
               let baseDate = new Date(Date.UTC(year, month - 1, day, hour, minute)); if (isNaN(baseDate.getTime())) { return null; }
