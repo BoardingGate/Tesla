@@ -2308,15 +2308,19 @@ let isFlying = false; // Flag para saber si una animación flyTo está en curso
 
     let navigationChart = null;
     let currentGraphMode = localStorage.getItem(GRAPH_STATE_KEY) || 'Velocidad';
-    let graphDataAccumulator = { speedSum: 0, altitudeSum: 0, count: 0, lastPositionTime: null, lastPositionCoords: null };
-    let graphIntervalDuration = 0;
+    
+    // --- INICIO: Variables para la nueva lógica de gráficas ---
+    let graphPlotState = { lastPlotTime: null, lastPlotCoords: null };
+    let graphIntervalDuration = 0; // en milisegundos
     let graphIntervalTimer = null;
     let graphDataPoints = { speed: [], altitude: [] };
     let graphLabels = [];
     let graphExpectedAvgSpeed = 0;
-
-    const GRAPH_TARGET_POINTS = 30;
-
+    
+    // Constantes para la lógica dinámica
+    const GRAPH_PIXELS_PER_DATAPOINT = 12; // 12px de separación entre puntos.
+    const GRAPH_BUFFER_PERCENTAGE = 0.15;    // 15% de buffer para retrasos.
+    // --- FIN: Variables para la nueva lógica de gráficas ---
 
     const managedDesc = managedKeys.map(k => {
             switch(k){
@@ -8070,6 +8074,9 @@ function toggleAddReminderAtLocationMode() {
     setNavigationMapClickHandler();
 }
 
+
+    
+
 function handleMapClickToAddReminder(e) {
     if (!isAddReminderAtLocationModeActive || !navigationMapInstance) return;
     const latlng = e.latlng;
@@ -8091,6 +8098,9 @@ function handleMapClickToAddReminder(e) {
         excludeFromList: false
     });
 }
+
+
+
 
 function closeNavigationMap(force = false) {
     const wasInDirectToMapModeSession = sessionStorage.getItem('isInDirectToMapMode') === 'true';
@@ -8217,15 +8227,19 @@ function closeNavigationMap(force = false) {
     }
     hideIntersectionPreviewMap();
     updateDirectionWarningCardsVisibility();
+    
     if (graphIntervalTimer) clearInterval(graphIntervalTimer);
+    graphIntervalTimer = null;
     graphDataPoints = { speed: [], altitude: [] };
     graphLabels = [];
     if (navigationChart) navigationChart.destroy();
     navigationChart = null;
     const graphCard = document.getElementById('navigation-graph-card');
     if (graphCard) graphCard.classList.add('hidden');
-}
+}    
 
+
+    
 
 function calculateDistanceToEndOfStep(route, targetLegIndex, targetStepIndex) {
     let totalDistance = 0;
@@ -9121,6 +9135,7 @@ function drawRouteOnMap(route) {
     }
 }
 
+
 async function toggleNavigationState() {
     const startNavButton = document.getElementById('start-navigation-button');
     const startNavImg = startNavButton ? startNavButton.querySelector('img') : null;
@@ -9174,7 +9189,6 @@ async function toggleNavigationState() {
             compassAndModeControl.updateMaxSpeed(maxSpeedDuringTrip); 
         }
 
-
         if(startNavImg) startNavImg.src = "TERMINARNAVEGACION.PNG";
         if(startNavButton) startNavButton.classList.add('navigating');
         if (mapContainer) mapContainer.classList.add('navigating');
@@ -9211,6 +9225,8 @@ async function toggleNavigationState() {
     actualizarContadorTareas(tareasEnRutaActual.length);
     updateDirectionWarningCardsVisibility();
 }
+    
+
 
 async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
     isRecalculatingRoute = true;
@@ -12077,17 +12093,15 @@ function initializeNavigationGraph() {
     graphCard.classList.remove('hidden');
     
     const compassElement = document.querySelector('.leaflet-control-orientation-altitude');
-    if (compassElement) {
-        graphCard.style.height = compassElement.offsetHeight + 'px';
-    } else {
-        graphCard.style.height = '157px'; // Fallback
-    }
+    graphCard.style.height = compassElement ? (compassElement.offsetHeight + 'px') : '157px';
 
-
+    // Resetear estado para una nueva gráfica
     graphDataPoints = { speed: [], altitude: [] };
     graphLabels = [];
-    graphDataAccumulator = { speedSum: 0, altitudeSum: 0, count: 0, lastPositionTime: null, lastPositionCoords: null };
-
+    graphPlotState = { 
+        lastPlotTime: Date.now(), 
+        lastPlotCoords: navigationCurrentLocation ? { ...navigationCurrentLocation } : null 
+    };
 
     if (navigationChart) {
         navigationChart.destroy();
@@ -12095,21 +12109,26 @@ function initializeNavigationGraph() {
     }
 
     const ctx = document.getElementById('navigation-chart')?.getContext('2d');
-    if (!ctx) {
-        showToast("Error crítico: Canvas context para gráfica no encontrado.", "error");
+    if (!ctx || !ctx.canvas) {
+        showToast("Error crítico: Canvas para gráfica no encontrado.", "error");
         if (graphCard) graphCard.classList.add('hidden');
         return;
     }
     
-    const initialRouteDuration = navigationCurrentRouteData?.routes?.[0]?.duration || 0;
-    graphIntervalDuration = initialRouteDuration > 0 ? Math.max(5000, (initialRouteDuration / GRAPH_TARGET_POINTS) * 1000) : 4 * 60 * 1000;
+    const canvasWidth = ctx.canvas.clientWidth;
+    const maxPoints = Math.floor(canvasWidth / GRAPH_PIXELS_PER_DATAPOINT);
+    const targetPointsForEta = Math.floor(maxPoints * (1 - GRAPH_BUFFER_PERCENTAGE));
 
-
-    if (initialRouteDuration > 0 && navigationCurrentRouteData.routes[0].distance > 0) {
-        graphExpectedAvgSpeed = (navigationCurrentRouteData.routes[0].distance / initialRouteDuration) * 3.6;
+    const initialRouteDurationSec = navigationCurrentRouteData?.routes?.[0]?.duration || 0;
+    
+    if (initialRouteDurationSec > 0 && targetPointsForEta > 0) {
+        graphIntervalDuration = (initialRouteDurationSec * 1000) / targetPointsForEta;
     } else {
-        graphExpectedAvgSpeed = 0;
+        graphIntervalDuration = 30000; 
     }
+    
+    const initialRouteDistance = navigationCurrentRouteData?.routes?.[0]?.distance || 0;
+    graphExpectedAvgSpeed = (initialRouteDurationSec > 0 && initialRouteDistance > 0) ? (initialRouteDistance / initialRouteDurationSec) * 3.6 : 0;
     
     navigationChart = new Chart(ctx, {
         type: 'line',
@@ -12117,47 +12136,25 @@ function initializeNavigationGraph() {
             labels: [],
             datasets: [
                 {
-                    label: '', 
-                    data: [],
-                    borderColor: 'rgba(75, 192, 192, 1)',
-                    backgroundColor: 'rgba(252, 75, 8, 1)',
-                    tension: 0.1,
-                    yAxisID: 'yPrimary'
+                    label: 'Dato', data: [], borderColor: 'rgba(75, 192, 192, 1)',
+                    backgroundColor: 'rgba(75, 192, 192, 0.2)', tension: 0.1,
+                    yAxisID: 'yPrimary', fill: true, pointRadius: 0, order: 1 
                 },
                 {
-                    label: '', 
-                    data: [],
-                    borderColor: 'rgba(255, 99, 132, 0.7)',
-                    borderDash: [3, 3],
-                    fill: false,
-                    pointRadius: 0,
-                    yAxisID: 'yPrimary',
-                    hidden: currentGraphMode !== 'Velocidad'
+                    label: 'Media', data: [], borderColor: 'rgba(255, 99, 132, 1)',
+                    borderWidth: 1.5, borderDash: [5, 5], fill: false,
+                    pointRadius: 0, yAxisID: 'yPrimary', hidden: false, order: 0 
                 }
             ]
         },
         options: {
-            responsive: true,
-            maintainAspectRatio: false,
+            responsive: true, maintainAspectRatio: false,
             scales: {
-                x: {
-                    type: 'category',
-                    ticks: { display: false },
-                    grid: { drawOnChartArea: false }
-                },
+                x: { type: 'category', ticks: { display: false }, grid: { drawOnChartArea: false } },
                 yPrimary: {
-                    type: 'linear',
-                    position: 'left',
-                    ticks: { 
-                        color: 'white', 
-                        callback: function(value) {
-                            return Math.round(Number(value)).toString(); 
-                        }
-                    },
-                    grid: { color: 'rgba(255,255,255,0.1)' },
-                    title: { 
-                        display: false, 
-                    }
+                    type: 'linear', position: 'left',
+                    ticks: { color: 'white', font: { size: 10 }, callback: (v) => Math.round(Number(v)).toString() },
+                    grid: { color: 'rgba(255,255,255,0.1)' }, title: { display: false }
                 }
             },
             plugins: {
@@ -12166,9 +12163,7 @@ function initializeNavigationGraph() {
                     callbacks: {
                         label: function(context) {
                             let label = context.dataset.label || '';
-                            if (label) {
-                                label += ': ';
-                            }
+                            if (label) { label += ': '; }
                             if (context.parsed.y !== null) {
                                 label += context.parsed.y.toFixed(1);
                                 if (currentGraphMode === 'Velocidad') label += ' km/h';
@@ -12179,44 +12174,85 @@ function initializeNavigationGraph() {
                     }
                  }
             },
-            animation: { duration: 200 }
+            animation: { duration: 250 }
         }
     });
+
     startGraphIntervalTimer();
     updateNavigationGraphVisibilityAndMode();
+}    
+
+
+function plotIntervalData() {
+    if (!isNavigating || !navigationChart || !graphPlotState.lastPlotCoords || !navigationCurrentLocation) {
+        return;
+    }
+
+    const currentTime = Date.now();
+    const timeDiffSeconds = (currentTime - graphPlotState.lastPlotTime) / 1000;
+
+    if (timeDiffSeconds < 1) return;
+
+    const distanceMeters = calculateDistance(
+        graphPlotState.lastPlotCoords.latitude, graphPlotState.lastPlotCoords.longitude,
+        navigationCurrentLocation.latitude, navigationCurrentLocation.longitude
+    );
+    
+    const avgSpeedKmh = (timeDiffSeconds > 0) ? (distanceMeters / timeDiffSeconds) * 3.6 : 0;
+    const currentAltitude = navigationCurrentLocation.altitude || 0;
+    const timeLabel = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    
+    graphLabels.push(timeLabel);
+    graphDataPoints.speed.push(avgSpeedKmh);
+    graphDataPoints.altitude.push(currentAltitude);
+
+    updateChartData();
+
+    graphPlotState.lastPlotTime = currentTime;
+    graphPlotState.lastPlotCoords = { ...navigationCurrentLocation };
 }
 
+    
 function updateChartData() {
     if (!navigationChart) return;
 
-    let currentDataForChart = [];
     const graphTitleElement = document.getElementById('navigation-graph-title');
 
     if (currentGraphMode === 'Velocidad') {
-        currentDataForChart = [...graphDataPoints.speed];
-        navigationChart.data.datasets[0].label = 'Velocidad Media Tramo';
+        navigationChart.data.datasets[0].data = graphDataPoints.speed;
+        navigationChart.data.datasets[0].label = 'Velocidad';
+        navigationChart.data.datasets[0].borderColor = 'rgba(75, 192, 192, 1)';
+        navigationChart.data.datasets[0].backgroundColor = 'rgba(75, 192, 192, 0.2)';
+
         navigationChart.data.datasets[1].hidden = false;
         navigationChart.data.datasets[1].data = graphLabels.map(() => graphExpectedAvgSpeed);
         navigationChart.data.datasets[1].label = 'Velocidad Media Prevista';
-        if(graphTitleElement) graphTitleElement.textContent = 'Desviación ETA';
+        
+        if(graphTitleElement) graphTitleElement.textContent = 'Velocidad';
+        navigationChart.options.scales.yPrimary.ticks.callback = function(value) { return Math.round(value) + ' km/h'; };
+
     } else if (currentGraphMode === 'Altitud') {
-        currentDataForChart = [...graphDataPoints.altitude];
-        navigationChart.data.datasets[0].label = 'Altitud Media Tramo';
-        navigationChart.data.datasets[1].hidden = true;
+        navigationChart.data.datasets[0].data = graphDataPoints.altitude;
+        navigationChart.data.datasets[0].label = 'Altitud';
+        navigationChart.data.datasets[0].borderColor = 'rgba(252, 75, 8, 1)';
+        navigationChart.data.datasets[0].backgroundColor = 'rgba(252, 75, 8, 0.2)';
+        
+        const altitudePoints = graphDataPoints.altitude;
+        const avgAltitudeValue = altitudePoints.length > 0
+            ? altitudePoints.reduce((a, b) => a + b, 0) / altitudePoints.length
+            : 0;
+            
+        navigationChart.data.datasets[1].hidden = false;
+        navigationChart.data.datasets[1].data = graphLabels.map(() => avgAltitudeValue);
+        navigationChart.data.datasets[1].label = 'Altitud Media Actual';
+        
         if(graphTitleElement) graphTitleElement.textContent = 'Desnivel ruta';
-    } else { 
-        navigationChart.data.datasets[1].hidden = true;
-        if(graphTitleElement) graphTitleElement.textContent = '';
+        navigationChart.options.scales.yPrimary.ticks.callback = function(value) { return Math.round(value) + ' m'; };
     }
     
-    navigationChart.data.datasets[0].data = currentDataForChart;
-    navigationChart.options.scales.yPrimary.ticks.callback = function(value) {
-        return Math.round(Number(value)).toString();
-    };
-            
     navigationChart.data.labels = graphLabels; 
-    navigationChart.update();
-}
+    navigationChart.update('none');
+}    
 
     
     
@@ -12757,17 +12793,10 @@ function updateNavigationGraphVisibilityAndMode() {
 function startGraphIntervalTimer() {
     if (graphIntervalTimer) clearInterval(graphIntervalTimer);
     if (isNavigating && currentGraphMode !== 'Gráfica off' && graphIntervalDuration > 0) { 
-        graphIntervalTimer = setInterval(() => {
-            if (!isNavigating) {
-                clearInterval(graphIntervalTimer);
-                graphIntervalTimer = null;
-                return;
-            }
-            plotAccumulatedGraphData();
-        }, graphIntervalDuration);
-    } else {
+        graphIntervalTimer = setInterval(plotIntervalData, graphIntervalDuration);
     }
 }
+
     
 
 
