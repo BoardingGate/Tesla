@@ -2347,23 +2347,23 @@ let isFlying = false; // Flag para saber si una animación flyTo está en curso
             }
         }).join(', ');
 
-  const vehicleIcon = L.divIcon({
-    html: `<div id="vehicle-icon-wrapper">
-               <img src="AVANCE.PNG" alt="Coche">
-           </div>`,
-    className: 'vehicle-icon-leaflet-container',
-    iconSize: [48, 48],
-    iconAnchor: [24, 24]
-});
-
-const vehicleIconMiniMap = L.divIcon({
-    html: `<div class="vehicle-icon-minimap">
-               <img src="AVANCE.PNG" alt="Coche Mini">
-           </div>`,
-    className: 'vehicle-icon-minimap-leaflet-container',
-    iconSize: [24, 24],
-    iconAnchor: [12, 12]
-});
+          const vehicleIcon = L.divIcon({
+            html: `<div id="vehicle-icon-wrapper">
+                       <img src="AVANCE.PNG" alt="Coche">
+                   </div>`,
+            className: 'vehicle-icon-leaflet-container',
+            iconSize: [48, 48],
+            iconAnchor: [24, 24]
+        });
+        
+        const vehicleIconMiniMap = L.divIcon({
+            html: `<div class="vehicle-icon-minimap">
+                       <img src="AVANCE.PNG" alt="Coche Mini">
+                   </div>`,
+            className: 'vehicle-icon-minimap-leaflet-container',
+            iconSize: [24, 24],
+            iconAnchor: [12, 12]
+        });
 
 
     const smallRadarMarkerIcon = L.icon({
@@ -2426,6 +2426,60 @@ const vehicleIconMiniMap = L.divIcon({
 
     const SMOOTH_ZOOM_DURATION = 5.0;
 
+/**
+ * Calcula el punto central objetivo del mapa para mantener el vehículo en la
+ * posición de visualización correcta (con el offset hacia abajo).
+ * @param {L.Map} mapInstanceToUse - La instancia del mapa.
+ * @param {object} coords - Las coordenadas actuales del vehículo.
+ * @returns {L.LatLng | null} El objeto LatLng del centro objetivo o null si no se puede calcular.
+ */
+function calculateTargetMapCenter(mapInstanceToUse, coords) {
+    if (!mapInstanceToUse || !coords) {
+        return mapInstanceToUse ? mapInstanceToUse.getCenter() : null;
+    }
+
+    const effectiveHeading = (coords && typeof coords.heading === 'number' && coords.heading !== null) ? coords.heading : (currentMapBearing || 0);
+    const mapSize = mapInstanceToUse.getSize();
+    const progressBar = document.getElementById('navigation-bottom-progress-bar');
+    let progressBarHeight = 0;
+    if (progressBar && progressBar.offsetParent !== null && progressBar.style.display !== 'none') {
+        progressBarHeight = progressBar.offsetHeight;
+    }
+
+    const offsetFactor = 0.33;
+    const minMapDimension = Math.min(mapSize.x, mapSize.y);
+    const offsetDistance = minMapDimension * offsetFactor;
+    const headingRad = (effectiveHeading % 360) * Math.PI / 180;
+
+    let calculatedTargetMapCenterOffset = { x: 0, y: 0 };
+    calculatedTargetMapCenterOffset.x = -offsetDistance * Math.sin(headingRad);
+    calculatedTargetMapCenterOffset.y = offsetDistance * Math.cos(headingRad);
+
+    const isGoingNorth = (effectiveHeading <= 60 || effectiveHeading >= 300);
+    const isGoingSouth = effectiveHeading > 120 && effectiveHeading < 240;
+
+    if (miniMapOffsetActive.y === 0 && progressBarHeight > 0) {
+        if (isGoingNorth) {
+            calculatedTargetMapCenterOffset.y -= progressBarHeight * 0.2;
+        } else if (isGoingSouth) {
+            calculatedTargetMapCenterOffset.y += progressBarHeight * 0.5;
+        }
+    }
+
+    calculatedTargetMapCenterOffset.x += miniMapOffsetActive.x;
+    calculatedTargetMapCenterOffset.y += miniMapOffsetActive.y;
+
+    const vehicleLatLng = L.latLng(coords.latitude, coords.longitude);
+    const vehicleScreenPos = mapInstanceToUse.project(vehicleLatLng);
+    const idealMapCenterScreenPos = L.point(
+        vehicleScreenPos.x - calculatedTargetMapCenterOffset.x,
+        vehicleScreenPos.y - calculatedTargetMapCenterOffset.y
+    );
+    
+    return mapInstanceToUse.unproject(idealMapCenterScreenPos);
+}
+    
+    
 async function toggleNavigationState() {
     const startNavButton = document.getElementById('start-navigation-button');
     const startNavImg = startNavButton ? startNavButton.querySelector('img') : null;
@@ -3807,26 +3861,22 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
 }
 
 /**
- * Gestiona el zoom progresivo usando map.flyTo para una animación suave.
+ * Gestiona el zoom progresivo usando map.flyTo para una animación suave de ZOOM y CENTRADO.
  * @param {object} currentStep - El paso actual de la ruta de OSRM.
  * @param {number} distanceToManeuver - Distancia en metros hasta la siguiente maniobra.
  */
 function handleProgressiveManeuverZoom(currentStep, distanceToManeuver) {
     if (!isNavigating || !navigationMapInstance || !currentStep || isFlying) {
-        return; // No hacer nada si no navegamos, no hay mapa, no hay paso o ya hay una animación en curso
+        return; 
     }
 
-    // --- INICIO DE LA MODIFICACIÓN ---
-    // Determinamos el zoom máximo dinámicamente según la capa del mapa
     const maxZoomForMap = navigationMapInstance.getMaxZoom() || 19;
     const currentMapLayerName = (localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "satélite + calles").toLowerCase();
     const isSatelliteWithLabels = currentMapLayerName.includes("satélite + calles");
 
-    // Si es "Satélite + Calles", reducimos el zoom pico para evitar teselas blancas.
     const MANEUVER_PEAK_ZOOM_LEVEL = isSatelliteWithLabels 
         ? Math.min(17.5, maxZoomForMap) 
         : Math.min(18.5, maxZoomForMap);
-    // --- FIN DE LA MODIFICACIÓN ---
 
     const currentStepIdentifier = `${currentLegIndexNav}_${currentStepIndexNav}`;
 
@@ -3838,14 +3888,21 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver) {
     lastProcessedStepIdentifier = currentStepIdentifier;
 
     const distanceIntoCurrentStep = currentStep.distance - distanceToManeuver;
-    let targetZoom = null; // El zoom que queremos alcanzar
+    let targetZoom = null;
 
-    // Función para ejecutar la animación de zoom
-    const setFlyToZoom = (zoomLevel) => {
+    // Función para ejecutar la animación de zoom Y centrado
+    const setFlyToZoomAndCenter = (zoomLevel) => {
         if (Math.abs(navigationMapInstance.getZoom() - zoomLevel) < 0.1) return;
-        
+
+        // --- INICIO DE LA MODIFICACIÓN CLAVE ---
+        // Calcula el centro ideal del mapa usando la nueva función de ayuda
+        const targetCenter = calculateTargetMapCenter(navigationMapInstance, navigationCurrentLocation);
+        if (!targetCenter) return; // Salida segura si no se puede calcular
+        // --- FIN DE LA MODIFICACIÓN CLAVE ---
+
         isFlying = true;
-        navigationMapInstance.flyTo(navigationMapInstance.getCenter(), zoomLevel, {
+        // Ahora flyTo anima tanto el zoom como el centro simultáneamente
+        navigationMapInstance.flyTo(targetCenter, zoomLevel, {
             animate: true,
             duration: 1.0 
         });
@@ -3869,7 +3926,7 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver) {
             }
             break;
 
-        default: // 'none', 'zooming-in', 'holding'
+        default: 
             if (distanceToManeuver <= PROGRESSIVE_ZOOM_START_DISTANCE && distanceToManeuver > PROGRESSIVE_ZOOM_PEAK_DISTANCE) {
                 if (progressiveZoomState !== 'zooming-in') {
                     mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
@@ -3895,7 +3952,7 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver) {
     }
 
     if (targetZoom !== null) {
-        setFlyToZoom(targetZoom);
+        setFlyToZoomAndCenter(targetZoom);
     }
 }
 
@@ -3982,56 +4039,18 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
     // Lógica de centrado del mapa, solo se ejecuta si el zoom progresivo NO está activo.
     const shouldFollow = shouldCenterOnUser || navigationFollowUser;
     if (shouldFollow && mapInstanceToUse && coords && progressiveZoomState === 'none' && !isFlying) {
-        const effectiveHeading = (coords && typeof coords.heading === 'number' && coords.heading !== null) ? coords.heading : (currentMapBearing || 0);
-        const mapSize = mapInstanceToUse.getSize();
-        const progressBar = document.getElementById('navigation-bottom-progress-bar');
-        let progressBarHeight = 0;
-        if (progressBar && progressBar.offsetParent !== null && progressBar.style.display !== 'none') {
-            progressBarHeight = progressBar.offsetHeight;
+        const idealMapCenterLatLng = calculateTargetMapCenter(mapInstanceToUse, coords);
+        if (idealMapCenterLatLng) {
+            mapInstanceToUse.setView(idealMapCenterLatLng, mapInstanceToUse.getZoom(), {
+                animate: true,
+                duration: 0.5,
+                easeLinearity: 0.75
+            });
         }
-
-        const offsetFactor = 0.33;
-        const minMapDimension = Math.min(mapSize.x, mapSize.y);
-        const offsetDistance = minMapDimension * offsetFactor;
-        const headingRad = (effectiveHeading % 360) * Math.PI / 180;
-
-        let calculatedTargetMapCenterOffset = { x: 0, y: 0 };
-        calculatedTargetMapCenterOffset.x = -offsetDistance * Math.sin(headingRad);
-        calculatedTargetMapCenterOffset.y = offsetDistance * Math.cos(headingRad);
-
-        const isGoingNorth = (effectiveHeading <= 60 || effectiveHeading >= 300);
-        const isGoingSouth = effectiveHeading > 120 && effectiveHeading < 240;
-
-        if (miniMapOffsetActive.y === 0 && progressBarHeight > 0) {
-            if (isGoingNorth) {
-                calculatedTargetMapCenterOffset.y -= progressBarHeight * 0.2;
-            } else if (isGoingSouth) {
-                calculatedTargetMapCenterOffset.y += progressBarHeight * 0.5;
-            }
-        }
-
-        calculatedTargetMapCenterOffset.x += miniMapOffsetActive.x;
-        calculatedTargetMapCenterOffset.y += miniMapOffsetActive.y;
-
-        const vehicleLatLng = L.latLng(coords.latitude, coords.longitude);
-        const vehicleScreenPos = mapInstanceToUse.project(vehicleLatLng);
-        const idealMapCenterScreenPos = L.point(
-            vehicleScreenPos.x - calculatedTargetMapCenterOffset.x,
-            vehicleScreenPos.y - calculatedTargetMapCenterOffset.y
-        );
-        const idealMapCenterLatLng = mapInstanceToUse.unproject(idealMapCenterScreenPos);
-
-        // Usamos setView porque no hay animación de zoom en curso que pueda ser interrumpida.
-        mapInstanceToUse.setView(idealMapCenterLatLng, mapInstanceToUse.getZoom(), {
-            animate: true,
-            duration: 0.5,
-            easeLinearity: 0.75
-        });
     }
     
     updateDirectionWarningCardsVisibility();
-}   
-
+}
     
 function hideNavigationUI() {
     const topInfoBar = document.getElementById('navigation-top-info-bar');
