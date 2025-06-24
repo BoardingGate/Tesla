@@ -2128,15 +2128,18 @@
     const darkModeGenericButtonColor = '#ABAB99';
     let snoozedRouteRadars = new Map();
 
-    // --- INICIO: Nuevas variables para el zoom progresivo (versión fluida) ---
-    let progressiveZoomState = 'none'; // 'none', 'zooming-in', 'holding', 'zooming-out'
-    let mapPreviousZoomLevelForProgressive = null;
-    let lastProcessedStepIdentifier = null; // Para detectar cuando pasamos una maniobra
-    const PROGRESSIVE_ZOOM_START_DISTANCE = 120; // Metros antes de la maniobra para empezar el zoom in
-    const PROGRESSIVE_ZOOM_PEAK_DISTANCE = 50;  // Metros antes de la maniobra para alcanzar el zoom máximo
-    const PROGRESSIVE_ZOOM_EXIT_START_DISTANCE = 50; // Metros después de la maniobra para empezar el zoom out
-    const PROGRESSIVE_ZOOM_EXIT_END_DISTANCE = 120; // Metros después de la maniobra para volver al zoom previo
-    // --- FIN: Nuevas variables para el zoom progresivo ---
+    // --- INICIO: Nuevas variables para el zoom progresivo SUAVE ---
+let progressiveZoomState = 'none'; // 'none', 'zooming-in', 'holding', 'zooming-out'
+let mapPreviousZoomLevelForProgressive = null;
+let lastProcessedStepIdentifier = null;
+const PROGRESSIVE_ZOOM_START_DISTANCE = 120;
+const PROGRESSIVE_ZOOM_PEAK_DISTANCE = 50;
+const PROGRESSIVE_ZOOM_EXIT_START_DISTANCE = 50;
+const PROGRESSIVE_ZOOM_EXIT_END_DISTANCE = 120;
+// Variables para la animación suave
+let targetZoomLevel = null;
+let zoomAnimationId = null;
+// --- FIN: Nuevas variables ---
     
     const TOTAL_CELLS = 96; const COLS = 6; const grid = document.getElementById('bookmark-grid');
     let isDarkMode = false; let pressStartTime = null; let reminderPressStartTime = null; let isActive = true; let isFooterVisible = true; let notices = []; let currentNoticeIndex = 0; let fromReminderModal = false;
@@ -2418,13 +2421,43 @@ const vehicleIconMiniMap = L.divIcon({
     const SMOOTH_ZOOM_DURATION = 5.0;
 
 /**
- * Función de suavizado (ease-in-out). Transforma un progreso lineal (0 a 1)
- * en un progreso no lineal que empieza y termina suavemente.
+ * Función de suavizado (ease-out). Empieza rápido y decelera suavemente.
+ * Ideal para que las animaciones se sientan responsivas pero no bruscas al final.
  * @param {number} t - Progreso lineal de 0 a 1.
  * @returns {number} Progreso suavizado de 0 a 1.
  */
-function easeInOutCubic(t) {
-    return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+function easeOutQuart(t) {
+    return 1 - Math.pow(1 - t, 4);
+}
+
+/**
+ * Bucle de animación para el zoom suave.
+ * Se ejecuta en cada frame para interpolar el zoom actual hacia el zoom objetivo.
+ */
+function animateZoom() {
+    if (!navigationMapInstance || targetZoomLevel === null) {
+        zoomAnimationId = null; // Detiene el bucle si no hay mapa o target
+        return;
+    }
+
+    const currentZoom = navigationMapInstance.getZoom();
+    const difference = targetZoomLevel - currentZoom;
+
+    // Si la diferencia es mínima, se detiene la animación para ahorrar recursos.
+    if (Math.abs(difference) < 0.01) {
+        navigationMapInstance.setZoom(targetZoomLevel); // Ajuste final para asegurar precisión
+        zoomAnimationId = null; // Detiene el bucle
+        return;
+    }
+
+    // Factor de suavizado. Un valor más pequeño hace la transición más lenta y suave.
+    const smoothingFactor = 0.08; 
+    const newAnimatedZoom = currentZoom + difference * smoothingFactor;
+
+    navigationMapInstance.setZoom(newAnimatedZoom);
+
+    // Pide al navegador que ejecute esta función de nuevo en el próximo frame.
+    zoomAnimationId = requestAnimationFrame(animateZoom);
 }
     
 /**
@@ -2440,25 +2473,30 @@ function easeInOutCubic(t) {
  * @param {object} currentStep - El paso actual de la ruta de OSRM.
  * @param {number} distanceToManeuver - Distancia en metros hasta la siguiente maniobra.
  */
+ /**
+ * Establece el NIVEL DE ZOOM OBJETIVO basado en la distancia a la maniobra.
+ * La animación real la gestiona la función animateZoom.
+ * @param {object} currentStep - El paso actual de la ruta de OSRM.
+ * @param {number} distanceToManeuver - Distancia en metros hasta la siguiente maniobra.
+ */
 function handleProgressiveManeuverZoom(currentStep, distanceToManeuver) {
     if (!isNavigating || !navigationMapInstance || !currentStep) {
-        // Si no estamos navegando, reseteamos el estado del zoom.
-        if (progressiveZoomState !== 'none' && mapPreviousZoomLevelForProgressive !== null) {
-            navigationMapInstance.setZoom(mapPreviousZoomLevelForProgressive);
+        // Detiene la animación y resetea el estado si no estamos navegando.
+        if (zoomAnimationId) {
+            cancelAnimationFrame(zoomAnimationId);
+            zoomAnimationId = null;
         }
+        targetZoomLevel = null;
         progressiveZoomState = 'none';
         lastProcessedStepIdentifier = null;
-        mapPreviousZoomLevelForProgressive = null;
+        // No reseteamos el zoom del mapa aquí, la lógica de control ya lo hará.
         return;
     }
 
-    const MANEUVER_PEAK_ZOOM_LEVEL = Math.min(18, navigationMapInstance.getMaxZoom());
+    const MANEUVER_PEAK_ZOOM_LEVEL = Math.min(18.5, navigationMapInstance.getMaxZoom());
     const currentStepIdentifier = `${currentLegIndexNav}_${currentStepIndexNav}`;
 
-    // Detectar si acabamos de pasar una maniobra
     if (lastProcessedStepIdentifier !== null && lastProcessedStepIdentifier !== currentStepIdentifier) {
-        // Hemos avanzado al siguiente paso. Si estábamos haciendo zoom-in o en holding,
-        // ahora pasamos a hacer zoom-out.
         if (progressiveZoomState === 'zooming-in' || progressiveZoomState === 'holding') {
             progressiveZoomState = 'zooming-out';
         }
@@ -2466,56 +2504,60 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver) {
     lastProcessedStepIdentifier = currentStepIdentifier;
 
     const distanceIntoCurrentStep = currentStep.distance - distanceToManeuver;
+    let newTargetZoom = null;
 
-    // Máquina de estados para el zoom
     switch (progressiveZoomState) {
         case 'zooming-out':
             if (distanceIntoCurrentStep > PROGRESSIVE_ZOOM_EXIT_START_DISTANCE && distanceIntoCurrentStep <= PROGRESSIVE_ZOOM_EXIT_END_DISTANCE) {
                 const progress = (distanceIntoCurrentStep - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE) / (PROGRESSIVE_ZOOM_EXIT_END_DISTANCE - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE);
-                const zoomLevel = MANEUVER_PEAK_ZOOM_LEVEL - (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * progress;
-                navigationMapInstance.setZoom(zoomLevel);
+                const easedProgress = easeOutQuart(progress);
+                newTargetZoom = MANEUVER_PEAK_ZOOM_LEVEL - (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * easedProgress;
             } else if (distanceIntoCurrentStep > PROGRESSIVE_ZOOM_EXIT_END_DISTANCE) {
-                // Terminamos el zoom-out
-                if (mapPreviousZoomLevelForProgressive !== null) {
-                    navigationMapInstance.setZoom(mapPreviousZoomLevelForProgressive);
-                }
+                newTargetZoom = mapPreviousZoomLevelForProgressive;
                 progressiveZoomState = 'none';
                 mapPreviousZoomLevelForProgressive = null;
             } else {
-                // Aún estamos muy cerca de la maniobra pasada, mantenemos zoom máximo
-                navigationMapInstance.setZoom(MANEUVER_PEAK_ZOOM_LEVEL);
+                newTargetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
             }
             break;
 
-        default: // Incluye 'none', 'zooming-in', 'holding'
+        default: // 'none', 'zooming-in', 'holding'
             if (distanceToManeuver <= PROGRESSIVE_ZOOM_START_DISTANCE && distanceToManeuver > PROGRESSIVE_ZOOM_PEAK_DISTANCE) {
                 if (progressiveZoomState !== 'zooming-in') {
                     mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
                     progressiveZoomState = 'zooming-in';
                 }
                 const progress = 1.0 - ((distanceToManeuver - PROGRESSIVE_ZOOM_PEAK_DISTANCE) / (PROGRESSIVE_ZOOM_START_DISTANCE - PROGRESSIVE_ZOOM_PEAK_DISTANCE));
-                const newZoom = mapPreviousZoomLevelForProgressive + (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * progress;
-                navigationMapInstance.setZoom(newZoom);
+                const easedProgress = easeOutQuart(progress);
+                newTargetZoom = mapPreviousZoomLevelForProgressive + (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * easedProgress;
             } else if (distanceToManeuver <= PROGRESSIVE_ZOOM_PEAK_DISTANCE) {
                 if (progressiveZoomState !== 'holding') {
-                   if (progressiveZoomState !== 'zooming-in') {
-                       mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
-                   }
-                   progressiveZoomState = 'holding';
-                }
-                navigationMapInstance.setZoom(MANEUVER_PEAK_ZOOM_LEVEL);
-            } else { // distance > PROGRESSIVE_ZOOM_START_DISTANCE
-                if (progressiveZoomState !== 'none') {
-                    if (mapPreviousZoomLevelForProgressive !== null) {
-                        navigationMapInstance.setZoom(mapPreviousZoomLevelForProgressive);
+                    if (progressiveZoomState !== 'zooming-in') {
+                        mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
                     }
+                    progressiveZoomState = 'holding';
+                }
+                newTargetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
+            } else {
+                if (progressiveZoomState !== 'none') {
+                    newTargetZoom = mapPreviousZoomLevelForProgressive;
                     progressiveZoomState = 'none';
                     mapPreviousZoomLevelForProgressive = null;
+                } else {
+                    newTargetZoom = navigationMapInstance.getZoom();
                 }
             }
             break;
     }
-} 
+
+    // Actualizamos el zoom objetivo y nos aseguramos de que la animación se esté ejecutando.
+    if (newTargetZoom !== null) {
+        targetZoomLevel = newTargetZoom;
+        if (!zoomAnimationId) {
+            zoomAnimationId = requestAnimationFrame(animateZoom);
+        }
+    }
+}   
     
 function hideNavigationUI() {
     const topInfoBar = document.getElementById('navigation-top-info-bar');
