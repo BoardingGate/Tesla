@@ -1,4 +1,4 @@
-
+.
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -2128,7 +2128,7 @@
     const darkModeGenericButtonColor = '#ABAB99';
     let snoozedRouteRadars = new Map();
 
-    // --- INICIO: Nuevas variables para el zoom progresivo SUAVE ---
+// --- INICIO: Nuevas variables para el zoom con flyTo ---
 let progressiveZoomState = 'none'; // 'none', 'zooming-in', 'holding', 'zooming-out'
 let mapPreviousZoomLevelForProgressive = null;
 let lastProcessedStepIdentifier = null;
@@ -2136,9 +2136,7 @@ const PROGRESSIVE_ZOOM_START_DISTANCE = 120;
 const PROGRESSIVE_ZOOM_PEAK_DISTANCE = 50;
 const PROGRESSIVE_ZOOM_EXIT_START_DISTANCE = 50;
 const PROGRESSIVE_ZOOM_EXIT_END_DISTANCE = 120;
-// Variables para la animación suave
-let targetZoomLevel = null;
-let zoomAnimationId = null;
+let isFlying = false; // Flag para saber si una animación flyTo está en curso
 // --- FIN: Nuevas variables ---
     
     const TOTAL_CELLS = 96; const COLS = 6; const grid = document.getElementById('bookmark-grid');
@@ -2520,98 +2518,141 @@ function animateZoom() {
     zoomAnimationId = requestAnimationFrame(animateZoom);
 }
 
-    
-/**
- * Gestiona el zoom progresivo al acercarse y alejarse de una maniobra.
- * Esta es la función principal que implementa la nueva lógica de zoom.
- * @param {object} currentStep - El paso actual de la ruta de OSRM.
- * @param {number} distanceToManeuver - Distancia en metros hasta la siguiente maniobra.
- */
- /**
- * Establece el NIVEL DE ZOOM OBJETIVO basado en la distancia a la maniobra.
- * La animación real la gestiona la función animateZoom.
- * @param {object} currentStep - El paso actual de la ruta de OSRM.
- * @param {number} distanceToManeuver - Distancia en metros hasta la siguiente maniobra.
- */
-function handleProgressiveManeuverZoom(currentStep, distanceToManeuver) {
-    if (!isNavigating || !navigationMapInstance || !currentStep) {
-        // Detiene la animación y resetea el estado si no estamos navegando.
-        if (zoomAnimationId) {
-            cancelAnimationFrame(zoomAnimationId);
-            zoomAnimationId = null;
-        }
-        targetZoomLevel = null;
-        progressiveZoomState = 'none';
-        lastProcessedStepIdentifier = null;
-        // No reseteamos el zoom del mapa aquí, la lógica de control ya lo hará.
+function updateInitialUserPosition(coords, mapInstanceToUse) {
+    if (!mapInstanceToUse || !coords || typeof coords.latitude !== 'number' || typeof coords.longitude !== 'number') {
         return;
     }
+    const latLng = L.latLng(coords.latitude, coords.longitude);
 
-    const MANEUVER_PEAK_ZOOM_LEVEL = Math.min(18.5, navigationMapInstance.getMaxZoom());
-    const currentStepIdentifier = `${currentLegIndexNav}_${currentStepIndexNav}`;
+    initialUserLocationMarkerLat = coords.latitude;
+    initialUserLocationMarkerLng = coords.longitude;
 
-    if (lastProcessedStepIdentifier !== null && lastProcessedStepIdentifier !== currentStepIdentifier) {
-        if (progressiveZoomState === 'zooming-in' || progressiveZoomState === 'holding') {
-            progressiveZoomState = 'zooming-out';
+    if (!initialUserLocationMarker) {
+        initialUserLocationMarker = L.marker(latLng, { icon: vehicleIcon, zIndexOffset: 1000, interactive: false });
+        if (mapInstanceToUse && mapInstanceToUse.getPane) {
+             try { initialUserLocationMarker.addTo(mapInstanceToUse); } catch(e) {  return; }
+        } else { return; }
+    } else {
+        initialUserLocationMarker.setLatLng(latLng);
+    }
+
+    const currentHeading = (coords && typeof coords.heading === 'number' && coords.heading !== null) ? coords.heading : (currentMapBearing || 0);
+    const vehicleWrapper = initialUserLocationMarker.getElement()?.querySelector('#vehicle-icon-wrapper');
+    if (vehicleWrapper) {
+        let iconRotationAngle = currentHeading - 90;
+        vehicleWrapper.style.transform = `rotate(${iconRotationAngle}deg)`;
+    }
+
+    if (compassAndModeControl) {
+        compassAndModeControl.updateOrientation(currentHeading);
+        compassAndModeControl.updateAltitude(coords.altitude);
+
+        if (window.lastPositionForSpeedCalc && typeof coords.latitude === 'number' && typeof coords.longitude === 'number' && typeof coords.speed === 'number' && coords.speed !== null) {
+            const distM = calculateDistance(window.lastPositionForSpeedCalc.latitude, window.lastPositionForSpeedCalc.longitude, coords.latitude, coords.longitude);
+            const timeS = (Date.now() - window.lastPositionForSpeedCalc.time) / 1000;
+            if (timeS > 0 && distM >= 0) {
+                let speedMs = coords.speed;
+                if (typeof speedMs !== 'number' || speedMs === null || speedMs < 0) { speedMs = distM / timeS; }
+                window.currentSpeedKmh = speedMs * 3.6;
+            } else { window.currentSpeedKmh = 0; }
+        } else {
+             if (typeof coords.speed === 'number' && coords.speed !== null && coords.speed >= 0) { window.currentSpeedKmh = coords.speed * 3.6; }
+             else { window.currentSpeedKmh = 0; }
         }
-    }
-    lastProcessedStepIdentifier = currentStepIdentifier;
+        window.lastPositionForSpeedCalc = { latitude: coords.latitude, longitude: coords.longitude, time: Date.now() };
 
-    const distanceIntoCurrentStep = currentStep.distance - distanceToManeuver;
-    let newTargetZoom = null;
-
-    switch (progressiveZoomState) {
-        case 'zooming-out':
-            if (distanceIntoCurrentStep > PROGRESSIVE_ZOOM_EXIT_START_DISTANCE && distanceIntoCurrentStep <= PROGRESSIVE_ZOOM_EXIT_END_DISTANCE) {
-                const progress = (distanceIntoCurrentStep - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE) / (PROGRESSIVE_ZOOM_EXIT_END_DISTANCE - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE);
-                const easedProgress = easeOutQuart(progress);
-                newTargetZoom = MANEUVER_PEAK_ZOOM_LEVEL - (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * easedProgress;
-            } else if (distanceIntoCurrentStep > PROGRESSIVE_ZOOM_EXIT_END_DISTANCE) {
-                newTargetZoom = mapPreviousZoomLevelForProgressive;
-                progressiveZoomState = 'none';
-                mapPreviousZoomLevelForProgressive = null;
-            } else {
-                newTargetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
-            }
-            break;
-
-        default: // 'none', 'zooming-in', 'holding'
-            if (distanceToManeuver <= PROGRESSIVE_ZOOM_START_DISTANCE && distanceToManeuver > PROGRESSIVE_ZOOM_PEAK_DISTANCE) {
-                if (progressiveZoomState !== 'zooming-in') {
-                    mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
-                    progressiveZoomState = 'zooming-in';
-                }
-                const progress = 1.0 - ((distanceToManeuver - PROGRESSIVE_ZOOM_PEAK_DISTANCE) / (PROGRESSIVE_ZOOM_START_DISTANCE - PROGRESSIVE_ZOOM_PEAK_DISTANCE));
-                const easedProgress = easeOutQuart(progress);
-                newTargetZoom = mapPreviousZoomLevelForProgressive + (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * easedProgress;
-            } else if (distanceToManeuver <= PROGRESSIVE_ZOOM_PEAK_DISTANCE) {
-                if (progressiveZoomState !== 'holding') {
-                    if (progressiveZoomState !== 'zooming-in') {
-                        mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
-                    }
-                    progressiveZoomState = 'holding';
-                }
-                newTargetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
-            } else {
-                if (progressiveZoomState !== 'none') {
-                    newTargetZoom = mapPreviousZoomLevelForProgressive;
-                    progressiveZoomState = 'none';
-                    mapPreviousZoomLevelForProgressive = null;
-                } else {
-                    newTargetZoom = navigationMapInstance.getZoom();
-                }
-            }
-            break;
-    }
-
-    // Actualizamos el zoom objetivo y nos aseguramos de que la animación se esté ejecutando.
-    if (newTargetZoom !== null) {
-        targetZoomLevel = newTargetZoom;
-        if (!zoomAnimationId) {
-            zoomAnimationId = requestAnimationFrame(animateZoom);
+        if (isNavigating || (isSimulatingGpsLocation && automatedSimulationIntervalId)) {
+             maxSpeedDuringTrip = Math.max(maxSpeedDuringTrip, window.currentSpeedKmh);
+             if (coords.altitude !== null && !isNaN(coords.altitude)) {
+                maxAltitudeDuringTrip = Math.max(maxAltitudeDuringTrip, coords.altitude);
+                minAltitudeDuringTrip = Math.min(minAltitudeDuringTrip, coords.altitude);
+             }
         }
+
+        if (isNavigating && navigationStartTimeForStats && typeof totalDistanceTravelledForStats === 'number') {
+             if (lastPositionForStats && coords) {
+                const distanceIncrement = calculateDistance(lastPositionForStats.latitude, lastPositionForStats.longitude, coords.latitude, coords.longitude);
+                 if (distanceIncrement > 0 && distanceIncrement < 5000) { totalDistanceTravelledForStats += distanceIncrement; }
+             }
+             lastPositionForStats = {...coords};
+
+            const timeElapsedS = (Date.now() - navigationStartTimeForStats.getTime()) / 1000;
+            if (timeElapsedS > 0 && totalDistanceTravelledForStats > 0) {
+                const avgSpeedMs = totalDistanceTravelledForStats / timeElapsedS;
+                window.averageSpeedKmh = avgSpeedMs * 3.6;
+            } else { window.averageSpeedKmh = 0; }
+        } else if (isSimulatingGpsLocation && automatedSimulationIntervalId && navigationStartTimeForStats && typeof simulatedDistanceAlongRoute === 'number') {
+            const timeElapsedS = (Date.now() - navigationStartTimeForStats.getTime()) / 1000;
+            if (timeElapsedS > 0 && simulatedDistanceAlongRoute > 0) {
+                const avgSpeedMs = simulatedDistanceAlongRoute / timeElapsedS;
+                window.averageSpeedKmh = avgSpeedMs * 3.6;
+            } else { window.averageSpeedKmh = 0; }
+        } else { window.averageSpeedKmh = 0; }
+
+        compassAndModeControl.updateCurrentSpeed(window.currentSpeedKmh);
+        compassAndModeControl.updateAverageSpeed(window.averageSpeedKmh);
+        compassAndModeControl.updateMaxSpeed(maxSpeedDuringTrip); 
     }
-}   
+
+    if (navigationMapInstance && currentMapRotationAngle !== 0 && typeof navigationMapInstance.setBearing === 'function') {
+        try { navigationMapInstance.setBearing(0); currentMapRotationAngle = 0; } catch (e) {  }
+    }
+
+    // --- INICIO DE LA MODIFICACIÓN CRÍTICA ---
+    // Solo llamamos a setView si el zoom progresivo NO está activo.
+    const shouldFollow = shouldCenterOnUser || navigationFollowUser;
+    if (shouldFollow && mapInstanceToUse && coords && progressiveZoomState === 'none' && !isFlying) {
+        const effectiveHeading = (coords && typeof coords.heading === 'number' && coords.heading !== null) ? coords.heading : (currentMapBearing || 0);
+        const mapSize = mapInstanceToUse.getSize();
+        const progressBar = document.getElementById('navigation-bottom-progress-bar');
+        let progressBarHeight = 0;
+        if (progressBar && progressBar.offsetParent !== null && progressBar.style.display !== 'none') {
+            progressBarHeight = progressBar.offsetHeight;
+        }
+
+        const offsetFactor = 0.33;
+        const minMapDimension = Math.min(mapSize.x, mapSize.y);
+        const offsetDistance = minMapDimension * offsetFactor;
+        const headingRad = (effectiveHeading % 360) * Math.PI / 180;
+
+        let calculatedTargetMapCenterOffset = { x: 0, y: 0 };
+        calculatedTargetMapCenterOffset.x = -offsetDistance * Math.sin(headingRad);
+        calculatedTargetMapCenterOffset.y = offsetDistance * Math.cos(headingRad);
+
+        const isGoingNorth = (effectiveHeading <= 60 || effectiveHeading >= 300);
+        const isGoingSouth = effectiveHeading > 120 && effectiveHeading < 240;
+
+        if (miniMapOffsetActive.y === 0 && progressBarHeight > 0) {
+            if (isGoingNorth) {
+                calculatedTargetMapCenterOffset.y -= progressBarHeight * 0.2;
+            } else if (isGoingSouth) {
+                calculatedTargetMapCenterOffset.y += progressBarHeight * 0.5;
+            }
+        }
+
+        calculatedTargetMapCenterOffset.x += miniMapOffsetActive.x;
+        calculatedTargetMapCenterOffset.y += miniMapOffsetActive.y;
+
+        const vehicleLatLng = L.latLng(coords.latitude, coords.longitude);
+        const vehicleScreenPos = mapInstanceToUse.project(vehicleLatLng);
+        const idealMapCenterScreenPos = L.point(
+            vehicleScreenPos.x - calculatedTargetMapCenterOffset.x,
+            vehicleScreenPos.y - calculatedTargetMapCenterOffset.y
+        );
+        const idealMapCenterLatLng = mapInstanceToUse.unproject(idealMapCenterScreenPos);
+
+        // Usamos setView porque no hay animación de zoom en curso que pueda ser interrumpida.
+        mapInstanceToUse.setView(idealMapCenterLatLng, mapInstanceToUse.getZoom(), {
+            animate: true,
+            duration: 0.5,
+            easeLinearity: 0.75
+        });
+    }
+    // --- FIN DE LA MODIFICACIÓN CRÍTICA ---
+    
+    updateDirectionWarningCardsVisibility();
+}    
+    
     
 function hideNavigationUI() {
     const topInfoBar = document.getElementById('navigation-top-info-bar');
@@ -3505,6 +3546,7 @@ document.body.classList.toggle('keyword-assignment-active', isKeywordAssignmentM
          }
     }
     function applyInitialKeywordHighlights() { const filterInput = document.getElementById('grid-filter-input'); const keyword = filterInput.value.trim().replace(/\s+/g, '').toUpperCase(); if (!keyword) return; const keywordTag = `[${keyword}]`; cellElements.forEach((cell, index) => { const bookmark = currentBookmarks[index]; if (bookmark && bookmark.name && bookmark.name.includes(keywordTag)) { cell.classList.add('keyword-assigned-highlight'); } else { cell.classList.remove('keyword-assigned-highlight'); } }); }
+    
     function handleKeywordAssignmentClick(index) {
         const filterInput = document.getElementById('grid-filter-input'); const keyword = filterInput.value.trim().replace(/\s+/g, '').toUpperCase();
         if (!keyword) { showToast("Escribe una palabra en el campo filtro primero.", "warning"); return; }
@@ -3520,6 +3562,7 @@ document.body.classList.toggle('keyword-assignment-active', isKeywordAssignmentM
         if (actionTaken === 'added') { showToast(`"${keyword}" añadido. Nombre: ${newName}`, "success", 2500); } else if (actionTaken === 'removed') { showToast(`"${keyword}" quitado. Nombre: ${newName}`, "info", 2500); }
     }
     function handleToggleClickForAssignment(toggleElement) { const start = parseInt(toggleElement.dataset.rangeStart); if (isNaN(start)) return; currentlyAssigningToggleStart = start; document.querySelectorAll('.range-toggle').forEach(t => { t.classList.toggle('assigning-selected', t === toggleElement); t.style.opacity = t === toggleElement ? '' : '0.7'; }); updateGridAssignmentVisuals(); showToast(`Asignando botones para: ${toggleElement.textContent.substring(1)}`, "info", 2500); }
+    
     function handleGridCellClickForAssignment(cellIndex) {
         if (currentlyAssigningToggleStart === null) { showToast("Selecciona primero un botón lateral (PdR,s, iAs, etc.)", "warning"); return; }
         const startKey = currentlyAssigningToggleStart.toString(); if (!customData.toggles[startKey]) { const currentRange = currentToggleRanges.find(r => r.start == startKey); customData.toggles[startKey] = { label: currentRange ? currentRange.label : `Rango ${startKey}`, assignedIndexes: currentRange ? [...currentRange.assignedIndexes] : [] }; }
@@ -9171,10 +9214,10 @@ function updateNavigationProgressDisplay(route, carDistanceAlongTheRoute = 0) {
 
 
     finalDestDistEl.textContent = `${(remainingDistanceTotal / 1000).toFixed(1)} km`;
-   const finalDestTotalMinutes = Math.round(remainingDurationTotal / 60);
-const finalDestHours = Math.floor(finalDestTotalMinutes / 60);
-const finalDestMinutes = finalDestTotalMinutes % 60;
-finalDestTimeEl.textContent = `${String(finalDestHours).padStart(2, '0')}:${String(finalDestMinutes).padStart(2, '0')}`;
+    const finalDestTotalMinutes = Math.round(remainingDurationTotal / 60);
+    const finalDestHours = Math.floor(finalDestTotalMinutes / 60);
+    const finalDestMinutes = finalDestTotalMinutes % 60;
+    finalDestTimeEl.textContent = `${String(finalDestHours).padStart(2, '0')}:${String(finalDestMinutes).padStart(2, '0')}`;
     const currentFinalEta = new Date(Date.now() + remainingDurationTotal * 1000);
     finalDestEtaEl.textContent = currentFinalEta.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
@@ -9544,8 +9587,7 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
 
         progressBarEl.style.width = `${progressToTurnPercent}%`;
 
-        // --- INICIO: Lógica de zoom y minimapa automático ---
-        // Se elimina la lógica anterior de `isZoomedForManeuver` y se reemplaza por la llamada a la nueva función
+        // Llamada a la lógica de zoom
         handleProgressiveManeuverZoom(currentStep, distanceToStepManeuver);
 
         if (isNavigating && previousStepForPath && completedRouteSegmentsLayer && navigationCurrentLocation ) {
@@ -9567,16 +9609,15 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
         }
 
         const isRelevantIntersectionManeuver = type !== 'continue' && type !== 'new name' && type !== 'depart' && type !== 'straight';
-        if (isNavigating && displayDistance < 850 && displayDistance >= 130 && isRelevantIntersectionManeuver &&
+        if (isNavigating && displayDistance < 800 && displayDistance >= 100 && isRelevantIntersectionManeuver &&
             (!intersectionPreviewWindow || intersectionPreviewWindow.classList.contains('hidden') || intersectionPreviewWindow.dataset.source !== 'click') &&
             (currentLegIndexNav + '_' + currentStepIndexNav) !== lastAutoShownManeuverId) {
-            showIntersectionPreviewMap(currentStep, route, false, 5000);
+            showIntersectionPreviewMap(currentStep, route, false, 7000);
             lastAutoShownManeuverId = currentLegIndexNav + '_' + currentStepIndexNav;
         } else if (intersectionPreviewWindow && !intersectionPreviewWindow.classList.contains('hidden') && intersectionPreviewWindow.dataset.source !== 'click' &&
-                   (displayDistance >= 850 || displayDistance < 130 || !isRelevantIntersectionManeuver)) {
+                   (displayDistance >= 800 || displayDistance < 100 || !isRelevantIntersectionManeuver)) {
             hideIntersectionPreviewMap();
         }
-        // --- FIN: Lógica de zoom y minimapa automático ---
 
     } else {
         if (turnIconDisplayEl) turnIconDisplayEl.innerHTML = `<span class="leaflet-routing-icon leaflet-routing-icon-arrive"></span>`;
@@ -9586,9 +9627,8 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
         progressBarEl.style.width = '100%';
         distanceToNextManeuverOSRM = Infinity;
         
-        // Si estábamos haciendo zoom, volvemos al estado normal
         if (progressiveZoomState !== 'none' && mapPreviousZoomLevelForProgressive !== null) {
-            navigationMapInstance.setZoom(mapPreviousZoomLevelForProgressive);
+            setFlyToZoom(mapPreviousZoomLevelForProgressive);
             progressiveZoomState = 'none';
             mapPreviousZoomLevelForProgressive = null;
         }
@@ -9598,7 +9638,9 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
         }
     }
     updateDirectionWarningCardsVisibility();
-}    
+}
+
+    
 
 function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = false, timerDurationMs = null) {
     const previewWindow = document.getElementById('intersection-preview-map-window');
