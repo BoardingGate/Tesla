@@ -2434,31 +2434,6 @@ function easeOutQuart(t) {
  * Bucle de animación para el zoom suave.
  * Se ejecuta en cada frame para interpolar el zoom actual hacia el zoom objetivo.
  */
-function animateZoom() {
-    if (!navigationMapInstance || targetZoomLevel === null) {
-        zoomAnimationId = null; // Detiene el bucle si no hay mapa o target
-        return;
-    }
-
-    const currentZoom = navigationMapInstance.getZoom();
-    const difference = targetZoomLevel - currentZoom;
-
-    // Si la diferencia es mínima, se detiene la animación para ahorrar recursos.
-    if (Math.abs(difference) < 0.01) {
-        navigationMapInstance.setZoom(targetZoomLevel); // Ajuste final para asegurar precisión
-        zoomAnimationId = null; // Detiene el bucle
-        return;
-    }
-
-    // Factor de suavizado. Un valor más pequeño hace la transición más lenta y suave.
-    const smoothingFactor = 0.08; 
-    const newAnimatedZoom = currentZoom + difference * smoothingFactor;
-
-    navigationMapInstance.setZoom(newAnimatedZoom);
-
-    // Pide al navegador que ejecute esta función de nuevo en el próximo frame.
-    zoomAnimationId = requestAnimationFrame(animateZoom);
-}
     
 /**
  * Gestiona el zoom progresivo al acercarse y alejarse de una maniobra.
@@ -2466,7 +2441,86 @@ function animateZoom() {
  * @param {object} currentStep - El paso actual de la ruta de OSRM.
  * @param {number} distanceToManeuver - Distancia en metros hasta la siguiente maniobra.
  */
+/**
+ * Bucle de animación para el zoom y centrado suaves.
+ * Se ejecuta en cada frame para interpolar el zoom y la posición
+ * del mapa hacia sus objetivos. Es el motor central de la animación del mapa.
+ */
+function animateZoom() {
+    if (!navigationMapInstance || !navigationMapInstance._loaded) {
+        zoomAnimationId = null;
+        return;
+    }
 
+    const currentZoom = navigationMapInstance.getZoom();
+    const currentCenter = navigationMapInstance.getCenter();
+
+    let zoomDifference = 0;
+    let centerDifferenceLat = 0;
+    let centerDifferenceLng = 0;
+    let needsUpdate = false;
+
+    // 1. Interpolar el Zoom
+    if (targetZoomLevel !== null) {
+        zoomDifference = targetZoomLevel - currentZoom;
+        if (Math.abs(zoomDifference) > 0.005) {
+            needsUpdate = true;
+        }
+    }
+
+    // 2. Interpolar el Centrado (si está activado el seguimiento)
+    const shouldFollow = shouldCenterOnUser || navigationFollowUser;
+    let targetCenter = null;
+    
+    if (shouldFollow && navigationCurrentLocation) {
+        const vehicleLatLng = L.latLng(navigationCurrentLocation.latitude, navigationCurrentLocation.longitude);
+        const vehicleScreenPos = navigationMapInstance.project(vehicleLatLng);
+        
+        const idealMapCenterScreenPos = L.point(
+            vehicleScreenPos.x - targetMapCenterOffset.x,
+            vehicleScreenPos.y - targetMapCenterOffset.y
+        );
+        targetCenter = navigationMapInstance.unproject(idealMapCenterScreenPos);
+
+        centerDifferenceLat = targetCenter.lat - currentCenter.lat;
+        centerDifferenceLng = targetCenter.lng - currentCenter.lng;
+
+        if (Math.abs(centerDifferenceLat) > 0.00001 || Math.abs(centerDifferenceLng) > 0.00001) {
+            needsUpdate = true;
+        }
+    }
+
+    // Si no hay nada que actualizar, detenemos el bucle
+    if (!needsUpdate) {
+        zoomAnimationId = null;
+        return;
+    }
+
+    const smoothingFactor = 0.08;
+    
+    const newAnimatedZoom = currentZoom + zoomDifference * smoothingFactor;
+    
+    let newAnimatedCenter;
+    if (targetCenter) {
+        newAnimatedCenter = L.latLng(
+            currentCenter.lat + centerDifferenceLat * smoothingFactor,
+            currentCenter.lng + centerDifferenceLng * smoothingFactor
+        );
+    } else {
+        newAnimatedCenter = currentCenter; // Mantener el centro si no hay seguimiento
+    }
+
+    // Aplicamos la nueva vista en una sola llamada para evitar conflictos
+    navigationMapInstance.setView(newAnimatedCenter, newAnimatedZoom, {
+        animate: false, // La animación la hacemos nosotros frame a frame
+        noMoveStart: true,
+    });
+
+    // Siguiente frame
+    zoomAnimationId = requestAnimationFrame(animateZoom);
+}
+
+    
 /**
  * Gestiona el zoom progresivo al acercarse y alejarse de una maniobra.
  * Esta es la función principal que implementa la nueva lógica de zoom.
@@ -5847,9 +5901,10 @@ function postponeAllVisibleReminders() {
         try { navigationMapInstance.setBearing(0); currentMapRotationAngle = 0; } catch (e) {  }
     }
 
-    // --- MODIFICACIÓN CLAVE ---
-    // Se cambia `!isZoomedForManeuver` por `progressiveZoomState === 'none'`
-    if ((shouldCenterOnUser || navigationFollowUser) && mapInstanceToUse && coords && progressiveZoomState === 'none') {
+    // --- INICIO DE LA MODIFICACIÓN CRÍTICA ---
+    // Ya no llamamos a setView. Solo calculamos el offset si el seguimiento está activo.
+    const shouldFollow = shouldCenterOnUser || navigationFollowUser;
+    if (shouldFollow && mapInstanceToUse) {
         const effectiveHeading = (coords && typeof coords.heading === 'number' && coords.heading !== null) ? coords.heading : (currentMapBearing || 0);
         const mapSize = mapInstanceToUse.getSize();
         const progressBar = document.getElementById('navigation-bottom-progress-bar');
@@ -5883,65 +5938,18 @@ function postponeAllVisibleReminders() {
 
         targetMapCenterOffset = { ...calculatedTargetMapCenterOffset };
 
-
-            const animatePanFrame = () => {
-            if (!shouldCenterOnUser && !navigationFollowUser) {
-                mapOffsetAnimationId = null;
-                currentSmoothedMapCenter = null;
-                currentMapCenterOffset = {x:0, y:0};
-                return;
-            }
-
-           
-            const currentCoordsForPan = navigationCurrentLocation;
-            if (!currentCoordsForPan || !mapInstanceToUse || !mapInstanceToUse.project || !mapInstanceToUse._loaded) {
-                mapOffsetAnimationId = requestAnimationFrame(animatePanFrame);
-                return;
-            }
-
-            const currentVehicleLatLng = L.latLng(currentCoordsForPan.latitude, currentCoordsForPan.longitude);
-            const vehicleScreenPos = mapInstanceToUse.project(currentVehicleLatLng);
-
-            const idealMapCenterScreenPos = L.point(
-                vehicleScreenPos.x - targetMapCenterOffset.x,
-                vehicleScreenPos.y - targetMapCenterOffset.y
-            );
-            const idealMapCenterLatLng = mapInstanceToUse.unproject(idealMapCenterScreenPos);
-
-            const SMOOTHING_FACTOR = 0.1;
-
-            if (!currentSmoothedMapCenter) {
-                currentSmoothedMapCenter = idealMapCenterLatLng;
-            } else {
-                currentSmoothedMapCenter = L.latLng(
-                    currentSmoothedMapCenter.lat + (idealMapCenterLatLng.lat - currentSmoothedMapCenter.lat) * SMOOTHING_FACTOR,
-                    currentSmoothedMapCenter.lng + (idealMapCenterLatLng.lng - currentSmoothedMapCenter.lng) * SMOOTHING_FACTOR
-                );
-            }
-
-            if (!mapInstanceToUse._panAnim || !mapInstanceToUse._panAnim._inProgress) {
-                mapInstanceToUse.setView(currentSmoothedMapCenter, mapInstanceToUse.getZoom(), {
-                    animate: false,
-                    noMoveStart: true,
-                });
-            }
-
-            mapOffsetAnimationId = requestAnimationFrame(animatePanFrame);
-        };
-
-        if (!mapOffsetAnimationId) {
-            currentSmoothedMapCenter = null;
-            mapOffsetAnimationId = requestAnimationFrame(animatePanFrame);
-        }
     } else {
-        if (mapOffsetAnimationId) {
-            cancelAnimationFrame(mapOffsetAnimationId);
-            mapOffsetAnimationId = null;
-        }
-        currentSmoothedMapCenter = null;
-        currentMapCenterOffset = { x: 0, y: 0 };
+        // Si no hay seguimiento, el offset es cero.
         targetMapCenterOffset = { x: 0, y: 0 };
     }
+
+    // Nos aseguramos de que el bucle de animación esté activo para procesar este offset
+    // y cualquier cambio de zoom.
+    if (!zoomAnimationId) {
+        zoomAnimationId = requestAnimationFrame(animateZoom);
+    }
+    // --- FIN DE LA MODIFICACIÓN CRÍTICA ---
+    
     updateDirectionWarningCardsVisibility();
 }
     
