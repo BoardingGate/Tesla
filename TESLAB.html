@@ -2127,7 +2127,18 @@
     const sectionColors = { 18: '#F0E0D3', 30: '#D8D4E0', 42: '#D9E5DB', 60: '#F2ECD0', unassigned: '#C5C8B8', off: '#ABAB99' };
     const darkModeGenericButtonColor = '#ABAB99';
     let snoozedRouteRadars = new Map();
+
+    // --- INICIO: Nuevas variables para el zoom progresivo ---
+    let progressiveZoomState = 'none'; // 'none', 'zooming-in', 'holding', 'zooming-out'
+    let mapPreviousZoomLevelForProgressive = null;
+    let lastProcessedStepIdentifier = null; // Para detectar cuando pasamos una maniobra
+    const PROGRESSIVE_ZOOM_START_DISTANCE = 80; // Metros antes de la maniobra para empezar el zoom in
+    const PROGRESSIVE_ZOOM_PEAK_DISTANCE = 30;  // Metros antes de la maniobra para alcanzar el zoom máximo
+    const PROGRESSIVE_ZOOM_EXIT_START_DISTANCE = 30; // Metros después de la maniobra para empezar el zoom out
+    const PROGRESSIVE_ZOOM_EXIT_END_DISTANCE = 80; // Metros después de la maniobra para volver al zoom previo
+    // --- FIN: Nuevas variables para el zoom progresivo ---
     
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 
     const TOTAL_CELLS = 96; const COLS = 6; const grid = document.getElementById('bookmark-grid');
     let isDarkMode = false; let pressStartTime = null; let reminderPressStartTime = null; let isActive = true; let isFooterVisible = true; let notices = []; let currentNoticeIndex = 0; let fromReminderModal = false;
     let isEditMode = false; let isAssignmentMode = false;
@@ -2407,6 +2418,91 @@ const vehicleIconMiniMap = L.divIcon({
 
     const SMOOTH_ZOOM_DURATION = 5.0;
 
+/**
+ * Gestiona el zoom progresivo al acercarse y alejarse de una maniobra.
+ * Esta es la función principal que implementa la nueva lógica de zoom.
+ * @param {object} currentStep - El paso actual de la ruta de OSRM.
+ * @param {number} distanceToManeuver - Distancia en metros hasta la siguiente maniobra.
+ */
+function handleProgressiveManeuverZoom(currentStep, distanceToManeuver) {
+    if (!isNavigating || !navigationMapInstance || !currentStep) {
+        // Si no estamos navegando, reseteamos el estado del zoom.
+        if (progressiveZoomState !== 'none' && mapPreviousZoomLevelForProgressive !== null) {
+            navigationMapInstance.setZoom(mapPreviousZoomLevelForProgressive);
+        }
+        progressiveZoomState = 'none';
+        lastProcessedStepIdentifier = null;
+        mapPreviousZoomLevelForProgressive = null;
+        return;
+    }
+
+    const MANEUVER_PEAK_ZOOM_LEVEL = Math.min(18, navigationMapInstance.getMaxZoom());
+    const currentStepIdentifier = `${currentLegIndexNav}_${currentStepIndexNav}`;
+
+    // Detectar si acabamos de pasar una maniobra
+    if (lastProcessedStepIdentifier !== null && lastProcessedStepIdentifier !== currentStepIdentifier) {
+        // Hemos avanzado al siguiente paso. Si estábamos haciendo zoom-in o en holding,
+        // ahora pasamos a hacer zoom-out.
+        if (progressiveZoomState === 'zooming-in' || progressiveZoomState === 'holding') {
+            progressiveZoomState = 'zooming-out';
+        }
+    }
+    lastProcessedStepIdentifier = currentStepIdentifier;
+
+    const distanceIntoCurrentStep = currentStep.distance - distanceToManeuver;
+
+    // Máquina de estados para el zoom
+    switch (progressiveZoomState) {
+        case 'zooming-out':
+            if (distanceIntoCurrentStep > PROGRESSIVE_ZOOM_EXIT_START_DISTANCE && distanceIntoCurrentStep <= PROGRESSIVE_ZOOM_EXIT_END_DISTANCE) {
+                const progress = (distanceIntoCurrentStep - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE) / (PROGRESSIVE_ZOOM_EXIT_END_DISTANCE - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE);
+                const zoomLevel = MANEUVER_PEAK_ZOOM_LEVEL - (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * progress;
+                navigationMapInstance.setZoom(zoomLevel);
+            } else if (distanceIntoCurrentStep > PROGRESSIVE_ZOOM_EXIT_END_DISTANCE) {
+                // Terminamos el zoom-out
+                if (mapPreviousZoomLevelForProgressive !== null) {
+                    navigationMapInstance.setZoom(mapPreviousZoomLevelForProgressive);
+                }
+                progressiveZoomState = 'none';
+                mapPreviousZoomLevelForProgressive = null;
+            } else {
+                // Aún estamos muy cerca de la maniobra pasada, mantenemos zoom máximo
+                navigationMapInstance.setZoom(MANEUVER_PEAK_ZOOM_LEVEL);
+            }
+            break;
+
+        default: // Incluye 'none', 'zooming-in', 'holding'
+            if (distanceToManeuver <= PROGRESSIVE_ZOOM_START_DISTANCE && distanceToManeuver > PROGRESSIVE_ZOOM_PEAK_DISTANCE) {
+                if (progressiveZoomState !== 'zooming-in') {
+                    mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
+                    progressiveZoomState = 'zooming-in';
+                }
+                const progress = 1.0 - ((distanceToManeuver - PROGRESSIVE_ZOOM_PEAK_DISTANCE) / (PROGRESSIVE_ZOOM_START_DISTANCE - PROGRESSIVE_ZOOM_PEAK_DISTANCE));
+                const newZoom = mapPreviousZoomLevelForProgressive + (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * progress;
+                navigationMapInstance.setZoom(newZoom);
+            } else if (distanceToManeuver <= PROGRESSIVE_ZOOM_PEAK_DISTANCE) {
+                if (progressiveZoomState !== 'holding') {
+                   if (progressiveZoomState !== 'zooming-in') {
+                       mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
+                   }
+                   progressiveZoomState = 'holding';
+                }
+                navigationMapInstance.setZoom(MANEUVER_PEAK_ZOOM_LEVEL);
+            } else { // distance > PROGRESSIVE_ZOOM_START_DISTANCE
+                if (progressiveZoomState !== 'none') {
+                    if (mapPreviousZoomLevelForProgressive !== null) {
+                        navigationMapInstance.setZoom(mapPreviousZoomLevelForProgressive);
+                    }
+                    progressiveZoomState = 'none';
+                    mapPreviousZoomLevelForProgressive = null;
+                }
+            }
+            break;
+    }
+}
+
+
+    
 function hideNavigationUI() {
     const topInfoBar = document.getElementById('navigation-top-info-bar');
     const bottomProgressBar = document.getElementById('navigation-bottom-progress-bar');
@@ -5695,7 +5791,9 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
         try { navigationMapInstance.setBearing(0); currentMapRotationAngle = 0; } catch (e) {  }
     }
 
-    if ((shouldCenterOnUser || navigationFollowUser) && mapInstanceToUse && coords && !isZoomedForManeuver) {
+    // --- MODIFICACIÓN CLAVE ---
+    // Se cambia `!isZoomedForManeuver` por `progressiveZoomState === 'none'`
+    if ((shouldCenterOnUser || navigationFollowUser) && mapInstanceToUse && coords && progressiveZoomState === 'none') {
         const effectiveHeading = (coords && typeof coords.heading === 'number' && coords.heading !== null) ? coords.heading : (currentMapBearing || 0);
         const mapSize = mapInstanceToUse.getSize();
         const progressBar = document.getElementById('navigation-bottom-progress-bar');
@@ -5790,7 +5888,7 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
     }
     updateDirectionWarningCardsVisibility();
 }
-
+    
     
      function updateReminderCount() {
          let reminders = []; try { reminders = JSON.parse(localStorage.getItem('reminders') || '[]'); } catch (e) { reminders = []; }
@@ -9181,7 +9279,6 @@ finalDestTimeEl.textContent = `${String(finalDestHours).padStart(2, '0')}:${Stri
     }
 }
 
-    
 function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     const topInfoBar = document.getElementById('navigation-top-info-bar');
     const intersectionPreviewWindow = document.getElementById('intersection-preview-map-window');
@@ -9285,21 +9382,17 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
                     currentLegIndexNav = legIdx;
                     currentStepIndexNav = stepIdx;
                     foundNextStepThisUpdate = true;
-                    console.log(`Nav LOG (Turf): Maniobra encontrada: Leg ${legIdx}, Step ${stepIdx}. Dist. al final del Step: ${distanceToEndOfThisStep}m. Dist. coche: ${lastCarDistanceAlongRouteForNavLogic}m. Dist. a maniobra: ${distanceToStepManeuver}m`);
 
                     if (isNavigating && currentLegIndexNav > oldLegIndexNav && currentStageInitialExpectedEtaTime) {
                         const nowTime = new Date();
                         const deviationOfCompletedStageMs = nowTime.getTime() - currentStageInitialExpectedEtaTime.getTime();
                         accumulatedDeviationMs += deviationOfCompletedStageMs;
-                        console.log(`Nav LOG (ETA Stage Change): Etapa ${oldLegIndexNav} completada. Desviación etapa: ${deviationOfCompletedStageMs}ms. Acumulada: ${accumulatedDeviationMs}ms.`);
 
                         if (currentLegIndexNav < route.legs.length) {
                              const nextLegDurationMs = (route.legs[currentLegIndexNav].duration || 0) * 1000;
                              currentStageInitialExpectedEtaTime = new Date(nowTime.getTime() + nextLegDurationMs);
-                             console.log("Nav LOG (ETA Stage Change): Nueva currentStageInitialExpectedEtaTime para etapa " + currentLegIndexNav + ":", currentStageInitialExpectedEtaTime);
                         } else {
                              currentStageInitialExpectedEtaTime = null;
-                              console.log("Nav LOG (ETA Stage Change): Se alcanzó la última etapa, currentStageInitialExpectedEtaTime es null.");
                         }
                     }
                     break;
@@ -9331,7 +9424,6 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     if (currentStep && currentStep.maneuver) {
         const maneuver = currentStep.maneuver;
         const type = maneuver.type || '';
-        const modifier = maneuver.modifier || '';
 
         if (turnIconDisplayEl) {
             turnIconDisplayEl.innerHTML = '';
@@ -9370,7 +9462,6 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
         maneuverTextEl.textContent = maneuverText ? `${maneuverText} ` : '';
         streetEl.textContent = streetNameText;
 
-
         let displayDistance = distanceToStepManeuver;
         let adjustedDisplayDistance = displayDistance;
         if (isNavigating) {
@@ -9378,8 +9469,6 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
              adjustedDisplayDistance = Math.max(0, displayDistance - speedAdjustment);
         }
         distanceToNextManeuverOSRM = displayDistance;
-        console.log(`Nav LOG (Turf): UI Turn-by-turn - Maniobra: ${maneuverTextEl.textContent}${streetEl.textContent}, Distancia UI: ${adjustedDisplayDistance.toFixed(0)}m (Original OSRM: ${displayDistance.toFixed(0)}m)`);
-
 
         if (adjustedDisplayDistance < 1000) {
             const roundedDistance = Math.round(adjustedDisplayDistance / 5) * 5;
@@ -9392,34 +9481,9 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
 
         progressBarEl.style.width = `${progressToTurnPercent}%`;
 
-        const MANEUVER_ZOOM_ACTIVATION_DISTANCE = 150;
-        const MANEUVER_ZOOM_DEACTIVATION_DISTANCE = 200;
-
-        if (isNavigating && navigationMapInstance && displayDistance > 0 && displayDistance < MANEUVER_ZOOM_ACTIVATION_DISTANCE) {
-            if (!isZoomedForManeuver) {
-                mapPreviousZoomLevel = navigationMapInstance.getZoom();
-
-                let targetZoom = Math.max(MIN_MANEUVER_ZOOM_LEVEL, (mapPreviousZoomLevel || MIN_MANEUVER_ZOOM_LEVEL) + 1 );
-                targetZoom = Math.min(targetZoom, navigationMapInstance.getMaxZoom() || 19);
-
-                const currentMapLayerNameForMainMap = (localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "Satélite + Calles").toLowerCase();
-                if (currentMapLayerNameForMainMap.includes("satélite + calles")) {
-                    targetZoom = Math.min(targetZoom, 18);
-                }
-
-                navigationMapInstance.setView(navigationMapInstance.getCenter(), targetZoom, {animate: true, duration: SMOOTH_ZOOM_DURATION});
-                isZoomedForManeuver = true;
-                 if (navigationCurrentLocation && navigationFollowUser) {
-                 }
-            }
-        } else if (isZoomedForManeuver && displayDistance >= MANEUVER_ZOOM_DEACTIVATION_DISTANCE) {
-            if (mapPreviousZoomLevel !== null && navigationMapInstance) {
-                navigationMapInstance.setView(navigationMapInstance.getCenter(), mapPreviousZoomLevel, {animate: true, duration: SMOOTH_ZOOM_DURATION});
-            }
-            isZoomedForManeuver = false;
-            mapPreviousZoomLevel = null;
-        }
-
+        // --- INICIO: Lógica de zoom y minimapa automático ---
+        // Se elimina la lógica anterior de `isZoomedForManeuver` y se reemplaza por la llamada a la nueva función
+        handleProgressiveManeuverZoom(currentStep, distanceToStepManeuver);
 
         if (isNavigating && previousStepForPath && completedRouteSegmentsLayer && navigationCurrentLocation ) {
              if (previousStepForPath.maneuver && previousStepForPath.maneuver.location && previousStepForPath.maneuver.location.length === 2) {
@@ -9449,7 +9513,7 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
                    (displayDistance >= 800 || displayDistance < 100 || !isRelevantIntersectionManeuver)) {
             hideIntersectionPreviewMap();
         }
-
+        // --- FIN: Lógica de zoom y minimapa automático ---
 
     } else {
         if (turnIconDisplayEl) turnIconDisplayEl.innerHTML = `<span class="leaflet-routing-icon leaflet-routing-icon-arrive"></span>`;
@@ -9458,17 +9522,20 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
         streetEl.textContent = 'Calculando... o destino alcanzado.';
         progressBarEl.style.width = '100%';
         distanceToNextManeuverOSRM = Infinity;
-        if (isZoomedForManeuver && mapPreviousZoomLevel !== null && navigationMapInstance) {
-             navigationMapInstance.setView(navigationMapInstance.getCenter(), mapPreviousZoomLevel, {animate:true, duration: SMOOTH_ZOOM_DURATION});
-             isZoomedForManeuver = false;
-             mapPreviousZoomLevel = null;
+        
+        // Si estábamos haciendo zoom, volvemos al estado normal
+        if (progressiveZoomState !== 'none' && mapPreviousZoomLevelForProgressive !== null) {
+            navigationMapInstance.setZoom(mapPreviousZoomLevelForProgressive);
+            progressiveZoomState = 'none';
+            mapPreviousZoomLevelForProgressive = null;
         }
+
         if (intersectionPreviewWindow && !intersectionPreviewWindow.classList.contains('hidden') && intersectionPreviewWindow.dataset.source !== 'click') {
             hideIntersectionPreviewMap();
         }
     }
     updateDirectionWarningCardsVisibility();
-}
+}    
 
 function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = false, timerDurationMs = null) {
     const previewWindow = document.getElementById('intersection-preview-map-window');
