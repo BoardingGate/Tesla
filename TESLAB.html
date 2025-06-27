@@ -1,4 +1,4 @@
-..
+
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -7342,9 +7342,6 @@ L.control.compassAndMode = function(opts) {
     
 
 
-    
-
-
 function openNavigationMap() {
     isNavigationMapActive = true;
     sessionStorage.setItem('mapContext', 'navigation');
@@ -7462,7 +7459,7 @@ function openNavigationMap() {
     // Cargar estado de la gráfica (ya se hace globalmente, pero es buena práctica confirmarlo)
     currentGraphMode = localStorage.getItem(GRAPH_STATE_KEY) || 'Desviación ETA';
 
-    toggleMapHeaderRowsVisibility(mapHeaderButtonsVisible);
+    toggleMapHeaderButtonsVisibility(mapHeaderButtonsVisible);
 
     // 2. INICIALIZACIÓN SECUENCIAL
     requestAnimationFrame(() => {
@@ -7518,7 +7515,7 @@ function openNavigationMap() {
                 updateNavigationGraphVisibilityAndMode();
             });
             navigationMapInstance.on('load', function() {
-                toggleMapHeaderRowsVisibility(mapHeaderButtonsVisible);
+                toggleMapHeaderButtonsVisibility(mapHeaderButtonsVisible);
                 const loadingToast = document.getElementById("map-loading-toast");
                 if (loadingToast) {
                     loadingToast.remove();
@@ -7534,6 +7531,7 @@ function openNavigationMap() {
             plotRemindersOnNavigationMap();
 
             // 5. GEOLOCALIZACIÓN
+            // <--- INICIO DE LA CORRECCIÓN CLAVE EN openNavigationMap (Parte 1/2) --->
             getCurrentLocation(
                 (currentPos) => {
                     navigationCurrentLocation = currentPos;
@@ -7543,37 +7541,127 @@ function openNavigationMap() {
                     }
                     if (locationWatchId === null && 'geolocation' in navigator && 'watchPosition' in navigator.geolocation) {
                         locationWatchId = navigator.geolocation.watchPosition(
-                            (position) => { /* ... */ },
-                            (error) => { /* ... */ },
+                            (position) => { // <--- ESTO ESTABA COMENTADO/VACÍO
+                                if (isSimulatingGpsLocation && automatedSimulationIntervalId) return; // No procesar GPS real si la simulación automática está activa
+
+                                const coordsForUpdate = {
+                                     latitude: position.coords.latitude, longitude: position.coords.longitude,
+                                     accuracy: position.coords.accuracy, heading: position.coords.heading,
+                                     altitude: position.coords.altitude, speed: position.coords.speed
+                                };
+                                navigationCurrentLocation = coordsForUpdate;
+                                updateInitialUserPosition(coordsForUpdate, navigationMapInstance);
+                                
+                                 // Actualiza el progreso de la navegación y las indicaciones si la ruta está activa
+                                 if(isNavigating && navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0] && coordsForUpdate) {
+                                    const routeForDistCalc = navigationCurrentRouteData.routes[0];
+                                    let carDistTurf = 0;
+                                     if (navigationRouteLayer && typeof turf !== 'undefined' && navigationRouteLayer.getLatLngs().length > 0) {
+                                        try {
+                                            const carPointTurf = turf.point([coordsForUpdate.longitude, coordsForUpdate.latitude]);
+                                            const routeLineStringTurf = turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat]));
+                                            const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
+                                            const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
+                                            carDistTurf = turf.length(lineSliceToNearestTurf, { units: 'meters' });
+                                        } catch (e) { /* console.error("Error calculating turf distance:", e); */ }
+                                     }
+
+                                    const totalRouteLength = routeForDistCalc.distance;
+                                     if (carDistTurf >= 0 && carDistTurf <= totalRouteLength + 500) { // Tolerancia para el final de la ruta
+                                        // Si el coche retrocede significativamente, podría indicar una re-evaluación
+                                        if (carDistTurf < lastCarDistanceAlongRouteForNavLogic - 100 && lastCarDistanceAlongRouteForNavLogic > 100) {
+                                            // Lógica para manejar retroceso o GPS erróneo, aquí podrías forzar un recalculo
+                                            // o simplemente dejar que se actualice la posición.
+                                        }
+                                        lastCarDistanceAlongRouteForNavLogic = carDistTurf;
+                                    } else if (carDistTurf > totalRouteLength + 500) { // Si ya se pasó la ruta por mucho
+                                        lastCarDistanceAlongRouteForNavLogic = totalRouteLength; // Marca como al final
+                                    }
+
+                                    updateTurnByTurnDisplay(routeForDistCalc, lastCarDistanceAlongRouteForNavLogic);
+                                    updateNavigationProgressDisplay(routeForDistCalc, lastCarDistanceAlongRouteForNavLogic);
+                                }
+                            },
+                            (error) => { showToast(`Error seguimiento GPS: ${error.message}`, "warning"); if (locationWatchId !== null) { navigator.geolocation.clearWatch(locationWatchId); locationWatchId = null; } if (isNavigating && currentCheckIntervalDuration < 15000) { currentCheckIntervalDuration = 15000; if (reminderCheckIntervalId) clearInterval(reminderCheckIntervalId); reminderCheckIntervalId = setInterval(checkReminders, currentCheckIntervalDuration); } },
                             { enableHighAccuracy: true, timeout: 15000, maximumAge: 1000, distanceFilter: 3 }
                         );
                     }
                 },
-                () => { /* ... */ }
+                // Callback de error para getCurrentLocation inicial
+                () => {
+                    showToast("No se pudo obtener tu ubicación actual. Algunas funciones pueden estar limitadas", "warning");
+                    if (compassAndModeControl) { compassAndModeControl.updateOrientation(null); compassAndModeControl.updateAltitude(null); }
+                    if (navigationWaypoints.length === 0 && remindersWithLocation.length === 0) {
+                        navigationMapInstance.setView([40.416775, -3.703790], 6);
+                    } else if (remindersWithLocation.length > 0 && navigationWaypoints.length === 0) {
+                        const bounds = L.latLngBounds(remindersWithLocation.map(r => [r.locationCoordinates.latitude, r.locationCoordinates.longitude]));
+                        if (bounds.isValid()) {
+                             navigationMapInstance.fitBounds(bounds.pad(0.15));
+                        }
+                    }
+                     const loadingToast = document.getElementById("map-loading-toast");
+                     if (loadingToast) {
+                         loadingToast.remove();
+                         activeToasts = activeToasts.filter(t => t.id !== "map-loading-toast");
+                     }
+                }
             );
+            // <--- FIN DE LA CORRECCIÓN CLAVE EN openNavigationMap (Parte 1/2) --->
 
+            mapActualContainer.classList.remove('navigating');
             setNavigationMapClickHandler();
-            requestAnimationFrame(() => requestAnimationFrame(() => {
-                if(navigationMapInstance) navigationMapInstance.invalidateSize({debounceMoveend: true});
-            }));
+
+            requestAnimationFrame(() => {
+                requestAnimationFrame(() => {
+                     if (navigationMapInstance) {
+                        try {
+                            navigationMapInstance.invalidateSize({debounceMoveend: true});
+                        } catch (e) { /* console.error("Error invalidating map size on openNavigationMap:", e); */ }
+                     }
+                });
+            });
+
         } catch (error) {
-             const errorContainer = document.getElementById('leaflet-map-actual-container') || mapActualContainer;
-             if (errorContainer) errorContainer.innerHTML = `<p style="color:red; text-align:center; padding:20px;">Error al cargar el mapa: ${error.message}</p>`;
-             isNavigationMapActive = false;
-             const loadingToast = document.getElementById("map-loading-toast");
-             if (loadingToast) loadingToast.remove();
-             activeToasts = activeToasts.filter(t => t.id !== "map-loading-toast");
+     const errorContainer = document.getElementById('leaflet-map-actual-container') || mapActualContainer;
+     if (errorContainer) errorContainer.innerHTML = `<p style="color:red; text-align:center; padding:20px;">Error al cargar el mapa: ${error.message}</p>`;
+            isNavigationMapActive = false;
+            const loadingToast = document.getElementById("map-loading-toast");
+            if (loadingToast) loadingToast.remove();
+            activeToasts = activeToasts.filter(t => t.id !== "map-loading-toast");
         }
 
-        // 6. ACTUALIZACIÓN FINAL DE LA INTERFAZ
+        // Estas líneas no necesitan cambio, solo asegúrate de que el resto de tu código las llame adecuadamente
+        if(clearMapSearchInputButton) clearMapSearchInputButton.addEventListener('click', () => {
+            if(mapLocationSearchInput) mapLocationSearchInput.value = '';
+            clearMapSearchInputButton.style.display = 'none';
+            if (mapLocationSearchButton) mapLocationSearchButton.style.display = 'none';
+            if(mapLocationSearchInput) mapLocationSearchInput.focus();
+             hideAddressSuggestionsModal();
+        });
+
+        if(mapLocationSearchInput) mapLocationSearchInput.dispatchEvent(new Event('input')); // Para activar la lógica de visibilidad inicial del botón de búsqueda
+
         updateStartNavigationButtonState();
         updateNavigationButtonColor();
         toggleMapLocationSearchVisibility(!isNavigating);
+        // Lógica para ocultar/mostrar botones de cabecera de mapa si no se está navegando
+        if (!isNavigating) {
+            mapHeaderButtonsVisible = true;
+            mapHeaderButtonRows.forEach(row => row.classList.remove('hidden-map-header'));
+        } else {
+            mapHeaderButtonsVisible = false;
+            mapHeaderButtonRows.forEach(row => row.classList.add('hidden-map-header'));
+        }
         actualizarContadorRadares(radaresEnRutaActual.length);
         actualizarContadorTareas(tareasEnRutaActual.length);
         updateNavigationGraphVisibilityAndMode();
     });
 }
+
+    
+    
+
+
 
 
     
@@ -8306,11 +8394,17 @@ function stopAutomatedRouteSimulation() {
 
     
 
+
+
 function reactivateRealGpsAfterSimulation() {
+    // <--- INICIO DE LA CORRECCIÓN CLAVE en reactivateRealGpsAfterSimulation --->
+    // Solo inicia el watchPosition si no está ya activo
     if (locationWatchId === null && 'geolocation' in navigator && 'watchPosition' in navigator.geolocation) {
         locationWatchId = navigator.geolocation.watchPosition(
             (position) => {
-                if (isSimulatingGpsLocation) return;
+                // Si la simulación está activa o el modo GPS simulado por clic está activo, no proceses el GPS real
+                if (isSimulatingGpsLocation && (simulatedGpsLocation || automatedSimulationIntervalId)) return;
+
                 const coordsForUpdate = {
                      latitude: position.coords.latitude, longitude: position.coords.longitude,
                      accuracy: position.coords.accuracy, heading: position.coords.heading,
@@ -8319,8 +8413,9 @@ function reactivateRealGpsAfterSimulation() {
                 navigationCurrentLocation = coordsForUpdate;
                 updateInitialUserPosition(coordsForUpdate, navigationMapInstance);
                 
-
-                 if(isNavigating && navigationCurrentRouteData && navigationCurrentRouteData.routes[0]) {
+                // Actualiza el progreso de la navegación y las indicaciones si la ruta está activa
+                 if(isNavigating && navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0] && coordsForUpdate) {
+                    const routeForDistCalc = navigationCurrentRouteData.routes[0];
                     let carDistTurf = 0;
                      if (navigationRouteLayer && typeof turf !== 'undefined' && navigationRouteLayer.getLatLngs().length > 0) {
                         try {
@@ -8329,31 +8424,40 @@ function reactivateRealGpsAfterSimulation() {
                             const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
                             const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
                             carDistTurf = turf.length(lineSliceToNearestTurf, { units: 'meters' });
-                        } catch(e){  }
+                        } catch(e){ /* console.error("Error calculating turf distance in reactivate:", e); */ }
                      }
-                    const totalRouteLength = navigationCurrentRouteData.routes[0].distance;
+                    const totalRouteLength = routeForDistCalc.distance;
                      if (carDistTurf >= 0 && carDistTurf <= totalRouteLength + 500) {
                         if (carDistTurf < lastCarDistanceAlongRouteForNavLogic - 100 && lastCarDistanceAlongRouteForNavLogic > 100) {
+                            // Podría indicar un error de GPS o retroceso, aquí podrías forzar un recalculo si es necesario
                         }
                         lastCarDistanceAlongRouteForNavLogic = carDistTurf;
                     } else if (carDistTurf > totalRouteLength + 500) {
                         lastCarDistanceAlongRouteForNavLogic = totalRouteLength;
                     }
-                    updateTurnByTurnDisplay(navigationCurrentRouteData.routes[0], lastCarDistanceAlongRouteForNavLogic);
-                    updateNavigationProgressDisplay(navigationCurrentRouteData.routes[0], lastCarDistanceAlongRouteForNavLogic);
+                    updateTurnByTurnDisplay(routeForDistCalc, lastCarDistanceAlongRouteForNavLogic);
+                    updateNavigationProgressDisplay(routeForDistCalc, lastCarDistanceAlongRouteForNavLogic);
                 }
 
             }, (error) => {
                 showToast(`Error al reactivar GPS: ${error.message}`, "warning");
+                // Si el GPS falla, se podría considerar volver a un intervalo de chequeo más lento
+                if (isNavigating && currentCheckIntervalDuration < 15000) { // Si es un error durante la navegación y el intervalo es rápido
+                    currentCheckIntervalDuration = 15000; // Ralentiza el chequeo
+                    if (reminderCheckIntervalId) clearInterval(reminderCheckIntervalId);
+                    reminderCheckIntervalId = setInterval(checkReminders, currentCheckIntervalDuration);
+                }
             }, { enableHighAccuracy: true, timeout: 15000, maximumAge: 5000, distanceFilter: 3 }
         );
 
+        // Intenta obtener una posición inicial inmediatamente al reactivar, para no esperar al primer "watch"
         getCurrentLocation(coords => {
-            if (!isSimulatingGpsLocation) {
+            if (!isSimulatingGpsLocation) { // Asegúrate de que no se ha activado la simulación mientras tanto
                 navigationCurrentLocation = coords;
                 updateInitialUserPosition(coords, navigationMapInstance);
                 
-                if (isNavigating && navigationCurrentRouteData && navigationCurrentRouteData.routes[0]) {
+                if (isNavigating && navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0]) {
+                    const routeForDistCalc = navigationCurrentRouteData.routes[0];
                     let carDistTurf = 0;
                      if (navigationRouteLayer && typeof turf !== 'undefined' && navigationRouteLayer.getLatLngs().length > 0) {
                         try {
@@ -8362,9 +8466,9 @@ function reactivateRealGpsAfterSimulation() {
                             const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
                             const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
                             carDistTurf = turf.length(lineSliceToNearestTurf, { units: 'meters' });
-                        } catch(e){  }
+                        } catch(e){ /* console.error("Error calculating turf distance on initial reactivate:", e); */ }
                      }
-                    const totalRouteLength = navigationCurrentRouteData.routes[0].distance;
+                    const totalRouteLength = routeForDistCalc.distance;
                      if (carDistTurf >= 0 && carDistTurf <= totalRouteLength + 500) {
                         if (carDistTurf < lastCarDistanceAlongRouteForNavLogic - 100 && lastCarDistanceAlongRouteForNavLogic > 100) {
                         }
@@ -8372,13 +8476,16 @@ function reactivateRealGpsAfterSimulation() {
                     } else if (carDistTurf > totalRouteLength + 500) {
                         lastCarDistanceAlongRouteForNavLogic = totalRouteLength;
                     }
-                    updateTurnByTurnDisplay(navigationCurrentRouteData.routes[0], lastCarDistanceAlongRouteForNavLogic);
-                    updateNavigationProgressDisplay(navigationCurrentRouteData.routes[0], lastCarDistanceAlongRouteForNavLogic);
+                    updateTurnByTurnDisplay(routeForDistCalc, lastCarDistanceAlongRouteForNavLogic);
+                    updateNavigationProgressDisplay(routeForDistCalc, lastCarDistanceAlongRouteForNavLogic);
                 }
             }
         });
     }
+    // <--- FIN DE LA CORRECCIÓN CLAVE en reactivateRealGpsAfterSimulation --->
 }
+
+    
 
 
 
