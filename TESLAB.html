@@ -1,4 +1,4 @@
-
+..
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -2565,42 +2565,85 @@ const vehicleIconMiniMap = L.divIcon({
  * @param {FormData} formData - El objeto FormData con los datos a enviar.
  * @returns {Promise<object>} - La respuesta JSON del script.
  */
+/**
+ * Función central para comunicarse con el Google Apps Script.
+ * Esta versión es más robusta y verbosa para diagnosticar errores de fetch/TypeError.
+ * @param {FormData} formData - El objeto FormData con los datos a enviar.
+ * @returns {Promise<object>} - La respuesta JSON del script o un objeto de error.
+ */
 async function callGoogleScript(formData) {
+    let response = null; // Declaramos response fuera del try para que sea accesible en el catch si la conexión falla antes de la respuesta.
     try {
-        // Hacemos la petición inicial
-        const initialResponse = await fetch(SCRIPT_URL_GDRIVE, {
+        console.log("callGoogleScript: Iniciando fetch a:", SCRIPT_URL_GDRIVE);
+
+        // Realizamos la petición fetch
+        response = await fetch(SCRIPT_URL_GDRIVE, {
             method: 'POST',
             body: formData,
-            // Añadimos 'follow' para intentar controlar la redirección manualmente
-            redirect: 'follow', 
+            redirect: 'follow', // Indica a fetch que siga las redirecciones (ej. 302 de Apps Script)
+            mode: 'cors',       // Modo CORS estándar. Apps Script está configurado para manejar esto.
+            credentials: 'omit', // No enviar cookies ni credenciales, a veces ayuda con CORS.
+            cache: 'no-cache'   // Asegura que la respuesta sea fresca y no de la caché del navegador.
         });
 
-        // Apps Script a veces devuelve una redirección 302 a una URL temporal.
-        // El navegador sigue esta redirección, pero a veces el fetch en modo 'no-cors' falla.
-        // Si la respuesta es de tipo 'opaqueredirect', es una señal de que la petición
-        // probablemente se completó con éxito en el servidor de Google, aunque no podamos
-        // leer la respuesta directamente.
-        if (initialResponse.type === 'opaqueredirect') {
-            // No podemos leer el cuerpo de la respuesta, pero asumimos éxito.
-            // Devolvemos un objeto de éxito genérico para que el flujo de la app continúe.
-            // La desventaja es que no veremos mensajes de éxito/error específicos del script.
-            console.warn("Respuesta opaca recibida. Asumiendo éxito. Revisa las ejecuciones en Apps Script para confirmar.");
-            return { status: "success", message: "Operación enviada (respuesta no legible)." };
+        console.log("callGoogleScript: Respuesta recibida. Status:", response.status, "Type:", response.type);
+        
+        // Si la respuesta es de tipo 'opaque', la petición llegó pero no podemos leer el contenido por seguridad (común con Apps Script y CORS).
+        // En este caso, asumimos el éxito y la operación en el script de Google debería haberse completado.
+        if (response.type === 'opaque') {
+            console.warn("callGoogleScript: Recibida respuesta opaca (tipo 'opaque'). Esto significa que la petición llegó al servidor, pero el navegador no permite leer el contenido por seguridad (políticas CORS o redirección). Asumiendo que la operación en el servidor fue exitosa. Por favor, revisa las ejecuciones en el panel de Apps Script para confirmar.");
+            return { status: "assumed_success", message: "Operación enviada; respuesta no legible. Consulta registros del script." };
         }
 
-        if (!initialResponse.ok) {
-            const errorText = await initialResponse.text();
-            throw new Error(`Error del servidor: ${initialResponse.status} ${errorText}`);
+        // Si la respuesta HTTP no es un código 2xx (ej. 404, 500, etc.)
+        if (!response.ok) {
+            let errorDetails = `HTTP Error: ${response.status} ${response.statusText || 'Desconocido'}`;
+            try {
+                // Intentamos leer el cuerpo de la respuesta como texto para obtener más detalles del error del servidor
+                const serverErrorText = await response.text();
+                errorDetails += ` - Contenido del cuerpo: ${serverErrorText.substring(0, 500)}`; // Limitamos a los primeros 500 caracteres
+            } catch (readError) {
+                errorDetails += " - (No se pudo leer el cuerpo de la respuesta)";
+                console.warn("callGoogleScript: Error al intentar leer el cuerpo de una respuesta HTTP no OK:", readError);
+            }
+            console.error("callGoogleScript: Respuesta HTTP no OK:", errorDetails);
+            throw new Error(errorDetails); // Lanzamos un error con los detalles del HTTP
         }
-        
-        return await initialResponse.json();
+
+        // Si la respuesta.ok es true, esperamos que el cuerpo sea JSON.
+        // Clonamos la respuesta para poder leerla como texto si el parseo JSON falla.
+        const clonedResponse = response.clone();
+        try {
+            const jsonResponse = await response.json(); // Intentamos parsear el cuerpo como JSON
+            console.log("callGoogleScript: JSON de respuesta parseado:", jsonResponse);
+            return jsonResponse;
+        } catch (jsonParseError) {
+            // Si await response.json() falla, significa que el contenido no es JSON válido.
+            // Esto es un TypeError o SyntaxError.
+            const rawText = await clonedResponse.text(); // Leemos el cuerpo como texto para depuración
+            console.error("callGoogleScript: Error al parsear JSON:", jsonParseError.message, "Respuesta RAW:", rawText.substring(0, 500));
+            throw new Error(`Error al procesar la respuesta JSON: ${jsonParseError.message}. Contenido recibido: "${rawText.substring(0, 50)}..."`);
+        }
 
     } catch (error) {
-        console.error("Error en callGoogleScript:", error);
-        // El error "Failed to fetch" suele caer aquí.
-        return { status: "error", message: `Error de conexión: ${error.message}` };
+        // Este bloque captura errores que ocurren *antes* de obtener una respuesta HTTP válida (errores de red puros, CORS que bloquea la conexión, etc.).
+        // El 'TypeError {}' genérico suele caer aquí.
+        console.error("callGoogleScript: Error definitivo en la comunicación (captura final):", error);
+        
+        let errorMessage = "Error desconocido en la comunicación.";
+        if (error.message) {
+            errorMessage = error.message; // Mensaje de error más específico si está disponible
+        } else if (error instanceof TypeError) {
+            // Si el error es un TypeError sin mensaje, suele ser un problema de red a bajo nivel
+            errorMessage = "Error de red o conexión (TypeError genérico). El navegador no pudo completar la petición.";
+        }
+        
+        // Propaga el error de una manera que la función que llamó a callGoogleScript pueda manejarlo.
+        return { status: "error", message: errorMessage };
     }
 }
+
+    
 /**
  * Valida si el usuario existe y guarda/actualiza los datos en Google Sheets.
  */
