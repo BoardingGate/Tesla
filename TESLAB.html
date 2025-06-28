@@ -2189,6 +2189,11 @@ V1
     let snoozedRouteRadars = new Map();
 
 
+let simulationSpeedKmph = 85;
+let currentSimulationSpeedKmph = 85; // <-- NUEVA VARIABLE
+const SIMULATION_TICK_INTERVAL_MS = 300;
+
+    
 let isArrivalSequenceStarted = false;
 // --- INICIO DE LA MODIFICACIÓN ---
 let maxSpeedCoordinates = null; // Para guardar las coordenadas de la velocidad máxima
@@ -2507,7 +2512,35 @@ function toggleMapHeaderRowsVisibility(show) {
 
 
 
+/**
+ * Calcula un multiplicador de velocidad aleatorio basado en el tipo de maniobra.
+ * @param {object} maneuver - El objeto de maniobra de OSRM.
+ * @returns {number} - Un multiplicador entre -0.3 y +0.25.
+ */
+function getRandomSpeedMultiplierForManeuver(maneuver) {
+    const type = maneuver.type || '';
+    const modifier = maneuver.modifier || '';
+    let min, max;
 
+    if (type === 'roundabout' || type === 'rotary' || modifier.includes('sharp') || modifier.includes('uturn')) {
+        // Maniobras lentas
+        min = -0.30;
+        max = 0.10;
+    } else if (type === 'turn' || type === 'fork' || type === 'merge' || type === 'end of road') {
+        // Maniobras normales
+        min = -0.20;
+        max = 0.20;
+    } else {
+        // Tramos rectos o maniobras suaves
+        min = -0.05;
+        max = 0.25;
+    }
+
+    return Math.random() * (max - min) + min;
+}
+
+
+    
 
 
 
@@ -8067,6 +8100,12 @@ function handleGpsSimulationToggle() {
 }
 
 
+
+
+
+
+
+
 function startAutomatedRouteSimulation(speedKmph) {
     if (!isSimulatingGpsLocation) {
         showToast("Error: El modo de simulación GPS no está activo.", "error");
@@ -8089,7 +8128,12 @@ function startAutomatedRouteSimulation(speedKmph) {
         toggleNavigationState(); 
     }
 
+    // --- INICIO DE LA MODIFICACIÓN ---
+    simulationSpeedKmph = speedKmph; // Guardamos la velocidad base
+    currentSimulationSpeedKmph = speedKmph; // La velocidad actual empieza igual que la base
+
     const routeLine = navigationRouteLayer.getLatLngs();
+    const route = navigationCurrentRouteData.routes[0];
     const startWaypoint = navigationWaypoints.find(wp => wp.type === 'S' || wp.isRecalculatedStart) || navigationWaypoints[0];
     let initialHeading = 0;
     if (routeLine.length >= 2) {
@@ -8098,7 +8142,8 @@ function startAutomatedRouteSimulation(speedKmph) {
         initialHeading = turf.bearing(firstPoint, secondPoint);
         if (initialHeading < 0) initialHeading += 360;
     }
-
+    
+    // Inicialización de variables de simulación
     simulatedGpsLocation = {
         latitude: startWaypoint.lat,
         longitude: startWaypoint.lng,
@@ -8115,19 +8160,48 @@ function startAutomatedRouteSimulation(speedKmph) {
         navigationStartTimeForStats = new Date();
     }
 
+    // Inicialización de estadísticas de viaje
+    maxSpeedDuringTrip = 0;
+    maxSpeedCoordinates = { lat: startWaypoint.lat, lng: startWaypoint.lng };
+    
     processSimulatedGpsPosition(true); 
 
-    const totalRouteDistance = navigationCurrentRouteData.routes[0].distance;
-    const speedMps = (speedKmph * 1000) / 3600;
-
-    showToast(`Simulación automática de ruta iniciada a ${speedKmph.toFixed(0)} km/h.`, "info");
-
+    const totalRouteDistance = route.distance;
+    
+    showToast(`Simulación automática de ruta iniciada a ${speedKmph.toFixed(0)} km/h (velocidad variable).`, "info");
     setNavigationMapClickHandler(); 
 
+    let simulationStepIndex = 0;
+    let simulationLegIndex = 0;
+    let distanceToEndOfCurrentStep = calculateDistanceToEndOfStep(route, 0, 0);
+
     automatedSimulationIntervalId = setInterval(() => {
+        // Usamos la velocidad variable actual para el cálculo
+        const speedMps = (currentSimulationSpeedKmph * 1000) / 3600;
         const distanceIncrement = speedMps * (SIMULATION_TICK_INTERVAL_MS / 1000);
         simulatedDistanceAlongRoute += distanceIncrement;
         totalDistanceTravelledForStats = simulatedDistanceAlongRoute;
+        
+        // Comprobar si hemos pasado al siguiente paso de la ruta
+        if (simulatedDistanceAlongRoute > distanceToEndOfCurrentStep) {
+            simulationStepIndex++;
+            if (simulationStepIndex >= route.legs[simulationLegIndex].steps.length) {
+                simulationStepIndex = 0;
+                simulationLegIndex++;
+            }
+            
+            if (simulationLegIndex < route.legs.length) {
+                const currentStep = route.legs[simulationLegIndex].steps[simulationStepIndex];
+                // Aplicar variación de velocidad para la nueva maniobra
+                const multiplier = getRandomSpeedMultiplierForManeuver(currentStep.maneuver);
+                let newSpeed = simulationSpeedKmph * (1 + multiplier);
+                // Limitar la velocidad a un rango lógico
+                currentSimulationSpeedKmph = Math.max(20, Math.min(160, newSpeed));
+                
+                distanceToEndOfCurrentStep = calculateDistanceToEndOfStep(route, simulationLegIndex, simulationStepIndex);
+            }
+        }
+        // --- FIN DE LA MODIFICACIÓN ---
 
         if (simulatedDistanceAlongRoute >= totalRouteDistance) {
             stopAutomatedRouteSimulationInternal();
@@ -8180,7 +8254,15 @@ function startAutomatedRouteSimulation(speedKmph) {
         }
     }, SIMULATION_TICK_INTERVAL_MS);
 }
+    
 
+
+
+
+
+    
+
+    
 
 function processSimulatedGpsPosition(forceExactPosition = false) {
     if (!isSimulatingGpsLocation || !simulatedGpsLocation) return;
@@ -13449,6 +13531,9 @@ function plotAccumulatedGraphData() {
     
 
 
+
+
+
 function showArrivalStatsModal() {
     closeOtherModals('arrival-stats-modal');
     let modal = document.getElementById('arrival-stats-modal');
@@ -13504,25 +13589,27 @@ function showArrivalStatsModal() {
         deviationHtml = formatDeviation(finalDeviationMs);
     }
     
-    // --- INICIO DE LA MODIFICACIÓN ---
+    // --- INICIO DE LA LÓGICA DE COHERENCIA ETA ---
     let initialEtaDetailsHtml = '';
     const initialRoute = navigationCurrentRouteData?.routes?.[0];
 
-    // Comprobamos si hay datos de la ruta inicial y si la desviación fue mínima
-    if (initialRoute && tripInitialOverallEtaTime && Math.abs(finalDeviationMs) < 30000) { // Menos de 30 segundos de desviación
+    // Si la desviación es mínima (ej. menos de 5 segundos), mostramos los datos reales como si fueran la previsión.
+    if (initialRoute && tripInitialOverallEtaTime && Math.abs(finalDeviationMs) < 5000) { 
         const realEtaTime = arrivalTime.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
-        const realDurationHours = Math.floor(durationMinutes / 60);
-        const realDurationMins = durationMinutes % 60;
+        const realDurationTotalMinutes = Math.round(durationMs / (1000 * 60));
+        const realDurationHours = Math.floor(realDurationTotalMinutes / 60);
+        const realDurationMins = realDurationTotalMinutes % 60;
         const realDurationFormatted = `${String(realDurationHours).padStart(2,'0')}:${String(realDurationMins).padStart(2,'0')}`;
-        const realAvgSpeed = (totalDistanceTravelledForStats / (durationMs/1000) * 3.6).toFixed(1);
+        // Usamos la velocidad media real del viaje
+        const realAvgSpeed = velocidadMedia;
         initialEtaDetailsHtml = `
-        <div id="initial-eta-details" style="font-size: 0.9rem; color: #555; margin-top: 8px; padding-top: 8px; border-top: 1px solid #ccc; text-align: center; font-weight: bold; line-height: 1.4;">
+        <div id="initial-eta-details" style="font-size: 0.9rem; color: #333; margin-top: 8px; padding-top: 8px; border-top: 1px solid #ccc; text-align: center; font-weight: bold; line-height: 1.4;">
             <strong>Previsión (coincide con real):</strong><br>
             Hora llegada: ${realEtaTime} | Tiempo: ${realDurationFormatted} h. | Vel. media: ${realAvgSpeed} Km/h
         </div>
         `;
     } else if (initialRoute && tripInitialOverallEtaTime) {
-        // Si hay desviación, mostramos los datos de la previsión original
+        // Si hay una desviación notable, mostramos la previsión original.
         const initialEtaTime = tripInitialOverallEtaTime.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
         const initialDurationTotalMinutes = Math.round(initialRoute.duration / 60);
         const initialDurationHours = Math.floor(initialDurationTotalMinutes / 60);
@@ -13536,6 +13623,7 @@ function showArrivalStatsModal() {
         </div>
         `;
     }
+    // --- FIN DE LA LÓGICA DE COHERENCIA ETA ---
     
     modal.innerHTML = `
         <h2 style="font-size: 1.6rem; color: #006400; font-weight: bold; margin-bottom: 15px; display: flex; align-items: center; justify-content: center;">
@@ -13580,7 +13668,7 @@ function showArrivalStatsModal() {
                 <span style="font-size: 1.1rem; color: black; font-weight: bold;">Vel. máxima:</span>
                 <span style="font-size: 1.3rem; color: #0000CD; font-weight: bold;"> ${velocidadMaxima} km/h</span>
             </div>
-            <button id="show-max-speed-location-button" style="padding: 4px 8px; font-size: 0.8rem; background-color: #6c757d; color: white; border: 1px solid #5a6268; border-radius: 4px; cursor: pointer;">¿Dónde?</button>
+            <button id="show-max-speed-location-button" style="padding: 6px 12px; font-size: 1rem; background-color: #f59e0b; color: white; border: 1px solid #d97706; border-radius: 4px; cursor: pointer; max-width: 100px;">¿Dónde?</button>
         </div>
         <div style="display: flex; justify-content: space-around; align-items: center; margin-bottom: 20px; font-size: 1.1rem; border-top: 1px solid #ccc; padding-top: 15px; margin-top:15px;">
             <div>
@@ -13615,7 +13703,7 @@ function showArrivalStatsModal() {
     const showLocationButton = modal.querySelector('#show-max-speed-location-button');
     showLocationButton.addEventListener('click', () => {
         if (!maxSpeedCoordinates || !navigationMapInstance) {
-            showToast("No se registraron coordenadas para la velocidad máxima.", "warning");
+            showToast("No se han registrado coordenadas para la velocidad máxima.", "warning");
             return;
         }
         clearModalAutoCloseTimer(modal, acceptButton, 'arrival-stats-modal');
@@ -13645,12 +13733,11 @@ function showArrivalStatsModal() {
         mapHeaderButtonsVisible = true;
         toggleMapHeaderRowsVisibility(true);
     });
-    // --- FIN DE LA MODIFICACIÓN ---
 
     addModalAutoCloseTimer(modal, acceptButton, 'arrival-stats-modal', 60000);
 }
 
-
+    
     
     
 
