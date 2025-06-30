@@ -1,4 +1,4 @@
-f24
+f25
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -2237,6 +2237,7 @@ const PROGRESSIVE_ZOOM_EXIT_END_DISTANCE = 150;
 let isZoomedForManeuver = false;
 let isFlying = false; // <-- ASEGÚRATE DE QUE ESTA LÍNEA EXISTA
 let navigationTargetZoom = null; // <-- Y TAMBIÉN ESTA
+let currentSmoothedMapCenter = null;    
 // ...    
     
     
@@ -3185,10 +3186,10 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
 
 
 
-    
-/**
+ /**
  * Controlador principal de la vista del mapa. Actualiza el icono y ejecuta una única animación
  * para el seguimiento (centrado/descentrado) y el zoom.
+ * Incluye lógica de suavizado (smoothing) para un movimiento menos nervioso.
  */
 function updateInitialUserPosition(coords, mapInstanceToUse) {
     if (!mapInstanceToUse || !coords || typeof coords.latitude !== 'number' || typeof coords.longitude !== 'number') {
@@ -3216,55 +3217,61 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
 
     const shouldFollow = shouldCenterOnUser || navigationFollowUser;
     
-    // --- LÓGICA DE CONTROL DE VISTA UNIFICADA ---
+    // --- INICIO DE LA LÓGICA DE CONTROL Y SUAVIZADO ---
     if (shouldFollow && navigationMapInstance && !isFlying) {
         // 1. Determina el nivel de zoom objetivo
         const finalZoom = navigationTargetZoom !== null ? navigationTargetZoom : navigationMapInstance.getZoom();
-        
-        // 2. Calcula el centro ideal del mapa (con descentrado)
+
+        // 2. Calcula el centro IDEAL del mapa (con descentrado)
         const effectiveHeading = (coords && typeof coords.heading === 'number' && coords.heading !== null) ? coords.heading : (currentMapBearing || 0);
         const mapSize = mapInstanceToUse.getSize();
-        const progressBar = document.getElementById('navigation-bottom-progress-bar');
-        let progressBarHeight = 0;
-        if (progressBar && progressBar.offsetParent !== null && progressBar.style.display !== 'none') { progressBarHeight = progressBar.offsetHeight; }
-        const offsetFactor = 0.33; const minMapDimension = Math.min(mapSize.x, mapSize.y);
+        const offsetFactor = 0.33;
+        const minMapDimension = Math.min(mapSize.x, mapSize.y);
         const offsetDistance = minMapDimension * offsetFactor;
         const headingRad = (effectiveHeading % 360) * Math.PI / 180;
-        let calculatedTargetMapCenterOffset = { x: -offsetDistance * Math.sin(headingRad), y: offsetDistance * Math.cos(headingRad) };
-        const isGoingNorth = (effectiveHeading <= 60 || effectiveHeading >= 300);
-        const isGoingSouth = effectiveHeading > 120 && effectiveHeading < 240;
-        if (miniMapOffsetActive.y === 0 && progressBarHeight > 0) {
-            if (isGoingNorth) calculatedTargetMapCenterOffset.y -= progressBarHeight * 0.2;
-            else if (isGoingSouth) calculatedTargetMapCenterOffset.y += progressBarHeight * 0.5;
-        }
-        calculatedTargetMapCenterOffset.x += miniMapOffsetActive.x; calculatedTargetMapCenterOffset.y += miniMapOffsetActive.y;
-        targetMapCenterOffset = { ...calculatedTargetMapCenterOffset };
+        targetMapCenterOffset = { x: -offsetDistance * Math.sin(headingRad), y: offsetDistance * Math.cos(headingRad) };
         
         const vehicleLatLng = L.latLng(coords.latitude, coords.longitude);
         const vehicleScreenPos = navigationMapInstance.project(vehicleLatLng);
         const idealMapCenterScreenPos = L.point(vehicleScreenPos.x - targetMapCenterOffset.x, vehicleScreenPos.y - targetMapCenterOffset.y);
         const idealMapCenterLatLng = navigationMapInstance.unproject(idealMapCenterScreenPos);
 
-        // 3. Ejecutar la animación si es necesario
-        const currentZoom = navigationMapInstance.getZoom();
-        const currentCenter = navigationMapInstance.getCenter();
-        const zoomDifference = Math.abs(currentZoom - finalZoom);
-        const centerDifference = currentCenter.distanceTo(idealMapCenterLatLng);
-
-        if (zoomDifference > 0.05 || centerDifference > 5) { // Umbrales ajustados
-            isFlying = true;
-            navigationMapInstance.flyTo(idealMapCenterLatLng, finalZoom, {
-                animate: true,
-                duration: 1.2, // Aumentamos la duración para más fluidez
-                easeLinearity: 0.25
-            });
-            setTimeout(() => { isFlying = false; }, 1250);
+        // --- LÓGICA DE SUAVIZADO (LERP) ---
+        // Si es la primera vez, el centro suavizado es el ideal.
+        if (currentSmoothedMapCenter === null) {
+            currentSmoothedMapCenter = idealMapCenterLatLng;
         }
+
+        // Interpolación lineal: Mueve el centro suavizado un pequeño porcentaje
+        // hacia el centro ideal en cada fotograma. Un valor más bajo es más suave.
+        const lerpFactor = 0.1; // 10% del camino en cada tick
+        currentSmoothedMapCenter = L.latLng(
+            currentSmoothedMapCenter.lat + (idealMapCenterLatLng.lat - currentSmoothedMapCenter.lat) * lerpFactor,
+            currentSmoothedMapCenter.lng + (idealMapCenterLatLng.lng - currentSmoothedMapCenter.lng) * lerpFactor
+        );
+
+        // 3. Ejecutar la animación usando el centro SUAVIZADO
+        const currentZoom = navigationMapInstance.getZoom();
+        const zoomDifference = Math.abs(currentZoom - finalZoom);
+        
+        // El umbral de diferencia de centro ahora es más pequeño, ya que el movimiento es más sutil
+        if (zoomDifference > 0.05 || currentSmoothedMapCenter.distanceTo(navigationMapInstance.getCenter()) > 1) {
+            isFlying = true;
+            navigationMapInstance.flyTo(currentSmoothedMapCenter, finalZoom, {
+                animate: true,
+                duration: 1.0, // Duración consistente
+                easeLinearity: 0.5
+            });
+            setTimeout(() => { isFlying = false; }, 1050);
+        }
+    } else {
+        // Si no estamos siguiendo, reseteamos el centro suavizado.
+        currentSmoothedMapCenter = null;
     }
     
     navigationTargetZoom = null;
     updateDirectionWarningCardsVisibility();
-}    
+}   
 
 
 
