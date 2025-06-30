@@ -1,4 +1,4 @@
-f31
+f32
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -3353,39 +3353,48 @@ function smoothZoomAnimation(startZoom, endZoom, duration = 1200) {
 
     
 
-
-    
-// >>> REEMPLAZAR ESTA FUNCIÓN COMPLETA <<<
-async function proceedWithRecalculation(deleteNextUnvisitedStage = false) {
-    if (!isNavigating) {
-        showToast("No se puede recalcular si no se está navegando.", "warning");
-        return;
-    }
-    if (!navigationCurrentLocation) {
-        showToast("No se puede recalcular: ubicación actual desconocida.", "error");
+/**
+ * Procede con el recálculo de la ruta basándose en la acción del usuario.
+ * @param {string} action - La acción decidida: 'recalculate_forward', 'recalculate_turn_back', 'skip_one', 'skip_multiple'.
+ */
+async function proceedWithRecalculation(action) {
+    if (!isNavigating || !navigationCurrentLocation) {
+        showToast("No se puede recalcular: no se está navegando o la ubicación es desconocida.", "error");
         return;
     }
 
-    if (deleteNextUnvisitedStage) {
-        const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
-        let nextUnvisitedStageIndex = -1;
-        
-        // Buscamos la PRIMERA etapa intermedia no visitada
-        for (let i = 0; i < actualWaypoints.length; i++) {
-            const wp = actualWaypoints[i];
-            if (wp && !wp.visited && wp.type === 'intermediate') {
-                nextUnvisitedStageIndex = i;
-                break;
+    // Identificar las etapas que se han quedado atrás
+    const stagesLeftBehind = [];
+    if (action === 'skip_multiple' && navigationCurrentLocation) {
+        const currentHeading = navigationCurrentLocation.heading;
+        navigationWaypoints.forEach(wp => {
+            if (!wp.visited && wp.type !== 'S' && wp.type !== 'S_Recalc') {
+                const bearingToWp = turf.bearing(
+                    turf.point([navigationCurrentLocation.longitude, navigationCurrentLocation.latitude]),
+                    turf.point([wp.lng, wp.lat])
+                );
+                let angleDiff = Math.abs(currentHeading - (bearingToWp < 0 ? bearingToWp + 360 : bearingToWp));
+                if (angleDiff > 180) angleDiff = 360 - angleDiff;
+                if (angleDiff > 110) {
+                    stagesLeftBehind.push(wp.id);
+                }
             }
-        }
+        });
+    }
 
-        // Si no hay intermedias, buscamos el destino final si no está visitado
-        if (nextUnvisitedStageIndex === -1) {
-             const finalWpIndex = actualWaypoints.findIndex(wp => !wp.visited && wp.type === 'F');
-             if (finalWpIndex !== -1) {
-                 nextUnvisitedStageIndex = finalWpIndex;
-             }
-        }
+    if (action === 'skip_multiple' && stagesLeftBehind.length > 0) {
+        // Marcar todas las etapas saltadas como visitadas
+        navigationWaypoints.forEach(wp => {
+            if (stagesLeftBehind.includes(wp.id)) {
+                wp.visited = true;
+            }
+        });
+        showToast(`Saltando ${stagesLeftBehind.length} etapas que han quedado atrás.`, "info");
+    
+    } else if (action === 'skip_one') {
+        // Marcar solo la próxima etapa no visitada como visitada
+        const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
+        const nextUnvisitedStageIndex = actualWaypoints.findIndex(wp => !wp.visited && wp.type !== 'S' && wp.type !== 'S_Recalc');
         
         if (nextUnvisitedStageIndex !== -1) {
             const waypointToSkip = actualWaypoints[nextUnvisitedStageIndex];
@@ -3399,10 +3408,10 @@ async function proceedWithRecalculation(deleteNextUnvisitedStage = false) {
         }
     }
     
-    // Llamamos a la función de recálculo, indicando que debe PRESERVAR las estadísticas.
-    await recalculateAndDrawRoute(true);
+    // Todas las acciones ('recalculate_forward', 'recalculate_turn_back', y las de skip) terminan en un recálculo.
+    // La diferencia es qué waypoints están marcados como "visitados" antes de llamar a la función.
+    await recalculateAndDrawRoute(true); // 'true' preserva las estadísticas acumuladas del viaje
 }
-
     
 
 
@@ -12953,7 +12962,12 @@ let locationsPreviewMap = null;
     
 
 
-// >>> REEMPLAZAR ESTA FUNCIÓN COMPLETA <<<
+
+
+/**
+ * Muestra el modal de desvío. Analiza si se han saltado una o varias etapas
+ * y presenta las opciones correspondientes al usuario.
+ */
 function showDeviationModal() {
     closeOtherModals('deviation-modal');
     isDeviationModalActive = true;
@@ -12964,17 +12978,9 @@ function showDeviationModal() {
         modal.id = 'deviation-modal';
         document.body.appendChild(modal);
     }
-    
-    // --- LÓGICA DE ANÁLISIS DEL DESVÍO (con número y nombre de etapa) ---
-    let suggestion = 'recalculate_forward';
-    let message = "Te has desviado. RECALCULAR EN DIRECCIÓN DE LA MARCHA...";
-    let primaryButtonText = "RECALCULAR SIN DAR LA VUELTA";
-    let secondaryButtonText = "SALTAR ETAPA";
-    let showSecondaryButton = false;
 
     const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
-    const totalStages = actualWaypoints.length - 1; // El -1 es para no contar el inicio como etapa
-    const nextUnvisitedIndex = actualWaypoints.findIndex(wp => !wp.visited && wp.type !== 'S' && wp.type !== 'S_Recalc');
+    let stagesLeftBehind = [];
 
     // Función auxiliar para resumir la dirección
     const getSummarizedAddress = (address) => {
@@ -12983,105 +12989,93 @@ function showDeviationModal() {
         return parts[0].trim();
     };
 
-    if (nextUnvisitedIndex !== -1 && navigationCurrentLocation) {
-        const nextWp = actualWaypoints[nextUnvisitedIndex];
-        const summarizedAddress = getSummarizedAddress(nextWp.address);
-        
-        // --- NUEVO: Formateo del identificador de etapa ---
-        let stageIdentifier = '';
-        if (nextWp.type === 'F') {
-            stageIdentifier = `(Destino Final)`;
-        } else if (totalStages > 1) {
-            stageIdentifier = `(Etapa ${nextWp.label} de ${totalStages})`;
-        } else {
-             stageIdentifier = `(Etapa ${nextWp.label})`;
-        }
-
-
+    if (navigationCurrentLocation) {
         const currentHeading = navigationCurrentLocation.heading;
-        const bearingToNextWp = turf.bearing(
-            turf.point([navigationCurrentLocation.longitude, navigationCurrentLocation.latitude]),
-            turf.point([nextWp.lng, nextWp.lat])
-        );
-        let angleDiff = Math.abs(currentHeading - (bearingToNextWp < 0 ? bearingToNextWp + 360 : bearingToNextWp));
-        if (angleDiff > 180) angleDiff = 360 - angleDiff;
-        const distanceToNextWp = calculateDistance(navigationCurrentLocation.latitude, navigationCurrentLocation.longitude, nextWp.lat, nextWp.lng);
+        actualWaypoints.forEach(wp => {
+            if (wp.visited || wp.type === 'S' || wp.type === 'S_Recalc') return;
 
-        if (angleDiff > 110) { 
-            suggestion = 'skip_stage';
-            message = `TE HAS PASADO:<br><strong>${summarizedAddress}</strong><br><small>${stageIdentifier}</small>`;
-            primaryButtonText = `SALTAR ETAPA`;
-            secondaryButtonText = `IR A ETAPA (dar vuelta)`;
-            showSecondaryButton = true;
-        } else if (angleDiff > 80 && distanceToNextWp < 3000) { 
-            suggestion = 'recalculate_turn_back';
-            message = `La etapa <strong>${summarizedAddress}</strong> ${stageIdentifier} está CERCA pero DETRÁS`;
-            primaryButtonText = "DAR VUELTA";
-            secondaryButtonText = `SALTAR ETAPA`;
-            showSecondaryButton = true;
-        } else {
-             suggestion = 'recalculate_forward';
-             message = "TE HAS DESVIADO de la ruta. ¿Continuamos recalculando?";
-             primaryButtonText = "RECALCULAR";
-             secondaryButtonText = `SALTAR PRÓXIMA ETAPA ${stageIdentifier}`;
-             showSecondaryButton = true;
-        }
+            const bearingToWp = turf.bearing(
+                turf.point([navigationCurrentLocation.longitude, navigationCurrentLocation.latitude]),
+                turf.point([wp.lng, wp.lat])
+            );
+            let angleDiff = Math.abs(currentHeading - (bearingToWp < 0 ? bearingToWp + 360 : bearingToWp));
+            if (angleDiff > 180) angleDiff = 360 - angleDiff;
+
+            if (angleDiff > 110) { // El waypoint está claramente detrás
+                stagesLeftBehind.push(wp);
+            }
+        });
     }
-    
-    if (actualWaypoints.length > 0 && actualWaypoints.every((wp, i) => wp.visited || (i === actualWaypoints.length - 1 && wp.type === 'F'))) {
-        suggestion = 'recalculate_forward';
-        message = "Te has desviado. Recalculando hacia tu destino final.";
+
+    let message = "";
+    let primaryButtonText = "";
+    let secondaryButtonText = "";
+    let tertiaryButtonText = "";
+    let showSecondaryButton = false;
+    let showTertiaryButton = false;
+    let defaultAction = 'recalculate_forward';
+
+
+    if (stagesLeftBehind.length > 1) {
+        // --- CASO 1: Múltiples etapas saltadas ---
+        defaultAction = 'skip_multiple';
+        message = `PARECE QUE TE HAS SALTADO <strong>${stagesLeftBehind.length} ETAPAS</strong>. ¿Qué deseas hacer?`;
+        primaryButtonText = `SALTAR LAS ${stagesLeftBehind.length} ETAPAS QUE HAN QUEDADO ATRÁS`;
+        secondaryButtonText = `IR A LA PRIMERA ETAPA ATRÁS`;
+        tertiaryButtonText = `RECALCULAR (ignorar desvío)`;
+        showSecondaryButton = true;
+        showTertiaryButton = true;
+
+    } else if (stagesLeftBehind.length === 1) {
+        // --- CASO 2: Una etapa saltada ---
+        defaultAction = 'skip_one';
+        const skippedWp = stagesLeftBehind[0];
+        message = `TE HAS PASADO:<br><strong>${getSummarizedAddress(skippedWp.address)}</strong>`;
+        primaryButtonText = `SALTAR ETAPA`;
+        secondaryButtonText = `IR A ETAPA (dar vuelta)`;
+        showSecondaryButton = true;
+
+    } else {
+        // --- CASO 3: Desvío genérico (ninguna etapa claramente detrás) ---
+        defaultAction = 'recalculate_forward';
+        const nextUnvisitedWp = actualWaypoints.find(wp => !wp.visited && wp.type !== 'S' && wp.type !== 'S_Recalc');
+        message = "TE HAS DESVIADO de la ruta. ¿Continuamos recalculando?";
         primaryButtonText = "RECALCULAR";
-        showSecondaryButton = false;
+        if (nextUnvisitedWp) {
+            secondaryButtonText = `SALTAR PRÓXIMA ETAPA (${getSummarizedAddress(nextUnvisitedWp.address)})`;
+            showSecondaryButton = true;
+        }
     }
 
     modal.innerHTML = `
         <style>
-            #deviation-modal {
-                position: fixed;
-                top: 10px;
-                left: 10px;
-                transform: none;
-                max-width: 450px;
-            }
+            #deviation-modal { position: fixed; top: 10px; left: 10px; transform: none; max-width: 450px; }
             #deviation-modal button {
-                background-color: #007bff;
-                color: white;
-                padding: 12px 20px;
-                border: none;
-                border-radius: 5px;
-                font-size: 1.1rem;
-                font-weight: bold;
-                cursor: pointer;
-                transition: background-color 0.2s ease;
+                background-color: #007bff; color: white; padding: 12px 20px;
+                border: none; border-radius: 5px; font-size: 1.1rem; font-weight: bold;
+                cursor: pointer; transition: background-color 0.2s ease;
             }
-            #deviation-modal button:hover {
-                background-color: #0056b3;
-            }
-            #deviation-modal h2 {
-                font-size: 1.4rem;
-                margin-bottom: 10px;
-            }
-            #deviation-modal p {
-                font-size: 1.1rem;
-                line-height: 1.4;
-            }
-             #deviation-modal p small {
-                font-size: 0.9rem;
-                color: #555;
-                font-weight: bold;
-            }
+            #deviation-modal button:hover { background-color: #0056b3; }
+            #deviation-modal button#deviation-secondary { background-color: #ffc107; color: #212529; }
+            #deviation-modal button#deviation-secondary:hover { background-color: #e0a800; }
+            #deviation-modal button#deviation-tertiary { background-color: #6c757d; }
+            #deviation-modal button#deviation-tertiary:hover { background-color: #5a6268; }
+            #deviation-modal h2 { font-size: 1.4rem; margin-bottom: 10px; }
+            #deviation-modal p { font-size: 1.1rem; line-height: 1.4; }
+            #deviation-modal p small { font-size: 0.9rem; color: #555; font-weight: bold; }
         </style>
         <h2>Desvío Detectado</h2>
         <p id="deviation-modal-message">${message}</p>
         <div style="display:flex; flex-direction: column; align-items: stretch; gap:10px; margin-top:15px;">
             <button id="deviation-primary">${primaryButtonText}</button>
             ${showSecondaryButton ? `<button id="deviation-secondary">${secondaryButtonText}</button>` : ''}
+            ${showTertiaryButton ? `<button id="deviation-tertiary">${tertiaryButtonText}</button>` : ''}
         </div>
     `;
-    
+
     const primaryButton = modal.querySelector('#deviation-primary');
     const secondaryButton = modal.querySelector('#deviation-secondary');
+    const tertiaryButton = modal.querySelector('#deviation-tertiary');
     let countdown = 10;
 
     const updatePrimaryButtonText = () => {
@@ -13098,21 +13092,26 @@ function showDeviationModal() {
             updatePrimaryButtonText();
         }
         if (countdown < 0) {
-            if(suggestion === 'skip_stage') closeModalAndProceed('delete_stage');
-            else closeModalAndProceed('accept');
+            closeModalAndProceed(defaultAction);
         }
     }, 1000);
 
     primaryButton.addEventListener('click', () => {
-         if (suggestion === 'skip_stage') closeModalAndProceed('delete_stage');
-         else closeModalAndProceed('accept');
+        if (stagesLeftBehind.length > 1) closeModalAndProceed('skip_multiple');
+        else if (stagesLeftBehind.length === 1) closeModalAndProceed('skip_one');
+        else closeModalAndProceed('recalculate_forward');
     });
 
     if (secondaryButton) {
         secondaryButton.addEventListener('click', () => {
-            if (suggestion === 'skip_stage') closeModalAndProceed('accept');
-            else closeModalAndProceed('delete_stage');
+            if (stagesLeftBehind.length > 1) closeModalAndProceed('recalculate_turn_back');
+            else if (stagesLeftBehind.length === 1) closeModalAndProceed('recalculate_turn_back');
+            else closeModalAndProceed('skip_one');
         });
+    }
+    
+    if (tertiaryButton) {
+        tertiaryButton.addEventListener('click', () => closeModalAndProceed('recalculate_forward'));
     }
 
     modal.classList.remove('hidden');
@@ -13779,13 +13778,10 @@ function plotIntervalData() {
 
 
 
-
-    
-
-
-
-
-// >>> REEMPLAZAR ESTA FUNCIÓN COMPLETA <<<
+/**
+ * Cierra el modal de desvío y ejecuta la acción seleccionada por el usuario.
+ * @param {string} action - La acción a realizar ('recalculate_forward', 'recalculate_turn_back', 'skip_one', 'skip_multiple').
+ */
 function closeModalAndProceed(action) {
     if (deviationModalTimerId) {
         clearInterval(deviationModalTimerId);
@@ -13793,19 +13789,18 @@ function closeModalAndProceed(action) {
     }
     const modal = document.getElementById('deviation-modal');
     if (modal) {
-        // --- CAMBIO: Se usa el ID del modal para limpiar el temporizador, no el del botón ---
         clearModalAutoCloseTimer(modal, modal.querySelector('button'), 'deviation-modal');
         modal.classList.add('hidden');
     }
     isDeviationModalActive = false;
     deviationStartTime = 0;
 
-    if (action === 'accept') {
-        proceedWithRecalculation(false);
-    } else if (action === 'delete_stage') {
-        proceedWithRecalculation(true);
-    }
+    proceedWithRecalculation(action);
 }
+    
+
+
+
 
     
 
