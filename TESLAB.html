@@ -1,4 +1,4 @@
-f17
+f18
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -2233,7 +2233,10 @@ const PROGRESSIVE_ZOOM_PEAK_DISTANCE = 50;
 const PROGRESSIVE_ZOOM_EXIT_START_DISTANCE = 60;
 const PROGRESSIVE_ZOOM_EXIT_END_DISTANCE = 150;
 let isFlying = false; // Flag para saber si una animación flyTo está en curso
-// --- FIN: Nuevas variables ---
+// --- FIN: Nuevas variables --
+let navigationTargetZoom = null;  
+let isAnimatingZoom = false;    
+    
     
     const TOTAL_CELLS = 96; const COLS = 6; const grid = document.getElementById('bookmark-grid');
     let isDarkMode = false; let pressStartTime = null; let reminderPressStartTime = null; let isActive = true; let isFooterVisible = true; let notices = []; let currentNoticeIndex = 0; let fromReminderModal = false;
@@ -3213,7 +3216,65 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
 
     
     
+
+
+
+
     
+
+/**
+ * INICIA una animación de zoom suave si es necesario, pero no la ejecuta directamente.
+ * Gestiona el estado para iniciar la transición de zoom.
+ * @param {object} currentStep - El paso actual de la ruta de OSRM.
+ * @param {number} distanceToManeuver - Distancia en metros hasta la siguiente maniobra.
+ */
+function handleProgressiveManeuverZoom(currentStep, distanceToManeuver) {
+    if (!isNavigating || !navigationMapInstance || !currentStep || isAnimatingZoom) {
+        if (isZoomedForManeuver && !isAnimatingZoom) isZoomedForManeuver = false;
+        return;
+    }
+
+    const maxZoomForMap = navigationMapInstance.getMaxZoom() || 19;
+    const currentMapLayerName = (localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "satélite + calles").toLowerCase();
+    const isSatelliteWithLabels = currentMapLayerName.includes("satélite + calles");
+
+    const MANEUVER_PEAK_ZOOM_LEVEL = isSatelliteWithLabels ? 17.5 : 18.5;
+    
+    const currentStepIdentifier = `${currentLegIndexNav}_${currentStepIndexNav}`;
+    if (lastProcessedStepIdentifier !== null && lastProcessedStepIdentifier !== currentStepIdentifier) {
+        if (progressiveZoomState === 'zooming-in' || progressiveZoomState === 'holding') {
+            progressiveZoomState = 'zooming-out';
+        }
+    }
+    lastProcessedStepIdentifier = currentStepIdentifier;
+    
+    const distanceIntoCurrentStep = currentStep.distance - distanceToManeuver;
+
+    // --- Lógica para INICIAR la animación ---
+    
+    // 1. Iniciar ZOOM-IN
+    if (distanceToManeuver <= PROGRESSIVE_ZOOM_START_DISTANCE && progressiveZoomState === 'none') {
+        progressiveZoomState = 'zooming-in';
+        isZoomedForManeuver = true;
+        mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
+        smoothZoomAnimation(mapPreviousZoomLevelForProgressive, MANEUVER_PEAK_ZOOM_LEVEL);
+    } 
+    // 2. Iniciar ZOOM-OUT
+    else if (distanceIntoCurrentStep >= PROGRESSIVE_ZOOM_EXIT_START_DISTANCE && (progressiveZoomState === 'zooming-in' || progressiveZoomState === 'holding')) {
+        progressiveZoomState = 'zooming-out';
+        isZoomedForManeuver = true; // Sigue siendo zoom de maniobra mientras se aleja
+        smoothZoomAnimation(MANEUVER_PEAK_ZOOM_LEVEL, mapPreviousZoomLevelForProgressive);
+    }
+    // 3. Resetear estado si ya estamos lejos después de un zoom-out
+    else if (progressiveZoomState === 'zooming-out' && distanceIntoCurrentStep > PROGRESSIVE_ZOOM_EXIT_END_DISTANCE) {
+        progressiveZoomState = 'none';
+        isZoomedForManeuver = false;
+        mapPreviousZoomLevelForProgressive = null;
+    }
+}
+
+
+
 
 
 
@@ -3221,85 +3282,58 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
 
 
 /**
- * CALCULA el nivel de zoom progresivo para una maniobra, pero NO mueve el mapa.
- * Devuelve el nivel de zoom deseado o null si no se necesita un cambio.
- * @param {object} currentStep - El paso actual de la ruta de OSRM.
- * @param {number} distanceToManeuver - Distancia en metros hasta la siguiente maniobra.
- * @returns {number|null} El nivel de zoom objetivo, o null.
+ * Realiza una animación de zoom suave y fluida usando requestAnimationFrame.
+ * @param {number} startZoom - El nivel de zoom inicial.
+ * @param {number} endZoom - El nivel de zoom final.
+ * @param {number} duration - Duración de la animación en milisegundos.
  */
-function handleProgressiveManeuverZoom(currentStep, distanceToManeuver) {
-    if (!isNavigating || !navigationMapInstance || !currentStep) {
-        if (isZoomedForManeuver) isZoomedForManeuver = false;
-        return null; // No hay zoom especial si no se navega
-    }
+function smoothZoomAnimation(startZoom, endZoom, duration = 1200) {
+    if (isAnimatingZoom || !navigationMapInstance) return;
 
-    const maxZoomForMap = navigationMapInstance.getMaxZoom() || 19;
-    const currentMapLayerName = (localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "satélite + calles").toLowerCase();
-    const isSatelliteWithLabels = currentMapLayerName.includes("satélite + calles");
+    isAnimatingZoom = true;
+    const startTime = performance.now();
 
-    const MANEUVER_PEAK_ZOOM_LEVEL = isSatelliteWithLabels 
-        ? Math.min(17.5, maxZoomForMap) 
-        : Math.min(18.5, maxZoomForMap);
+    function animate(currentTime) {
+        const elapsedTime = currentTime - startTime;
+        const progress = Math.min(elapsedTime / duration, 1); // Progreso de 0 a 1
 
-    const currentStepIdentifier = `${currentLegIndexNav}_${currentStepIndexNav}`;
+        // Interpolación lineal para el nivel de zoom
+        const currentZoom = startZoom + (endZoom - startZoom) * progress;
+        
+        // El centro del mapa se mantiene en la posición actual del vehículo (descentrado)
+        let targetCenter = navigationMapInstance.getCenter();
+        if (navigationCurrentLocation) {
+            const vehicleLatLng = L.latLng(navigationCurrentLocation.latitude, navigationCurrentLocation.longitude);
+            const vehicleScreenPos = navigationMapInstance.project(vehicleLatLng);
+            const idealMapCenterScreenPos = L.point(
+                vehicleScreenPos.x - targetMapCenterOffset.x,
+                vehicleScreenPos.y - targetMapCenterOffset.y
+            );
+            targetCenter = navigationMapInstance.unproject(idealMapCenterScreenPos);
+        }
 
-    if (lastProcessedStepIdentifier !== null && lastProcessedStepIdentifier !== currentStepIdentifier) {
-        if (progressiveZoomState === 'zooming-in' || progressiveZoomState === 'holding') {
-            progressiveZoomState = 'zooming-out';
+        // Usamos setView para actualizar centro y zoom en cada fotograma
+        navigationMapInstance.setView(targetCenter, currentZoom, { animate: false });
+
+        if (progress < 1) {
+            // Si la animación no ha terminado, solicita el siguiente fotograma
+            requestAnimationFrame(animate);
+        } else {
+            // La animación ha terminado, reseteamos el flag
+            isAnimatingZoom = false;
         }
     }
-    lastProcessedStepIdentifier = currentStepIdentifier;
 
-    const distanceIntoCurrentStep = currentStep.distance - distanceToManeuver;
-    let targetZoom = null;
-
-    switch (progressiveZoomState) {
-        case 'zooming-out':
-            isZoomedForManeuver = true;
-            if (distanceIntoCurrentStep > PROGRESSIVE_ZOOM_EXIT_END_DISTANCE || mapPreviousZoomLevelForProgressive === null) {
-                targetZoom = mapPreviousZoomLevelForProgressive;
-                progressiveZoomState = 'none';
-                mapPreviousZoomLevelForProgressive = null;
-                isZoomedForManeuver = false;
-            } else if (distanceIntoCurrentStep >= PROGRESSIVE_ZOOM_EXIT_START_DISTANCE) {
-                const progress = (distanceIntoCurrentStep - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE) / (PROGRESSIVE_ZOOM_EXIT_END_DISTANCE - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE);
-                targetZoom = MANEUVER_PEAK_ZOOM_LEVEL - (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * Math.min(1, progress);
-            } else {
-                targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
-            }
-            break;
-
-        default: // 'none', 'zooming-in', 'holding'
-            if (distanceToManeuver <= PROGRESSIVE_ZOOM_START_DISTANCE && distanceToManeuver > PROGRESSIVE_ZOOM_PEAK_DISTANCE) {
-                if (progressiveZoomState !== 'zooming-in' && progressiveZoomState !== 'holding') {
-                    mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
-                }
-                progressiveZoomState = 'zooming-in';
-                const progress = (PROGRESSIVE_ZOOM_START_DISTANCE - distanceToManeuver) / (PROGRESSIVE_ZOOM_START_DISTANCE - PROGRESSIVE_ZOOM_PEAK_DISTANCE);
-                targetZoom = mapPreviousZoomLevelForProgressive + (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * progress;
-                isZoomedForManeuver = true;
-            } else if (distanceToManeuver <= PROGRESSIVE_ZOOM_PEAK_DISTANCE) {
-                if (progressiveZoomState !== 'holding' && mapPreviousZoomLevelForProgressive === null) {
-                    mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
-                }
-                progressiveZoomState = 'holding';
-                targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
-                isZoomedForManeuver = true;
-            } else {
-                if (progressiveZoomState !== 'none' && mapPreviousZoomLevelForProgressive !== null) {
-                    targetZoom = mapPreviousZoomLevelForProgressive;
-                }
-                progressiveZoomState = 'none';
-                mapPreviousZoomLevelForProgressive = null;
-                isZoomedForManeuver = false;
-            }
-            break;
-    }
-
-    return targetZoom; // Devuelve el nivel de zoom calculado
+    // Inicia el primer fotograma de la animación
+    requestAnimationFrame(animate);
 }
 
 
+
+
+
+
+    
 
 
     
