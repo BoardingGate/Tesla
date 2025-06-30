@@ -2221,6 +2221,15 @@
     let snoozedRouteRadars = new Map();
 
 
+// ... (tus otras variables globales) ...
+
+let gpsRetryTimeoutId = null; // ID del temporizador para reintentar el GPS
+let gpsRetryAttempt = 0; // Contador de intentos de reconexión GPS
+const MAX_GPS_RETRIES = 10; // Número máximo de reintentos antes de dar un error persistente
+const GPS_RETRY_DELAY_MS = 5000; // Retraso en milisegundos entre reintentos de GPS
+
+// ... (resto de tus variables) ...
+
     
 let isArrivalSequenceStarted = false;
 // --- INICIO DE LA MODIFICACIÓN ---
@@ -2556,6 +2565,97 @@ const vehicleIconMiniMap = L.divIcon({
 
 
 
+
+
+function startGpsWatching() {
+    if (gpsRetryTimeoutId) {
+        clearTimeout(gpsRetryTimeoutId);
+        gpsRetryTimeoutId = null;
+    }
+
+    if (locationWatchId !== null) {
+        return;
+    }
+
+    if (!('geolocation' in navigator) || !('watchPosition' in navigator.geolocation)) {
+        showToast("Geolocalización no soportada por este navegador.", "error", 5000);
+        return;
+    }
+
+    if (gpsRetryAttempt >= MAX_GPS_RETRIES) {
+        showToast("Error persistente: No se pudo conectar al GPS. Revisa la configuración del dispositivo.", "error", 0, false, "gps-persistent-error");
+        return;
+    }
+
+    gpsRetryAttempt++;
+    showToast(`Intentando conectar al GPS (Intento ${gpsRetryAttempt}/${MAX_GPS_RETRIES})...`, "info", GPS_RETRY_DELAY_MS, false, "gps-attempt-toast");
+
+    locationWatchId = navigator.geolocation.watchPosition(
+        (position) => {
+            if (isSimulatingGpsLocation) return;
+
+            const attemptToast = document.getElementById("gps-attempt-toast");
+            if (attemptToast) attemptToast.remove();
+            activeToasts = activeToasts.filter(t => t.id !== "gps-attempt-toast");
+
+            gpsRetryAttempt = 0;
+            const persistentErrorToast = document.getElementById("gps-persistent-error");
+            if (persistentErrorToast) persistentErrorToast.remove();
+
+            const coordsForUpdate = {
+                latitude: position.coords.latitude,
+                longitude: position.coords.longitude,
+                accuracy: position.coords.accuracy,
+                heading: position.coords.heading,
+                speed: position.coords.speed,
+                altitude: position.coords.altitude
+            };
+
+            navigationCurrentLocation = coordsForUpdate;
+            updateInitialUserPosition(coordsForUpdate, navigationMapInstance);
+
+            if (isNavigating && navigationCurrentRouteData && navigationCurrentRouteData.routes[0] && coordsForUpdate) {
+                const routeForDistCalc = navigationCurrentRouteData.routes[0];
+                let carDistTurf = 0;
+                if (navigationRouteLayer && typeof turf !== 'undefined' && navigationRouteLayer.getLatLngs().length > 0) {
+                    try {
+                        const carPointTurf = turf.point([coordsForUpdate.longitude, coordsForUpdate.latitude]);
+                        const routeLineStringTurf = turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat]));
+                        const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
+                        const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
+                        carDistTurf = turf.length(lineSliceToNearestTurf, { units: 'meters' });
+                    } catch (e) { }
+                }
+                const totalRouteLength = routeForDistCalc.distance;
+                if (carDistTurf >= 0 && carDistTurf <= totalRouteLength + 500) {
+                    if (carDistTurf > lastCarDistanceAlongRouteForNavLogic - 100) {
+                         lastCarDistanceAlongRouteForNavLogic = carDistTurf;
+                    }
+                } else if (carDistTurf > totalRouteLength + 500) {
+                    lastCarDistanceAlongRouteForNavLogic = totalRouteLength;
+                }
+
+                updateTurnByTurnDisplay(routeForDistCalc, lastCarDistanceAlongRouteForNavLogic);
+                updateNavigationProgressDisplay(routeForDistCalc, lastCarDistanceAlongRouteForNavLogic);
+            }
+        },
+        (error) => {
+            showToast(`Error GPS: ${error.message}`, "warning");
+
+            if (locationWatchId !== null) {
+                navigator.geolocation.clearWatch(locationWatchId);
+                locationWatchId = null;
+            }
+
+            gpsRetryTimeoutId = setTimeout(startGpsWatching, GPS_RETRY_DELAY_MS);
+        },
+        { enableHighAccuracy: true, timeout: 15000, maximumAge: 2000, distanceFilter: 3 }
+    );
+}
+
+
+
+    
 
 
 /**
@@ -8605,32 +8705,34 @@ function showSimulationSpeedModal(defaultSpeed, callback) {
 
 
 
+
+
+
 function stopAutomatedRouteSimulation() {
-    // 1. Detener el intervalo del recorrido automático si existe
     stopAutomatedRouteSimulationInternal();
 
-    // 2. Apagar el interruptor maestro de la simulación
     isSimulatingGpsLocation = false;
 
-    // 3. Quitar la clase CSS que cambia el cursor del mapa
     const mapDiv = document.getElementById('reminders-location-map-div');
     if (mapDiv) {
         mapDiv.classList.remove('simulating-gps-click-mode');
     }
     
-    // 4. Actualizar el estado visual del botón de simulación
     const simulateGpsButton = document.getElementById('toggle-simulate-gps-button');
     if (simulateGpsButton) {
         simulateGpsButton.classList.remove('active-simulate-gps-mode');
         simulateGpsButton.title = "Activar Simulación GPS (recorrido automático o clic manual)";
     }
 
-    // 5. Intentar reactivar el seguimiento del GPS real
-    reactivateRealGpsAfterSimulation();
+    startGpsWatching();
     
-    // 6. Finalmente, actualizar el manejador de clics del mapa para que vuelva a su estado normal
     setNavigationMapClickHandler();
 }
+
+
+
+
+    
 
 
 
@@ -10032,10 +10134,6 @@ function drawRouteOnMap(route) {
     
 
 
-
-
-
-
 async function toggleNavigationState(isRecalculationStop = false) {
     const startNavButton = document.getElementById('start-navigation-button');
     const startNavImg = startNavButton ? startNavButton.querySelector('img') : null;
@@ -10061,6 +10159,16 @@ async function toggleNavigationState(isRecalculationStop = false) {
         mapHeaderButtonsVisible = true; 
         toggleMapHeaderRowsVisibility(true); 
 
+        if (locationWatchId !== null) {
+            navigator.geolocation.clearWatch(locationWatchId);
+            locationWatchId = null;
+        }
+        if (gpsRetryTimeoutId) {
+            clearTimeout(gpsRetryTimeoutId);
+            gpsRetryTimeoutId = null;
+        }
+        gpsRetryAttempt = 0;
+
     } else {
         if (!navigationCurrentRouteData || !navigationCurrentRouteData.routes || navigationCurrentRouteData.routes.length === 0 || navigationWaypoints.filter(wp => !wp.isInternal && !wp.isRecalculatedStart).length < 2) {
             showToast("No hay ruta calculada para iniciar la navegación", "warning");
@@ -10074,133 +10182,130 @@ async function toggleNavigationState(isRecalculationStop = false) {
 
         getCurrentLocation(
             (initialCoords) => {
-                const loadingToast = document.getElementById("gps-init-toast");
-                if (loadingToast) loadingToast.remove();
-                activeToasts = activeToasts.filter(t => t.id !== "gps-init-toast");
-
-                isNavigating = true;
-                shouldCenterOnUser = true; 
-                navigationFollowUser = true; 
-
-                const locateMeButton = document.getElementById('locate-me-on-reminders-map');
-                const locateMeImg = locateMeButton ? locateMeButton.querySelector('img') : null;
-                if(locateMeImg) locateMeImg.src = "DEJARSEGUIR.PNG";
-                if(locateMeButton) locateMeButton.title = "Dejar de centrar el mapa automáticamente en mi posición";
-
                 navigationCurrentLocation = initialCoords;
                 updateInitialUserPosition(initialCoords, navigationMapInstance);
-
-                if (navigationMapInstance && initialCoords) {
-                    const mapSize = navigationMapInstance.getSize();
-                    const progressBar = document.getElementById('navigation-bottom-progress-bar');
-                    let progressBarHeight = 0;
-                    if (progressBar && progressBar.offsetParent !== null && progressBar.style.display !== 'none') {
-                        progressBarHeight = progressBar.offsetHeight;
-                    }
-
-                    const offsetFactor = 0.33; 
-                    const minMapDimension = Math.min(mapSize.x, mapSize.y);
-                    const offsetDistance = minMapDimension * offsetFactor;
-                    const effectiveHeading = (initialCoords && typeof initialCoords.heading === 'number' && initialCoords.heading !== null) ? initialCoords.heading : (currentMapBearing || 0);
-                    const headingRad = (effectiveHeading % 360) * Math.PI / 180;
-
-                    let calculatedInitialMapCenterOffset = { x: 0, y: 0 };
-                    calculatedInitialMapCenterOffset.x = -offsetDistance * Math.sin(headingRad);
-                    calculatedInitialMapCenterOffset.y = offsetDistance * Math.cos(headingRad);
-
-                    const isGoingNorth = (effectiveHeading <= 60 || effectiveHeading >= 300);
-                    const isGoingSouth = effectiveHeading > 120 && effectiveHeading < 240;
-
-                    if (progressBarHeight > 0) { 
-                        if (isGoingNorth) {
-                            calculatedInitialMapCenterOffset.y -= progressBarHeight * 0.2; 
-                        } else if (isGoingSouth) {
-                            calculatedInitialMapCenterOffset.y += progressBarHeight * 0.5; 
-                        }
-                    }
-
-                    const vehicleLatLng = L.latLng(initialCoords.latitude, initialCoords.longitude);
-                    const vehicleScreenPos = navigationMapInstance.project(vehicleLatLng);
-                    const idealInitialMapCenterScreenPos = L.point(
-                        vehicleScreenPos.x - calculatedInitialMapCenterOffset.x,
-                        vehicleScreenPos.y - calculatedInitialMapCenterOffset.y
-                    );
-                    const idealInitialMapCenterLatLng = navigationMapInstance.unproject(idealInitialMapCenterScreenPos);
-                    const targetZoom = Math.min(navigationMapInstance.getMaxZoom() || 19, 17); 
-                    
-                    navigationMapInstance.setView(idealInitialMapCenterLatLng, targetZoom, {
-                        animate: true,
-                        duration: 0.8,
-                        easeLinearity: 0.75
-                    });
-                    targetMapCenterOffset = { ...calculatedInitialMapCenterOffset };
-                }
-
-                mapHeaderButtonsVisible = false;
-                toggleMapHeaderRowsVisibility(false);
-
-                if(startNavButton) startNavButton.classList.add('navigating');
-                if (mapContainer) mapContainer.classList.add('navigating');
-                setNavigationMapClickHandler();
-
-                routeStartTime = new Date();
-                navigationStartTimeForStats = new Date();
-                totalDistanceTravelledForStats = 0;
-                maxDistanceReachedOnRoute = 0; 
-                maxSpeedDuringTrip = 0; 
-                maxSpeedCoordinates = null; 
-                maxAltitudeDuringTrip = -Infinity; 
-                minAltitudeDuringTrip = Infinity; 
-                lastPositionForStats = {...navigationCurrentLocation};
-                if (speedMilestoneLayer) speedMilestoneLayer.clearLayers();
-                lastSpeedMilestone = 0;
-        
-                if (compassAndModeControl) {
-                    compassAndModeControl.updateMaxSpeed(maxSpeedDuringTrip); 
-                }
-                
-                let carDistanceAlongRouteStart = 0;
-                if (navigationCurrentLocation && navigationMapInstance && navigationRouteLayer && typeof turf !== 'undefined' && navigationRouteLayer.getLatLngs().length > 0) {
-                    try {
-                        const carPointTurf = turf.point([navigationCurrentLocation.longitude, navigationCurrentLocation.latitude]);
-                        const routeLineStringTurf = turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat]));
-                        const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
-                        const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
-                        carDistanceAlongRouteStart = turf.length(lineSliceToNearestTurf, { units: 'meters' });
-                    } catch(e){}
-                }
-                
-                maxDistanceReachedOnRoute = carDistanceAlongRouteStart; 
-
-                tripInitialOverallEtaTime = new Date(Date.now() + (navigationCurrentRouteData.routes[0].duration * 1000 * (1 - (carDistanceAlongRouteStart / navigationCurrentRouteData.routes[0].distance))));
-                
-                if (navigationCurrentRouteData.routes[0].legs && navigationCurrentRouteData.routes[0].legs.length > 0) {
-                    const firstLegDurationS = navigationCurrentRouteData.routes[0].legs[0].duration || 0;
-                    currentStageInitialExpectedEtaTime = new Date(Date.now() + (firstLegDurationS * 1000));
-                } else {
-                    currentStageInitialExpectedEtaTime = null;
-                }
-                accumulatedDeviationMs = 0;
-
-                navigationWaypoints.forEach(wp => { if(wp) wp.visited = false; if (wp && wp.marker && wp.marker.dragging) wp.marker.dragging.disable(); });
-                showToast("Navegación iniciada", "success");
-                
-                currentGraphMode = localStorage.getItem(GRAPH_STATE_KEY) || 'Desviación ETA';
-                initializeNavigationGraph();
-                
-                updateStartNavigationButtonState();
-                updateNavigationButtonColor();
-                updateDirectionWarningCardsVisibility();
             },
             (errorMsg) => {
-                const loadingToast = document.getElementById("gps-init-toast");
-                if (loadingToast) loadingToast.remove();
-                activeToasts = activeToasts.filter(t => t.id !== "gps-init-toast");
-                showToast(`Error al iniciar GPS: ${errorMsg}. Intenta de nuevo.`, "error", 5000);
-                if(startNavImg) startNavImg.src = "INICIARNAVEGACION.PNG";
+                showToast(`No se pudo obtener tu ubicación inicial: ${errorMsg}. El mapa se centrará cuando el GPS esté listo.`, "warning", 5000);
             }
         );
-        return;
+
+        startGpsWatching();
+
+        const loadingToast = document.getElementById("gps-init-toast");
+        if (loadingToast) loadingToast.remove();
+        activeToasts = activeToasts.filter(t => t.id !== "gps-init-toast");
+
+        isNavigating = true;
+        shouldCenterOnUser = true; 
+        navigationFollowUser = true; 
+
+        const locateMeButton = document.getElementById('locate-me-on-reminders-map');
+        const locateMeImg = locateMeButton ? locateMeButton.querySelector('img') : null;
+        if(locateMeImg) locateMeImg.src = "DEJARSEGUIR.PNG";
+        if(locateMeButton) locateMeButton.title = "Dejar de centrar el mapa automáticamente en mi posición";
+
+        if (navigationMapInstance && navigationCurrentLocation) {
+            const mapSize = navigationMapInstance.getSize();
+            const progressBar = document.getElementById('navigation-bottom-progress-bar');
+            let progressBarHeight = 0;
+            if (progressBar && progressBar.offsetParent !== null && progressBar.style.display !== 'none') {
+                progressBarHeight = progressBar.offsetHeight;
+            }
+
+            const offsetFactor = 0.33; 
+            const minMapDimension = Math.min(mapSize.x, mapSize.y);
+            const offsetDistance = minMapDimension * offsetFactor;
+            const effectiveHeading = (navigationCurrentLocation && typeof navigationCurrentLocation.heading === 'number' && navigationCurrentLocation.heading !== null) ? navigationCurrentLocation.heading : (currentMapBearing || 0);
+            const headingRad = (effectiveHeading % 360) * Math.PI / 180;
+
+            let calculatedInitialMapCenterOffset = { x: 0, y: 0 };
+            calculatedInitialMapCenterOffset.x = -offsetDistance * Math.sin(headingRad);
+            calculatedInitialMapCenterOffset.y = offsetDistance * Math.cos(headingRad);
+
+            const isGoingNorth = (effectiveHeading <= 60 || effectiveHeading >= 300);
+            const isGoingSouth = effectiveHeading > 120 && effectiveHeading < 240;
+
+            if (progressBarHeight > 0) { 
+                if (isGoingNorth) {
+                    calculatedInitialMapCenterOffset.y -= progressBarHeight * 0.2; 
+                } else if (isGoingSouth) {
+                    calculatedInitialMapCenterOffset.y += progressBarHeight * 0.5; 
+                }
+            }
+
+            const vehicleLatLng = L.latLng(navigationCurrentLocation.latitude, navigationCurrentLocation.longitude);
+            const vehicleScreenPos = navigationMapInstance.project(vehicleLatLng);
+            const idealInitialMapCenterScreenPos = L.point(
+                vehicleScreenPos.x - calculatedInitialMapCenterOffset.x,
+                vehicleScreenPos.y - calculatedInitialMapCenterOffset.y
+            );
+            const idealInitialMapCenterLatLng = navigationMapInstance.unproject(idealInitialMapCenterScreenPos);
+            const targetZoom = Math.min(navigationMapInstance.getMaxZoom() || 19, 17); 
+            
+            navigationMapInstance.setView(idealInitialMapCenterLatLng, targetZoom, {
+                animate: true,
+                duration: 0.8,
+                easeLinearity: 0.75
+            });
+            targetMapCenterOffset = { ...calculatedInitialMapCenterOffset };
+        }
+
+
+        mapHeaderButtonsVisible = false;
+        toggleMapHeaderRowsVisibility(false);
+
+        if(startNavButton) startNavButton.classList.add('navigating');
+        if (mapContainer) mapContainer.classList.add('navigating');
+        setNavigationMapClickHandler();
+
+        routeStartTime = new Date();
+        navigationStartTimeForStats = new Date();
+        totalDistanceTravelledForStats = 0;
+        maxDistanceReachedOnRoute = 0; 
+        maxSpeedDuringTrip = 0; 
+        maxSpeedCoordinates = null; 
+        maxAltitudeDuringTrip = -Infinity; 
+        minAltitudeDuringTrip = Infinity; 
+        lastPositionForStats = {...navigationCurrentLocation};
+        if (speedMilestoneLayer) speedMilestoneLayer.clearLayers();
+        lastSpeedMilestone = 0;
+        if (compassAndModeControl) {
+            compassAndModeControl.updateMaxSpeed(maxSpeedDuringTrip); 
+        }
+        
+        let carDistanceAlongRouteStart = 0;
+        if (navigationCurrentLocation && navigationMapInstance && navigationRouteLayer && typeof turf !== 'undefined' && navigationRouteLayer.getLatLngs().length > 0) {
+            try {
+                const carPointTurf = turf.point([navigationCurrentLocation.longitude, navigationCurrentLocation.latitude]);
+                const routeLineStringTurf = turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat]));
+                const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
+                const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
+                carDistanceAlongRouteStart = turf.length(lineSliceToNearestTurf, { units: 'meters' });
+            } catch(e){}
+        }
+        
+        maxDistanceReachedOnRoute = carDistanceAlongRouteStart; 
+
+        tripInitialOverallEtaTime = new Date(Date.now() + (navigationCurrentRouteData.routes[0].duration * 1000 * (1 - (carDistanceAlongRouteStart / navigationCurrentRouteData.routes[0].distance))));
+        
+        if (navigationCurrentRouteData.routes[0].legs && navigationCurrentRouteData.routes[0].legs.length > 0) {
+            const firstLegDurationS = navigationCurrentRouteData.routes[0].legs[0].duration || 0;
+            currentStageInitialExpectedEtaTime = new Date(Date.now() + (firstLegDurationS * 1000));
+        } else {
+            currentStageInitialExpectedEtaTime = null;
+        }
+        accumulatedDeviationMs = 0;
+
+        navigationWaypoints.forEach(wp => { if(wp) wp.visited = false; if (wp && wp.marker && wp.marker.dragging) wp.marker.dragging.disable(); });
+        showToast("Navegación iniciada", "success");
+        
+        currentGraphMode = localStorage.getItem(GRAPH_STATE_KEY) || 'Desviación ETA';
+        initializeNavigationGraph();
+        
+        updateStartNavigationButtonState();
+        updateNavigationButtonColor();
+        updateDirectionWarningCardsVisibility();
     } 
     
     updateStartNavigationButtonState();
@@ -10214,9 +10319,12 @@ async function toggleNavigationState(isRecalculationStop = false) {
     
 
 
+
+
     
-    
-   
+
+
+
 
 function closeNavigationMap(force = false) {
     const wasInDirectToMapModeSession = sessionStorage.getItem('isInDirectToMapMode') === 'true';
@@ -10235,6 +10343,12 @@ function closeNavigationMap(force = false) {
     sessionStorage.removeItem('mapContext');
 
     if (locationWatchId !== null && navigator.geolocation) { navigator.geolocation.clearWatch(locationWatchId); locationWatchId = null; }
+    if (gpsRetryTimeoutId) {
+        clearTimeout(gpsRetryTimeoutId);
+        gpsRetryTimeoutId = null;
+    }
+    gpsRetryAttempt = 0;
+
     const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
     if (radaresRutaCheckbox) {
         localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresRutaCheckbox.checked));
@@ -10343,10 +10457,17 @@ function closeNavigationMap(force = false) {
     updateDirectionWarningCardsVisibility();
     
     clearNavigationGraph();
-}    
+}
+
+
+
+
     
 
     
+    
+   
+
 
 
 
@@ -13768,6 +13889,8 @@ async function restoreCacheForMobile() {
 
 
 
+    
+
 
 
 async function initializeApp() {
@@ -13776,22 +13899,14 @@ async function initializeApp() {
 
     const { isMobile, primaryId } = parseUserId(localStorage.getItem('userData_userId'));
 
-    // --- INICIO DE LA LÓGICA DE INICIO CORREGIDA ---
     if (isMobile && primaryId) {
-        // Si es un móvil, SIEMPRE intenta restaurar los datos del primario al iniciar.
-        // Se hace de forma silenciosa, sin recargar la página, solo actualizando la caché.
         await restoreCacheForMobile();
     } else {
-        // Si es el coche, ejecuta la sincronización normal al cargar (si está activada).
-        // Esta sí puede provocar una recarga si descarga datos nuevos.
         await syncDataOnLoad();
     }
     
-    // Inicializamos el timestamp de sincronización móvil DESPUÉS de la posible carga inicial.
     lastMobileSyncTimestamp = parseInt(localStorage.getItem('lastCacheUpdateTimestamp') || '0');
-    // --- FIN DE LA LÓGICA DE INICIO ---
 
-    // El resto de la inicialización visual y de listeners se mantiene igual
     const shouldDirectToNav = JSON.parse(localStorage.getItem(DIRECT_TO_NAVIGATION_KEY)) || false;
     const tempPreventDirectNav = sessionStorage.getItem(TEMP_PREVENT_DIRECT_NAV_KEY);
 
@@ -13903,11 +14018,8 @@ async function initializeApp() {
         filterGridItems();
     }
 }
-    
-
 
     
- 
     
 
         
