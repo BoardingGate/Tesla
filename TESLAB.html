@@ -1,4 +1,4 @@
-v11
+v12
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -11181,7 +11181,6 @@ function updateNavigationProgressDisplay(route, carDistanceAlongTheRoute = 0) {
 
 
 
-
 // REEMPLAZA ESTA FUNCIÓN COMPLETA EN TU CÓDIGO
 function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = false, timerDurationMs = null) {
     const previewWindow = document.getElementById('intersection-preview-map-window');
@@ -11241,6 +11240,7 @@ function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = fa
             if (intersectionPreviewMap) intersectionPreviewMap.invalidateSize();
         });
 
+        // Limpiar capas anteriores
         Object.values(intersectionPreviewMap._layers).forEach(layer => {
             if (layer instanceof L.TileLayer || layer instanceof L.Polyline || layer instanceof L.Marker || layer instanceof L.CircleMarker) {
                 try { intersectionPreviewMap.removeLayer(layer); } catch(e){}
@@ -11267,60 +11267,30 @@ function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = fa
 
         const maneuverPoint = L.latLng(step.maneuver.location[1], step.maneuver.location[0]);
         
-        // --- INICIO DE LA LÓGICA DE TRAZADO CORREGIDA Y ROBUSTA ---
-        const routeCoords = route.geometry.coordinates;
-        const routeAnnotations = route.annotations;
-        let routeSegmentCoords = [];
-
-        if (routeCoords && routeAnnotations && routeAnnotations.distance) {
-            const distances = routeAnnotations.distance;
-            
-            // 1. Calcular la distancia acumulada hasta el inicio del `step` actual
-            let distanceToStartOfStep = 0;
-            let stepFound = false;
-            for (let leg of route.legs) {
-                for (let s of leg.steps) {
-                    if (s === step) {
-                        stepFound = true;
-                        break;
-                    }
-                    distanceToStartOfStep += s.distance;
-                }
-                if(stepFound) break;
-            }
-            
-            // 2. La distancia de la maniobra es la distancia hasta el inicio del step + la distancia dentro del step
-            const maneuverDistanceOnRoute = distanceToStartOfStep + step.distance;
-
-            // 3. Calcular el rango de distancias para el recorte
-            const startTargetDistance = maneuverDistanceOnRoute - DISTANCE_BEFORE_MANEUVER_METERS;
-            const endTargetDistance = maneuverDistanceOnRoute + DISTANCE_AFTER_MANEUVER_METERS;
-
-            // 4. Filtrar las coordenadas de la ruta completa que caen dentro de nuestro rango
-            for (let i = 0; i < routeCoords.length; i++) {
-                if (distances[i] >= startTargetDistance && distances[i] <= endTargetDistance) {
-                    routeSegmentCoords.push([routeCoords[i][1], routeCoords[i][0]]); // [lat, lng]
-                }
-            }
-        }
+        // --- INICIO DE LA LÓGICA DE TRAZADO CON TURF.JS (ROBUSTA) ---
+        const fullRouteLineString = turf.lineString(route.geometry.coordinates);
+        const maneuverPointOnRoute = turf.nearestPointOnLine(fullRouteLineString, step.maneuver.location, { units: 'kilometers' });
+        const maneuverDistanceKm = maneuverPointOnRoute.properties.location;
         
-        // Fallback por si la lógica de anotaciones falla
-        if (routeSegmentCoords.length < 2) {
-            routeSegmentCoords = step.geometry.coordinates.map(c => [c[1], c[0]]);
-        }
-        // --- FIN DE LA LÓGICA DE TRAZADO CORREGIDA ---
+        const startSliceDistanceKm = Math.max(0, maneuverDistanceKm - (DISTANCE_BEFORE_MANEUVER_METERS / 1000));
+        const endSliceDistanceKm = Math.min(turf.length(fullRouteLineString), maneuverDistanceKm + (DISTANCE_AFTER_MANEUVER_METERS / 1000));
+
+        const startSlicePoint = turf.along(fullRouteLineString, startSliceDistanceKm);
+        const endSlicePoint = turf.along(fullRouteLineString, endSliceDistanceKm);
+        
+        const routeSlice = turf.lineSlice(startSlicePoint, endSlicePoint, fullRouteLineString);
+        const routeSegmentCoords = routeSlice.geometry.coordinates.map(c => [c[1], c[0]]);
+        // --- FIN DE LA LÓGICA DE TRAZADO ---
 
         intersectionPreviewRouteLayer = L.polyline(routeSegmentCoords, { color: 'orange', weight: 10, opacity: 1 }).addTo(intersectionPreviewMap);
         intersectionPreviewManeuverMarker = L.circleMarker(maneuverPoint, { radius: 5, color: 'white', weight: 1, fillColor: 'blue', fillOpacity: 1, zIndexOffset: 1000 }).addTo(intersectionPreviewMap);
         
-        // --- INICIO: LÓGICA CORREGIDA PARA EL ICONO DEL COCHE ---
-        // Se coloca el icono del coche sobre el nuevo trazado naranja
+        // --- LÓGICA CORREGIDA PARA EL ICONO DEL COCHE ---
         const lineStringToPlaceCar = turf.lineString(routeSegmentCoords.map(c => [c[1], c[0]]));
         const distanceForCarOnSegment = Math.max(0, DISTANCE_BEFORE_MANEUVER_METERS - CAR_POSITION_BEFORE_MANEUVER_METERS);
         const carPositionPointTurf = turf.along(lineStringToPlaceCar, distanceForCarOnSegment, { units: 'meters' });
         const carPositionLatLng = L.latLng(carPositionPointTurf.geometry.coordinates[1], carPositionPointTurf.geometry.coordinates[0]);
-        // --- FIN: LÓGICA CORREGIDA PARA EL ICONO DEL COCHE ---
-
+        
         let segmentBearing = 0;
         if (step.geometry.coordinates.length >= 2) {
             const startPoint = turf.point([step.geometry.coordinates[0][1], step.geometry.coordinates[0][0]]);
