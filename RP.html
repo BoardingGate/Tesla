@@ -1,4 +1,4 @@
---
+---
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -11749,6 +11749,322 @@ async function initializeApp() {
     
     
 
+
+  // ===================================================================
+// NOMBRE: showReorderStagesModal
+// RESUMEN: Muestra el modal para reordenar las etapas de la ruta.
+// ===================================================================
+function showReorderStagesModal() {
+    if (isNavigating) {
+        showToast("No se puede reordenar etapas mientras se navega.", "warning");
+        return;
+    }
+    const actualWaypointsForReorder = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
+    if (actualWaypointsForReorder.length < 2) {
+        showToast("Se necesitan al menos 2 puntos para reordenar", "warning");
+        return;
+    }
+    const modal = document.getElementById('reorder-stages-modal');
+    if (!modal) {
+        showToast("Error interno: No se pudo mostrar el modal de reordenamiento.", "error");
+        return;
+    }
+    const listElement = modal.querySelector('#sortable-stages-list');
+    if (!listElement) {
+         showToast("Error interno: No se pudo encontrar la lista de etapas", "error");
+         return;
+    }
+    listElement.innerHTML = '';
+    actualWaypointsForReorder.forEach(async (wp) => {
+        const li = document.createElement('li');
+        li.dataset.id = wp.id;
+        const dragHandle = document.createElement('span');
+        dragHandle.className = 'drag-handle';
+        dragHandle.innerHTML = '<img src="MOVER.PNG" alt="Mover etapa">';
+        dragHandle.title = 'Arrastrar para reordenar';
+        dragHandle.draggable = true;
+        const badge = document.createElement('span');
+        badge.className = 'stage-label-badge';
+        badge.textContent = wp.label;
+        const nameSpan = document.createElement('span');
+        nameSpan.className = 'stage-name-text';
+        nameSpan.textContent = wp.address || `Cargando dirección para (${wp.lat.toFixed(3)}, ${wp.lng.toFixed(3)})...`;
+        if (!wp.address) {
+             wp.address = await getAddressForWaypoint(wp.lat, wp.lng);
+             nameSpan.textContent = wp.address;
+        }
+        const deleteButton = document.createElement('span');
+        deleteButton.className = 'delete-stage-button';
+        deleteButton.innerHTML = '×';
+        deleteButton.title = 'Eliminar esta etapa';
+        deleteButton.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const listItem = e.target.closest('li');
+            if (listItem) {
+                const waypointIdToDelete = parseInt(listItem.dataset.id);
+                const waypointIndexInNavigationArray = navigationWaypoints.findIndex(wp => wp && wp.id === waypointIdToDelete);
+                if (waypointIndexInNavigationArray !== -1) {
+                    const waypointObjectToDelete = navigationWaypoints[waypointIndexInNavigationArray];
+                    if (waypointObjectToDelete.marker && navigationMapInstance) {
+                        try {
+                            navigationMapInstance.removeLayer(waypointObjectToDelete.marker);
+                        } catch (mapError) {
+                        }
+                        waypointObjectToDelete.marker = null;
+                    }
+                }
+                listItem.remove();
+                navigationWaypoints = navigationWaypoints.filter(wayP => wayP.id !== waypointIdToDelete);
+                updateWaypointTypesAndLabels();
+                const remainingListItems = listElement.querySelectorAll('li');
+                const currentActualWaypointsAfterDelete = navigationWaypoints.filter(w => w && !w.isInternal && !w.isRecalculatedStart);
+                remainingListItems.forEach((remainingLi) => {
+                     const currentWpIdInModal = parseInt(remainingLi.dataset.id);
+                     const correspondingWp = currentActualWaypointsAfterDelete.find(w => w.id === currentWpIdInModal);
+                     if(correspondingWp){
+                        const badgeSpan = remainingLi.querySelector('.stage-label-badge');
+                        if(badgeSpan) badgeSpan.textContent = correspondingWp.label;
+                     }
+                });
+                const confirmBtn = modal.querySelector('#confirm-reorder-stages');
+                const canConfirm = remainingListItems.length >= 2;
+                if (confirmBtn) confirmBtn.disabled = !canConfirm;
+                if (!canConfirm && remainingListItems.length > 0) {
+                    showToast("Se necesitan al menos 2 puntos para una ruta.", "warning", 3000);
+                } else if (remainingListItems.length === 0){
+                    showToast("No quedan etapas. La ruta se eliminará al confirmar.", "info", 3000);
+                }
+            }
+        });
+        li.appendChild(dragHandle);
+        li.appendChild(badge);
+        li.appendChild(nameSpan);
+        li.appendChild(deleteButton);
+        listElement.appendChild(li);
+    });
+    modal.classList.remove('hidden');
+    const confirmButton = modal.querySelector('#confirm-reorder-stages');
+    const cancelButton = modal.querySelector('#cancel-reorder-stages');
+    if (confirmButton) confirmButton.disabled = listElement.querySelectorAll('li').length < 2;
+    const newConfirmButton = confirmButton.cloneNode(true);
+    confirmButton.parentNode.replaceChild(newConfirmButton, confirmButton);
+    const newCancelButton = cancelButton.cloneNode(true);
+    cancelButton.parentNode.replaceChild(newCancelButton, cancelButton);
+    const closeReorderModal = () => {
+        clearModalAutoCloseTimer(modal, newConfirmButton, 'reorder-stages-modal');
+        modal.classList.add('hidden');
+        listElement.querySelectorAll('.drag-handle').forEach(handle => {
+            handle.removeEventListener('dragstart', handleDragStartReorder);
+            handle.removeEventListener('touchstart', handleStageTouchStart);
+        });
+        listElement.removeEventListener('dragend', handleDragEndReorder);
+        listElement.removeEventListener('dragover', handleDragOverReorder);
+        listElement.removeEventListener('touchmove', handleStageTouchMove);
+        listElement.removeEventListener('touchend', handleStageTouchEnd);
+        listElement.removeEventListener('touchcancel', handleStageTouchEnd);
+        document.body.style.overflow = '';
+    };
+    newConfirmButton.addEventListener('click', async () => {
+        const orderedLiElements = Array.from(listElement.children);
+        const finalWaypointIds = orderedLiElements.map(li => parseInt(li.dataset.id));
+        clearAllWaypointMarkersFromMap();
+        if (finalWaypointIds.length < 2) {
+            showToast("Se necesitan al menos 2 etapas para formar una ruta. Ruta actual eliminada.", "warning");
+            navigationWaypoints = [];
+            if (navigationRouteLayer && navigationMapInstance) {
+                navigationMapInstance.removeLayer(navigationRouteLayer);
+                navigationRouteLayer = null;
+            }
+            if (completedRouteSegmentsLayer && navigationMapInstance) completedRouteSegmentsLayer.clearLayers();
+            navigationCurrentRouteData = null;
+            updateStartNavigationButtonState();
+            updateNavigationButtonColor();
+            hideNavigationUI();
+            hideMapInfoOverlay();
+            eliminarRadaresDeRuta();
+            actualizarContadorRadares(0);
+             eliminarTareasDeBarraProgreso();
+            actualizarContadorTareas(0);
+            const radaresCheckbox = document.getElementById('radares-ruta-checkbox');
+            if (radaresCheckbox) {
+                 localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresCheckbox.checked));
+            }
+            const tareasCheckbox = document.getElementById('tareas-ruta-checkbox');
+            if (tareasCheckbox) {
+                localStorage.setItem(TAREAS_RUTA_CHECKED_KEY, String(tareasCheckbox.checked));
+            }
+            closeReorderModal();
+            return;
+        }
+        try {
+            const newWaypointsOrdered = [];
+            finalWaypointIds.forEach(id => {
+                const foundWp = navigationWaypoints.find(wp => wp && wp.id === id);
+                if(foundWp) newWaypointsOrdered.push(foundWp);
+            });
+            navigationWaypoints = newWaypointsOrdered;
+            updateWaypointTypesAndLabels();
+            renderWaypointMarkers();
+            await recalculateAndDrawRoute();
+            const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+            if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
+                toggleRadaresRuta(true);
+            }
+            const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
+            if (tareasRutaCheckbox && tareasRutaCheckbox.checked) {
+                toggleTareasRuta(true);
+            }
+            showToast("Etapas reordenadas y ruta recalculada", "success");
+        } catch (error) {
+            showToast("Error recalculando ruta tras reordenar: " + error.message, "error");
+        } finally {
+             closeReorderModal();
+             updateStartNavigationButtonState();
+             updateNavigationButtonColor();
+        }
+    });
+    newCancelButton.addEventListener('click', () => {
+        showToast("Reordenación cancelada. Los marcadores eliminados se restaurarán al recalcular/cargar ruta.", "info");
+        closeReorderModal();
+        if (navigationWaypoints.length >= 2) {
+            renderWaypointMarkers();
+            recalculateAndDrawRoute().then(() => {
+                const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+                if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
+                    toggleRadaresRuta(true);
+                }
+                 const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
+                if (tareasRutaCheckbox && tareasRutaCheckbox.checked) {
+                    toggleTareasRuta(true);
+                }
+            });
+        } else {
+            clearAllWaypointMarkersFromMap();
+            navigationWaypoints = [];
+             if (navigationRouteLayer && navigationMapInstance) {
+                navigationMapInstance.removeLayer(navigationRouteLayer);
+                navigationRouteLayer = null;
+            }
+            if (completedRouteSegmentsLayer && navigationMapInstance) completedRouteSegmentsLayer.clearLayers();
+            navigationCurrentRouteData = null;
+            hideNavigationUI();
+            hideMapInfoOverlay();
+            eliminarRadaresDeRuta();
+            actualizarContadorRadares(0);
+            eliminarTareasDeBarraProgreso();
+            actualizarContadorTareas(0);
+            const radaresCheckbox = document.getElementById('radares-ruta-checkbox');
+            if (radaresCheckbox) {
+                localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresCheckbox.checked));
+            }
+             const tareasCheckbox = document.getElementById('tareas-ruta-checkbox');
+            if (tareasCheckbox) {
+                localStorage.setItem(TAREAS_RUTA_CHECKED_KEY, String(tareasCheckbox.checked));
+            }
+        }
+        updateStartNavigationButtonState();
+        updateNavigationButtonColor();
+    });
+    addModalAutoCloseTimer(modal, newConfirmButton, 'reorder-stages-modal', 60000);
+    listElement.querySelectorAll('.drag-handle').forEach(handle => {
+        handle.addEventListener('dragstart', handleDragStartReorder);
+        handle.addEventListener('touchstart', handleStageTouchStart, { passive: false });
+    });
+    listElement.addEventListener('dragend', handleDragEndReorder);
+    listElement.addEventListener('dragover', handleDragOverReorder);
+    listElement.addEventListener('touchmove', handleStageTouchMove, { passive: false });
+    listElement.addEventListener('touchend', handleStageTouchEnd);
+    listElement.addEventListener('touchcancel', handleStageTouchEnd);
+}
+
+// ===================================================================
+// NOMBRE: handleDragStartReorder
+// RESUMEN: Maneja el inicio de un arrastre en la lista de reordenación.
+// ===================================================================
+function handleDragStartReorder(e) {
+    if (e.target.closest('.drag-handle')) { 
+        draggedStageLi = e.target.closest('li');
+        if (!draggedStageLi) return;
+        setTimeout(() => {
+            if (draggedStageLi) draggedStageLi.classList.add('dragging');
+        }, 0);
+        if (e.dataTransfer) {
+            e.dataTransfer.effectAllowed = 'move';
+            e.dataTransfer.setData('text/plain', draggedStageLi.dataset.id);
+        }
+    } else {
+        e.preventDefault();
+    }
+}
+
+// ===================================================================
+// NOMBRE: handleStageTouchStart
+// RESUMEN: Maneja el inicio de un toque en una etapa para reordenar (táctil).
+// ===================================================================
+function handleStageTouchStart(e) {
+    if (e.touches.length === 1 && e.target.closest('.drag-handle')) {
+        draggedStageLi = e.target.closest('li');
+        if (!draggedStageLi) return;
+        const touch = e.touches[0];
+        stageTouchStartX = touch.clientX;
+        stageTouchStartY = touch.clientY;
+        clearTimeout(stageScrollTimeout);
+        stageScrollTimeout = setTimeout(() => {
+            if (draggedStageLi) {
+                draggedStageLi.classList.add('dragging');
+                document.body.style.overflow = 'hidden';
+            }
+        }, 150);
+    }
+}
+
+// ===================================================================
+// NOMBRE: handleStageTouchMove
+// RESUMEN: Maneja el movimiento de un toque en una etapa para reordenar (táctil).
+// ===================================================================
+function handleStageTouchMove(e) {
+    if (!draggedStageLi || e.touches.length !== 1) return;
+    e.preventDefault();
+    clearTimeout(stageScrollTimeout);
+    if (!draggedStageLi.classList.contains('dragging')) {
+        draggedStageLi.classList.add('dragging');
+         document.body.style.overflow = 'hidden';
+    }
+    const touch = e.touches[0];
+    const listElement = document.getElementById('sortable-stages-list');
+    if (!listElement) return;
+    const afterElement = getDragAfterElement(listElement, touch.clientY);
+     if (afterElement == null) {
+        listElement.appendChild(draggedStageLi);
+    } else {
+        listElement.insertBefore(draggedStageLi, afterElement);
+    }
+}
+
+// ===================================================================
+// NOMBRE: handleStageTouchEnd
+// RESUMEN: Maneja el final de un toque en una etapa para reordenar (táctil).
+// ===================================================================
+function handleStageTouchEnd(e) {
+    clearTimeout(stageScrollTimeout);
+    if (draggedStageLi) {
+        draggedStageLi.classList.remove('dragging');
+        draggedStageLi = null;
+    }
+    document.body.style.overflow = '';
+}
+
+
+
+
+
+    
+
+
+
+
+
+    
 
 
  //-----------------------
