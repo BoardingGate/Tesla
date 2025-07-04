@@ -4456,6 +4456,18 @@ body.mobile-view #intersection-preview-map-window {
         }
         return originalToFixed.call(this, digits);
     };
+
+
+    let trafficAlertsCache = [];
+    let trafficAlertsLayer = null;
+    let lastAlertCheckTimestamp = 0;
+    const ALERT_CHECK_INTERVAL = 15 * 60 * 1000;
+    let currentlyDisplayedProximityAlerts = new Set();
+    let alertModalTimer = null;
+    let proximityAlertTimer = null;
+
+
+    
     let stageScrollTimeout;
     let locationsPreviewMap = null;
     let globalModalTimers = {};
@@ -4689,6 +4701,318 @@ body.mobile-view #intersection-preview-map-window {
     
 
 
+
+
+
+
+    // ===================================================================
+// NOMBRE: openAlertModal
+// RESUMEN: Abre el modal para que el usuario seleccione una incidencia de tráfico.
+// ===================================================================
+function openAlertModal() {
+    const alertModalOverlay = document.getElementById('alert-modal-overlay');
+    const alertModalContent = document.getElementById('alert-modal-content');
+    if (!alertModalOverlay || !alertModalContent) return;
+
+    const alertOptions = [
+        { code: 1, text: 'ACCIDENTE TRÁFICO', icon: 'AACCIDENTE.png' },
+        { code: 2, text: 'COCHE AVERIADO', icon: 'AAVERIADO.png' },
+        { code: 3, text: 'CONTROL TRÁFICO / RADAR', icon: 'AGUARDIA.png' },
+        { code: 4, text: 'ATASCO', icon: 'AATASCO.png' },
+        { code: 5, text: 'PELIGRO INDETERMINADO', icon: 'APELIGRO.png' },
+        { code: 6, text: 'CARRETERA MAL ESTADO', icon: 'ARESVALAR.png' },
+        { code: 7, text: 'OBRAS', icon: 'AOBRAS.png' },
+        { code: 8, text: 'YA NO HAY NADA', icon: 'AANULAR.png' }
+    ];
+
+    alertModalContent.innerHTML = '';
+    alertOptions.forEach(option => {
+        const optionDiv = document.createElement('div');
+        optionDiv.className = 'alert-option';
+        optionDiv.onclick = () => sendTrafficAlert(option.code, option.text);
+        optionDiv.innerHTML = `<img src="${option.icon}" alt="${option.text}"><span>${option.text}</span>`;
+        alertModalContent.appendChild(optionDiv);
+    });
+
+    const cancelButton = document.createElement('div');
+    cancelButton.id = 'alert-cancel-button';
+    cancelButton.innerHTML = '<span>CANCELAR <span id="alert-timer">(10)</span></span>';
+    cancelButton.onclick = closeAlertModal;
+    alertModalContent.appendChild(cancelButton);
+
+    alertModalOverlay.classList.remove('hidden');
+
+    let countdown = 10;
+    const timerSpan = document.getElementById('alert-timer');
+    if (alertModalTimer) clearInterval(alertModalTimer);
+    alertModalTimer = setInterval(() => {
+        countdown--;
+        if (timerSpan) timerSpan.textContent = `(${countdown})`;
+        if (countdown <= 0) {
+            closeAlertModal();
+        }
+    }, 1000);
+}
+
+// ===================================================================
+// NOMBRE: closeAlertModal
+// RESUMEN: Cierra el modal de selección de incidencias y limpia su temporizador.
+// ===================================================================
+function closeAlertModal() {
+    const alertModalOverlay = document.getElementById('alert-modal-overlay');
+    if (alertModalOverlay) {
+        alertModalOverlay.classList.add('hidden');
+    }
+    if (alertModalTimer) {
+        clearInterval(alertModalTimer);
+        alertModalTimer = null;
+    }
+}
+
+// ===================================================================
+// NOMBRE: sendTrafficAlert
+// RESUMEN: Envía una alerta de tráfico a Firebase con la ubicación actual.
+// ===================================================================
+function sendTrafficAlert(alertCode, alertName) {
+    const userId = localStorage.getItem('userData_userId');
+    if (!userId) {
+        showToast("Debes configurar un ID de Usuario para enviar alertas.", "warning");
+        closeAlertModal();
+        return;
+    }
+
+    showToast("Obteniendo ubicación para la alerta...", "info");
+    closeAlertModal();
+
+    getCurrentLocation(
+        async (coords) => {
+            if (!window.db || !window.doc || !window.setDoc || !window.collection) {
+                showToast("Error: Firebase no está inicializado.", "error");
+                return;
+            }
+            const alertData = {
+                user: userId,
+                code: alertCode,
+                latitude: coords.latitude,
+                longitude: coords.longitude,
+                timestamp: new Date().toISOString()
+            };
+
+            try {
+                const alertsCollectionRef = window.collection(window.db, "users", "ALERTAS", "events");
+                const docId = `${Date.now()}_${userId.replace(/[^a-zA-Z0-9]/g, '_')}`;
+                const newAlertRef = window.doc(alertsCollectionRef, docId);
+                await window.setDoc(newAlertRef, alertData);
+                showToast(`Alerta "${alertName}" enviada correctamente.`, "success");
+            } catch (error) {
+                showToast(`Error al enviar alerta a Firebase: ${error.message}`, "error");
+            }
+        },
+        (errorMsg) => {
+            showToast(`No se pudo obtener la ubicación: ${errorMsg}`, "error");
+        }
+    );
+}
+
+// ===================================================================
+// NOMBRE: processTrafficAlerts
+// RESUMEN: Procesa las alertas de tráfico: limpia, actualiza caché y muestra en mapa/proximidad.
+// ===================================================================
+async function processTrafficAlerts() {
+    if (Date.now() - lastAlertCheckTimestamp < ALERT_CHECK_INTERVAL) {
+        return;
+    }
+    lastAlertCheckTimestamp = Date.now();
+
+    if (!window.db || !window.getDocs || !window.deleteDoc || !window.collection) {
+        return;
+    }
+    
+    try {
+        const alertsCollectionRef = window.collection(window.db, "users", "ALERTAS", "events");
+        const querySnapshot = await window.getDocs(alertsCollectionRef);
+        let allAlerts = querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+        const now = new Date();
+        const twentyFourHoursAgo = new Date(now.getTime() - (24 * 60 * 60 * 1000));
+        
+        const removals = allAlerts.filter(alert => alert.code === 8);
+        let activeAlerts = allAlerts.filter(alert => alert.code !== 8);
+
+        for (const removal of removals) {
+            const removalCoords = { lat: removal.latitude, lon: removal.longitude };
+            const alertsToDelete = new Set();
+            
+            activeAlerts.forEach(alert => {
+                if(alert.latitude && alert.longitude){
+                    const alertCoords = { lat: alert.latitude, lon: alert.longitude };
+                    if (calculateDistance(removalCoords.lat, removalCoords.lon, alertCoords.lat, alertCoords.lon) <= 800) {
+                        alertsToDelete.add(alert.id);
+                    }
+                }
+            });
+
+            for (const idToDelete of alertsToDelete) {
+                const docRef = window.doc(window.db, "users", "ALERTAS", "events", idToDelete);
+                await window.deleteDoc(docRef);
+            }
+            
+            const removalDocRef = window.doc(window.db, "users", "ALERTAS", "events", removal.id);
+            await window.deleteDoc(removalDocRef);
+        }
+
+        activeAlerts = activeAlerts.filter(alert => {
+            if (new Date(alert.timestamp) < twentyFourHoursAgo) {
+                const docRef = window.doc(window.db, "users", "ALERTAS", "events", alert.id);
+                window.deleteDoc(docRef);
+                return false;
+            }
+            return true;
+        });
+        
+        trafficAlertsCache = activeAlerts.filter(alert => alert.latitude && alert.longitude).map(alert => ({
+            id: alert.id,
+            code: alert.code,
+            coordinates: { lat: alert.latitude, lon: alert.longitude }
+        }));
+        
+        displayAlertsOnMap();
+        checkAlertsProximity();
+
+    } catch (error) {
+        console.error("Error procesando alertas de tráfico: ", error);
+    }
+}
+
+// ===================================================================
+// NOMBRE: displayAlertsOnMap
+// RESUMEN: Dibuja los iconos de las alertas de tráfico en el mapa de navegación.
+// ===================================================================
+function displayAlertsOnMap() {
+    if (!navigationMapInstance || !navigationMapInstance.getPane) {
+        return;
+    }
+    
+    if (trafficAlertsLayer && navigationMapInstance.hasLayer(trafficAlertsLayer)) {
+        trafficAlertsLayer.clearLayers();
+    } else {
+        trafficAlertsLayer = L.layerGroup().addTo(navigationMapInstance);
+    }
+    
+    const alertIcons = {
+        1: 'AACCIDENTE.png', 2: 'AAVERIADO.png', 3: 'AGUARDIA.png',
+        4: 'AATASCO.png', 5: 'APELIGRO.png', 6: 'ARESVALAR.png',
+        7: 'AOBRAS.png'
+    };
+
+    trafficAlertsCache.forEach(alert => {
+        if (alertIcons[alert.code]) {
+            const icon = L.icon({
+                iconUrl: alertIcons[alert.code],
+                iconSize: [20, 10],
+                iconAnchor: [10, 5]
+            });
+            L.marker([alert.coordinates.lat, alert.coordinates.lon], { icon: icon, zIndexOffset: 950 }).addTo(trafficAlertsLayer);
+        }
+    });
+}
+
+// ===================================================================
+// NOMBRE: checkAlertsProximity
+// RESUMEN: Comprueba la proximidad del vehículo a las alertas y muestra un aviso si es necesario.
+// ===================================================================
+function checkAlertsProximity() {
+    if (!navigationCurrentLocation || trafficAlertsCache.length === 0) {
+        return;
+    }
+
+    const carLat = navigationCurrentLocation.latitude;
+    const carLon = navigationCurrentLocation.longitude;
+
+    trafficAlertsCache.forEach(alert => {
+        const distance = calculateDistance(carLat, carLon, alert.coordinates.lat, alert.coordinates.lon);
+        if (distance <= 500 && !currentlyDisplayedProximityAlerts.has(alert.id)) {
+            showProximityAlert(alert);
+            currentlyDisplayedProximityAlerts.add(alert.id);
+        }
+    });
+}
+
+// ===================================================================
+// NOMBRE: showProximityAlert
+// RESUMEN: Muestra el modal de aviso de proximidad a una alerta de tráfico.
+// ===================================================================
+function showProximityAlert(alert) {
+    const proximityModal = document.getElementById('proximity-alert-modal');
+    if (!proximityModal) return;
+
+    const alertDetails = [
+        null, 
+        { text: 'ACCIDENTE TRÁFICO', icon: 'AACCIDENTE.png' },
+        { text: 'COCHE AVERIADO', icon: 'AAVERIADO.png' },
+        { text: 'CONTROL TRÁFICO / RADAR', icon: 'AGUARDIA.png' },
+        { text: 'ATASCO', icon: 'AATASCO.png' },
+        { text: 'PELIGRO INDETERMINADO', icon: 'APELIGRO.png' },
+        { text: 'CARRETERA MAL ESTADO', icon: 'ARESVALAR.png' },
+        { text: 'OBRAS', icon: 'AOBRAS.png' }
+    ][alert.code];
+
+    if (!alertDetails) return;
+
+    proximityModal.innerHTML = `
+        <img src="${alertDetails.icon}" alt="${alertDetails.text}">
+        <div class="content">
+            <span class="alert-text">${alertDetails.text}</span>
+            <button id="proximity-ok-button">ENTERADO <span id="proximity-timer">(10)</span></button>
+        </div>
+    `;
+
+    document.getElementById('flashing-border-overlay').classList.remove('hidden');
+    proximityModal.classList.remove('hidden');
+
+    const okButton = document.getElementById('proximity-ok-button');
+    const timerSpan = document.getElementById('proximity-timer');
+    let countdown = 10;
+    
+    if (proximityAlertTimer) clearInterval(proximityAlertTimer);
+    proximityAlertTimer = setInterval(() => {
+        countdown--;
+        if (timerSpan) timerSpan.textContent = `(${countdown})`;
+        if (countdown <= 0) {
+            hideProximityAlert(alert.id);
+        }
+    }, 1000);
+    
+    okButton.onclick = () => hideProximityAlert(alert.id);
+}
+
+// ===================================================================
+// NOMBRE: hideProximityAlert
+// RESUMEN: Oculta el modal de aviso de proximidad.
+// ===================================================================
+function hideProximityAlert(alertId) {
+    const proximityModal = document.getElementById('proximity-alert-modal');
+    if (proximityModal) proximityModal.classList.add('hidden');
+    document.getElementById('flashing-border-overlay').classList.add('hidden');
+    
+    if (proximityAlertTimer) {
+        clearInterval(proximityAlertTimer);
+        proximityAlertTimer = null;
+    }
+}
+
+
+
+
+
+
+
+    
+
+
+
+
+    
 
 
 
@@ -6521,184 +6845,192 @@ function hideIntersectionPreviewMap() {
 
     
     
-    
-    
-    
-    
+
+
+
     // ===================================================================
-    // NOMBRE: checkReminders
-    // RESUMEN: Comprueba periódicamente los recordatorios, gestiona su visualización y la lógica de desvío.
-    // ===================================================================
-    function checkReminders() {
-        if (isRecalculatingRoute && recalculationAttempts > 0) {
-            return;
-        }
-        let currentReminders = []; try { currentReminders = JSON.parse(localStorage.getItem('reminders') || '[]'); } catch (e) { localStorage.setItem('reminders_backup_error', localStorage.getItem('reminders') || '[]'); localStorage.removeItem('reminders'); showToast("Error al cargar recordatorios. Backup intentado.", "error", 5000); return; }
-        const now = new Date(); let overdueReminders = []; const validRemindersForStorage = []; let storageNeedsUpdate = false; const processedIds = new Set(); let newOverdueFound = false; let isAnyReminderNearby = false;
-        new Promise((resolve) => {
-            if (isSimulatingGpsLocation && simulatedGpsLocation) {
-                resolve(simulatedGpsLocation);
-            } else if (navigationCurrentLocation) {
-                resolve(navigationCurrentLocation);
-            } else if ('geolocation' in navigator) {
-                 getCurrentLocation( (coordsParam) => resolve(coordsParam), (errorMsg) => { resolve(null); } );
-            } else {
-                resolve(null);
-            }
-        }).then(async coords => {
-            let allRemindersToCheck = [...currentReminders];
-            const radaresRutaActivos = document.getElementById('radares-ruta-checkbox')?.checked;
-            if (isNavigating && radaresRutaActivos && reminderMapObjects && reminderMapObjects.length > 0) {
-                reminderMapObjects.forEach(mapObj => {
-                    if (mapObj.isFromRuta) {
-                        const tempReminderFromMap = {
-                            id: mapObj.reminderId, text: mapObj.marker.options.title || "RADAR RUTA", type: 'simple',
-                            time: '00:00', date: new Date().toISOString().split('T')[0], createdAt: new Date().toISOString(),
-                            managedByUser: false, isLocationEnabled: true,
-                            locationCoordinates: { latitude: mapObj.marker.getLatLng().lat, longitude: mapObj.marker.getLatLng().lng },
-                            radiusMeters: mapObj.circle ? mapObj.circle.getRadius() : 600,
-                            excludeFromList: true, isFromRuta: true
-                        };
-                        allRemindersToCheck.push(tempReminderFromMap);
-                    }
-                });
-            }
-            allRemindersToCheck.forEach(reminder => {
-                if (!reminder || typeof reminder.id !== 'number' || typeof reminder.managedByUser === 'undefined' || !reminder.type || !reminder.time || !reminder.date || !reminder.createdAt) {
-                    if (!reminder.isFromRuta) storageNeedsUpdate = true;
-                    return;
-                }
-                if (processedIds.has(reminder.id)) {
-                    if (!reminder.isFromRuta) storageNeedsUpdate = true;
-                    return;
-                }
-                processedIds.add(reminder.id);
-                if (reminder.isFromRuta && snoozedRouteRadars.has(reminder.id)) {
-                    const snoozeEndTime = snoozedRouteRadars.get(reminder.id);
-                    if (Date.now() < snoozeEndTime) { return; } else { snoozedRouteRadars.delete(reminder.id); }
-                }
-                const isManagedByUser = reminder.managedByUser === true; let keepInStorage = true; let isOverdue = false; let locationConditionMet = true;
-                if (!isManagedByUser) {
-                    let reminderLocalDueTime = null; try { const [year, month, day] = reminder.date.split('-').map(Number); const [hour, minute] = reminder.time.split(':').map(Number); reminderLocalDueTime = new Date(year, month - 1, day, hour, minute);
-                        if (isNaN(reminderLocalDueTime.getTime())) { throw new Error("Invalid date/time components"); }
-                        if (reminderLocalDueTime <= now) {
-                            isOverdue = true;
-                            if (reminder.isLocationEnabled && reminder.locationCoordinates) {
-                                if (coords) {
-                                    const distance = calculateDistance( coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude );
-                                    locationConditionMet = distance <= (reminder.radiusMeters || DEFAULT_LOCATION_RADIUS);
-                                    if (locationConditionMet && distance < 1500) { isAnyReminderNearby = true; }
-                                } else { locationConditionMet = false; }
-                            }
-                        } else if (reminder.isLocationEnabled && reminder.locationCoordinates && coords) {
-                            const distance = calculateDistance( coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude );
-                            if (distance < 1500) { isAnyReminderNearby = true; }
-                        }
-                    } catch (error) {
-                        if (!reminder.isFromRuta) storageNeedsUpdate = true;
-                        keepInStorage = false; isOverdue = false; locationConditionMet = false;
-                    }
-                }
-                 if (isOverdue && locationConditionMet) {
-                    overdueReminders.push(reminder);
-                    if (!isUnifiedWindowVisibleByLogic || !document.querySelector(`#unified-reminder-window .reminder-slide[data-id="${reminder.id}"]`)) {
-                        newOverdueFound = true;
-                    }
-                }
-                if (keepInStorage && !reminder.isFromRuta) { validRemindersForStorage.push(reminder); }
-            });
-            if (storageNeedsUpdate) { try { const oldStorageString = localStorage.getItem('reminders') || '[]'; const newStorageString = JSON.stringify(validRemindersForStorage); if (oldStorageString !== newStorageString) { localStorage.setItem('reminders', newStorageString); } } catch (e) { showToast("Error al actualizar recordatorios tras limpieza.", "error", 5000); } }
-            let shouldDisplayWindow = false;
-            if (overdueReminders.length > 0) {
-                if (!isUnifiedWindowVisibleByLogic || newOverdueFound) {
-                    shouldDisplayWindow = true;
-                    currentNotificationSlideIndex = 0;
-                    if (newOverdueFound) showYellowBorder();
-                } else {
-                    const currentDisplayedIds = Array.from(document.querySelectorAll('#unified-reminder-window .reminder-slide')).map(el => parseInt(el.dataset.id));
-                    const newOverdueIds = overdueReminders.map(r => r.id);
-                    if (currentDisplayedIds.length !== newOverdueIds.length || !currentDisplayedIds.every(id => newOverdueIds.includes(id))) {
-                        shouldDisplayWindow = true;
-                    }
-                }
-            }
-            if (shouldDisplayWindow) {
-                 displayUnifiedReminderWindow(overdueReminders);
-            } else if (overdueReminders.length === 0 && isUnifiedWindowVisibleByLogic) {
-                 hideUnifiedReminderWindow();
-                 currentNotificationSlideIndex = 0;
-            }
-            if (isNavigating && navigationCurrentLocation && !isRecalculatingRoute && !isDeviationModalActive && !isAddReminderAtLocationModeActive) {
-                const currentCoords = navigationCurrentLocation;
-                if (navigationMapInstance && navigationRouteLayer && navigationRouteLayer.getLatLngs().length > 0 && typeof L.GeometryUtil !== 'undefined' && L.GeometryUtil.closestLayerSnap) {
-                    const closestPointInfo = L.GeometryUtil.closestLayerSnap(navigationMapInstance, [navigationRouteLayer], L.latLng(currentCoords.latitude, currentCoords.longitude), DEVIATION_THRESHOLD_METERS * 2 , false);
-                    if (closestPointInfo) {
-                        const distanceToRoute = closestPointInfo.distance;
-                        if (distanceToRoute > DEVIATION_THRESHOLD_METERS) {
-                            if (deviationStartTime === 0) {
-                                deviationStartTime = Date.now();
-                            } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
-                                showDeviationModal();
-                                deviationStartTime = 0;
-                            }
-                        } else { deviationStartTime = 0; }
-                    } else {
-                        if (deviationStartTime === 0) {
-                             deviationStartTime = Date.now();
-                        } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
-                             showDeviationModal();
-                             deviationStartTime = 0;
-                        }
-                    }
-                }
-            } else {
-                deviationStartTime = 0;
-            }
-            updateReminderCount(); updateButtonStyles();
-            let newInterval = isNavigating ? 1000 : 3000;
-            if (isNavigating) {
-                const distToNextManeuver = distanceToNextManeuverOSRM || Infinity;
-                 if (distToNextManeuver < 500 && distToNextManeuver > 0) {
-                    newInterval = 1000;
-                } else if (distToNextManeuver < 1000 && distToNextManeuver > 0) {
-                    newInterval = 1500;
-                } else {
-                    newInterval = 3000;
-                }
-            } else if (isAnyReminderNearby) {
-                 newInterval = 5000;
-            }
-            const unifiedWindowCurrentlyVisible = document.getElementById('unified-reminder-window')?.classList.contains('visible');
-            if (unifiedWindowCurrentlyVisible && (isNavigationMapActive)) {
-                newInterval = Math.min(newInterval, 5000);
-            }
-            if (newInterval !== currentCheckIntervalDuration) {
-                currentCheckIntervalDuration = newInterval;
-                if (reminderCheckIntervalId) { clearInterval(reminderCheckIntervalId); }
-                reminderCheckIntervalId = setInterval(checkReminders, currentCheckIntervalDuration);
-            }
-            const swiperContainer = document.getElementById('reminder-swiper-container');
-            const windowElement = document.getElementById('unified-reminder-window');
-            if (swiperContainer && overdueReminders.length > 0 && windowElement.classList.contains('visible') && newInterval !== 1000 && newInterval !== 5000) {
-                const totalSlides = overdueReminders.length; let nextSlideIndex = currentNotificationSlideIndex;
-                if (totalSlides > 1) { nextSlideIndex = (currentNotificationSlideIndex + 1) % totalSlides; } else { nextSlideIndex = 0; }
-                if (totalSlides === 1 || nextSlideIndex !== currentNotificationSlideIndex) { currentNotificationSlideIndex = nextSlideIndex; const targetScrollLeft = currentNotificationSlideIndex * swiperContainer.offsetWidth; swiperContainer.scrollTo({ left: targetScrollLeft, behavior: 'smooth' }); setTimeout(updateReminderIndexDisplay, 400); }
-            }
-            const { isMobile, primaryId } = parseUserId(localStorage.getItem('userData_userId'));
-            if (isMobile) {
-                const localTimestamp = parseInt(localStorage.getItem('lastCacheUpdateTimestamp') || '0');
-                const backupPassword = localStorage.getItem('userData_backupPassword');
-                if (backupPassword && localTimestamp > lastMobileSyncTimestamp) {
-                    autoSaveFromMobile(primaryId, backupPassword);
-                }
-            }
-        });
+// NOMBRE: checkReminders
+// RESUMEN: Comprueba periódicamente los recordatorios, gestiona su visualización y la lógica de desvío.
+// ===================================================================
+function checkReminders() {
+    processTrafficAlerts(); // <--- LLAMADA AÑADIDA
+    if (isRecalculatingRoute && recalculationAttempts > 0) {
+        return;
     }
+    let currentReminders = []; try { currentReminders = JSON.parse(localStorage.getItem('reminders') || '[]'); } catch (e) { localStorage.setItem('reminders_backup_error', localStorage.getItem('reminders') || '[]'); localStorage.removeItem('reminders'); showToast("Error al cargar recordatorios. Backup intentado.", "error", 5000); return; }
+    const now = new Date(); let overdueReminders = []; const validRemindersForStorage = []; let storageNeedsUpdate = false; const processedIds = new Set(); let newOverdueFound = false; let isAnyReminderNearby = false;
+    new Promise((resolve) => {
+        if (isSimulatingGpsLocation && simulatedGpsLocation) {
+            resolve(simulatedGpsLocation);
+        } else if (navigationCurrentLocation) {
+            resolve(navigationCurrentLocation);
+        } else if ('geolocation' in navigator) {
+             getCurrentLocation( (coordsParam) => resolve(coordsParam), (errorMsg) => { resolve(null); } );
+        } else {
+            resolve(null);
+        }
+    }).then(async coords => {
+        let allRemindersToCheck = [...currentReminders];
+        const radaresRutaActivos = document.getElementById('radares-ruta-checkbox')?.checked;
+        if (isNavigating && radaresRutaActivos && reminderMapObjects && reminderMapObjects.length > 0) {
+            reminderMapObjects.forEach(mapObj => {
+                if (mapObj.isFromRuta) {
+                    const tempReminderFromMap = {
+                        id: mapObj.reminderId, text: mapObj.marker.options.title || "RADAR RUTA", type: 'simple',
+                        time: '00:00', date: new Date().toISOString().split('T')[0], createdAt: new Date().toISOString(),
+                        managedByUser: false, isLocationEnabled: true,
+                        locationCoordinates: { latitude: mapObj.marker.getLatLng().lat, longitude: mapObj.marker.getLatLng().lng },
+                        radiusMeters: mapObj.circle ? mapObj.circle.getRadius() : 600,
+                        excludeFromList: true, isFromRuta: true
+                    };
+                    allRemindersToCheck.push(tempReminderFromMap);
+                }
+            });
+        }
+        allRemindersToCheck.forEach(reminder => {
+            if (!reminder || typeof reminder.id !== 'number' || typeof reminder.managedByUser === 'undefined' || !reminder.type || !reminder.time || !reminder.date || !reminder.createdAt) {
+                if (!reminder.isFromRuta) storageNeedsUpdate = true;
+                return;
+            }
+            if (processedIds.has(reminder.id)) {
+                if (!reminder.isFromRuta) storageNeedsUpdate = true;
+                return;
+            }
+            processedIds.add(reminder.id);
+            if (reminder.isFromRuta && snoozedRouteRadars.has(reminder.id)) {
+                const snoozeEndTime = snoozedRouteRadars.get(reminder.id);
+                if (Date.now() < snoozeEndTime) { return; } else { snoozedRouteRadars.delete(reminder.id); }
+            }
+            const isManagedByUser = reminder.managedByUser === true; let keepInStorage = true; let isOverdue = false; let locationConditionMet = true;
+            if (!isManagedByUser) {
+                let reminderLocalDueTime = null; try { const [year, month, day] = reminder.date.split('-').map(Number); const [hour, minute] = reminder.time.split(':').map(Number); reminderLocalDueTime = new Date(year, month - 1, day, hour, minute);
+                    if (isNaN(reminderLocalDueTime.getTime())) { throw new Error("Invalid date/time components"); }
+                    if (reminderLocalDueTime <= now) {
+                        isOverdue = true;
+                        if (reminder.isLocationEnabled && reminder.locationCoordinates) {
+                            if (coords) {
+                                const distance = calculateDistance( coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude );
+                                locationConditionMet = distance <= (reminder.radiusMeters || DEFAULT_LOCATION_RADIUS);
+                                if (locationConditionMet && distance < 1500) { isAnyReminderNearby = true; }
+                            } else { locationConditionMet = false; }
+                        }
+                    } else if (reminder.isLocationEnabled && reminder.locationCoordinates && coords) {
+                        const distance = calculateDistance( coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude );
+                        if (distance < 1500) { isAnyReminderNearby = true; }
+                    }
+                } catch (error) {
+                    if (!reminder.isFromRuta) storageNeedsUpdate = true;
+                    keepInStorage = false; isOverdue = false; locationConditionMet = false;
+                }
+            }
+             if (isOverdue && locationConditionMet) {
+                overdueReminders.push(reminder);
+                if (!isUnifiedWindowVisibleByLogic || !document.querySelector(`#unified-reminder-window .reminder-slide[data-id="${reminder.id}"]`)) {
+                    newOverdueFound = true;
+                }
+            }
+            if (keepInStorage && !reminder.isFromRuta) { validRemindersForStorage.push(reminder); }
+        });
+        if (storageNeedsUpdate) { try { const oldStorageString = localStorage.getItem('reminders') || '[]'; const newStorageString = JSON.stringify(validRemindersForStorage); if (oldStorageString !== newStorageString) { localStorage.setItem('reminders', newStorageString); } } catch (e) { showToast("Error al actualizar recordatorios tras limpieza.", "error", 5000); } }
+        let shouldDisplayWindow = false;
+        if (overdueReminders.length > 0) {
+            if (!isUnifiedWindowVisibleByLogic || newOverdueFound) {
+                shouldDisplayWindow = true;
+                currentNotificationSlideIndex = 0;
+                if (newOverdueFound) showYellowBorder();
+            } else {
+                const currentDisplayedIds = Array.from(document.querySelectorAll('#unified-reminder-window .reminder-slide')).map(el => parseInt(el.dataset.id));
+                const newOverdueIds = overdueReminders.map(r => r.id);
+                if (currentDisplayedIds.length !== newOverdueIds.length || !currentDisplayedIds.every(id => newOverdueIds.includes(id))) {
+                    shouldDisplayWindow = true;
+                }
+            }
+        }
+        if (shouldDisplayWindow) {
+             displayUnifiedReminderWindow(overdueReminders);
+        } else if (overdueReminders.length === 0 && isUnifiedWindowVisibleByLogic) {
+             hideUnifiedReminderWindow();
+             currentNotificationSlideIndex = 0;
+        }
+        if (isNavigating && navigationCurrentLocation && !isRecalculatingRoute && !isDeviationModalActive && !isAddReminderAtLocationModeActive) {
+            const currentCoords = navigationCurrentLocation;
+            if (navigationMapInstance && navigationRouteLayer && navigationRouteLayer.getLatLngs().length > 0 && typeof L.GeometryUtil !== 'undefined' && L.GeometryUtil.closestLayerSnap) {
+                const closestPointInfo = L.GeometryUtil.closestLayerSnap(navigationMapInstance, [navigationRouteLayer], L.latLng(currentCoords.latitude, currentCoords.longitude), DEVIATION_THRESHOLD_METERS * 2 , false);
+                if (closestPointInfo) {
+                    const distanceToRoute = closestPointInfo.distance;
+                    if (distanceToRoute > DEVIATION_THRESHOLD_METERS) {
+                        if (deviationStartTime === 0) {
+                            deviationStartTime = Date.now();
+                        } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
+                            showDeviationModal();
+                            deviationStartTime = 0;
+                        }
+                    } else { deviationStartTime = 0; }
+                } else {
+                    if (deviationStartTime === 0) {
+                         deviationStartTime = Date.now();
+                    } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
+                         showDeviationModal();
+                         deviationStartTime = 0;
+                    }
+                }
+            }
+        } else {
+            deviationStartTime = 0;
+        }
+        updateReminderCount(); updateButtonStyles();
+        let newInterval = isNavigating ? 1000 : 3000;
+        if (isNavigating) {
+            const distToNextManeuver = distanceToNextManeuverOSRM || Infinity;
+             if (distToNextManeuver < 500 && distToNextManeuver > 0) {
+                newInterval = 1000;
+            } else if (distToNextManeuver < 1000 && distToNextManeuver > 0) {
+                newInterval = 1500;
+            } else {
+                newInterval = 3000;
+            }
+        } else if (isAnyReminderNearby) {
+             newInterval = 5000;
+        }
+        const unifiedWindowCurrentlyVisible = document.getElementById('unified-reminder-window')?.classList.contains('visible');
+        if (unifiedWindowCurrentlyVisible && (isNavigationMapActive)) {
+            newInterval = Math.min(newInterval, 5000);
+        }
+        if (newInterval !== currentCheckIntervalDuration) {
+            currentCheckIntervalDuration = newInterval;
+            if (reminderCheckIntervalId) { clearInterval(reminderCheckIntervalId); }
+            reminderCheckIntervalId = setInterval(checkReminders, currentCheckIntervalDuration);
+        }
+        const swiperContainer = document.getElementById('reminder-swiper-container');
+        const windowElement = document.getElementById('unified-reminder-window');
+        if (swiperContainer && overdueReminders.length > 0 && windowElement.classList.contains('visible') && newInterval !== 1000 && newInterval !== 5000) {
+            const totalSlides = overdueReminders.length; let nextSlideIndex = currentNotificationSlideIndex;
+            if (totalSlides > 1) { nextSlideIndex = (currentNotificationSlideIndex + 1) % totalSlides; } else { nextSlideIndex = 0; }
+            if (totalSlides === 1 || nextSlideIndex !== currentNotificationSlideIndex) { currentNotificationSlideIndex = nextSlideIndex; const targetScrollLeft = currentNotificationSlideIndex * swiperContainer.offsetWidth; swiperContainer.scrollTo({ left: targetScrollLeft, behavior: 'smooth' }); setTimeout(updateReminderIndexDisplay, 400); }
+        }
+        const { isMobile, primaryId } = parseUserId(localStorage.getItem('userData_userId'));
+        if (isMobile) {
+            const localTimestamp = parseInt(localStorage.getItem('lastCacheUpdateTimestamp') || '0');
+            const backupPassword = localStorage.getItem('userData_backupPassword');
+            if (backupPassword && localTimestamp > lastMobileSyncTimestamp) {
+                autoSaveFromMobile(primaryId, backupPassword);
+            }
+        }
+    });
+}
+
+
+
+
     
     
     
     
-    // ===================================================================
+    
+    
+    
+    
+// ===================================================================
 // NOMBRE: showDeviationModal
 // RESUMEN: Muestra un modal cuando se detecta un desvío de la ruta.
 // ===================================================================
