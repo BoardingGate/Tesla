@@ -1,4 +1,4 @@
-....
+
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -4708,7 +4708,7 @@ function closeAlertModal() {
 
 // ===================================================================
 // NOMBRE: sendTrafficAlert
-// RESUMEN: Envía una alerta de tráfico a Firebase con la ubicación actual.
+// RESUMEN: Envía una alerta de tráfico a Firebase y fuerza una actualización inmediata.
 // ===================================================================
 function sendTrafficAlert(alertCode, alertName) {
     const userId = localStorage.getItem('userData_userId');
@@ -4741,6 +4741,12 @@ function sendTrafficAlert(alertCode, alertName) {
                 const newAlertRef = window.doc(alertsCollectionRef, docId);
                 await window.setDoc(newAlertRef, alertData);
                 showToast(`Alerta "${alertName}" enviada correctamente.`, "success");
+                
+                // --- MODIFICACIÓN CLAVE ---
+                // Forzamos la actualización de alertas inmediatamente después de enviar una.
+                forceProcessTrafficAlerts();
+                // -------------------------
+
             } catch (error) {
                 showToast(`Error al enviar alerta a Firebase: ${error.message}`, "error");
             }
@@ -4751,30 +4757,18 @@ function sendTrafficAlert(alertCode, alertName) {
     );
 }
 
-
-
 // ===================================================================
 // NOMBRE: processTrafficAlerts
-// RESUMEN: Procesa las alertas de tráfico: limpia, actualiza caché y muestra en mapa/proximidad.
+// RESUMEN: Lógica principal que lee, limpia y actualiza las alertas desde Firebase.
 // ===================================================================
 async function processTrafficAlerts() {
-    if (Date.now() - lastAlertCheckTimestamp < ALERT_CHECK_INTERVAL) {
-        return;
-    }
-    lastAlertCheckTimestamp = Date.now();
-    
-    // Log de depuración para confirmar que se está ejecutando
-    console.log("-> Iniciando proceso de chequeo de alertas de tráfico...");
-
     if (!window.db || !window.getDocs || !window.deleteDoc || !window.collection) {
-        console.error("processTrafficAlerts: Funciones de Firebase no disponibles.");
         return;
     }
     
     try {
         const alertsCollectionRef = window.collection(window.db, "users", "ALERTAS", "events");
         const querySnapshot = await window.getDocs(alertsCollectionRef);
-        console.log(`-> Se han encontrado ${querySnapshot.docs.length} documentos de alertas en Firebase.`);
         
         let allAlerts = querySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
 
@@ -4784,42 +4778,36 @@ async function processTrafficAlerts() {
         const removals = allAlerts.filter(alert => alert.code === 8);
         let activeAlerts = allAlerts.filter(alert => alert.code !== 8);
 
-        if (removals.length > 0) {
-            console.log(`-> Procesando ${removals.length} alertas de anulación.`);
-            for (const removal of removals) {
-                const removalCoords = { lat: removal.latitude, lon: removal.longitude };
-                const alertsToDelete = new Set();
-                
-                activeAlerts.forEach(alert => {
-                    if(alert.latitude && alert.longitude){
-                        const alertCoords = { lat: alert.latitude, lon: alert.longitude };
-                        if (calculateDistance(removalCoords.lat, removalCoords.lon, alertCoords.lat, alertCoords.lon) <= 800) {
-                            alertsToDelete.add(alert.id);
-                        }
+        for (const removal of removals) {
+            const removalCoords = { lat: removal.latitude, lon: removal.longitude };
+            const alertsToDelete = new Set();
+            
+            activeAlerts.forEach(alert => {
+                if(alert.latitude && alert.longitude){
+                    const alertCoords = { lat: alert.latitude, lon: alert.longitude };
+                    if (calculateDistance(removalCoords.lat, removalCoords.lon, alertCoords.lat, alertCoords.lon) <= 800) {
+                        alertsToDelete.add(alert.id);
                     }
-                });
-
-                for (const idToDelete of alertsToDelete) {
-                    const docRef = window.doc(window.db, "users", "ALERTAS", "events", idToDelete);
-                    await window.deleteDoc(docRef);
                 }
-                
-                const removalDocRef = window.doc(window.db, "users", "ALERTAS", "events", removal.id);
-                await window.deleteDoc(removalDocRef);
+            });
+
+            for (const idToDelete of alertsToDelete) {
+                const docRef = window.doc(window.db, "users", "ALERTAS", "events", idToDelete);
+                await window.deleteDoc(docRef);
             }
+            
+            const removalDocRef = window.doc(window.db, "users", "ALERTAS", "events", removal.id);
+            await window.deleteDoc(removalDocRef);
         }
 
-        let deletedOldCount = 0;
         activeAlerts = activeAlerts.filter(alert => {
             if (!alert.timestamp || new Date(alert.timestamp) < twentyFourHoursAgo) {
                 const docRef = window.doc(window.db, "users", "ALERTAS", "events", alert.id);
                 window.deleteDoc(docRef);
-                deletedOldCount++;
                 return false;
             }
             return true;
         });
-        if(deletedOldCount > 0) console.log(`-> Se han eliminado ${deletedOldCount} alertas caducadas (>24h).`);
         
         trafficAlertsCache = activeAlerts.filter(alert => alert.latitude && alert.longitude).map(alert => ({
             id: alert.id,
@@ -4827,18 +4815,13 @@ async function processTrafficAlerts() {
             coordinates: { lat: alert.latitude, lon: alert.longitude }
         }));
         
-        console.log(`-> Caché de alertas actualizada con ${trafficAlertsCache.length} elementos.`);
-        
         displayAlertsOnMap();
         checkAlertsProximity();
 
     } catch (error) {
         console.error("Error procesando alertas de tráfico: ", error);
-        // El error que ves en la captura saldrá aquí si las reglas no están bien.
     }
 }
-
-
     
 // ===================================================================
 // NOMBRE: displayAlertsOnMap
@@ -4957,6 +4940,17 @@ function hideProximityAlert(alertId) {
     }
 }
 
+
+// ===================================================================
+// NOMBRE: forceProcessTrafficAlerts
+// RESUMEN: Lanza el proceso de actualización de alertas inmediatamente.
+// ===================================================================
+function forceProcessTrafficAlerts() {
+    console.log("-> Forzando actualización inmediata de alertas de tráfico...");
+    // Reseteamos el timestamp para que el próximo ciclo de 15 min empiece a contar desde ahora
+    lastAlertCheckTimestamp = Date.now();
+    processTrafficAlerts();
+}    
 
 
 
@@ -6803,12 +6797,19 @@ function hideIntersectionPreviewMap() {
 
 
 
-    // ===================================================================
+
+// ===================================================================
 // NOMBRE: checkReminders
-// RESUMEN: Comprueba periódicamente los recordatorios, gestiona su visualización y la lógica de desvío.
+// RESUMEN: Comprueba periódicamente los recordatorios y las alertas de tráfico.
 // ===================================================================
 function checkReminders() {
-    processTrafficAlerts(); // <--- LLAMADA AÑADIDA
+    // Control de tiempo para las alertas de tráfico
+    if (Date.now() - lastAlertCheckTimestamp >= ALERT_CHECK_INTERVAL) {
+        lastAlertCheckTimestamp = Date.now();
+        processTrafficAlerts();
+    }
+    
+    // El resto de tu lógica de recordatorios...
     if (isRecalculatingRoute && recalculationAttempts > 0) {
         return;
     }
@@ -6976,6 +6977,8 @@ function checkReminders() {
 
 
 
+
+    
 
     
     
