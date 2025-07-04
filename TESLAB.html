@@ -4107,6 +4107,49 @@ body.mobile-view #intersection-preview-map-window {
     object-fit: contain;
 }
 
+    #retry-route-modal {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background-color: #fbeae1; /* Un color de alerta suave */
+    padding: 25px;
+    border-radius: 12px;
+    border: 2px solid #D9534F; /* Borde rojo de error */
+    box-shadow: 0 0 20px rgba(0,0,0,0.5);
+    z-index: 9500;
+    text-align: center;
+    max-width: 500px;
+    width: 90%;
+}
+
+#retry-route-modal h2 {
+    font-size: 1.5rem;
+    color: #D9534F;
+    font-weight: bold;
+    margin-bottom: 15px;
+}
+
+#retry-route-modal p {
+    font-size: 1.1rem;
+    color: #333;
+    margin-bottom: 20px;
+}
+
+#retry-route-modal .modal-top-buttons button {
+    font-size: 1.1rem;
+    padding: 10px 18px;
+}
+
+#retry-route-modal #force-original-point-btn {
+    background-color: #f0ad4e; /* Naranja */
+    color: white;
+}
+
+#retry-route-modal #cancel-and-remove-point-btn {
+    background-color: #6c757d; /* Gris */
+    color: white;
+}
 /* =========================================================== */
 /* === FIN: CSS PARA ICONOS DE ALERTA EN MAPA (CORREGIDO) === */
 /* =========================================================== */
@@ -4698,6 +4741,65 @@ body.mobile-view #intersection-preview-map-window {
    
     
 
+
+
+
+// ===================================================================
+// NOMBRE: showRetryRouteModal
+// RESUMEN: Muestra un modal de error cuando OSRM no puede calcular una ruta.
+// ===================================================================
+function showRetryRouteModal(failedWaypoint) {
+    closeRetryRouteModal(); // Cierra cualquier instancia anterior
+
+    const modal = document.createElement('div');
+    modal.id = 'retry-route-modal';
+    
+    const addressHtml = failedWaypoint.address ? `<br><strong>Punto:</strong> ${failedWaypoint.address.substring(0, 50)}...` : '';
+
+    modal.innerHTML = `
+        <h2>Error al Calcular Ruta</h2>
+        <p>El servicio de rutas no pudo encontrar un camino hacia el último punto añadido. Puede que sea una ubicación inaccesible (peatonal, etc).${addressHtml}</p>
+        <div class="modal-top-buttons" style="justify-content: center; gap: 1rem;">
+            <button id="force-original-point-btn">Forzar Punto Original</button>
+            <button id="cancel-and-remove-point-btn">Cancelar y Quitar Punto</button>
+        </div>
+    `;
+    document.body.appendChild(modal);
+
+    document.getElementById('force-original-point-btn').onclick = () => {
+        closeRetryRouteModal();
+        forceAddOriginalPoint(failedWaypoint.lat, failedWaypoint.lng, failedWaypoint.address);
+    };
+
+    document.getElementById('cancel-and-remove-point-btn').onclick = () => {
+        closeRetryRouteModal();
+        // El punto ya fue eliminado temporalmente, así que solo confirmamos la acción
+        showToast("Punto problemático eliminado.", "info");
+        // Si hay menos de 2 puntos, limpiamos la ruta del mapa
+        if (navigationWaypoints.filter(wp => wp && wp.isCriticalForRecalc).length < 2) {
+             if (navigationRouteLayer) try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch(e){}
+             navigationRouteLayer = null;
+             navigationCurrentRouteData = null;
+             hideNavigationUI();
+        }
+    };
+    
+    // Autocierre del modal tras 15 segundos
+    setTimeout(closeRetryRouteModal, 15000);
+}
+
+// ===================================================================
+// NOMBRE: closeRetryRouteModal
+// RESUMEN: Cierra el modal de error de recálculo de ruta.
+// ===================================================================
+function closeRetryRouteModal() {
+    const modal = document.getElementById('retry-route-modal');
+    if (modal) {
+        modal.remove();
+    }
+}
+
+    
 
 
 // ===================================================================
@@ -16111,7 +16213,7 @@ function closeNavigationMap(force = false) {
 
 // ===================================================================
 // NOMBRE: recalculateAndDrawRoute
-// RESUMEN: Solicita una nueva ruta a OSRM y la redibuja, con manejo de errores robusto.
+// RESUMEN: Solicita una nueva ruta a OSRM y, si falla, muestra un modal de reintento.
 // ===================================================================
 async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
     isRecalculatingRoute = true;
@@ -16144,21 +16246,18 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
     
     try {
         const response = await fetch(url);
-        if (!response.ok) {
-            let errorData = { message: `HTTP error ${response.status}` };
-            try { errorData = await response.json(); } catch (e) { errorData.message = response.statusText || errorData.message; }
-            throw new Error(`OSRM Error: ${errorData.code || errorData.message || response.statusText}`);
-        }
         const data = await response.json();
-        const existingRecalcToastSuccess = document.getElementById(recalculateToastId);
-        if (existingRecalcToastSuccess) existingRecalcToastSuccess.remove();
-        activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
 
-        if (data.routes && data.routes.length > 0) {
+        // --- DETECCIÓN DE ERROR MEJORADA ---
+        if (response.ok && data.code === "Ok" && data.routes && data.routes.length > 0) {
+            // --- LÓGICA DE ÉXITO ---
+            const existingRecalcToastSuccess = document.getElementById(recalculateToastId);
+            if (existingRecalcToastSuccess) existingRecalcToastSuccess.remove();
+            activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
             navigationCurrentRouteData = data;
             if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
             drawRouteOnMap(data.routes[0]);
-            // ... (resto de la lógica de éxito)
+            // (El resto de la lógica de éxito permanece igual)
             currentLegIndexNav = 0; currentStepIndexNav = 0; lastProcessedStepManeuverLocation = null;
             if (preserveAccumulatedStats && data.routes[0]) {
                 tripInitialOverallEtaTime = new Date(Date.now() + (data.routes[0].duration * 1000));
@@ -16188,43 +16287,28 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
             if (recalculationRetryTimeoutId) clearTimeout(recalculationRetryTimeoutId);
             recalculationRetryTimeoutId = null;
         } else {
-            throw new Error("No se encontraron rutas.");
+            // --- LANZAMOS UN ERROR PERSONALIZADO SI OSRM DEVUELVE "NoRoute" O RESPUESTA VACÍA ---
+            throw new Error(data.message || "No se encontraron rutas.");
         }
     } catch (error) {
+        // --- LÓGICA DE ERROR QUE LLAMA AL NUEVO MODAL ---
         const existingRecalcToastError = document.getElementById(recalculateToastId);
         if (existingRecalcToastError) existingRecalcToastError.remove();
         activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
         
-        // --- LÓGICA DE ERROR ROBUSTA ---
-        const lastWaypoint = navigationWaypoints.pop(); // Saca el punto que falló y guárdalo
+        const lastWaypoint = navigationWaypoints.pop(); // Quita el punto que falló
         renderWaypointMarkers(); // Actualiza el mapa para mostrar que se ha eliminado
 
         if (lastWaypoint) {
-            // Construye el mensaje del toast con un botón real
-            const fragment = document.createDocumentFragment();
-            const textNode = document.createElement('span');
-            textNode.innerHTML = 'Error al calcular ruta. El punto puede ser inaccesible.<br>';
-            fragment.appendChild(textNode);
-            
-            const button = document.createElement('button');
-            button.textContent = 'Forzar Punto Original';
-            button.style.cssText = "background:orange;color:black;padding:4px 8px;border-radius:3px;margin-top:5px;cursor:pointer;";
-            button.onclick = () => {
-                forceAddOriginalPoint(lastWaypoint.lat, lastWaypoint.lng, lastWaypoint.address);
-            };
-            fragment.appendChild(button);
-
-            // Muestra el toast con el contenido dinámico
-            showToast(fragment, "error", 10000, true);
+            showRetryRouteModal(lastWaypoint); // Muestra el nuevo modal de error
         } else {
-            showToast("Error al calcular ruta. No se pudo identificar el punto problemático.", "error");
+            showToast(`Error al calcular ruta: ${error.message}`, "error");
         }
     }
     updateStartNavigationButtonState();
     updateNavigationButtonColor();
     isRecalculatingRoute = false;
 }
-
     
 
 
