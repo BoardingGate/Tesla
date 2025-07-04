@@ -15205,28 +15205,26 @@ function showNavigationMapHelpModal() {
     
     
     
-    
-    // ===================================================================
+  // ===================================================================
 // NOMBRE: addWaypoint
 // RESUMEN: Añade un punto de ruta al array de waypoints y actualiza el mapa.
 // ===================================================================
 async function addWaypoint(latlng, displayName = null) {
     if (!navigationMapInstance || isNavigating) return;
 
-    let address = displayName;
-    if (!address) {
-        // Si no tenemos un nombre, lo buscamos. 'await' es clave aquí.
-        address = await getAddressForWaypoint(latlng.lat, latlng.lng);
+    let finalAddress = displayName;
+    if (!finalAddress) {
+        finalAddress = await getAddressForWaypoint(latlng.lat, latlng.lng);
     }
 
     const newWaypoint = {
         id: Date.now(),
         lat: latlng.lat,
         lng: latlng.lng,
-        type: '', // Se determinará en updateWaypointTypesAndLabels
+        type: '',
         marker: null,
-        label: '', // Se determinará en updateWaypointTypesAndLabels
-        address: address, // Guardamos la dirección resuelta
+        label: '',
+        address: finalAddress,
         visited: false,
         isCriticalForRecalc: true,
         isInternal: false,
@@ -15254,24 +15252,13 @@ async function addWaypoint(latlng, displayName = null) {
     updateWaypointTypesAndLabels();
     renderWaypointMarkers();
 
-    // El recálculo ahora siempre funcionará con waypoints que tienen dirección
-    try {
-        await recalculateAndDrawRoute();
-        const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
-        if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
-            toggleRadaresRuta(true);
-        }
-        const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
-        if (tareasRutaCheckbox && tareasRutaCheckbox.checked) {
-            toggleTareasRuta(true);
-        }
-    } catch (e) {
-        showToast("Error recalculando la ruta tras añadir el punto.", "error");
-    }
+    // Importante: No ponemos try/catch aquí. Dejamos que el error, si lo hay, suba.
+    await recalculateAndDrawRoute();
 
     updateStartNavigationButtonState();
     updateNavigationButtonColor();
-}
+}  
+ 
     
     
     
@@ -15306,15 +15293,13 @@ async function addWaypoint(latlng, displayName = null) {
     }
     
     
-    
-    
-    
-    
-    
 
-    // ===================================================================
+
+
+    
+// ===================================================================
 // NOMBRE: searchAndAddWaypoint
-// RESUMEN: Busca una dirección, la transforma en coordenadas y la añade como waypoint.
+// RESUMEN: Busca una dirección, la transforma en coordenadas y la añade, manejando errores de forma robusta.
 // ===================================================================
 async function searchAndAddWaypoint(addressQuery = null) {
     const searchInput = document.getElementById('map-location-search-input');
@@ -15347,10 +15332,13 @@ async function searchAndAddWaypoint(addressQuery = null) {
         const displayName = result.display_name || `Ubicación (${lat.toFixed(3)}, ${lon.toFixed(3)})`;
         if (isNaN(lat) || isNaN(lon)) throw new Error("Coordenadas no válidas de Nominatim");
 
-        // --- PASO 2: AÑADIR WAYPOINT (la función addWaypoint se encargará del resto) ---
+        // --- PASO 2: AÑADIR WAYPOINT Y ESPERAR A QUE TERMINE EL RECÁLCULO ---
+        // Ponemos el AWAIT aquí. Esto es CRÍTICO.
+        // Si recalculateAndDrawRoute lanza un error, el `catch` de aquí abajo lo capturará.
         await addWaypoint(L.latLng(lat, lon), displayName);
-
-        if(navigationMapInstance) navigationMapInstance.setView(L.latLng(lat, lon), 15);
+        
+        // --- PASO 3: ACTUALIZAR LA INTERFAZ (solo si todo ha ido bien) ---
+        if (navigationMapInstance) navigationMapInstance.setView(L.latLng(lat, lon), 15);
         if (searchInput) {
             searchInput.value = '';
             searchInput.dispatchEvent(new Event('input'));
@@ -15358,7 +15346,9 @@ async function searchAndAddWaypoint(addressQuery = null) {
         showToast("Ubicación añadida a la ruta", "success");
 
     } catch (error) {
-        showToast(`Error al buscar: ${error.message}`, "error", 4000, true);
+        // --- CAPTURA DE ERRORES GLOBAL ---
+        // Este catch ahora se activará si falla CUALQUIER paso anterior, incluido el recálculo de ruta
+        showToast(`Error al añadir punto: ${error.message}`, "error", 4000, true);
     } finally {
         if (searchButton) {
             searchButton.disabled = false;
@@ -15371,6 +15361,11 @@ async function searchAndAddWaypoint(addressQuery = null) {
         }
     }
 }
+    
+    
+    
+
+ 
     
     
     
@@ -16209,11 +16204,9 @@ function closeNavigationMap(force = false) {
     
 
 
-
-
 // ===================================================================
 // NOMBRE: recalculateAndDrawRoute
-// RESUMEN: Solicita una nueva ruta a OSRM y, si falla, muestra un modal de reintento.
+// RESUMEN: Solicita una nueva ruta a OSRM. Si falla, lanza un error.
 // ===================================================================
 async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
     isRecalculatingRoute = true;
@@ -16239,75 +16232,62 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
         const existingToast = document.getElementById(recalculateToastId);
         if (existingToast) existingToast.remove();
         isRecalculatingRoute = false;
-        return;
+        return; // Devuelve una promesa resuelta
     }
     const coordsString = waypointsForRouteCalculation.map(wp => `${wp.lng},${wp.lat}`).join(';');
     const url = `${OSRM_SERVICE_URL}/driving/${coordsString}?overview=full&geometries=geojson&steps=true&alternatives=false&annotations=true`;
     
-    try {
-        const response = await fetch(url);
-        const data = await response.json();
+    // El try/catch está ahora en la función que llama a esta
+    const response = await fetch(url);
+    const data = await response.json();
+    const existingToast = document.getElementById(recalculateToastId);
+    if (existingToast) existingToast.remove();
 
-        // --- DETECCIÓN DE ERROR MEJORADA ---
-        if (response.ok && data.code === "Ok" && data.routes && data.routes.length > 0) {
-            // --- LÓGICA DE ÉXITO ---
-            const existingRecalcToastSuccess = document.getElementById(recalculateToastId);
-            if (existingRecalcToastSuccess) existingRecalcToastSuccess.remove();
-            activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
-            navigationCurrentRouteData = data;
-            if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
-            drawRouteOnMap(data.routes[0]);
-            // (El resto de la lógica de éxito permanece igual)
-            currentLegIndexNav = 0; currentStepIndexNav = 0; lastProcessedStepManeuverLocation = null;
-            if (preserveAccumulatedStats && data.routes[0]) {
-                tripInitialOverallEtaTime = new Date(Date.now() + (data.routes[0].duration * 1000));
-                if (data.routes[0].legs && data.routes[0].legs.length > 0) {
-                     currentStageInitialExpectedEtaTime = new Date(Date.now() + (data.routes[0].legs[0].duration * 1000));
-                }
+    if (response.ok && data.code === "Ok" && data.routes && data.routes.length > 0) {
+        navigationCurrentRouteData = data;
+        if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
+        drawRouteOnMap(data.routes[0]);
+        // Lógica de éxito...
+        currentLegIndexNav = 0; currentStepIndexNav = 0; lastProcessedStepManeuverLocation = null;
+        if (preserveAccumulatedStats && data.routes[0]) {
+            tripInitialOverallEtaTime = new Date(Date.now() + (data.routes[0].duration * 1000));
+            if (data.routes[0].legs && data.routes[0].legs.length > 0) {
+                 currentStageInitialExpectedEtaTime = new Date(Date.now() + (data.routes[0].legs[0].duration * 1000));
             }
-            if (data.routes[0]) {
-                 const currentCarPosForRecalc = navigationCurrentLocation;
-                 let carDistanceAlongRouteForInternalUse = 0;
-                 if (currentCarPosForRecalc && navigationMapInstance && navigationRouteLayer && typeof turf !== 'undefined' && navigationRouteLayer.getLatLngs().length > 0) {
-                    try {
-                        const carPointTurf = turf.point([currentCarPosForRecalc.longitude, currentCarPosForRecalc.latitude]);
-                        const routeLineStringTurf = turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat]));
-                        const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
-                        const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
-                        carDistanceAlongRouteForInternalUse = turf.length(lineSliceToNearestTurf, { units: 'meters' });
-                    } catch (turfError) {}
-                 }
-                 lastCarDistanceAlongRouteForNavLogic = carDistanceAlongRouteForInternalUse;
-                 updateNavigationProgressDisplay(data.routes[0], carDistanceAlongRouteForInternalUse);
-                 updateTurnByTurnDisplay(data.routes[0], carDistanceAlongRouteForInternalUse);
-                 showDestinationName();
-            }
-            showNavigationUIElementsForPlanning();
-            recalculationAttempts = 0;
-            if (recalculationRetryTimeoutId) clearTimeout(recalculationRetryTimeoutId);
-            recalculationRetryTimeoutId = null;
-        } else {
-            // --- LANZAMOS UN ERROR PERSONALIZADO SI OSRM DEVUELVE "NoRoute" O RESPUESTA VACÍA ---
-            throw new Error(data.message || "No se encontraron rutas.");
         }
-    } catch (error) {
-        // --- LÓGICA DE ERROR QUE LLAMA AL NUEVO MODAL ---
-        const existingRecalcToastError = document.getElementById(recalculateToastId);
-        if (existingRecalcToastError) existingRecalcToastError.remove();
-        activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
+        if (data.routes[0]) {
+             const currentCarPosForRecalc = navigationCurrentLocation;
+             let carDistanceAlongRouteForInternalUse = 0;
+             if (currentCarPosForRecalc && navigationMapInstance && navigationRouteLayer && typeof turf !== 'undefined' && navigationRouteLayer.getLatLngs().length > 0) {
+                try {
+                    const carPointTurf = turf.point([currentCarPosForRecalc.longitude, currentCarPosForRecalc.latitude]);
+                    const routeLineStringTurf = turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat]));
+                    const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
+                    const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
+                    carDistanceAlongRouteForInternalUse = turf.length(lineSliceToNearestTurf, { units: 'meters' });
+                } catch (turfError) {}
+             }
+             lastCarDistanceAlongRouteForNavLogic = carDistanceAlongRouteForInternalUse;
+             updateNavigationProgressDisplay(data.routes[0], carDistanceAlongRouteForInternalUse);
+             updateTurnByTurnDisplay(data.routes[0], carDistanceAlongRouteForInternalUse);
+             showDestinationName();
+        }
+        showNavigationUIElementsForPlanning();
+        isRecalculatingRoute = false;
+        // La función termina con éxito
+    } else {
+        // Si falla, lanzamos un error que será capturado por la función que nos llamó
+        const lastWaypoint = navigationWaypoints.pop(); // Quitamos el punto que causó el fallo
+        renderWaypointMarkers(); // Actualizamos el mapa para reflejar la eliminación
         
-        const lastWaypoint = navigationWaypoints.pop(); // Quita el punto que falló
-        renderWaypointMarkers(); // Actualiza el mapa para mostrar que se ha eliminado
-
-        if (lastWaypoint) {
-            showRetryRouteModal(lastWaypoint); // Muestra el nuevo modal de error
-        } else {
-            showToast(`Error al calcular ruta: ${error.message}`, "error");
+        // Ahora, mostramos el modal de error
+        if(lastWaypoint) {
+             showRetryRouteModal(lastWaypoint);
         }
+        
+        // Lanzamos el error para que la cadena de promesas se detenga
+        throw new Error(data.message || "No se pudo calcular la ruta al punto añadido.");
     }
-    updateStartNavigationButtonState();
-    updateNavigationButtonColor();
-    isRecalculatingRoute = false;
 }
     
 
