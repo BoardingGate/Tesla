@@ -15168,70 +15168,100 @@ function showNavigationMapHelpModal() {
     
     
     
-    
-    
-    
+
+
     // ===================================================================
-    // NOMBRE: searchAndAddWaypoint
-    // RESUMEN: Busca una dirección usando Nominatim y la añade como un punto de ruta.
-    // ===================================================================
-    async function searchAndAddWaypoint(addressQuery = null) {
-        const searchInput = document.getElementById('map-location-search-input');
-        const address = addressQuery || searchInput.value.trim();
-        if (!address) {
-            showToast("Por favor, introduce una dirección para buscar", "warning");
-            return;
+// NOMBRE: searchAndAddWaypoint
+// RESUMEN: Busca una dirección, la ajusta al punto más cercano de la carretera y la añade como waypoint.
+// ===================================================================
+async function searchAndAddWaypoint(addressQuery = null) {
+    const searchInput = document.getElementById('map-location-search-input');
+    const address = addressQuery || searchInput.value.trim();
+    if (!address) {
+        showToast("Por favor, introduce una dirección para buscar", "warning");
+        return;
+    }
+    const searchButton = document.getElementById('map-location-search-button');
+    if (searchButton) {
+        searchButton.disabled = true;
+        searchButton.innerHTML = `<img src="BUSCANDO.PNG" alt="Buscando...">`;
+    }
+
+    try {
+        // --- PASO 1: Búsqueda de la dirección con Nominatim ---
+        let addressToSearch = address;
+        if (typeof addressToSearch === 'string') {
+          addressToSearch = addressToSearch.replace(/,/g, '');
         }
-        const searchButton = document.getElementById('map-location-search-button');
-        if (searchButton) {
-            searchButton.disabled = true;
-            searchButton.innerHTML = `<img src="BUSCANDO.PNG" alt="Buscando...">`;
+        const searchUrl = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(addressToSearch)}&limit=1&accept-language=es&addressdetails=1`;
+        const searchResponse = await fetch(searchUrl);
+        if (!searchResponse.ok) {
+            throw new Error(`Error de red Nominatim: ${searchResponse.status}`);
         }
-        try {
-            let addressToSearch = address;
-            if (typeof addressToSearch === 'string') {
-              addressToSearch = addressToSearch.replace(/,/g, '');
-            }
-            const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(addressToSearch)}&limit=1&accept-language=es&addressdetails=1`;
-            const response = await fetch(url);
-            if (!response.ok) {
-                throw new Error(`Error de red: ${response.status} ${response.statusText}`);
-            }
-            const data = await response.json();
-            if (data && data.length > 0) {
-                const result = data[0];
-                const lat = parseFloat(result.lat);
-                const lon = parseFloat(result.lon);
-                const displayName = result.display_name || "Ubicación Desconocida";
-                if (!isNaN(lat) && !isNaN(lon)) {
-                    const latlng = L.latLng(lat, lon);
-                    addWaypoint(latlng, displayName.substring(0,30));
-                    if(navigationMapInstance) navigationMapInstance.setView(latlng, 15);
-                    if (searchInput) {
-                        searchInput.value = '';
-                        searchInput.dispatchEvent(new Event('input'));
-                    }
-                    showToast("Ubicación añadida como etapa", "success");
-                } else {
-                    showToast("Coordenadas no válidas para la dirección", "error", 4000, true);
-                }
+        const searchData = await searchResponse.json();
+
+        if (!searchData || searchData.length === 0) {
+            showToast("Dirección no encontrada vía Nominatim", "warning", 4000, true);
+            throw new Error("NoResults");
+        }
+        
+        const result = searchData[0];
+        const lat = parseFloat(result.lat);
+        const lon = parseFloat(result.lon);
+        const displayName = result.display_name || "Ubicación Desconocida";
+        if (isNaN(lat) || isNaN(lon)) {
+            throw new Error("Nominatim devolvió coordenadas no válidas.");
+        }
+
+        // --- PASO 2: Ajuste de las coordenadas a la carretera más cercana con OSRM ---
+        showToast("Ajustando ubicación a la carretera...", "info");
+        const nearestUrl = `${OSRM_SERVICE_URL}/nearest/v1/driving/${lon},${lat}?number=1`;
+        const nearestResponse = await fetch(nearestUrl);
+        if (!nearestResponse.ok) {
+            // Si el ajuste falla, usamos las coordenadas originales como último recurso
+            console.warn(`OSRM /nearest falló. Usando coordenadas originales de Nominatim.`);
+            addWaypoint(L.latLng(lat, lon), displayName.substring(0,30));
+        } else {
+            const nearestData = await nearestResponse.json();
+            if (nearestData.code === "Ok" && nearestData.waypoints && nearestData.waypoints.length > 0) {
+                const snappedCoords = nearestData.waypoints[0].location;
+                const snappedLat = snappedCoords[1];
+                const snappedLon = snappedCoords[0];
+                addWaypoint(L.latLng(snappedLat, snappedLon), displayName.substring(0,30));
             } else {
-                showToast("Dirección no encontrada", "warning", 4000, true);
+                // Si OSRM no encuentra un punto cercano, también usamos las originales
+                console.warn("OSRM /nearest no encontró un punto válido. Usando coordenadas originales de Nominatim.");
+                addWaypoint(L.latLng(lat, lon), displayName.substring(0,30));
             }
-        } catch (error) {
+        }
+        
+        // --- PASO 3: Actualizar la interfaz ---
+        if(navigationMapInstance) navigationMapInstance.setView(L.latLng(lat, lon), 15);
+        if (searchInput) {
+            searchInput.value = '';
+            searchInput.dispatchEvent(new Event('input'));
+        }
+        showToast("Ubicación añadida como etapa", "success");
+
+    } catch (error) {
+        if (error.message !== "NoResults") { // No mostrar toast de error si ya mostramos el de "no encontrado"
             showToast(`Error al buscar: ${error.message}`, "error", 4000, true);
-        } finally {
-            if (searchButton) {
-                searchButton.disabled = false;
-                searchButton.innerHTML = `<img src="ANADIRPUNTO.PNG" alt="Añadir Punto Ruta">`;
-                if (searchInput && searchInput.value.trim() === '') {
-                    searchButton.style.display = 'none';
-                    const clearMapSearchBtn = document.getElementById('clear-map-search-input-button');
-                    if (clearMapSearchBtn) clearMapSearchBtn.style.display = 'none';
-                }
+        }
+    } finally {
+        if (searchButton) {
+            searchButton.disabled = false;
+            searchButton.innerHTML = `<img src="ANADIRPUNTO.PNG" alt="Añadir Punto Ruta">`;
+            if (searchInput && searchInput.value.trim() === '') {
+                searchButton.style.display = 'none';
+                const clearMapSearchBtn = document.getElementById('clear-map-search-input-button');
+                if (clearMapSearchBtn) clearMapSearchBtn.style.display = 'none';
             }
         }
     }
+}
+    
+    
+    
     
     
     
