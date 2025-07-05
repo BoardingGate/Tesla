@@ -1,4 +1,4 @@
-
+..
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -14315,8 +14315,6 @@ function processSimulatedGpsPosition(forceExactPosition = false) {
     
     
     
-
-
 // ===================================================================
 // NOMBRE: openNavigationMap
 // RESUMEN: Abre y inicializa el mapa principal de navegación.
@@ -14486,7 +14484,9 @@ function openNavigationMap() {
             if (mapLayersControl) mapLayersControl.remove();
             if (compassAndModeControl) compassAndModeControl.remove();
 
-            navigationMapInstance = L.map(mapActualContainer, { zoomControl: false, attributionControl: false });
+            // *** CAMBIO CRÍTICO 1: Añadir una vista por defecto para evitar que el mapa se quede en blanco ***
+            navigationMapInstance = L.map(mapActualContainer, { zoomControl: false, attributionControl: false }).setView([40.416775, -3.703790], 6); // Vista por defecto de España
+            
             L.control.attribution({ prefix: '<a href="https://leafletjs.com" title="A JS library for interactive maps">Leaflet</a>', position: 'bottomright' }).addTo(navigationMapInstance);
 
             const osmLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© <a href="https://www.openstreetmap.org/copyright">OSM</a>' });
@@ -14509,10 +14509,42 @@ function openNavigationMap() {
             completedRouteSegmentsLayer = L.layerGroup().addTo(navigationMapInstance);
             maxSpeedMarkerLayer = L.layerGroup().addTo(navigationMapInstance);
             speedMilestoneLayer = L.layerGroup().addTo(navigationMapInstance);
+
+            navigationMapInstance.on('baselayerchange', function(e) {
+                localStorage.setItem(ACTIVE_MAP_LAYER_KEY, e.name);
+                updateRouteAndCarIconStyle();
+                updateNavigationGraphVisibilityAndMode();
+            });
             
-            // --- INICIO DE LA SOLUCIÓN ---
-            let initialCenterAction = () => {}; // Función vacía por defecto
+            navigationMapInstance.on('zoomend', () => {
+                displayAlertsOnMap();
+                renderWaypointMarkers();
+                updateDirectionWarningCardsVisibility();
+            });
             
+            let resizeInterval = setInterval(() => {
+                if (navigationMapInstance) {
+                    navigationMapInstance.invalidateSize();
+                }
+            }, 250);
+
+            setTimeout(() => {
+                clearInterval(resizeInterval);
+            }, 2000);
+
+            const originalCloseFunction = window.closeNavigationMap;
+            window.closeNavigationMap = (force) => {
+                clearInterval(resizeInterval);
+                window.closeNavigationMap = originalCloseFunction;
+                originalCloseFunction(force);
+            };
+
+            updateRouteAndCarIconStyle();
+            plotRemindersOnNavigationMap();
+            
+            // --- INICIO LÓGICA DE CENTRADO SEGURA ---
+            let centerAction = null;
+
             navigationMapInstance.on('load', function() {
                 toggleMapHeaderRowsVisibility(mapHeaderButtonsVisible); 
                 const loadingToast = document.getElementById("map-loading-toast");
@@ -14520,40 +14552,27 @@ function openNavigationMap() {
                     loadingToast.remove();
                     activeToasts = activeToasts.filter(t => t.id !== "map-loading-toast");
                 }
-                // Ejecutamos la acción de centrado aquí, cuando el mapa está listo
-                if(initialCenterAction) {
-                    initialCenterAction();
+                // Si la acción de centrado se definió antes de que el mapa cargara, se ejecuta ahora
+                if(centerAction) {
+                    centerAction();
                 }
             });
-            
-            navigationMapInstance.on('baselayerchange', function(e) {
-                localStorage.setItem(ACTIVE_MAP_LAYER_KEY, e.name);
-                updateRouteAndCarIconStyle();
-                updateNavigationGraphVisibilityAndMode();
-            });
 
-            navigationMapInstance.on('zoomend', () => {
-                displayAlertsOnMap();
-                renderWaypointMarkers();
-                updateDirectionWarningCardsVisibility();
-            });
-            
-            // ... (el resto del código de inicialización permanece igual) ...
-            updateRouteAndCarIconStyle();
-            plotRemindersOnNavigationMap();
             getCurrentLocation(
                 (currentPos) => {
                     navigationCurrentLocation = currentPos;
                     updateInitialUserPosition(currentPos, navigationMapInstance);
-                    // Memorizamos la acción de centrado en lugar de ejecutarla directamente
-                    initialCenterAction = () => {
+                    // Definimos la acción de centrado por GPS
+                    const gpsCenterAction = () => {
                          if (navigationWaypoints.length === 0) {
                             navigationMapInstance.setView([currentPos.latitude, currentPos.longitude], 15);
                         }
                     };
-                    // Si el mapa ya se ha cargado para cuando llegue el GPS, centramos
+                    // Si el mapa ya cargó, ejecutamos la acción. Si no, la guardamos para el evento 'load'
                     if (navigationMapInstance._loaded) {
-                        initialCenterAction();
+                        gpsCenterAction();
+                    } else {
+                        centerAction = gpsCenterAction;
                     }
                     startGpsWatching(); 
                 },
@@ -14561,11 +14580,11 @@ function openNavigationMap() {
                     showToast("No se pudo obtener tu ubicación actual. Algunas funciones pueden estar limitadas", "warning");
                     if (compassAndModeControl) { compassAndModeControl.updateOrientation(null); compassAndModeControl.updateAltitude(null); }
                     
-                    // Memorizamos la acción de centrado de fallback
-                    initialCenterAction = () => {
+                    // Definimos la acción de centrado de fallback
+                    const fallbackCenterAction = () => {
                         const remindersWithLocation = JSON.parse(localStorage.getItem('reminders') || '[]').filter(r => r.isLocationEnabled && r.locationCoordinates);
                         if (navigationWaypoints.length === 0 && remindersWithLocation.length === 0) {
-                            navigationMapInstance.setView([40.416775, -3.703790], 6);
+                            // No hacemos nada, ya está la vista por defecto de España
                         } else if (remindersWithLocation.length > 0 && navigationWaypoints.length === 0) {
                             const bounds = L.latLngBounds(remindersWithLocation.map(r => [r.locationCoordinates.latitude, r.locationCoordinates.longitude]));
                             if (bounds.isValid()) {
@@ -14573,11 +14592,13 @@ function openNavigationMap() {
                             }
                         }
                     };
-                     // Si el mapa ya se ha cargado, ejecutamos la acción de fallback
+
                     if (navigationMapInstance._loaded) {
-                        initialCenterAction();
+                        fallbackCenterAction();
+                    } else {
+                        centerAction = fallbackCenterAction;
                     }
-                     
+
                     const loadingToast = document.getElementById("map-loading-toast");
                      if (loadingToast) {
                          loadingToast.remove();
@@ -14586,6 +14607,7 @@ function openNavigationMap() {
                     startGpsWatching(); 
                 }
             );
+            // --- FIN LÓGICA DE CENTRADO SEGURA ---
             
             forceProcessTrafficAlerts();
             setNavigationMapClickHandler();
@@ -14606,6 +14628,8 @@ function openNavigationMap() {
         updateNavigationGraphVisibilityAndMode();
     });
 }
+
+    
 
 
     
