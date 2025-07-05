@@ -4918,59 +4918,45 @@ async function processTrafficAlerts() {
 
 
 // ===================================================================
-// NOMBRE: generateManeuverIconDataURL
-// RESUMEN: Crea una imagen escalada de una maniobra específica desde la hoja de sprites usando un canvas.
+// NOMBRE: getManeuverIconFilename
+// RESUMEN: Devuelve el nombre del fichero de imagen para una maniobra.
 // ===================================================================
-const maneuverIconCache = {};
-const spriteSheetImage = new Image();
+function getManeuverIconFilename(maneuver) {
+    if (!maneuver) return 'continue.png'; // Por defecto
+    const type = maneuver.type || '';
+    const modifier = maneuver.modifier || '';
 
-// *** CAMBIO CLAVE ***: Añadimos crossorigin="anonymous"
-// Esto le dice al navegador que intente cargar la imagen de forma anónima,
-// lo cual a veces es suficiente para que los servidores CDN con CORS flexible lo permitan.
-spriteSheetImage.crossOrigin = "Anonymous"; 
-
-const spriteSheetPromise = new Promise((resolve, reject) => {
-    spriteSheetImage.onload = () => resolve(spriteSheetImage);
-    spriteSheetImage.onerror = reject;
-    
-    // *** CAMBIO CLAVE ***: Apuntamos a la copia local en tu repositorio.
-    // Asegúrate de que la ruta sea correcta según donde hayas subido la imagen.
-    spriteSheetImage.src = 'https://boardinggate.github.io/Tesla/leaflet.routing.icons.png';
-});
-
-async function generateManeuverIconDataURL(maneuver, size) {
-    const iconIndex = getLrmIconIndex(maneuver);
-    const cacheKey = `${iconIndex}_${size}`;
-    
-    if (maneuverIconCache[cacheKey]) {
-        return maneuverIconCache[cacheKey];
+    // Salidas de rotonda específicas
+    if (type.includes('roundabout') && maneuver.exit && maneuver.exit >= 1 && maneuver.exit <= 5 && getManeuverInstructionText(maneuver).toLowerCase().includes("salida")) {
+        return `S${maneuver.exit}.PNG`;
     }
+    
+    // Casos únicos y sin ambigüedad
+    if (type === 'depart') return 'depart.png';
+    if (type === 'arrive') return 'arrive.png';
+    if (type.includes('roundabout') || type.includes('rotary')) return 'roundabout.png';
+    // *** NUEVA LÍNEA AÑADIDA ***
+    if (type.includes('ramp')) return 'ramp.png'; // Para vías de incorporación/salida
+    
+    // Casos con modificador (ordenados de más específico a más general)
+    if (modifier.includes('uturn')) return 'u-turn.png';
+    
+    // Giros a la DERECHA (de más brusco a más suave)
+    if (modifier.includes('sharp right')) return 'sharp-right.png';
+    if (modifier.includes('right')) return 'turn-right.png'; // Cubre 'turn right'
+    if (modifier.includes('slight right') || modifier.includes('bear right')) return 'bear-right.png';
+    
+    // Giros a la IZQUIERDA (de más brusco a más suave)
+    if (modifier.includes('sharp left')) return 'sharp-left.png';
+    if (modifier.includes('left')) return 'turn-left.png'; // Cubre 'turn left'
+    if (modifier.includes('slight left') || modifier.includes('bear left')) return 'bear-left.png';
 
-    try {
-        const image = await spriteSheetPromise;
-        const canvas = document.createElement('canvas');
-        canvas.width = size;
-        canvas.height = size;
-        const ctx = canvas.getContext('2d');
-
-        const sx = iconIndex * 24; // Posición X del icono en la imagen original
-        const sy = 0;              // Posición Y del icono en la imagen original
-        const sWidth = 24;         // Ancho del icono original
-        const sHeight = 24;        // Alto del icono original
-
-        ctx.imageSmoothingEnabled = false; 
-        ctx.drawImage(image, sx, sy, sWidth, sHeight, 0, 0, size, size);
-
-        const dataURL = canvas.toDataURL('image/png');
-        maneuverIconCache[cacheKey] = dataURL; 
-        return dataURL;
-    } catch (error) {
-        // En caso de que la imagen aún falle (por ejemplo, si no se ha subido correctamente),
-        // este log te dará una pista más clara.
-        console.error("Error al cargar o procesar la hoja de sprites. ¿Está la imagen en la URL correcta y se ha subido al repositorio?", error);
-        return ''; 
-    }
+    // Por defecto, para 'straight', 'continue', etc.
+    return 'continue.png'; 
 }
+
+
+
 
 
     
@@ -7303,136 +7289,6 @@ function showDeviationModal() {
     
 
 
-// ===================================================================
-// NOMBRE: updateTurnByTurnDisplay
-// RESUMEN: Actualiza la barra de información de giro en la navegación.
-// ===================================================================
-async function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
-    const topInfoBar = document.getElementById('navigation-top-info-bar');
-    const intersectionPreviewWindow = document.getElementById('intersection-preview-map-window');
-    if (!route || !topInfoBar || !route.legs || route.legs.length === 0) {
-        if (topInfoBar) topInfoBar.style.display = 'none';
-        if (intersectionPreviewWindow && !intersectionPreviewWindow.classList.contains('hidden') && intersectionPreviewWindow.dataset.source !== 'click') hideIntersectionPreviewMap();
-        updateDirectionWarningCardsVisibility();
-        return;
-    }
-    if (!isNavigating && (!navigationCurrentRouteData || navigationWaypoints.length < 2)) {
-         if (topInfoBar) topInfoBar.style.display = 'none';
-         if (intersectionPreviewWindow && !intersectionPreviewWindow.classList.contains('hidden') && intersectionPreviewWindow.dataset.source !== 'click') hideIntersectionPreviewMap();
-         updateDirectionWarningCardsVisibility();
-         return;
-    }
-    topInfoBar.style.display = 'flex';
-    const turnIconDisplayEl = document.getElementById('turn-icon-display');
-    const maneuverTextEl = document.getElementById('maneuver-text-display');
-    const distanceFormattedEl = document.getElementById('distance-to-turn-formatted');
-    const streetEl = document.getElementById('street-name-display');
-    const progressBarEl = document.getElementById('distance-progress-bar-to-turn');
-    const carDistance = Math.min(Math.max(0, carDistanceAlongTheRoute), route.distance);
-    let distanceCoveredInRoute = 0;
-    let currentLegIndex = -1; let currentStepIndex = -1;
-    let nextStepToDisplay = null; let distanceToEndOfCurrentStepForProgress = 0;
-    let previousStepForPath = null;
-    for (let i = 0; i < route.legs.length; i++) {
-        const leg = route.legs[i];
-        for (let j = 0; j < leg.steps.length; j++) {
-            const step = leg.steps[j];
-            if (carDistance < distanceCoveredInRoute + step.distance) {
-                currentLegIndex = i; currentStepIndex = j; distanceToEndOfCurrentStepForProgress = distanceCoveredInRoute + step.distance;
-                if (j > 0) { previousStepForPath = leg.steps[j - 1]; }
-                else if (i > 0) { previousStepForPath = route.legs[i-1].steps[route.legs[i-1].steps.length - 1]; }
-                break;
-            }
-            distanceCoveredInRoute += step.distance;
-        }
-        if (currentLegIndex !== -1) break;
-    }
-    if (currentLegIndex === -1) {
-        currentLegIndex = route.legs.length - 1; currentStepIndex = route.legs[currentLegIndex].steps.length - 1;
-        distanceToEndOfCurrentStepForProgress = route.distance;
-    }
-    currentLegIndexNav = currentLegIndex; currentStepIndexNav = currentStepIndex;
-    const currentLeg = route.legs[currentLegIndex];
-    if (currentStepIndex + 1 < currentLeg.steps.length) { nextStepToDisplay = currentLeg.steps[currentStepIndex + 1]; } 
-    else if (currentLegIndex + 1 < route.legs.length) { nextStepToDisplay = route.legs[currentLegIndex + 1].steps[0]; } 
-    else { nextStepToDisplay = currentLeg.steps[currentStepIndex]; }
-    const currentStepForProgress = currentLeg.steps[currentStepIndex];
-    const distanceToNextManeuver = Math.max(0, distanceToEndOfCurrentStepForProgress - carDistance);
-    navigationTargetZoom = handleProgressiveManeuverZoom(currentStepForProgress, distanceToNextManeuver);
-
-    if (nextStepToDisplay && nextStepToDisplay.maneuver) {
-        const maneuver = nextStepToDisplay.maneuver;
-        const type = maneuver.type || '';
-        
-        if (turnIconDisplayEl) {
-            turnIconDisplayEl.innerHTML = ''; // Limpiamos
-            const roundaboutExitTypes = ['roundabout turn', 'exit roundabout', 'rotary', 'roundabout'];
-            if (roundaboutExitTypes.includes(type) && maneuver.exit && maneuver.exit >= 1 && maneuver.exit <= 5 && getManeuverInstructionText(maneuver).toLowerCase().includes("salida")) {
-                const img = document.createElement('img'); img.src = `./S${maneuver.exit}.PNG`; img.style.width = '95%'; img.style.height = '95%'; img.style.objectFit = 'contain';
-                turnIconDisplayEl.appendChild(img);
-            } else {
-                const iconImg = document.createElement('img');
-                // *** CAMBIO CLAVE: Se ajusta el tamaño para dejar un pequeño margen ***
-                iconImg.style.width = '90%';
-                iconImg.style.height = '90%';
-                iconImg.style.objectFit = 'contain';
-                iconImg.style.imageRendering = 'pixelated';
-                turnIconDisplayEl.appendChild(iconImg);
-                
-                generateManeuverIconDataURL(maneuver, 48).then(dataUrl => {
-                    if (dataUrl) iconImg.src = dataUrl;
-                });
-            }
-        }
-
-        let maneuverText = getManeuverInstructionText(maneuver);
-        let streetNameText = nextStepToDisplay.name || '';
-        if (type === 'arrive' || type === 'depart' || type === 'end of road' || type === 'roundabout' || type === 'rotary') { streetNameText = ''; }
-        maneuverTextEl.textContent = maneuverText ? `${maneuverText} ` : ''; streetEl.textContent = streetNameText;
-        distanceToNextManeuverOSRM = distanceToNextManeuver;
-        if (distanceToNextManeuver < 1000) { distanceFormattedEl.textContent = `${Math.round(distanceToNextManeuver / 5) * 5} m`; } 
-        else { distanceFormattedEl.textContent = `${(distanceToNextManeuver / 1000).toFixed(1)} km`; }
-        const distanceCoveredInCurrentStep = (currentStepForProgress.distance || 0) - distanceToNextManeuver;
-        const progressPercent = (currentStepForProgress.distance > 0) ? (distanceCoveredInCurrentStep / currentStepForProgress.distance) * 100 : (distanceToNextManeuver === 0 ? 100 : 0);
-        progressBarEl.style.width = `${Math.min(100, Math.max(0, progressPercent))}%`;
-        
-        if (isNavigating && previousStepForPath && completedRouteSegmentsLayer && navigationCurrentLocation ) {
-             if (previousStepForPath.maneuver && previousStepForPath.maneuver.location && previousStepForPath.maneuver.location.length === 2) {
-                const prevManeuverLocLatLng = L.latLng(previousStepForPath.maneuver.location[1], previousStepForPath.maneuver.location[0]);
-                 if (!lastProcessedStepManeuverLocation || (lastProcessedStepManeuverLocation.lat.toFixed(5) !== prevManeuverLocLatLng.lat.toFixed(5) || lastProcessedStepManeuverLocation.lng.toFixed(5) !== prevManeuverLocLatLng.lng.toFixed(5))) {
-                    if (previousStepForPath.geometry && previousStepForPath.geometry.coordinates) {
-                        const segmentCoords = previousStepForPath.geometry.coordinates.map(c => [c[1], c[0]]);
-                        if (segmentCoords.length >= 2) {
-                            if (completedRouteSegmentsLayer) L.polyline(segmentCoords, { color: 'green', weight: 6, opacity: 0.8 }).addTo(completedRouteSegmentsLayer);
-                            lastProcessedStepManeuverLocation = prevManeuverLocLatLng;
-                        }
-                    }
-                }
-            }
-        }
-        const isRelevantIntersectionManeuver = type !== 'continue' && type !== 'new name' && type !== 'depart' && type !== 'straight';
-        if (isNavigating && distanceToNextManeuver < 800 && distanceToNextManeuver >= 100 && isRelevantIntersectionManeuver && (!intersectionPreviewWindow || intersectionPreviewWindow.classList.contains('hidden') || intersectionPreviewWindow.dataset.source !== 'click') && (currentLegIndex + '_' + currentStepIndex) !== lastAutoShownManeuverId) {
-            showIntersectionPreviewMap(nextStepToDisplay, route, false, 6000);
-            lastAutoShownManeuverId = currentLegIndex + '_' + currentStepIndex;
-        } else if (intersectionPreviewWindow && !intersectionPreviewWindow.classList.contains('hidden') && intersectionPreviewWindow.dataset.source !== 'click' && (distanceToNextManeuver >= 800 || distanceToNextManeuver < 100 || !isRelevantIntersectionManeuver)) {
-            hideIntersectionPreviewMap();
-        }
-    } else {
-        if (turnIconDisplayEl) {
-            turnIconDisplayEl.innerHTML = '';
-            const iconImg = document.createElement('img');
-            iconImg.style.width = '90%'; iconImg.style.height = '90%'; iconImg.style.objectFit = 'contain';
-            turnIconDisplayEl.appendChild(iconImg);
-            generateManeuverIconDataURL({ type: 'arrive' }, 48).then(dataUrl => {
-                if (dataUrl) iconImg.src = dataUrl;
-            });
-        }
-        maneuverTextEl.textContent = ''; distanceFormattedEl.textContent = '0 m'; streetEl.textContent = 'Calculando... o alcanzado.'; progressBarEl.style.width = '100%';
-        distanceToNextManeuverOSRM = Infinity;
-        if (intersectionPreviewWindow && !intersectionPreviewWindow.classList.contains('hidden') && intersectionPreviewWindow.dataset.source !== 'click') hideIntersectionPreviewMap();
-    }
-    updateDirectionWarningCardsVisibility();
-}
 
 
 
@@ -7444,40 +7300,6 @@ async function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
 
     
 
- // ===================================================================
-// NOMBRE: getLrmIconIndex
-// RESUMEN: Devuelve el índice (0, 1, 2, ...) de una maniobra en la hoja de sprites.
-// ESTA VERSIÓN ESTÁ CORREGIDA SEGÚN LA IMAGEN DE SPRITES PROPORCIONADA Y EL ORDEN DE LOS IFs.
-// ===================================================================
-function getLrmIconIndex(maneuver) {
-    if (!maneuver) return 0; // Por defecto: 'continue' (índice 0)
-    const type = maneuver.type || '';
-    const modifier = maneuver.modifier || '';
-
-    // Mapeo basado en la imagen: ↑(0) ↘(1) ↳(2) ↱(3) ↶(4) ↙(5) ↲(6) ↰(7) A(8) ○(9) B(10)
-    
-    // Casos únicos y sin ambigüedad
-    if (type === 'depart') return 8;    // 'A'
-    if (type === 'arrive') return 10;   // 'B'
-    if (type.includes('roundabout') || type.includes('rotary')) return 9; // '○'
-    
-    // Maniobras con modificador (el orden de los 'if' es CRÍTICO, de más específico a más general)
-    if (modifier.includes('uturn')) return 4;
-
-    // Giros a la DERECHA (de más brusco a más suave)
-    if (modifier.includes('sharp right')) return 3;     // '↱'
-    if (modifier.includes('slight right') || modifier.includes('bear right')) return 1; // '↘'
-    if (modifier.includes('right')) return 2;            // '↳' (Este debe ir al final de los 'right')
-
-    // Giros a la IZQUIERDA (de más brusco a más suave)
-    if (modifier.includes('sharp left')) return 7;      // '↰'
-    if (modifier.includes('slight left') || modifier.includes('bear left')) return 5; // '↙'
-    if (modifier.includes('left')) return 6;             // '↲' (Este debe ir al final de los 'left')
-    
-    // Por defecto, para 'straight', 'continue', etc.
-    return 0; // '↑'
-}   
-    
     
     
     
