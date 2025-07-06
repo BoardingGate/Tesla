@@ -3,7 +3,7 @@ name: Actualizar Puntos de Recarga DGT
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 5 * * *' # Se ejecuta todos los días a las 5:00 AM UTC
+    - cron: '0 5 * * *'
 
 jobs:
   update-data:
@@ -30,79 +30,65 @@ jobs:
 
             const DGT_URL = "https://infocar.dgt.es/datex2/v3/miterd/EnergyInfrastructureTablePublication/electrolineras.xml";
 
-            // --- FUNCIÓN DE BÚSQUEDA ROBUSTA ---
-            // Busca una clave en cualquier parte de un objeto, sin importar la anidación.
-            function findKey(obj, keyToFind) {
-              let result = null;
-              if (!obj || typeof obj !== "object") return null;
-
-              if (obj.hasOwnProperty(keyToFind)) {
-                return obj[keyToFind];
-              }
-
-              for (const key of Object.keys(obj)) {
-                const found = findKey(obj[key], keyToFind);
-                if (found) {
-                  result = found;
-                  break;
-                }
-              }
-              return result;
-            }
-
             async function fetchData() {
               try {
-                console.log(`Pidiendo datos a ${DGT_URL} simulando ser un navegador...`);
-                
+                console.log(`Pidiendo datos a ${DGT_URL}...`);
                 const response = await axios.get(DGT_URL, {
-                  headers: {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-                  },
-                  timeout: 30000
+                  headers: { "User-Agent": "Mozilla/5.0" },
+                  timeout: 45000 
                 });
                 
                 const xmlData = response.data;
                 console.log("Datos XML recibidos. Parseando...");
 
-                const jsonData = convert.xml2js(xmlData, { compact: true, spaces: 2 });
+                // --- CORRECCIÓN 1: Se ignoran los namespaces para un parseo más simple ---
+                const jsonData = convert.xml2js(xmlData, { compact: true, spaces: 2, ignoreComment: true, ignoreDeclaration: true, ignoreDoctype: true, nativeType: true, alwaysArray: true });
                 
-                // --- BÚSQUEDA INTELIGENTE EN LUGAR DE RUTA FIJA ---
-                const sitesSource = findKey(jsonData, "energyInfrastructureSite");
+                // --- CORRECCIÓN 2: Acceso robusto a los datos ---
+                const sites = jsonData?.d2Payload?.[0]?.payloadPublication?.[0]?.energyInfrastructureTablePublication?.[0]?.energyInfrastructureTable?.[0]?.energyInfrastructureSite;
                 
-                if (!sitesSource) {
-                    throw new Error("No se pudo encontrar la lista de `energyInfrastructureSite` en el XML. La estructura es inesperada.");
+                if (!sites || sites.length === 0) {
+                    throw new Error("No se pudo encontrar la lista de `energyInfrastructureSite` en la ruta esperada del XML.");
                 }
-                
-                // Aseguramos que `sites` siempre sea un array para poder iterar
-                const sites = Array.isArray(sitesSource) ? sitesSource : [sitesSource];
-                
+
                 console.log(`Encontrados ${sites.length} sitios.`);
                 const processedData = sites.map(site => {
                   try {
-                    const lat = parseFloat(site?.pointCoordinates?.latitude?._text);
-                    const lon = parseFloat(site?.pointCoordinates?.longitude?._text);
+                    // --- CORRECCIÓN 3: Acceso a datos con optional chaining y valor por defecto ---
+                    const fac = site.energyInfrastructureSiteExtension?.[0]?.energyFacility?.[0] || {};
+                    const loc = site.locationReference?.[0]?.pointLocation?.[0] || {};
 
-                    if (isNaN(lat) || isNaN(lon)) return null;
+                    const lat = loc.pointCoordinates?.[0]?.latitude?.[0]?._text;
+                    const lon = loc.pointCoordinates?.[0]?.longitude?.[0]?._text;
+
+                    if (lat === undefined || lon === undefined) return null;
+
+                    // Función para extraer valores de forma segura
+                    const getValue = (node) => node?.[0]?.values?.[0]?.value?.[0]?._text || null;
+                    const getDirectValue = (node) => node?.[0]?._text || null;
+                    const getArrayValues = (node) => (node || []).map(n => n.values?.[0]?.value?.[0]?._text).filter(Boolean).join(", ");
 
                     return {
-                      address: site?.siteName?._text || "Dirección no disponible",
-                      lat: lat, lon: lon,
-                      power: site?.power?._text || "N/A",
-                      numPoints: site?.numberOfChargingPoints?._text || "0",
-                      available: site?.availableCapacity?._text || "0",
-                      price: site?.price?._text || "Consultar",
-                      plugTypes: Array.isArray(site?.plugType) ? site.plugType.map(p => p?._text).filter(Boolean).join(", ") : (site?.plugType?._text || "N/A"),
-                      payment: Array.isArray(site?.paymentMethod) ? site.paymentMethod.map(p => p?._text).filter(Boolean).join(", ") : (site?.paymentMethod?._text || "No especificado"),
-                      services: Array.isArray(site?.service) ? site.service.map(s => s?._text).filter(Boolean).join(", ") : (site?.service?._text || "No especificados"),
-                      hours: site?.openingHours?._text || "No especificado"
+                      address: getValue(fac.name) || "Dirección no disponible",
+                      lat: parseFloat(lat),
+                      lon: parseFloat(lon),
+                      power: getDirectValue(fac.power) || "N/A",
+                      numPoints: getDirectValue(fac.numberOfChargingPoints) || "0",
+                      available: getDirectValue(fac.availableCapacity) || "0",
+                      price: getValue(fac.price) || "Consultar",
+                      plugTypes: getArrayValues(fac.plugType) || "N/A",
+                      payment: getArrayValues(fac.paymentMethod) || "No especificado",
+                      services: getArrayValues(fac.service) || "No especificados",
+                      hours: fac.operatingHours?.[0]?.label?.[0]?._text || "No especificado"
                     };
                   } catch (e) {
+                    console.warn("Se omitió un punto de recarga por datos malformados:", e.message);
                     return null;
                   }
                 }).filter(Boolean);
 
                 if (processedData.length < 100) {
-                    throw new Error(`Se procesaron muy pocos puntos (${processedData.length}). El fichero de la DGT podría estar vacío o bloqueado.`);
+                    throw new Error(`Se procesaron muy pocos puntos (${processedData.length}). El fichero de la DGT podría estar vacío o malformado.`);
                 }
 
                 console.log(`Procesados ${processedData.length} puntos de recarga válidos.`);
