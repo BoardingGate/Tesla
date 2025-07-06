@@ -17627,10 +17627,9 @@ async function showSimulationModal() {
 
 
 
-
 // ===================================================================
-// NOMBRE: showIntersectionPreviewMap (VERSIÓN CORREGIDA)
-// RESUMEN: Muestra un minimapa detallado de la intersección, asegurando el correcto renderizado.
+// NOMBRE: showIntersectionPreviewMap (VERSIÓN CORREGIDA Y ROBUSTA)
+// RESUMEN: Muestra un minimapa detallado de la intersección, asegurando su correcta inicialización.
 // ===================================================================
 function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = false, timerDurationMs = null) {
     const previewWindow = document.getElementById('intersection-preview-map-window');
@@ -17673,22 +17672,30 @@ function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = fa
     previewWindow.classList.remove('hidden');
     previewWindow.dataset.source = isSimulationContextOrClick ? 'click' : 'auto';
     if (intersectionPreviewTimer) clearTimeout(intersectionPreviewTimer);
+
     try {
-        if (!intersectionPreviewMap) {
-            intersectionPreviewMap = L.map(mapContainerEl, {
-                zoomControl: false, dragging: false, touchZoom: false, scrollWheelZoom: false,
-                doubleClickZoom: false, boxZoom: false, keyboard: false, attributionControl: false
-            });
+        // --- INICIO DE LA CORRECCIÓN CLAVE ---
+        // Destruimos la instancia del mapa anterior si existe. Esto fuerza a Leaflet
+        // a reinicializarse y medir correctamente el contenedor cada vez.
+        if (intersectionPreviewMap) {
+            try {
+                intersectionPreviewMap.remove();
+            } catch(e) {}
+            intersectionPreviewMap = null;
         }
+        // --- FIN DE LA CORRECCIÓN CLAVE ---
+
+        // Ahora, siempre creamos una nueva instancia del mapa
+        intersectionPreviewMap = L.map(mapContainerEl, {
+            zoomControl: false, dragging: false, touchZoom: false, scrollWheelZoom: false,
+            doubleClickZoom: false, boxZoom: false, keyboard: false, attributionControl: false
+        });
+
         if (rotatorDiv) {
             rotatorDiv.style.transition = 'none';
             rotatorDiv.style.transform = 'rotate(0deg)';
         }
-        Object.values(intersectionPreviewMap._layers).forEach(layer => {
-            if (layer instanceof L.TileLayer || layer instanceof L.Polyline || layer instanceof L.Marker || layer instanceof L.CircleMarker) {
-                try { intersectionPreviewMap.removeLayer(layer); } catch(e){}
-            }
-        });
+
         const currentMapLayerName = localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "Satélite + Calles";
         let tileLayerInstance;
         if (currentMapLayerName.toLowerCase().includes("satélite puro")) {
@@ -17706,6 +17713,7 @@ function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = fa
             tileLayerInstance = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap' });
         }
         tileLayerInstance.addTo(intersectionPreviewMap);
+
         const maneuverPoint = L.latLng(step.maneuver.location[1], step.maneuver.location[0]);
         const fullRouteLineString = turf.lineString(route.geometry.coordinates);
         const maneuverPointOnRoute = turf.nearestPointOnLine(fullRouteLineString, step.maneuver.location, { units: 'kilometers' });
@@ -17716,29 +17724,25 @@ function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = fa
         const endSlicePoint = turf.along(fullRouteLineString, endSliceDistanceKm);
         const routeSlice = turf.lineSlice(startSlicePoint, endSlicePoint, fullRouteLineString);
         const routeSegmentCoords = routeSlice.geometry.coordinates.map(c => [c[1], c[0]]);
+
         intersectionPreviewRouteLayer = L.polyline(routeSegmentCoords, { color: 'orange', weight: 10, opacity: 1 }).addTo(intersectionPreviewMap);
         intersectionPreviewManeuverMarker = L.circleMarker(maneuverPoint, { radius: 5, color: 'white', weight: 1, fillColor: 'blue', fillOpacity: 1, zIndexOffset: 1000 }).addTo(intersectionPreviewMap);
+        
         const lineStringToPlaceCar = turf.lineString(routeSegmentCoords.map(c => [c[1], c[0]]));
         const distanceForCarOnSegment = Math.max(0, DISTANCE_BEFORE_MANEUVER_METERS - CAR_POSITION_BEFORE_MANEUVER_METERS);
         const carPositionPointTurf = turf.along(lineStringToPlaceCar, distanceForCarOnSegment, { units: 'meters' });
         const carPositionLatLng = L.latLng(carPositionPointTurf.geometry.coordinates[1], carPositionPointTurf.geometry.coordinates[0]);
         intersectionPreviewCarMarker = L.marker(carPositionLatLng, { icon: vehicleIconMiniMap, zIndexOffset: 1001 }).addTo(intersectionPreviewMap);
+
         const bounds = L.latLngBounds(routeSegmentCoords).pad(0.5);
-        
-        // --- INICIO DE LA CORRECCIÓN DE RENDERIZADO ---
+
         requestAnimationFrame(() => {
             if (intersectionPreviewMap && document.body.contains(mapContainerEl)) {
-                
-                // 1. Invalidar el tamaño del mapa PRIMERO. Este es el paso crucial.
                 intersectionPreviewMap.invalidateSize();
                 
-                // 2. Ahora que Leaflet conoce el tamaño del contenedor, calcular y ajustar la vista.
                 const maneuverType = step.maneuver.type || '';
                 const maneuverModifier = step.maneuver.modifier || '';
-                const isShortManeuver = maneuverType.includes('roundabout') || 
-                                        maneuverType.includes('rotary') || 
-                                        maneuverModifier.includes('sharp') || 
-                                        maneuverModifier.includes('uturn');
+                const isShortManeuver = maneuverType.includes('roundabout') || maneuverType.includes('rotary') || maneuverModifier.includes('sharp') || maneuverModifier.includes('uturn');
                 const mapMaxZoom = intersectionPreviewMap.getMaxZoom() || 19;
                 let targetZoom;
                 if (isShortManeuver) {
@@ -17750,7 +17754,6 @@ function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = fa
                 targetZoom = Math.min(targetZoom, mapMaxZoom);
                 intersectionPreviewMap.fitBounds(bounds, { animate: false, paddingTopLeft: [0, 50], paddingBottomRight: [0, 50], maxZoom: targetZoom });
                 
-                // 3. Usar un segundo 'requestAnimationFrame' para aplicar la rotación de forma segura.
                 requestAnimationFrame(() => {
                     let segmentBearing = 0;
                     const lookAheadPointTurf = turf.along(lineStringToPlaceCar, distanceForCarOnSegment + 5, { units: 'meters' });
@@ -17776,7 +17779,6 @@ function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = fa
                 });
             }
         });
-        // --- FIN DE LA CORRECCIÓN ---
 
         if (timerDurationMs && timerDurationMs > 0) {
             intersectionPreviewTimer = setTimeout(hideIntersectionPreviewMap, timerDurationMs);
@@ -17786,6 +17788,16 @@ function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = fa
         hideIntersectionPreviewMap();
     }
 }
+
+
+
+
+
+
+    
+
+
+
 
 
 // ===================================================================
