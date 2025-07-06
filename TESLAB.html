@@ -1,4 +1,4 @@
-
+jdj
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -14863,9 +14863,13 @@ function assignMapButtonListeners() {
 
 
 
+
+
+
+
 // ===================================================================
 // NOMBRE: findChargingPointsOnRoute
-// RESUMEN: Carga el XML local y lo procesa en el cliente para encontrar PDRs.
+// RESUMEN: Carga el XML local y lo procesa en el cliente usando getElementsByTagNameNS.
 // ===================================================================
 async function findChargingPointsOnRoute() {
     if (!navigationRouteLayer) {
@@ -14877,9 +14881,7 @@ async function findChargingPointsOnRoute() {
     clearChargingPoints();
 
     try {
-        // Se lee el fichero XML local, que es actualizado diariamente por la GitHub Action.
         const response = await fetch('./electrolineras.xml');
-
         if (!response.ok) throw new Error(`No se pudo cargar el fichero electrolineras.xml: ${response.statusText}`);
         
         const xmlText = await response.text();
@@ -14888,16 +14890,31 @@ async function findChargingPointsOnRoute() {
         
         const routeLine = turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat]));
 
-        // Usamos querySelectorAll, que maneja namespaces automáticamente. Escapamos los dos puntos.
-        const sites = xmlDoc.querySelectorAll("egi\\:energyInfrastructureSite");
+        // --- INICIO DE LA CORRECCIÓN DEFINITIVA DE PARSEO ---
+        // Se definen los URIs de los namespaces del XML
+        const NS = {
+            EGI: 'http://datex2.eu/schema/3/energyInfrastructure',
+            LOC: 'http://datex2.eu/schema/3/locationReferencing',
+            FAC: 'http://datex2.eu/schema/3/facilities',
+            COM: 'http://datex2.eu/schema/3/common'
+        };
 
-        sites.forEach(site => {
+        // Se usa getElementsByTagNameNS, el método correcto para XML con namespaces
+        const sites = xmlDoc.getElementsByTagNameNS(NS.EGI, 'energyInfrastructureSite');
+
+        // Convertimos el HTMLCollection a un Array para poder usar forEach
+        Array.from(sites).forEach(site => {
             try {
                 // Función auxiliar para obtener texto de un nodo de forma segura
-                const getText = (selector) => site.querySelector(selector)?.textContent || null;
+                const getText = (element, nsURI, tagName) => element?.getElementsByTagNameNS(nsURI, tagName)[0]?.textContent || null;
+                const getArrayValues = (element, nsURI, tagName, valueNS, valueTagName) => 
+                    Array.from(element.getElementsByTagNameNS(nsURI, tagName))
+                         .map(node => getText(node, valueNS, valueTagName))
+                         .filter(Boolean)
+                         .join(', ');
 
-                const lat = parseFloat(getText("loc\\:latitude"));
-                const lon = parseFloat(getText("loc\\:longitude"));
+                const lat = parseFloat(getText(site, NS.LOC, 'latitude'));
+                const lon = parseFloat(getText(site, NS.LOC, 'longitude'));
 
                 if (isNaN(lat) || isNaN(lon)) return;
 
@@ -14905,23 +14922,31 @@ async function findChargingPointsOnRoute() {
                 const distanceKm = turf.pointToLineDistance(point, routeLine, { units: 'kilometers' });
 
                 if (distanceKm <= 20) {
+                    const nameNode = site.getElementsByTagNameNS(NS.FAC, 'name')[0];
+                    const powerNode = site.getElementsByTagNameNS(NS.FAC, 'power')[0];
+                    const numPointsNode = site.getElementsByTagNameNS(NS.FAC, 'numberOfChargingPoints')[0];
+                    const availableNode = site.getElementsByTagNameNS(NS.FAC, 'availableCapacity')[0];
+                    const priceNode = site.getElementsByTagNameNS(NS.FAC, 'price')[0];
+                    const hoursNode = site.getElementsByTagNameNS(NS.FAC, 'operatingHours')[0]?.getElementsByTagNameNS(NS.FAC, 'label')[0];
+
                     currentChargingPointsOnRoute.push({
                         lat, lon,
-                        address: getText("fac\\:name com\\:value") || "Dirección no disponible",
-                        power: getText("fac\\:power") || "N/A",
-                        numPoints: getText("fac\\:numberOfChargingPoints") || "0",
-                        available: getText("fac\\:availableCapacity") || "0",
-                        price: getText("fac\\:price com\\:value") || "Consultar",
-                        plugTypes: Array.from(site.querySelectorAll("fac\\:plugType com\\:value")).map(n => n.textContent).join(', ') || "N/A",
-                        payment: Array.from(site.querySelectorAll("fac\\:paymentMethod com\\:value")).map(n => n.textContent).join(', ') || "No especificado",
-                        services: Array.from(site.querySelectorAll("fac\\:service com\\:value")).map(n => n.textContent).join(', ') || "No especificados",
-                        hours: getText("fac\\:operatingHours fac\\:label") || "No especificado"
+                        address: nameNode ? getText(nameNode, NS.COM, 'value') : "Dirección no disponible",
+                        power: powerNode?.textContent || "N/A",
+                        numPoints: numPointsNode?.textContent || "0",
+                        available: availableNode?.textContent || "0",
+                        price: priceNode ? getText(priceNode, NS.COM, 'value') : "Consultar",
+                        plugTypes: getArrayValues(site, NS.FAC, 'plugType', NS.COM, 'value') || "N/A",
+                        payment: getArrayValues(site, NS.FAC, 'paymentMethod', NS.COM, 'value') || "No especificado",
+                        services: getArrayValues(site, NS.FAC, 'service', NS.COM, 'value') || "No especificados",
+                        hours: hoursNode?.textContent || "No especificado"
                     });
                 }
             } catch (e) {
-                // Ignorar un punto si tiene un formato inesperado, pero continuar con los demás
+                // Ignorar un punto si tiene un formato inesperado
             }
         });
+        // --- FIN DE LA CORRECCIÓN ---
 
         const existingToast = document.getElementById("pdrs-search");
         if (existingToast) existingToast.remove();
@@ -14933,12 +14958,7 @@ async function findChargingPointsOnRoute() {
         if (existingToast) existingToast.remove();
         showToast(`Error al procesar PDRs: ${error.message}`, "error");
     }
-}
-
-
-
-
-    
+}    
 
 
     
