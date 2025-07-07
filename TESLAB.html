@@ -1,4 +1,4 @@
-V2
+
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -5083,7 +5083,7 @@ function showPDRsFilterModal() {
         <div class="filter-modal-content">
             <h2>FILTRO PUNTOS DE CARGA</h2>
             <div class="filter-group">
-                <label id="power-range-label">Potencia: 30 kW - 2000 kW</label>
+                <label id="power-range-label">Potencia: 30 kW - 600 kW</label>
                 <div class="slider-container">
                     <div class="slider-track"></div>
                     <div class="slider-range" id="power-slider-range"></div>
@@ -5185,6 +5185,110 @@ function showPDRsFilterModal() {
 }
 
 
+// ===================================================================
+// NOMBRE: findChargingPointsOnRoute (VERSIÓN CORREGIDA Y MEJORADA)
+// RESUMEN: Busca PDRs de OCM. Se ajusta si hay ruta, si se navega o no, para definir el área de búsqueda.
+// ===================================================================
+async function findChargingPointsOnRoute(powerFilters, searchConfig) {
+    showToast("Buscando puntos de recarga (OCM)...", "info", 0, false, "pdrs-search");
+    clearChargingPoints();
+
+    let apiUrl;
+
+    // --- INICIO DE LA LÓGICA CORREGIDA ---
+    if (searchConfig.type === 'route') {
+        const routeLine = navigationRouteLayer ? turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat])) : null;
+        if (!routeLine) {
+            showToast("Error: No hay una línea de ruta válida para buscar.", "error");
+            return;
+        }
+        
+        // Se define el área de búsqueda (bounds) de forma diferente según el estado de navegación.
+        let routePointsForBounds = [];
+
+        if (isNavigating && navigationCurrentLocation) {
+            // **PREMISA 3: Ruta cargada Y navegación activa**
+            // El área de búsqueda empieza en la posición actual del coche...
+            routePointsForBounds.push(L.latLng(navigationCurrentLocation.latitude, navigationCurrentLocation.longitude));
+            // ...y abarca todos los waypoints que AÚN NO se han visitado.
+            const remainingWaypoints = navigationWaypoints.filter(wp => wp && !wp.visited);
+            remainingWaypoints.forEach(wp => {
+                routePointsForBounds.push(L.latLng(wp.lat, wp.lng));
+            });
+
+        } else {
+            // **PREMISA 2: Ruta cargada, sin navegación activa**
+            // Se usa el trazado completo de la ruta para definir el área de búsqueda.
+            if (navigationRouteLayer) {
+                routePointsForBounds = navigationRouteLayer.getLatLngs();
+            }
+        }
+        
+        // Si no hay puntos para definir el área, se usa la vista actual del mapa.
+        if (routePointsForBounds.length < 1) {
+             const mapBounds = navigationMapInstance.getBounds();
+             if (mapBounds.isValid()) {
+                routePointsForBounds.push(mapBounds.getNorthWest(), mapBounds.getSouthEast());
+            } else {
+                 showToast("No se pudo determinar el área de la ruta.", "error");
+                 return;
+            }
+        }
+
+        // Se crea el cuadro delimitador (bounds) y se le añade un margen del 20%
+        // para asegurar que se capturan puntos cercanos a la ruta.
+        const bounds = L.latLngBounds(routePointsForBounds).pad(0.2);
+        
+        // La URL de la API ahora usa esta área de búsqueda inteligente.
+        apiUrl = `https://api.openchargemap.io/v3/poi/?output=json&key=${OCM_API_KEY}&countrycode=ES&boundingbox=(${bounds.getNorthWest().lat},${bounds.getNorthWest().lng}),(${bounds.getSouthEast().lat},${bounds.getSouthEast().lng})&maxresults=1500&compact=false&verbose=true`;
+    
+    } else if (searchConfig.type === 'radius') {
+        // **PREMISA 1: No hay ruta cargada**
+        // La lógica para búsqueda por radio ya era correcta.
+        apiUrl = `https://api.openchargemap.io/v3/poi/?output=json&key=${OCM_API_KEY}&countrycode=ES&latitude=${searchConfig.center.lat}&longitude=${searchConfig.center.lng}&distance=${searchConfig.radiusKm}&distanceunit=km&maxresults=1000&compact=false&verbose=true`;
+    } else {
+        showToast("Tipo de búsqueda no válido.", "error");
+        return;
+    }
+    // --- FIN DE LA LÓGICA CORREGIDA ---
+    
+    try {
+        const response = await fetch(apiUrl);
+        if (!response.ok) throw new Error(`Error de red de OCM: ${response.statusText}`);
+        const data = await response.json();
+        if (!data || !Array.isArray(data)) throw new Error("Respuesta de OCM no válida.");
+
+        currentChargingPointsOnRoute = [];
+        const routeLine = searchConfig.type === 'route' && navigationRouteLayer ? turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat])) : null;
+
+        data.forEach(point => {
+            const formattedPoint = formatOCMPoint(point);
+            if (!formattedPoint) return;
+            const power = parseFloat(formattedPoint.power);
+            if (isNaN(power) || power < powerFilters.min || power > powerFilters.max) return;
+
+            if (searchConfig.type === 'route' && routeLine) {
+                const pointTurf = turf.point([formattedPoint.lon, formattedPoint.lat]);
+                const distanceKm = turf.pointToLineDistance(pointTurf, routeLine, { units: 'kilometers' });
+                if (distanceKm <= searchConfig.distanceFilters.max) {
+                    currentChargingPointsOnRoute.push(formattedPoint);
+                }
+            } else if (searchConfig.type === 'radius') {
+                currentChargingPointsOnRoute.push(formattedPoint);
+            }
+        });
+
+        const existingToast = document.getElementById("pdrs-search");
+        if (existingToast) existingToast.remove();
+        showToast(`${currentChargingPointsOnRoute.length} PDRs encontrados.`, "success");
+        displayChargingPointsOnMap();
+
+    } catch (error) {
+        const existingToast = document.getElementById("pdrs-search");
+        if (existingToast) existingToast.remove();
+        showToast(`Error al buscar PDRs: ${error.message}`, "error");
+    }
+}
     
 
 
@@ -5317,102 +5421,6 @@ function formatOCMPoint(point) {
 
 
 
-// ===================================================================
-// NOMBRE: findChargingPointsOnRoute (VERSIÓN CORREGIDA Y MEJORADA)
-// RESUMEN: Busca PDRs de OCM. Si se navega, el área de búsqueda se define por la posición actual
-//          y los waypoints restantes, asegurando que solo se busquen PDRs en el camino que falta.
-// ===================================================================
-async function findChargingPointsOnRoute(powerFilters, searchConfig) {
-    showToast("Buscando puntos de recarga (OCM)...", "info", 0, false, "pdrs-search");
-    clearChargingPoints();
-
-    let apiUrl;
-
-    if (searchConfig.type === 'route') {
-        // --- INICIO DE LA CORRECCIÓN ---
-        // Se crea un área de búsqueda inteligente basada en la ruta restante.
-        
-        let routePointsForBounds = [];
-
-        // 1. Añadimos la posición actual del coche como punto de partida para el área de búsqueda.
-        if (navigationCurrentLocation) {
-            routePointsForBounds.push(L.latLng(navigationCurrentLocation.latitude, navigationCurrentLocation.longitude));
-        }
-
-        // 2. Añadimos todos los waypoints que AÚN NO se han visitado.
-        const remainingWaypoints = navigationWaypoints.filter(wp => wp && !wp.visited);
-        remainingWaypoints.forEach(wp => {
-            routePointsForBounds.push(L.latLng(wp.lat, wp.lng));
-        });
-
-        // Si no hay puntos para definir un área (ej. al inicio), usamos el mapa completo.
-        if (routePointsForBounds.length < 1 && navigationMapInstance) {
-            const mapBounds = navigationMapInstance.getBounds();
-            // Aseguramos que los límites son válidos
-             if (mapBounds.isValid()) {
-                routePointsForBounds.push(mapBounds.getNorthWest(), mapBounds.getSouthEast());
-            } else {
-                 showToast("No se pudo determinar el área de la ruta.", "error");
-                 return;
-            }
-        } else if (routePointsForBounds.length < 1) {
-            showToast("No hay ruta o posición para buscar puntos.", "error");
-            return;
-        }
-
-        // 3. Creamos el cuadro delimitador (bounds) y le añadimos un margen (padding) del 20%
-        //    para asegurar que capturamos puntos cercanos a la ruta.
-        const bounds = L.latLngBounds(routePointsForBounds).pad(0.2);
-        // --- FIN DE LA CORRECCIÓN ---
-
-        // La URL de la API ahora usa esta área de búsqueda inteligente.
-        apiUrl = `https://api.openchargemap.io/v3/poi/?output=json&key=${OCM_API_KEY}&countrycode=ES&boundingbox=(${bounds.getNorthWest().lat},${bounds.getNorthWest().lng}),(${bounds.getSouthEast().lat},${bounds.getSouthEast().lng})&maxresults=1500&compact=false&verbose=true`;
-    
-    } else if (searchConfig.type === 'radius') {
-        apiUrl = `https://api.openchargemap.io/v3/poi/?output=json&key=${OCM_API_KEY}&countrycode=ES&latitude=${searchConfig.center.lat}&longitude=${searchConfig.center.lng}&distance=${searchConfig.radiusKm}&distanceunit=km&maxresults=1000&compact=false&verbose=true`;
-    } else {
-        showToast("Tipo de búsqueda no válido.", "error");
-        return;
-    }
-    
-    try {
-        const response = await fetch(apiUrl);
-        if (!response.ok) throw new Error(`Error de red de OCM: ${response.statusText}`);
-        const data = await response.json();
-        if (!data || !Array.isArray(data)) throw new Error("Respuesta de OCM no válida.");
-
-        currentChargingPointsOnRoute = [];
-        // La polilínea de la ruta visible (el tramo restante) se sigue usando para el filtro de distancia final.
-        const routeLine = searchConfig.type === 'route' && navigationRouteLayer ? turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat])) : null;
-
-        data.forEach(point => {
-            const formattedPoint = formatOCMPoint(point);
-            if (!formattedPoint) return;
-            const power = parseFloat(formattedPoint.power);
-            if (isNaN(power) || power < powerFilters.min || power > powerFilters.max) return;
-
-            if (searchConfig.type === 'route' && routeLine) {
-                const pointTurf = turf.point([formattedPoint.lon, formattedPoint.lat]);
-                const distanceKm = turf.pointToLineDistance(pointTurf, routeLine, { units: 'kilometers' });
-                if (distanceKm <= searchConfig.distanceFilters.max) {
-                    currentChargingPointsOnRoute.push(formattedPoint);
-                }
-            } else if (searchConfig.type === 'radius') {
-                currentChargingPointsOnRoute.push(formattedPoint);
-            }
-        });
-
-        const existingToast = document.getElementById("pdrs-search");
-        if (existingToast) existingToast.remove();
-        showToast(`${currentChargingPointsOnRoute.length} PDRs encontrados en la ruta restante.`, "success");
-        displayChargingPointsOnMap();
-
-    } catch (error) {
-        const existingToast = document.getElementById("pdrs-search");
-        if (existingToast) existingToast.remove();
-        showToast(`Error al buscar PDRs: ${error.message}`, "error");
-    }
-}
 
     
 
