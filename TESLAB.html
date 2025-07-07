@@ -14869,114 +14869,6 @@ function assignMapButtonListeners() {
 
 
 
-// ===================================================================
-// NOMBRE: findChargingPointsOnRoute
-// RESUMEN: Parsea el XML de la DGT siguiendo la estructura oficial de su documentación.
-// ===================================================================
-async function findChargingPointsOnRoute() {
-    if (!navigationRouteLayer) {
-        showToast("Primero debe calcular una ruta para buscar puntos de recarga.", "warning");
-        return;
-    }
-    showToast("Buscando puntos de recarga en ruta...", "info", 0, false, "pdrs-search");
-
-    clearChargingPoints();
-
-    try {
-        const response = await fetch('./electrolineras.xml');
-        if (!response.ok) throw new Error(`No se pudo cargar el fichero electrolineras.xml: ${response.statusText}`);
-        
-        const xmlText = await response.text();
-        const parser = new DOMParser();
-        const xmlDoc = parser.parseFromString(xmlText, "application/xml");
-        
-        const routeLine = turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat]));
-
-        const NS = {
-            EGI: 'http://datex2.eu/schema/3/energyInfrastructure',
-            LOC: 'http://datex2.eu/schema/3/locationReferencing',
-            FAC: 'http://datex2.eu/schema/3/facilities',
-            COM: 'http://datex2.eu/schema/3/common'
-        };
-
-        const sites = xmlDoc.getElementsByTagNameNS(NS.EGI, 'energyInfrastructureSite');
-
-        Array.from(sites).forEach(site => {
-            try {
-                const locationNode = site.getElementsByTagNameNS(NS.FAC, 'locationReference')[0];
-                const lat = parseFloat(locationNode?.getElementsByTagNameNS(NS.LOC, 'latitude')[0]?.textContent);
-                const lon = parseFloat(locationNode?.getElementsByTagNameNS(NS.LOC, 'longitude')[0]?.textContent);
-
-                if (isNaN(lat) || isNaN(lon)) return;
-
-                const point = turf.point([lon, lat]);
-                const distanceKm = turf.pointToLineDistance(point, routeLine, { units: 'kilometers' });
-
-                if (distanceKm <= 20) {
-                    
-                    // --- INICIO DE LA CORRECCIÓN BASADA EN LA DOCUMENTACIÓN OFICIAL ---
-                    
-                    // Funciones auxiliares robustas
-                    const getText = (element, ns, tag) => element?.getElementsByTagNameNS(ns, tag)[0]?.textContent || null;
-                    const getComplexValue = (parentNode, ns, tagName) => {
-                        const node = parentNode?.getElementsByTagNameNS(ns, tagName)[0];
-                        return node ? (getText(node, NS.COM, 'value') || node.textContent) : null;
-                    };
-                    const getArrayValues = (parentNode, ns, tagName) => Array.from(parentNode.getElementsByTagNameNS(ns, tagName)).map(node => node.textContent.trim()).filter(Boolean).join(', ');
-
-                    // Buscamos el nodo de la estación, que tiene muchos datos generales
-                    const stationNode = site.getElementsByTagNameNS(NS.EGI, 'energyInfrastructureStation')[0];
-                    const facilityNode = stationNode?.getElementsByTagNameNS(NS.EGI, 'energyFacility')[0] || site; // Fallback al nodo site
-                    
-                    let data = { lat, lon };
-
-                    // Datos del Sitio/Facilidad
-                    data.address = getComplexValue(site, NS.FAC, 'name') || "Dirección no disponible";
-                    data.hours = getText(site.getElementsByTagNameNS(NS.FAC, 'operatingHours')[0], NS.FAC, 'label') || "No especificado";
-                    data.services = getArrayValues(site, NS.FAC, 'service') || "No especificados";
-
-                    // Datos de la Estación (si existen)
-                    if (stationNode) {
-                        data.numPoints = getText(stationNode, NS.FAC, 'numberOfChargingPoints') || "0";
-                        data.available = getText(stationNode, NS.FAC, 'availableCapacity') || "0";
-                        data.payment = getArrayValues(stationNode.getElementsByTagNameNS(NS.EGI, 'authenticationAndIdentificationMethods')[0], NS.EGI, 'authenticationAndIdentificationMethods') || "No especificado";
-                        data.price = getComplexValue(stationNode, NS.FAC, 'price') || "Consultar";
-
-                        // Datos del primer punto de recarga para potencia y conectores
-                        const firstRefillPoint = stationNode.getElementsByTagNameNS(NS.EGI, 'refillPoint')[0];
-                        if (firstRefillPoint) {
-                            const firstConnector = firstRefillPoint.getElementsByTagNameNS(NS.EGI, 'connector')[0];
-                            if (firstConnector) {
-                                const powerRaw = getText(firstConnector, NS.EGI, 'maxPowerAtSocket');
-                                data.power = powerRaw ? (parseFloat(powerRaw) / 1000).toFixed(1) : "N/A";
-                                data.plugTypes = getText(firstConnector, NS.EGI, 'connectorType') || "N/A";
-                            }
-                        }
-                    }
-                    
-                    // Fallbacks por si algún dato no está en la estación
-                    data.power = data.power || getText(facilityNode, NS.FAC, 'power') || "N/A";
-                    data.price = data.price || getComplexValue(facilityNode, NS.FAC, 'price') || "Consultar";
-
-                    currentChargingPointsOnRoute.push(data);
-                    // --- FIN DE LA CORRECCIÓN ---
-                }
-            } catch (e) {
-                // Ignorar errores y continuar
-            }
-        });
-
-        const existingToast = document.getElementById("pdrs-search");
-        if (existingToast) existingToast.remove();
-        showToast(`${currentChargingPointsOnRoute.length} puntos de recarga encontrados en ruta.`, "success");
-        displayChargingPointsOnMap();
-
-    } catch (error) {
-        const existingToast = document.getElementById("pdrs-search");
-        if (existingToast) existingToast.remove();
-        showToast(`Error al procesar PDRs: ${error.message}`, "error");
-    }
-}
 
 
     
@@ -15020,7 +14912,6 @@ function handlePDRsResponse(data) {
 
     
  
-
 // ===================================================================
 // NOMBRE: displayChargingPointsOnMap
 // RESUMEN: Dibuja las tarjetas de los puntos de recarga encontrados sobre el mapa.
@@ -15035,28 +14926,25 @@ function displayChargingPointsOnMap() {
     }
 
     currentChargingPointsOnRoute.forEach((point, index) => {
+        // Formato mejorado para la disponibilidad
+        const availabilityText = `${point.available || '?'}/${point.numPoints || '?'} disp.`;
+
         const cardHtml = `
             <div class="charging-point-card">
                 <p>${point.power} kW</p>
-                <p>${point.available} / ${point.numPoints} disp.</p>
+                <p>${availabilityText}</p>
                 <p>${point.price}</p>
                 <p>${point.plugTypes}</p>
             </div>
         `;
 
-        // --- INICIO DE LA CORRECCIÓN DE TAMAÑO ---
-        // Al poner el tamaño en null, Leaflet medirá el DivIcon automáticamente.
-        // El ancla se calculará dinámicamente, pero lo dejamos en [0,0] para que la esquina
-        // superior izquierda sea el punto de anclaje, y luego ajustamos.
-        // O mejor, lo calculamos en base a un ancho estimado.
-        const estimatedWidth = 125; // Un ancho promedio para calcular el ancla
+        const estimatedWidth = 125;
         const icon = L.divIcon({
             html: cardHtml,
-            className: '', // La clase ya está en el HTML
-            iconSize: null, // Leaflet medirá el tamaño real
-            iconAnchor: [estimatedWidth / 2, 0] // Anclamos en el centro superior
+            className: '',
+            iconSize: null,
+            iconAnchor: [estimatedWidth / 2, 0]
         });
-        // --- FIN DE LA CORRECCIÓN DE TAMAÑO ---
 
         const marker = L.marker([point.lat, point.lon], { icon: icon, zIndexOffset: 900 }).addTo(chargingPointsLayer);
         marker.on('click', () => showChargingPointDetails(point, index));
