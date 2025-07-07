@@ -4658,6 +4658,8 @@ body.mobile-view #intersection-preview-map-window {
         return originalToFixed.call(this, digits);
     };
 
+   const OCM_API_KEY = "be9a78f7-0f5e-4f28-b742-4b7ab4b7eb5a";
+    
    let chargingPointsLayer = null;
    let currentChargingPointsOnRoute = [];
  
@@ -5112,89 +5114,100 @@ function openAlertModal() {
 
 
 // ===================================================================
+// NOMBRE: formatOCMPoint
+// RESUMEN: Convierte un punto de recarga del formato OCM a un formato interno estandarizado.
+// ===================================================================
+function formatOCMPoint(point) {
+    if (!point || !point.AddressInfo) {
+        return null;
+    }
+
+    let availableCount = 0;
+    let totalConnectors = 0;
+    let maxPower = 0;
+    const plugTypes = new Set();
+
+    if (point.Connections && Array.isArray(point.Connections)) {
+        totalConnectors = point.Connections.length;
+        point.Connections.forEach(conn => {
+            if (conn.StatusType && conn.StatusType.ID === 50) {
+                availableCount++;
+            }
+            if (conn.PowerKW && conn.PowerKW > maxPower) {
+                maxPower = conn.PowerKW;
+            }
+            if (conn.ConnectionType && conn.ConnectionType.Title) {
+                plugTypes.add(conn.ConnectionType.Title.replace(' (Socket)', '').replace(' (Connector)', ''));
+            }
+        });
+    }
+
+    const totalPoints = point.NumberOfPoints || totalConnectors;
+
+    return {
+        lat: point.AddressInfo.Latitude,
+        lon: point.AddressInfo.Longitude,
+        address: point.AddressInfo.Title || 'Dirección no disponible',
+        numPoints: totalPoints > 0 ? totalPoints : '?',
+        available: availableCount,
+        payment: point.UsageCost ? point.UsageCost : 'Consultar',
+        price: point.UsageCost ? point.UsageCost : 'Consultar',
+        power: maxPower > 0 ? maxPower.toFixed(1) : 'N/A',
+        plugTypes: plugTypes.size > 0 ? Array.from(plugTypes).join(', ') : 'N/A',
+        services: 'No especificado',
+        hours: point.AddressInfo.AccessComments || 'No especificado'
+    };
+}
+
+// ===================================================================
 // NOMBRE: findChargingPointsOnRoute
-// RESUMEN: Parsea el XML y filtra los PDRs según los criterios del modal.
+// RESUMEN: Busca PDRs de OCM en la zona de la ruta y los filtra según los criterios.
 // ===================================================================
 async function findChargingPointsOnRoute(powerFilters, distanceFilters) {
-    showToast("Buscando puntos de recarga en ruta...", "info", 0, false, "pdrs-search");
+    showToast("Buscando puntos de recarga en ruta (OCM)...", "info", 0, false, "pdrs-search");
     clearChargingPoints();
 
+    if (!navigationRouteLayer) {
+        showToast("Primero debe calcular una ruta.", "warning");
+        return;
+    }
+
     try {
-        const response = await fetch('./electrolineras.xml');
-        if (!response.ok) throw new Error(`No se pudo cargar el fichero electrolineras.xml: ${response.statusText}`);
-        
-        const xmlText = await response.text();
-        const parser = new DOMParser();
-        const xmlDoc = parser.parseFromString(xmlText, "application/xml");
-        
+        const bounds = navigationRouteLayer.getBounds();
+        const northWest = bounds.getNorthWest();
+        const southEast = bounds.getSouthEast();
+
+        const apiUrl = `https://api.openchargemap.io/v3/poi/?output=json&key=${OCM_API_KEY}&countrycode=ES&boundingbox=(${northWest.lat},${northWest.lng}),(${southEast.lat},${southEast.lng})&maxresults=1500&compact=true&verbose=false`;
+
+        const response = await fetch(apiUrl);
+        if (!response.ok) {
+            throw new Error(`Error de red de OCM: ${response.statusText}`);
+        }
+
+        const data = await response.json();
+        if (!data || !Array.isArray(data)) {
+            throw new Error("Respuesta de OCM no válida.");
+        }
+
         const routeLine = turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat]));
 
-        const NS = { EGI: 'http://datex2.eu/schema/3/energyInfrastructure', LOC: 'http://datex2.eu/schema/3/locationReferencing', FAC: 'http://datex2.eu/schema/3/facilities', COM: 'http://datex2.eu/schema/3/common' };
-        const PLUG_TYPE_MAP = { "iec62196t2": "Tipo 2", "iec62196t2combo": "CCS2", "chademo": "CHAdeMO", "iec62196t1": "Tipo 1", "iec62196t1combo": "CCS1", "domesticsocket": "Schuko" };
-        const PAYMENT_MAP = { "application": "App", "rfidcard": "RFID", "creditcard": "Tarjeta", "directcash": "Efectivo" };
-
-        const sites = xmlDoc.getElementsByTagNameNS(NS.EGI, 'energyInfrastructureSite');
-
-        Array.from(sites).forEach(site => {
+        data.forEach(point => {
             try {
-                const locationNode = site.getElementsByTagNameNS(NS.FAC, 'locationReference')[0];
-                const lat = parseFloat(locationNode?.getElementsByTagNameNS(NS.LOC, 'latitude')[0]?.textContent);
-                const lon = parseFloat(locationNode?.getElementsByTagNameNS(NS.LOC, 'longitude')[0]?.textContent);
+                const formattedPoint = formatOCMPoint(point);
+                if (!formattedPoint) return;
 
-                if (isNaN(lat) || isNaN(lon)) return;
+                const pointTurf = turf.point([formattedPoint.lon, formattedPoint.lat]);
+                const distanceKm = turf.pointToLineDistance(pointTurf, routeLine, { units: 'kilometers' });
 
-                const point = turf.point([lon, lat]);
-                const distanceKm = turf.pointToLineDistance(point, routeLine, { units: 'kilometers' });
-
-                // Filtro de distancia
-                if (distanceKm > distanceFilters.max || distanceKm < distanceFilters.min) return;
-
-                const stationNode = site.getElementsByTagNameNS(NS.EGI, 'energyInfrastructureStation')[0];
-                if (!stationNode) return;
-
-                const getText = (el, ns, tag) => el?.getElementsByTagNameNS(ns, tag)[0]?.textContent?.trim() || null;
-                const getComplexValue = (pNode, ns, tagName) => { const n = pNode?.getElementsByTagNameNS(ns, tagName)[0]; return n ? (getText(n, NS.COM, 'value') || n.textContent.trim()) : null; };
+                if (distanceKm > distanceFilters.max) return;
                 
-                let maxPowerInSite = 0;
-                const refillPoints = stationNode.getElementsByTagNameNS(NS.EGI, 'refillPoint');
-                Array.from(refillPoints).forEach(rp => {
-                    const powerRaw = getText(rp.getElementsByTagNameNS(NS.EGI, 'connector')[0], NS.EGI, 'maxPowerAtSocket');
-                    if (powerRaw) {
-                        const powerKw = parseFloat(powerRaw) / 1000;
-                        if (!isNaN(powerKw) && powerKw > maxPowerInSite) {
-                            maxPowerInSite = powerKw;
-                        }
-                    }
-                });
+                const power = parseFloat(formattedPoint.power);
+                if (isNaN(power) || power < powerFilters.min || power > powerFilters.max) return;
 
-                // Filtro de potencia
-                if (maxPowerInSite < powerFilters.min || maxPowerInSite > powerFilters.max) return;
-
-                // Si pasa todos los filtros, extraemos el resto de datos
-                const getArrayValues = (pNode, ns, tagName) => Array.from(pNode.getElementsByTagNameNS(ns, tagName)).map(n => getComplexValue(n, NS.COM, 'value') || n.textContent).filter(Boolean).join(', ');
-                
-                let data = { lat, lon };
-                data.address = getComplexValue(site, NS.FAC, 'name') || "Dirección no disponible";
-                data.numPoints = getText(stationNode, NS.FAC, 'numberOfChargingPoints') || "?";
-                data.available = getText(stationNode, NS.FAC, 'availableCapacity') || "?";
-                data.payment = Array.from(stationNode.getElementsByTagNameNS(NS.EGI, 'authenticationAndIdentificationMethods')).map(n => n.textContent.trim().toLowerCase()).map(p => PAYMENT_MAP[p] || p).join(', ') || "No especificado";
-                data.price = getComplexValue(stationNode, NS.FAC, 'price') || "Consultar";
-                if(data.price === "0.0") data.price = "Consultar";
-                
-                let plugTypes = new Set();
-                Array.from(refillPoints).forEach(rp => {
-                    const connectors = rp.getElementsByTagNameNS(NS.EGI, 'connector');
-                    Array.from(connectors).forEach(conn => {
-                        const plugCode = getText(conn, NS.EGI, 'connectorType')?.toLowerCase();
-                        if (plugCode) plugTypes.add(PLUG_TYPE_MAP[plugCode] || plugCode);
-                    });
-                });
-                
-                data.power = maxPowerInSite > 0 ? maxPowerInSite.toFixed(1) : "N/A";
-                data.plugTypes = plugTypes.size > 0 ? Array.from(plugTypes).join(', ') : "N/A";
-                
-                currentChargingPointsOnRoute.push(data);
-            } catch (e) {}
+                currentChargingPointsOnRoute.push(formattedPoint);
+            } catch (e) {
+                // Ignorar puntos individuales que fallen en el procesamiento
+            }
         });
 
         const existingToast = document.getElementById("pdrs-search");
@@ -5205,10 +5218,15 @@ async function findChargingPointsOnRoute(powerFilters, distanceFilters) {
     } catch (error) {
         const existingToast = document.getElementById("pdrs-search");
         if (existingToast) existingToast.remove();
-        showToast(`Error al procesar PDRs: ${error.message}`, "error");
+        showToast(`Error al buscar PDRs: ${error.message}`, "error");
     }
-}    
+}
 
+
+
+
+
+    
     
 
 
