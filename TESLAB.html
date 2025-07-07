@@ -4863,6 +4863,137 @@ function openAlertModal() {
 
 
 
+
+// ===================================================================
+// NOMBRE: findChargingPointsOnRoute
+// RESUMEN: Parsea el XML y traduce los datos técnicos a un formato legible.
+// ===================================================================
+async function findChargingPointsOnRoute() {
+    if (!navigationRouteLayer) {
+        showToast("Primero debe calcular una ruta para buscar puntos de recarga.", "warning");
+        return;
+    }
+    showToast("Buscando puntos de recarga en ruta...", "info", 0, false, "pdrs-search");
+
+    clearChargingPoints();
+
+    try {
+        const response = await fetch('./electrolineras.xml');
+        if (!response.ok) throw new Error(`No se pudo cargar el fichero electrolineras.xml: ${response.statusText}`);
+        
+        const xmlText = await response.text();
+        const parser = new DOMParser();
+        const xmlDoc = parser.parseFromString(xmlText, "application/xml");
+        
+        const routeLine = turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat]));
+
+        const NS = {
+            EGI: 'http://datex2.eu/schema/3/energyInfrastructure',
+            LOC: 'http://datex2.eu/schema/3/locationReferencing',
+            FAC: 'http://datex2.eu/schema/3/facilities',
+            COM: 'http://datex2.eu/schema/3/common'
+        };
+
+        // --- DICCIONARIO DE TRADUCCIÓN DE CONECTORES ---
+        const PLUG_TYPE_MAP = {
+            "iec62196T2": "Tipo 2",
+            "iec62196T2Combo": "CCS2",
+            "chademo": "CHAdeMO",
+            "iec62196T1": "Tipo 1",
+            "iec62196T1Combo": "CCS1",
+            "domesticSocket": "Schuko",
+            // Añadir más traducciones si se descubren
+        };
+
+        const sites = xmlDoc.getElementsByTagNameNS(NS.EGI, 'energyInfrastructureSite');
+
+        Array.from(sites).forEach(site => {
+            try {
+                const locationNode = site.getElementsByTagNameNS(NS.FAC, 'locationReference')[0];
+                const lat = parseFloat(locationNode?.getElementsByTagNameNS(NS.LOC, 'latitude')[0]?.textContent);
+                const lon = parseFloat(locationNode?.getElementsByTagNameNS(NS.LOC, 'longitude')[0]?.textContent);
+
+                if (isNaN(lat) || isNaN(lon)) return;
+
+                const point = turf.point([lon, lat]);
+                const distanceKm = turf.pointToLineDistance(point, routeLine, { units: 'kilometers' });
+
+                if (distanceKm <= 20) {
+                    
+                    const getText = (element, ns, tag) => element?.getElementsByTagNameNS(ns, tag)[0]?.textContent || null;
+                    const getComplexValue = (parentNode, ns, tagName) => {
+                        const node = parentNode?.getElementsByTagNameNS(ns, tagName)[0];
+                        return node ? (getText(node, NS.COM, 'value') || node.textContent) : null;
+                    };
+                    
+                    const stationNode = site.getElementsByTagNameNS(NS.EGI, 'energyInfrastructureStation')[0];
+                    if (!stationNode) return;
+
+                    let data = {
+                        lat, lon,
+                        address: getComplexValue(site, NS.FAC, 'name') || "Dirección no disponible",
+                        payment: "No especificado",
+                        services: Array.from(site.getElementsByTagNameNS(NS.FAC, 'service')).map(n => n.textContent).filter(Boolean).join(', ') || "No especificados",
+                        hours: getText(site.getElementsByTagNameNS(NS.FAC, 'operatingHours')[0], NS.FAC, 'label') || "No especificado",
+                        power: "N/A", numPoints: "0", available: "0", plugTypes: []
+                    };
+                    
+                    data.numPoints = getText(stationNode, NS.FAC, 'numberOfChargingPoints') || data.numPoints;
+                    data.available = getText(stationNode, NS.FAC, 'availableCapacity') || data.available;
+                    data.payment = Array.from(stationNode.getElementsByTagNameNS(NS.EGI, 'authenticationAndIdentificationMethods')).map(n => n.textContent.trim()).join(', ') || data.payment;
+
+                    // Extraer precio de forma más robusta
+                    const priceNode = stationNode.getElementsByTagNameNS(NS.FAC, 'price')[0];
+                    data.price = priceNode ? (getComplexValue(priceNode, NS.COM, 'value') || "Consultar") : "Consultar";
+                    
+                    // Iterar sobre todos los puntos de recarga para agregar datos
+                    const refillPoints = stationNode.getElementsByTagNameNS(NS.EGI, 'refillPoint');
+                    let powers = [];
+                    
+                    Array.from(refillPoints).forEach(rp => {
+                        const connectors = rp.getElementsByTagNameNS(NS.EGI, 'connector');
+                        Array.from(connectors).forEach(conn => {
+                            const powerRaw = getText(conn, NS.EGI, 'maxPowerAtSocket');
+                            if (powerRaw) {
+                                const powerKw = parseFloat(powerRaw) / 1000;
+                                if (!isNaN(powerKw)) powers.push(powerKw);
+                            }
+                            const plugCode = getText(conn, NS.EGI, 'connectorType');
+                            if (plugCode) {
+                                const readablePlug = PLUG_TYPE_MAP[plugCode.toLowerCase()] || plugCode;
+                                if (!data.plugTypes.includes(readablePlug)) {
+                                    data.plugTypes.push(readablePlug);
+                                }
+                            }
+                        });
+                    });
+
+                    if (powers.length > 0) {
+                        data.power = Math.max(...powers).toFixed(1);
+                    }
+                    data.plugTypes = data.plugTypes.join(', ') || "N/A";
+                    
+                    currentChargingPointsOnRoute.push(data);
+                }
+            } catch (e) {
+                // Ignorar errores y continuar
+            }
+        });
+
+        const existingToast = document.getElementById("pdrs-search");
+        if (existingToast) existingToast.remove();
+        showToast(`${currentChargingPointsOnRoute.length} puntos de recarga encontrados en ruta.`, "success");
+        displayChargingPointsOnMap();
+
+    } catch (error) {
+        const existingToast = document.getElementById("pdrs-search");
+        if (existingToast) existingToast.remove();
+        showToast(`Error al procesar PDRs: ${error.message}`, "error");
+    }
+}
+
+
+
     
 
 
