@@ -4864,9 +4864,10 @@ function openAlertModal() {
 
 
 
+
 // ===================================================================
 // NOMBRE: findChargingPointsOnRoute
-// RESUMEN: Parsea el XML y traduce los datos técnicos a un formato legible.
+// RESUMEN: Parsea el XML con lógica avanzada para manejar inconsistencias y traducir datos.
 // ===================================================================
 async function findChargingPointsOnRoute() {
     if (!navigationRouteLayer) {
@@ -4894,16 +4895,15 @@ async function findChargingPointsOnRoute() {
             COM: 'http://datex2.eu/schema/3/common'
         };
 
-        // --- DICCIONARIO DE TRADUCCIÓN DE CONECTORES ---
         const PLUG_TYPE_MAP = {
-            "iec62196T2": "Tipo 2",
-            "iec62196T2Combo": "CCS2",
+            "iec62196t2": "Tipo 2",
+            "iec62196t2combo": "CCS2",
             "chademo": "CHAdeMO",
-            "iec62196T1": "Tipo 1",
-            "iec62196T1Combo": "CCS1",
-            "domesticSocket": "Schuko",
-            // Añadir más traducciones si se descubren
+            "iec62196t1": "Tipo 1",
+            "iec62196t1combo": "CCS1",
+            "domesticsocket": "Schuko"
         };
+        const PAYMENT_MAP = { "application": "App", "rfidcard": "RFID", "creditcard": "Tarjeta", "directcash": "Efectivo" };
 
         const sites = xmlDoc.getElementsByTagNameNS(NS.EGI, 'energyInfrastructureSite');
 
@@ -4920,36 +4920,37 @@ async function findChargingPointsOnRoute() {
 
                 if (distanceKm <= 20) {
                     
-                    const getText = (element, ns, tag) => element?.getElementsByTagNameNS(ns, tag)[0]?.textContent || null;
+                    const getText = (element, ns, tag) => element?.getElementsByTagNameNS(ns, tag)[0]?.textContent?.trim() || null;
                     const getComplexValue = (parentNode, ns, tagName) => {
                         const node = parentNode?.getElementsByTagNameNS(ns, tagName)[0];
-                        return node ? (getText(node, NS.COM, 'value') || node.textContent) : null;
+                        return node ? (getText(node, NS.COM, 'value') || node.textContent.trim()) : null;
                     };
                     
                     const stationNode = site.getElementsByTagNameNS(NS.EGI, 'energyInfrastructureStation')[0];
                     if (!stationNode) return;
 
-                    let data = {
-                        lat, lon,
-                        address: getComplexValue(site, NS.FAC, 'name') || "Dirección no disponible",
-                        payment: "No especificado",
-                        services: Array.from(site.getElementsByTagNameNS(NS.FAC, 'service')).map(n => n.textContent).filter(Boolean).join(', ') || "No especificados",
-                        hours: getText(site.getElementsByTagNameNS(NS.FAC, 'operatingHours')[0], NS.FAC, 'label') || "No especificado",
-                        power: "N/A", numPoints: "0", available: "0", plugTypes: []
-                    };
-                    
-                    data.numPoints = getText(stationNode, NS.FAC, 'numberOfChargingPoints') || data.numPoints;
-                    data.available = getText(stationNode, NS.FAC, 'availableCapacity') || data.available;
-                    data.payment = Array.from(stationNode.getElementsByTagNameNS(NS.EGI, 'authenticationAndIdentificationMethods')).map(n => n.textContent.trim()).join(', ') || data.payment;
+                    let data = { lat, lon };
 
-                    // Extraer precio de forma más robusta
-                    const priceNode = stationNode.getElementsByTagNameNS(NS.FAC, 'price')[0];
-                    data.price = priceNode ? (getComplexValue(priceNode, NS.COM, 'value') || "Consultar") : "Consultar";
+                    data.address = getComplexValue(site, NS.FAC, 'name') || "Dirección no disponible";
+                    data.services = Array.from(site.getElementsByTagNameNS(NS.FAC, 'service')).map(n => n.textContent.trim()).filter(Boolean).join(', ') || "No especificados";
+                    data.hours = getText(site.getElementsByTagNameNS(NS.FAC, 'operatingHours')[0], NS.FAC, 'label') || "No especificado";
                     
-                    // Iterar sobre todos los puntos de recarga para agregar datos
-                    const refillPoints = stationNode.getElementsByTagNameNS(NS.EGI, 'refillPoint');
+                    // --- LÓGICA DE PARSEO MEJORADA ---
+                    data.numPoints = getText(stationNode, NS.FAC, 'numberOfChargingPoints');
+                    data.available = getText(stationNode, NS.FAC, 'availableCapacity');
+                    if (data.numPoints === null || data.numPoints === "") data.numPoints = "?";
+                    if (data.available === null || data.available === "") data.available = "?";
+
+                    let paymentMethods = Array.from(stationNode.getElementsByTagNameNS(NS.EGI, 'authenticationAndIdentificationMethods')).map(n => n.textContent.trim().toLowerCase());
+                    data.payment = paymentMethods.map(p => PAYMENT_MAP[p] || p).join(', ') || "No especificado";
+
+                    let priceText = getComplexValue(stationNode, NS.FAC, 'price');
+                    data.price = (priceText && priceText !== "0.0") ? priceText : "Consultar";
+
+                    let plugTypes = new Set();
                     let powers = [];
                     
+                    const refillPoints = stationNode.getElementsByTagNameNS(NS.EGI, 'refillPoint');
                     Array.from(refillPoints).forEach(rp => {
                         const connectors = rp.getElementsByTagNameNS(NS.EGI, 'connector');
                         Array.from(connectors).forEach(conn => {
@@ -4958,20 +4959,15 @@ async function findChargingPointsOnRoute() {
                                 const powerKw = parseFloat(powerRaw) / 1000;
                                 if (!isNaN(powerKw)) powers.push(powerKw);
                             }
-                            const plugCode = getText(conn, NS.EGI, 'connectorType');
+                            const plugCode = getText(conn, NS.EGI, 'connectorType')?.toLowerCase();
                             if (plugCode) {
-                                const readablePlug = PLUG_TYPE_MAP[plugCode.toLowerCase()] || plugCode;
-                                if (!data.plugTypes.includes(readablePlug)) {
-                                    data.plugTypes.push(readablePlug);
-                                }
+                                plugTypes.add(PLUG_TYPE_MAP[plugCode] || plugCode);
                             }
                         });
                     });
 
-                    if (powers.length > 0) {
-                        data.power = Math.max(...powers).toFixed(1);
-                    }
-                    data.plugTypes = data.plugTypes.join(', ') || "N/A";
+                    data.power = powers.length > 0 ? Math.max(...powers).toFixed(1) : "N/A";
+                    data.plugTypes = plugTypes.size > 0 ? Array.from(plugTypes).join(', ') : "N/A";
                     
                     currentChargingPointsOnRoute.push(data);
                 }
@@ -4992,7 +4988,7 @@ async function findChargingPointsOnRoute() {
     }
 }
 
-
+    
 
     
 
