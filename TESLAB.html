@@ -1,4 +1,4 @@
-V1
+V2
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -17100,176 +17100,6 @@ async function findChargingPointsOnRoute(powerFilters, searchConfig) {
 
 
 
-// ===================================================================
-// NOMBRE: recalculateAndDrawRoute (VERSIÓN CORREGIDA)
-// RESUMEN: Recalcula la ruta y reinicia la simulación si está activa.
-// ===================================================================
-async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
-    isRecalculatingRoute = true;
-    lastAutoShownManeuverId = null;
-
-    if (preserveAccumulatedStats) {
-        accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
-    } else {
-        isArrivalSequenceStarted = false;
-        accumulatedDistanceBeforeCurrentSegment = 0;
-        totalDistanceTravelledForStats = 0;
-        maxDistanceReachedOnRoute = 0;
-        lastPositionForStats = null;
-        if (isNavigating) navigationStartTimeForStats = new Date();
-        tripInitialOverallEtaTime = null;
-        currentStageInitialExpectedEtaTime = null;
-        accumulatedDeviationMs = 0;
-        maxSpeedDuringTrip = 0;
-        maxSpeedCoordinates = null;
-        maxAltitudeDuringTrip = -Infinity;
-        minAltitudeDuringTrip = Infinity;
-        if (compassAndModeControl) {
-            compassAndModeControl.updateMaxSpeed(maxSpeedDuringTrip);
-        }
-    }
-
-    const recalculateToastId = "recalculating-route-toast";
-    showToast("Recalculando ruta...", "info", 0, false, recalculateToastId);
-    
-    lastCarDistanceAlongRouteForNavLogic = 0;
-    lastValidCarDistanceForDisplay = 0;
-
-    let waypointsForRouteCalculation = [];
-    if (navigationCurrentLocation) {
-        const currentPositionAsWaypoint = { lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude };
-        waypointsForRouteCalculation.push(currentPositionAsWaypoint);
-    } else {
-        const firstUnvisited = navigationWaypoints.find(wp => wp && !wp.visited);
-        if (firstUnvisited) {
-            waypointsForRouteCalculation.push(firstUnvisited);
-        }
-    }
-    const remainingWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.visited);
-    waypointsForRouteCalculation.push(...remainingWaypoints);
-
-    if (waypointsForRouteCalculation.length < 2) {
-        const existingRecalcToast = document.getElementById(recalculateToastId);
-        if (existingRecalcToast) existingRecalcToast.remove();
-        activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
-        showToast("No hay suficientes etapas restantes para calcular una nueva ruta.", "warning");
-        if (navigationRouteLayer && navigationMapInstance) { try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {} navigationRouteLayer = null; }
-        if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
-        navigationCurrentRouteData = null;
-        hideMapInfoOverlay();
-        isRecalculatingRoute = false;
-        return;
-    }
-
-    const coordsString = waypointsForRouteCalculation.map(wp => {
-        if (typeof wp.lng !== 'number' || typeof wp.lat !== 'number' || isNaN(wp.lng) || isNaN(wp.lat) ) return null;
-        return `${wp.lng},${wp.lat}`;
-    }).filter(Boolean).join(';');
-
-    if (!coordsString || waypointsForRouteCalculation.filter(wp => wp && typeof wp.lng === 'number' && typeof wp.lat === 'number').length < 2) {
-        const existingRecalcToast = document.getElementById(recalculateToastId);
-        if (existingRecalcToast) existingRecalcToast.remove();
-        activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
-        showToast("No hay suficientes waypoints válidos para calcular la ruta.", "warning");
-        if (navigationRouteLayer && navigationMapInstance) { try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {} navigationRouteLayer = null; }
-        if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
-        navigationCurrentRouteData = null;
-        hideMapInfoOverlay();
-        isRecalculatingRoute = false;
-        recalculationAttempts = 0;
-        if (recalculationRetryTimeoutId) clearTimeout(recalculationRetryTimeoutId);
-        recalculationRetryTimeoutId = null;
-        updateStartNavigationButtonState();
-        return;
-    }
-
-    const url = `${OSRM_SERVICE_URL}/driving/${coordsString}?overview=full&geometries=geojson&steps=true&alternatives=false&annotations=true`;
-    try {
-        const response = await fetch(url);
-        if (!response.ok) {
-            let errorData = { message: `HTTP error ${response.status}` };
-            try { errorData = await response.json(); } catch (e) { errorData.message = response.statusText || errorData.message; }
-            throw new Error(`OSRM Error: ${errorData.code || errorData.message || response.statusText}`);
-        }
-        const data = await response.json();
-        const existingRecalcToastSuccess = document.getElementById(recalculateToastId);
-        if (existingRecalcToastSuccess) existingRecalcToastSuccess.remove();
-        activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
-
-        if (data.routes && data.routes.length > 0) {
-            navigationCurrentRouteData = data;
-            if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
-            drawRouteOnMap(data.routes[0]);
-            currentLegIndexNav = 0;
-            currentStepIndexNav = 0;
-            lastProcessedStepManeuverLocation = null;
-            
-            if (preserveAccumulatedStats && data.routes[0]) {
-                tripInitialOverallEtaTime = new Date(Date.now() + (data.routes[0].duration * 1000));
-                if (data.routes[0].legs && data.routes[0].legs.length > 0) {
-                     currentStageInitialExpectedEtaTime = new Date(Date.now() + (data.routes[0].legs[0].duration * 1000));
-                }
-            }
-
-            if (data.routes[0]) {
-                 const currentCarPosForRecalc = navigationCurrentLocation;
-                 let carDistanceAlongRouteForInternalUse = 0;
-                 if (currentCarPosForRecalc && navigationMapInstance && navigationRouteLayer && typeof turf !== 'undefined' && navigationRouteLayer.getLatLngs().length > 0) {
-                    try {
-                        const carPointTurf = turf.point([currentCarPosForRecalc.longitude, currentCarPosForRecalc.latitude]);
-                        const routeLineStringTurf = turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat]));
-                        const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
-                        const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
-                        carDistanceAlongRouteForInternalUse = turf.length(lineSliceToNearestTurf, { units: 'meters' });
-                    } catch (turfError) {}
-                 }
-                 lastCarDistanceAlongRouteForNavLogic = carDistanceAlongRouteForInternalUse;
-                 updateNavigationProgressDisplay(data.routes[0], carDistanceAlongRouteForInternalUse);
-                 updateTurnByTurnDisplay(data.routes[0], carDistanceAlongRouteForInternalUse);
-                 showDestinationName();
-            }
-            showNavigationUIElementsForPlanning();
-            recalculationAttempts = 0;
-            if (recalculationRetryTimeoutId) clearTimeout(recalculationRetryTimeoutId);
-            recalculationRetryTimeoutId = null;
-
-            // --- CORRECCIÓN CLAVE PARA SIMULACIÓN ---
-            // Si la simulación automática estaba corriendo, la detenemos y la reiniciamos
-            // con la nueva ruta para que siga el camino correcto.
-            if (automatedSimulationIntervalId) {
-                stopAutomatedRouteSimulationInternal();
-                showToast("Ruta recalculada. Reiniciando simulación automática.", "info");
-                startAutomatedRouteSimulation(simulationSpeedKmph); // Usa la velocidad que ya tenía
-            }
-            // --- FIN DE LA CORRECCIÓN ---
-
-        } else {
-            throw new Error("No se encontraron rutas.");
-        }
-    } catch (error) {
-        const existingRecalcToastError = document.getElementById(recalculateToastId);
-        if (existingRecalcToastError) existingRecalcToastError.remove();
-        activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
-        let errorMessageForToast = `Error al calcular ruta: ${error.message}`;
-        showToast(errorMessageForToast, "error");
-        if (navigationRouteLayer && navigationMapInstance) { try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch(e) {} navigationRouteLayer = null; }
-        if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
-        navigationCurrentRouteData = null;
-        lastValidCarDistanceForDisplay = 0;
-        hideMapInfoOverlay();
-        const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
-        if (radaresRutaCheckbox) { eliminarRadaresDeRuta(); actualizarContadorRadares(0); localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresRutaCheckbox.checked)); }
-        const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
-        if (tareasRutaCheckbox) { eliminarTareasDeBarraProgreso(); actualizarContadorTareas(0); localStorage.setItem(TAREAS_RUTA_CHECKED_KEY, String(tareasRutaCheckbox.checked)); }
-        if (recalculationRetryTimeoutId) clearTimeout(recalculationRetryTimeoutId);
-        recalculationRetryTimeoutId = setTimeout(() => recalculateAndDrawRoute(preserveAccumulatedStats), 2000);
-    }
-    updateStartNavigationButtonState();
-    updateNavigationButtonColor();
-    if (!recalculationRetryTimeoutId) {
-        isRecalculatingRoute = false;
-    }
-}
     
 
 
@@ -19652,6 +19482,9 @@ function handleStageTouchStart(e) {
     }
 }
 
+
+    
+
 // ===================================================================
 // NOMBRE: handleStageTouchMove
 // RESUMEN: Maneja el movimiento de un toque en una etapa para reordenar.
@@ -19675,6 +19508,8 @@ function handleStageTouchMove(e) {
     }
 }
 
+
+    
 // ===================================================================
 // NOMBRE: handleStageTouchEnd
 // RESUMEN: Maneja el final de un toque en una etapa para reordenar.
@@ -19709,6 +19544,235 @@ function getDragAfterElement(container, y) {
 
 
 
+
+
+
+
+// ===================================================================
+// NOMBRE: recalculateAndDrawRoute (VERSIÓN CORREGIDA)
+// RESUMEN: Recalcula la ruta y reinicia la simulación si está activa.
+// ===================================================================
+async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
+    isRecalculatingRoute = true;
+    lastAutoShownManeuverId = null;
+
+    if (preserveAccumulatedStats) {
+        accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
+    } else {
+        isArrivalSequenceStarted = false;
+        accumulatedDistanceBeforeCurrentSegment = 0;
+        totalDistanceTravelledForStats = 0;
+        maxDistanceReachedOnRoute = 0;
+        lastPositionForStats = null;
+        if (isNavigating) navigationStartTimeForStats = new Date();
+        tripInitialOverallEtaTime = null;
+        currentStageInitialExpectedEtaTime = null;
+        accumulatedDeviationMs = 0;
+        maxSpeedDuringTrip = 0;
+        maxSpeedCoordinates = null;
+        maxAltitudeDuringTrip = -Infinity;
+        minAltitudeDuringTrip = Infinity;
+        // INICIO: Inicialización de variables para la nueva gráfica
+        minAverageSpeedInTrip = Infinity;
+        maxAverageSpeedInTrip = -Infinity;
+        // FIN: Inicialización de variables para la nueva gráfica
+        if (compassAndModeControl) {
+            compassAndModeControl.updateMaxSpeed(maxSpeedDuringTrip);
+        }
+    }
+
+    const recalculateToastId = "recalculating-route-toast";
+    showToast("Recalculando ruta...", "info", 0, false, recalculateToastId);
+    
+    lastCarDistanceAlongRouteForNavLogic = 0;
+    lastValidCarDistanceForDisplay = 0;
+
+    let waypointsForRouteCalculation = [];
+    if (navigationCurrentLocation) {
+        const currentPositionAsWaypoint = { lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude };
+        waypointsForRouteCalculation.push(currentPositionAsWaypoint);
+    } else {
+        const firstUnvisited = navigationWaypoints.find(wp => wp && !wp.visited);
+        if (firstUnvisited) {
+            waypointsForRouteCalculation.push(firstUnvisited);
+        }
+    }
+    const remainingWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.visited);
+    waypointsForRouteCalculation.push(...remainingWaypoints);
+
+    if (waypointsForRouteCalculation.length < 2) {
+        const existingRecalcToast = document.getElementById(recalculateToastId);
+        if (existingRecalcToast) existingRecalcToast.remove();
+        activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
+        showToast("No hay suficientes etapas restantes para calcular una nueva ruta.", "warning");
+        if (navigationRouteLayer && navigationMapInstance) { try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {} navigationRouteLayer = null; }
+        if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
+        navigationCurrentRouteData = null;
+        hideMapInfoOverlay();
+        isRecalculatingRoute = false;
+        return;
+    }
+
+    const coordsString = waypointsForRouteCalculation.map(wp => {
+        if (typeof wp.lng !== 'number' || typeof wp.lat !== 'number' || isNaN(wp.lng) || isNaN(wp.lat) ) return null;
+        return `${wp.lng},${wp.lat}`;
+    }).filter(Boolean).join(';');
+
+    if (!coordsString || waypointsForRouteCalculation.filter(wp => wp && typeof wp.lng === 'number' && typeof wp.lat === 'number').length < 2) {
+        const existingRecalcToast = document.getElementById(recalculateToastId);
+        if (existingRecalcToast) existingRecalcToast.remove();
+        activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
+        showToast("No hay suficientes waypoints válidos para calcular la ruta.", "warning");
+        if (navigationRouteLayer && navigationMapInstance) { try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {} navigationRouteLayer = null; }
+        if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
+        navigationCurrentRouteData = null;
+        hideMapInfoOverlay();
+        isRecalculatingRoute = false;
+        recalculationAttempts = 0;
+        if (recalculationRetryTimeoutId) clearTimeout(recalculationRetryTimeoutId);
+        recalculationRetryTimeoutId = null;
+        updateStartNavigationButtonState();
+        return;
+    }
+
+    const url = `${OSRM_SERVICE_URL}/driving/${coordsString}?overview=full&geometries=geojson&steps=true&alternatives=false&annotations=true`;
+    try {
+        const response = await fetch(url);
+        if (!response.ok) {
+            let errorData = { message: `HTTP error ${response.status}` };
+            try { errorData = await response.json(); } catch (e) { errorData.message = response.statusText || errorData.message; }
+            throw new Error(`OSRM Error: ${errorData.code || errorData.message || response.statusText}`);
+        }
+        const data = await response.json();
+        const existingRecalcToastSuccess = document.getElementById(recalculateToastId);
+        if (existingRecalcToastSuccess) existingRecalcToastSuccess.remove();
+        activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
+
+        if (data.routes && data.routes.length > 0) {
+            navigationCurrentRouteData = data;
+            if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
+            drawRouteOnMap(data.routes[0]);
+            currentLegIndexNav = 0;
+            currentStepIndexNav = 0;
+            lastProcessedStepManeuverLocation = null;
+            
+            if (preserveAccumulatedStats && data.routes[0]) {
+                tripInitialOverallEtaTime = new Date(Date.now() + (data.routes[0].duration * 1000));
+                if (data.routes[0].legs && data.routes[0].legs.length > 0) {
+                     currentStageInitialExpectedEtaTime = new Date(Date.now() + (data.routes[0].legs[0].duration * 1000));
+                }
+            }
+
+            if (data.routes[0]) {
+                 const currentCarPosForRecalc = navigationCurrentLocation;
+                 let carDistanceAlongRouteForInternalUse = 0;
+                 if (currentCarPosForRecalc && navigationMapInstance && navigationRouteLayer && typeof turf !== 'undefined' && navigationRouteLayer.getLatLngs().length > 0) {
+                    try {
+                        const carPointTurf = turf.point([currentCarPosForRecalc.longitude, currentCarPosForRecalc.latitude]);
+                        const routeLineStringTurf = turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat]));
+                        const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
+                        const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
+                        carDistanceAlongRouteForInternalUse = turf.length(lineSliceToNearestTurf, { units: 'meters' });
+                    } catch (turfError) {}
+                 }
+                 lastCarDistanceAlongRouteForNavLogic = carDistanceAlongRouteForInternalUse;
+                 updateNavigationProgressDisplay(data.routes[0], carDistanceAlongRouteForInternalUse);
+                 updateTurnByTurnDisplay(data.routes[0], carDistanceAlongRouteForInternalUse);
+                 showDestinationName();
+            }
+            showNavigationUIElementsForPlanning();
+            recalculationAttempts = 0;
+            if (recalculationRetryTimeoutId) clearTimeout(recalculationRetryTimeoutId);
+            recalculationRetryTimeoutId = null;
+
+            if (automatedSimulationIntervalId) {
+                stopAutomatedRouteSimulationInternal();
+                showToast("Ruta recalculada. Reiniciando simulación automática.", "info");
+                startAutomatedRouteSimulation(simulationSpeedKmph);
+            }
+
+        } else {
+            throw new Error("No se encontraron rutas.");
+        }
+    } catch (error) {
+        const existingRecalcToastError = document.getElementById(recalculateToastId);
+        if (existingRecalcToastError) existingRecalcToastError.remove();
+        activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
+        let errorMessageForToast = `Error al calcular ruta: ${error.message}`;
+        showToast(errorMessageForToast, "error");
+        if (navigationRouteLayer && navigationMapInstance) { try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch(e) {} navigationRouteLayer = null; }
+        if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
+        navigationCurrentRouteData = null;
+        lastValidCarDistanceForDisplay = 0;
+        hideMapInfoOverlay();
+        const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+        if (radaresRutaCheckbox) { eliminarRadaresDeRuta(); actualizarContadorRadares(0); localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresRutaCheckbox.checked)); }
+        const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
+        if (tareasRutaCheckbox) { eliminarTareasDeBarraProgreso(); actualizarContadorTareas(0); localStorage.setItem(TAREAS_RUTA_CHECKED_KEY, String(tareasRutaCheckbox.checked)); }
+        if (recalculationRetryTimeoutId) clearTimeout(recalculationRetryTimeoutId);
+        recalculationRetryTimeoutId = setTimeout(() => recalculateAndDrawRoute(preserveAccumulatedStats), 2000);
+    }
+    updateStartNavigationButtonState();
+    updateNavigationButtonColor();
+    if (!recalculationRetryTimeoutId) {
+        isRecalculatingRoute = false;
+    }
+}
+
+
+
+
+    
+// ===================================================================
+// NOMBRE: plotIntervalData
+// RESUMEN: Añade un nuevo punto de datos a la gráfica a intervalos regulares.
+// ===================================================================
+function plotIntervalData() {
+    if (!isNavigating || !navigationChart || !navigationStartTimeForStats || !navigationCurrentLocation) {
+        return;
+    }
+
+    // Calcular la velocidad media acumulada REAL del viaje
+    let currentAverageSpeed = 0;
+    const timeElapsedS = (Date.now() - navigationStartTimeForStats.getTime()) / 1000;
+
+    if (timeElapsedS > 0 && totalDistanceTravelledForStats > 0) {
+        const avgSpeedMs = totalDistanceTravelledForStats / timeElapsedS;
+        currentAverageSpeed = avgSpeedMs * 3.6;
+    }
+    
+    // Actualizar los valores mínimo y máximo de la velocidad media
+    if (currentAverageSpeed > 0) { // Solo registrar cuando hay movimiento
+        minAverageSpeedInTrip = Math.min(minAverageSpeedInTrip, currentAverageSpeed);
+        maxAverageSpeedInTrip = Math.max(maxAverageSpeedInTrip, currentAverageSpeed);
+    }
+    
+    // Obtener la altitud actual
+    const currentAltitude = navigationCurrentLocation.altitude || 0;
+
+    // Añadir los nuevos puntos a los arrays de datos de la gráfica
+    const timeLabel = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    graphLabels.push(timeLabel);
+    graphDataPoints.speed.push(currentAverageSpeed); // Se usa la media acumulada real
+    graphDataPoints.altitude.push(currentAltitude);
+    
+    // Actualizar la gráfica con los nuevos datos
+    updateChartData();
+
+    const isCurrentlyStopped = (window.currentSpeedKmh || 0) < 1;
+    if (isCurrentlyStopped) {
+        if (isCarStoppedForGraph) return; 
+        isCarStoppedForGraph = true;
+    } else {
+        isCarStoppedForGraph = false;
+    }
+}
+
+
+
+
+
+    
 // ===================================================================
 // NOMBRE: initializeNavigationGraph
 // RESUMEN: Inicializa el gráfico de Chart.js para la navegación.
@@ -19728,6 +19792,8 @@ function initializeNavigationGraph() {
     isCarStoppedForGraph = false;
     graphDataPoints = { speed: [], altitude: [] };
     graphLabels = [];
+    minAverageSpeedInTrip = Infinity;
+    maxAverageSpeedInTrip = -Infinity;
     graphPlotState = { 
         lastPlotTime: Date.now(), 
         lastPlotCoords: navigationCurrentLocation ? { ...navigationCurrentLocation } : null 
@@ -19742,16 +19808,11 @@ function initializeNavigationGraph() {
         if (graphCard) graphCard.classList.add('hidden');
         return;
     }
-
-    // --- MODIFICACIÓN CLAVE ---
-    // Usamos un intervalo de tiempo fijo para actualizar la gráfica,
-    // en lugar de basarlo en la duración de la ruta.
-    // 30 segundos es un buen valor para tener actualizaciones regulares.
     graphIntervalDuration = 30000; 
 
     const initialRouteDurationSec = navigationCurrentRouteData?.routes?.[0]?.duration || 0;
     const initialRouteDistance = navigationCurrentRouteData?.routes?.[0]?.distance || 0;
-    graphExpectedAvgSpeed = (initialRouteDurationSec > 0 && initialRouteDistance > 0) ? (initialRouteDistance / initialRouteDurationSec) * 3.6 : 0;
+    graphExpectedAvgSpeed = (initialRouteDurationSec > 0 && initialRouteDistance > 0) ? (initialRouteDistance / initialRouteDistance * 3600) : 0;
     
     navigationChart = new Chart(ctx, {
         type: 'line',
@@ -19759,10 +19820,10 @@ function initializeNavigationGraph() {
             labels: [],
             datasets: [
                 {
-                    label: 'Dato', data: [],
+                    label: 'Velocidad Media Real', data: [],
                     borderColor: 'rgba(75, 192, 192, 1)',
                     backgroundColor: 'rgba(75, 192, 192, 0.2)',
-                    tension: 0.1, yAxisID: 'yPrimary', pointRadius: 0, order: 2,
+                    tension: 0.1, yAxisID: 'yPrimary', pointRadius: 2, order: 3,
                     fill: false
                 },
                 {
@@ -19770,20 +19831,20 @@ function initializeNavigationGraph() {
                     borderColor: 'rgba(255, 165, 0, 0.5)', 
                     backgroundColor: 'rgba(255, 165, 0, 0.2)', 
                     fill: 'origin',
-                    pointRadius: 0, yAxisID: 'yPrimary', hidden: true, order: 3
+                    pointRadius: 0, yAxisID: 'yPrimary', hidden: true, order: 4
                 },
                 {
-                    label: 'Referencia', data: [], borderColor: 'white',
+                    label: 'Media ETA Inicial', data: [], borderColor: 'white',
                     borderWidth: 2, fill: false,
+                    pointRadius: 0, yAxisID: 'yPrimary', hidden: false, order: 2
+                },
+                {
+                    label: 'Media Mínima', data: [], borderColor: '#FFA500', // Naranja
+                    borderWidth: 1.5, borderDash: [5, 5], fill: false,
                     pointRadius: 0, yAxisID: 'yPrimary', hidden: false, order: 1
                 },
                 {
-                    label: 'Media/Min', data: [], borderColor: '#D9EF9F',
-                    borderWidth: 1.5, borderDash: [5, 5], fill: false,
-                    pointRadius: 0, yAxisID: 'yPrimary', hidden: false, order: 0
-                },
-                {
-                    label: 'Máxima', data: [], borderColor: '#FFA420',
+                    label: 'Media Máxima', data: [], borderColor: '#28a745', // Verde
                     borderWidth: 1.5, borderDash: [5, 5], fill: false,
                     pointRadius: 0, yAxisID: 'yPrimary', hidden: false, order: 0
                 }
@@ -19795,12 +19856,23 @@ function initializeNavigationGraph() {
                 padding: { top: 5, bottom: 2, left: 0, right: 2 }
             },
             scales: {
-                x: { type: 'category', ticks: { display: false }, grid: { drawOnChartArea: false } },
+                x: {
+                    type: 'category',
+                    ticks: {
+                        color: 'white',
+                        font: { size: 9 },
+                        autoSkip: true,
+                        maxTicksLimit: 6
+                    },
+                    grid: {
+                        drawOnChartArea: false
+                    }
+                },
                 yPrimary: {
                     type: 'linear', position: 'left',
                     grace: '5%',
                     min: 0,
-                    ticks: { color: 'white', font: { size: 11 }, callback: (v) => Math.round(Number(v)).toString() },
+                    ticks: { color: 'white', font: { size: 11 }, callback: (v) => Math.round(Number(v)).toString(), stepSize: 2 }, // Intervalo de 2km/h
                     grid: { color: 'rgba(255,255,255,0.1)' }, title: { display: false }
                 }
             },
@@ -19829,10 +19901,10 @@ function initializeNavigationGraph() {
 }
 
 
+
+
+
     
-
-
-
 // ===================================================================
 // NOMBRE: updateChartData
 // RESUMEN: Actualiza los datos y la configuración de la gráfica de navegación.
@@ -19844,41 +19916,51 @@ function updateChartData() {
     const valueStyle = "font-size: 1.2em; opacity: 1.0; line-height: 1.4; font-weight: bold; text-align: right; padding-right: 22px;";
     const etaColor = "white";
     const avgColor = "#D9EF9F";
-    const maxColor = "#FFA420";
+    const maxColor = "#FFA420"; // Naranja para el máximo de velocidad (en el título)
+    const minAvgLineColor = '#FFA500'; // Naranja para la línea de media mínima
+    const maxAvgLineColor = '#28a745'; // Verde para la línea de media máxima
+
     const mainDataset = navigationChart.data.datasets[0];
     const altitudeFillDataset = navigationChart.data.datasets[1];
     const referenceDataset = navigationChart.data.datasets[2];
-    const avgSpeedOrMinAltitudeDataset = navigationChart.data.datasets[3];
-    const maxSpeedOrMaxAltitudeDataset = navigationChart.data.datasets[4];
+    const minAvgSpeedDataset = navigationChart.data.datasets[3];
+    const maxAvgSpeedDataset = navigationChart.data.datasets[4];
+
     if (currentGraphMode === 'Desviación ETA') {
         navigationChart.options.scales.yPrimary.ticks.callback = function(value) { return Math.round(value) + ' km/h'; };
         navigationChart.options.scales.yPrimary.min = 0; 
+        
         mainDataset.borderColor = 'rgba(129, 216, 208, 1)'; 
         mainDataset.backgroundColor = 'rgba(37, 99, 235, 0.2)';
-        mainDataset.fill = true;
+        mainDataset.fill = false; // El fondo ahora lo hace el área de desnivel, que está oculta
+        mainDataset.pointRadius = 2; // Puntos visibles para la media real
+
         altitudeFillDataset.hidden = true; 
         altitudeFillDataset.data = []; 
+        
         const allRelevantSpeedValues = [
             ...(graphDataPoints.speed.length > 0 ? graphDataPoints.speed : [0]),
-            maxSpeedDuringTrip || 0,
             graphExpectedAvgSpeed || 0
         ];
         const timeSinceStartMs = navigationStartTimeForStats ? Date.now() - navigationStartTimeForStats.getTime() : Infinity;
         if (timeSinceStartMs > 60000) {
             allRelevantSpeedValues.push(window.averageSpeedKmh || 0);
         }
+        
         const currentMaxDataValue = Math.max(...allRelevantSpeedValues);
         const yAxisMax = Math.min(250, Math.max(50, currentMaxDataValue + 15));
         navigationChart.options.scales.yPrimary.max = yAxisMax;
-        const targetTickCount = isEnlarged ? 30 : 10;
+        
         const yAxisRange = yAxisMax - 0; 
+        const targetTickCount = isEnlarged ? 15 : 8;
         const rawStep = yAxisRange > 0 ? yAxisRange / targetTickCount : 10;
-        const niceIntervals = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50];
+        const niceIntervals = [2, 5, 10, 20, 25, 50];
         let stepSize = niceIntervals[niceIntervals.length - 1];
         for (const interval of niceIntervals) {
             if (rawStep <= interval) { stepSize = interval; break; }
         }
         navigationChart.options.scales.yPrimary.ticks.stepSize = stepSize;
+
         const graphTitleElement = document.getElementById('navigation-graph-title');
         if (graphTitleElement) {
             const etaVal = (graphExpectedAvgSpeed || 0).toFixed(1);
@@ -19892,37 +19974,50 @@ function updateChartData() {
                     <span style="color:${maxColor};">   |  Máx: ${maxVal}Km/h</span>
                 </small>`;
         }
+        
         mainDataset.data = graphDataPoints.speed;
-        mainDataset.label = 'Velocidad';
+        mainDataset.label = 'Velocidad Media Real';
+        
         referenceDataset.data = graphLabels.map(() => graphExpectedAvgSpeed);
-        referenceDataset.label = 'Velocidad ETA';
-        avgSpeedOrMinAltitudeDataset.data = graphLabels.map(() => window.averageSpeedKmh || 0);
-        avgSpeedOrMinAltitudeDataset.label = 'Media del Viaje';
-        maxSpeedOrMaxAltitudeDataset.data = graphLabels.map(() => maxSpeedDuringTrip || 0);
-        maxSpeedOrMaxAltitudeDataset.label = 'Máxima del Viaje';
+        referenceDataset.label = 'Media ETA Inicial';
+        
+        minAvgSpeedDataset.data = graphLabels.map(() => minAverageSpeedInTrip === Infinity ? null : minAverageSpeedInTrip);
+        minAvgSpeedDataset.label = 'Media Mínima';
+        minAvgSpeedDataset.borderColor = minAvgLineColor;
+        
+        maxAvgSpeedDataset.data = graphLabels.map(() => maxAverageSpeedInTrip === -Infinity ? null : maxAverageSpeedInTrip);
+        maxAvgSpeedDataset.label = 'Media Máxima';
+        maxAvgSpeedDataset.borderColor = maxAvgLineColor;
+
     } else if (currentGraphMode === 'Altitud') {
         navigationChart.options.scales.yPrimary.ticks.callback = function(value) { return Math.round(value) + ' m'; };
         navigationChart.options.scales.yPrimary.max = undefined;
         navigationChart.options.scales.yPrimary.min = undefined;
+        
         mainDataset.borderColor = 'rgba(129, 216, 208, 1)'; 
-        mainDataset.backgroundColor = 'rgba(255, 165, 0, 0.2)';
+        mainDataset.backgroundColor = 'transparent';
         mainDataset.fill = false;
+        mainDataset.pointRadius = 0;
+
         altitudeFillDataset.data = graphDataPoints.altitude;
-        altitudeFillDataset.hidden = false; 
-        const targetTickCountAlt = isEnlarged ? 15 : 8;
+        altitudeFillDataset.hidden = false;
+        
         const altitudeValues = graphDataPoints.altitude.length > 0 ? graphDataPoints.altitude : [0];
         const minAlt = Math.min(...altitudeValues);
         const maxAlt = Math.max(...altitudeValues);
         const altRange = maxAlt - minAlt;
+        const targetTickCountAlt = isEnlarged ? 10 : 5;
+
         if (altRange > 0) {
             const rawStepAlt = altRange / targetTickCountAlt;
-            const niceIntervalsAlt = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 100, 200, 500];
+            const niceIntervalsAlt = [2, 5, 10, 20, 50, 100];
             let stepSizeAlt = niceIntervalsAlt[niceIntervalsAlt.length - 1];
             for (const interval of niceIntervalsAlt) { if(rawStepAlt <= interval) { stepSizeAlt = interval; break; } }
             navigationChart.options.scales.yPrimary.ticks.stepSize = stepSizeAlt;
         } else {
              navigationChart.options.scales.yPrimary.ticks.stepSize = undefined;
         }
+        
         const altitudePoints = graphDataPoints.altitude;
         const avgAltitudeValue = altitudePoints.length > 0 ? altitudePoints.reduce((a, b) => a + b, 0) / altitudePoints.length : 0;
         const graphTitleElement = document.getElementById('navigation-graph-title');
@@ -19938,14 +20033,20 @@ function updateChartData() {
                     <span style="color:${avgColor};">   |  Mín: ${minAltVal}m</span>
                 </small>`;
         }
+        
         mainDataset.data = graphDataPoints.altitude;
         mainDataset.label = 'Altitud';
+        
         referenceDataset.data = graphLabels.map(() => avgAltitudeValue);
         referenceDataset.label = 'Media';
-        avgSpeedOrMinAltitudeDataset.data = graphLabels.map(() => minAltitudeDuringTrip !== Infinity ? minAltitudeDuringTrip : null);
-        avgSpeedOrMinAltitudeDataset.label = 'Mínima';
-        maxSpeedOrMaxAltitudeDataset.data = graphLabels.map(() => maxAltitudeDuringTrip !== -Infinity ? maxAltitudeDuringTrip : null);
-        maxSpeedOrMaxAltitudeDataset.label = 'Máxima';
+        
+        minAvgSpeedDataset.data = graphLabels.map(() => minAltitudeDuringTrip !== Infinity ? minAltitudeDuringTrip : null);
+        minAvgSpeedDataset.label = 'Mínima';
+        minAvgSpeedDataset.borderColor = '#FFA500'; // Naranja
+        
+        maxAvgSpeedDataset.data = graphLabels.map(() => maxAltitudeDuringTrip !== -Infinity ? maxAltitudeDuringTrip : null);
+        maxAvgSpeedDataset.label = 'Máxima';
+        maxAvgSpeedDataset.borderColor = '#28a745'; // Verde
     }
     navigationChart.data.labels = graphLabels; 
     navigationChart.update('none');
@@ -19954,48 +20055,14 @@ function updateChartData() {
 
 
 
-// ===================================================================
-// NOMBRE: plotIntervalData
-// RESUMEN: Añade un nuevo punto de datos a la gráfica a intervalos regulares.
-// ===================================================================
-function plotIntervalData() {
-    if (!isNavigating || !navigationChart || !navigationStartTimeForStats || !navigationCurrentLocation) {
-        return;
-    }
-    
-    // --- INICIO DE LA MODIFICACIÓN CLAVE ---
-    // 1. Calcular la velocidad media acumulada REAL del viaje
-    let currentAverageSpeed = 0;
-    const timeElapsedS = (Date.now() - navigationStartTimeForStats.getTime()) / 1000;
 
-    // Usamos la distancia total recorrida que ya se está calculando para las estadísticas
-    if (timeElapsedS > 0 && totalDistanceTravelledForStats > 0) {
-        const avgSpeedMs = totalDistanceTravelledForStats / timeElapsedS;
-        currentAverageSpeed = avgSpeedMs * 3.6;
-    }
-    
-    // 2. Obtener la altitud actual
-    const currentAltitude = navigationCurrentLocation.altitude || 0;
 
-    // 3. Añadir los nuevos puntos a los arrays de datos de la gráfica
-    const timeLabel = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    graphLabels.push(timeLabel);
-    graphDataPoints.speed.push(currentAverageSpeed); // Usamos la media acumulada
-    graphDataPoints.altitude.push(currentAltitude);
-    
-    // 4. Actualizar la gráfica con los nuevos datos
-    updateChartData();
 
-    // 5. Gestión del estado de "parado" para no añadir puntos si el coche no se mueve
-    const isCurrentlyStopped = (window.currentSpeedKmh || 0) < 1;
-    if (isCurrentlyStopped) {
-        if (isCarStoppedForGraph) return; // Si ya estábamos parados, no hacemos nada más
-        isCarStoppedForGraph = true;
-    } else {
-        isCarStoppedForGraph = false;
-    }
-    // --- FIN DE LA MODIFICACIÓN CLAVE ---
-}
+    
+
+
+
+
 
 
 
@@ -20011,9 +20078,6 @@ function startGraphIntervalTimer() {
         graphIntervalTimer = setInterval(plotIntervalData, graphIntervalDuration);
     }
 }
-
-
-
 
 
 
