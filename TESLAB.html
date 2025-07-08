@@ -5163,8 +5163,11 @@ p.ocm-price-info {
 
    const OCM_API_KEY = "be9a78f7-0f5e-4f28-b742-4b7ab4b7eb5a";
     
-   let chargingPointsLayer = null;
-   let currentChargingPointsOnRoute = [];
+    let pdrSearchState = 'initial'; // Estados: 'initial', 'results_shown', 'cheapest_shown'
+    let lastPdrSearchResults = []; // Para guardar los resultados completos de la última búsqueda
+    
+    let chargingPointsLayer = null;
+    let currentChargingPointsOnRoute = [];
  
     let trafficAlertsCache = [];
     let trafficAlertsLayer = null;
@@ -16073,7 +16076,7 @@ function assignMapButtonListeners() {
                 openAlertModal();
                 break;
             case 'pdrs-ruta-button':
-                showPDRsFilterModal(); 
+                handlePdrSearchButtonClick();
                 break;
             case 'add-reminder-at-location-button':
                 toggleAddReminderAtLocationMode();
@@ -16189,12 +16192,79 @@ function assignMapButtonListeners() {
 
 
 
+// ===================================================================
+// NOMBRE: handlePdrSearchButtonClick
+// RESUMEN: Gestiona los 3 estados del botón de búsqueda de PDRs.
+// ===================================================================
+function handlePdrSearchButtonClick() {
+    switch (pdrSearchState) {
+        case 'initial':
+        case 'cheapest_shown':
+            showPDRsFilterModal();
+            pdrSearchState = 'initial'; 
+            break;
+            
+        case 'results_shown':
+            filterForCheapestPDRs();
+            pdrSearchState = 'cheapest_shown';
+            break;
+    }
+}
 
 
 
 
+// ===================================================================
+// NOMBRE: filterForCheapestPDRs
+// RESUMEN: Filtra los resultados de PDRs para mostrar solo el más barato de cada rango de potencia.
+// ===================================================================
+function filterForCheapestPDRs() {
+    if (lastPdrSearchResults.length === 0) {
+        showToast("No hay resultados previos para filtrar. Realiza una nueva búsqueda.", "info");
+        pdrSearchState = 'initial';
+        return;
+    }
+    showToast("Mostrando solo los PDRs más económicos por rango de potencia...", "info");
 
-    
+    const cheapestBySegment = {
+        '#5e5e5e': { price: Infinity, point: null }, // Gris (0-50 kW)
+        '#007863': { price: Infinity, point: null }, // Verde (51-100 kW)
+        'rgb(30, 144, 255)': { price: Infinity, point: null }, // Azul (101-250 kW)
+        '#de2e03': { price: Infinity, point: null }  // Rojo (>250 kW)
+    };
+
+    const parsePrice = (priceString) => {
+        if (priceString && typeof priceString === 'string') {
+            const priceMatch = priceString.match(/(\d[\d,.]*)/);
+            if (priceMatch && priceMatch[1]) {
+                const priceNum = parseFloat(priceMatch[1].replace(',', '.'));
+                if (!isNaN(priceNum) && priceNum > 0 && priceNum < 10) {
+                    return priceNum;
+                }
+            }
+        }
+        return Infinity;
+    };
+
+    lastPdrSearchResults.forEach(point => {
+        const power = parseFloat(point.power);
+        const segmentColor = getChargingPointColorByPower(power);
+        const price = parsePrice(point.price);
+        
+        if (cheapestBySegment[segmentColor] && price < cheapestBySegment[segmentColor].price) {
+            cheapestBySegment[segmentColor].price = price;
+            cheapestBySegment[segmentColor].point = point;
+        }
+    });
+
+    currentChargingPointsOnRoute = Object.values(cheapestBySegment)
+        .map(item => item.point)
+        .filter(p => p !== null);
+
+    currentChargingPointsOnRoute.forEach(p => { p.isCheapest = true; });
+
+    displayChargingPointsOnMap();
+}    
 
 
 
@@ -17779,6 +17849,8 @@ function showPDRsFilterModal() {
     const modalOverlay = document.createElement('div');
     modalOverlay.id = 'pdrs-filter-modal-overlay';
     modalOverlay.className = 'filter-modal-overlay';
+    // Dentro de la función showPDRsFilterModal...
+// ...
     modalOverlay.innerHTML = `
         <div class="filter-modal-content">
             <h2>FILTRO PUNTOS DE CARGA</h2>
@@ -17811,11 +17883,15 @@ function showPDRsFilterModal() {
             <div class="filter-help-text">
                 <center>
                 <p><strong>(*)</strong> Si hay ruta cargada se buscará en el trazado, sino en el radio desde el centro del mapa.</p>
+                <!-- INICIO: NOTA AÑADIDA -->
+                <p style="margin-top:5px;"><strong>(*)</strong> Tras una búsqueda, si vuelve a pulsar BUSCAR Pdrs, se mostrarán solo los más económicos de cada rango de potencia. Tras una segunda pulsación, se abrirá de nuevo esta ventana.</p>
+                <!-- FIN: NOTA AÑADIDA -->
                 <p style="margin-top:5px; font-style:italic;">Datos proporcionados por <a href="https://openchargemap.org" target="_blank" style="color:#0056b3; text-decoration:underline;">Open Charge Map</a>.</p>
               </center>
             </div>
         </div>
     `;
+// ... resto de la función
     mapContainer.appendChild(modalOverlay);
     
     // --- LÓGICA DE INTERACCIÓN DE CONTROLES (Sin cambios) ---
@@ -18005,12 +18081,17 @@ function showPDRsFilterModal() {
 
 
 
-// ===================================================================
+
+
+
+    
+ // ===================================================================
 // NOMBRE: findChargingPointsOnRoute
-// RESUMEN: Busca PDRs de OCM. Se ajusta si hay ruta, si se navega o no, o si se busca en la vista actual.
+// RESUMEN: Busca PDRs de OCM y gestiona el estado de la búsqueda.
 // ===================================================================
 async function findChargingPointsOnRoute(powerFilters, searchConfig) {
     clearChargingPoints();
+    lastPdrSearchResults = []; // Limpiamos resultados anteriores
     
     showToast("Buscando puntos de recarga (OCM)...", "info", 0, false, "pdrs-search");
 
@@ -18055,6 +18136,7 @@ async function findChargingPointsOnRoute(powerFilters, searchConfig) {
     
     } else {
         showToast("Tipo de búsqueda no válido.", "error");
+        pdrSearchState = 'initial'; // Resetear estado en error
         return;
     }
     
@@ -18070,6 +18152,8 @@ async function findChargingPointsOnRoute(powerFilters, searchConfig) {
         const operatorFilterWords = operatorFilterText ? operatorFilterText.split(/\s+/).filter(w => w) : [];
         
         const routeLineForDistanceCheck = (searchConfig.type === 'route' && navigationRouteLayer) ? turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat])) : null;
+        
+        let filteredPoints = [];
 
         data.forEach(point => {
             const formattedPoint = formatOCMPoint(point);
@@ -18090,12 +18174,15 @@ async function findChargingPointsOnRoute(powerFilters, searchConfig) {
                 const pointTurf = turf.point([formattedPoint.lon, formattedPoint.lat]);
                 const distanceKm = turf.pointToLineDistance(pointTurf, routeLineForDistanceCheck, { units: 'kilometers' });
                 if (distanceKm <= searchConfig.distanceFilters.max) {
-                    currentChargingPointsOnRoute.push(formattedPoint);
+                    filteredPoints.push(formattedPoint);
                 }
             } else { 
-                currentChargingPointsOnRoute.push(formattedPoint);
+                filteredPoints.push(formattedPoint);
             }
         });
+        
+        lastPdrSearchResults = [...filteredPoints]; // Guardamos los resultados completos
+        currentChargingPointsOnRoute = [...filteredPoints]; // Mostramos todos inicialmente
 
         const cheapestBySegment = {
             '#5e5e5e': { price: Infinity, point: null },
@@ -18141,17 +18228,15 @@ async function findChargingPointsOnRoute(powerFilters, searchConfig) {
         showToast(`${currentChargingPointsOnRoute.length} PDRs encontrados.`, "success");
         displayChargingPointsOnMap();
 
+        pdrSearchState = 'results_shown'; // Actualizamos el estado tras una búsqueda exitosa
+
     } catch (error) {
         const existingToast = document.getElementById("pdrs-search");
         if (existingToast) existingToast.remove();
         showToast(`Error al buscar PDRs: ${error.message}`, "error");
+        pdrSearchState = 'initial'; // Resetear estado en error
     }
-}
-
-
-
-    
-    
+}   
 
  
 
