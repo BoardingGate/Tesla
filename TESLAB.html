@@ -13131,7 +13131,357 @@ function displayUnifiedReminderWindow(overdueReminders) {
     
     
     
+ // ===================================================================
+// NOMBRE: initializeNavigationGraph
+// RESUMEN: Inicializa el gráfico de Chart.js para la navegación.
+// ===================================================================
+function initializeNavigationGraph() {
+    const graphCard = document.getElementById('navigation-graph-card');
+    const graphContainer = document.getElementById('navigation-graph-container');
+    const graphTitleElement = document.getElementById('navigation-graph-title');
+    if (!graphCard || !graphContainer || !graphTitleElement || !isNavigating || currentGraphMode === 'Gráfica off') {
+        if (graphCard) graphCard.classList.add('hidden');
+        if (navigationChart) { navigationChart.destroy(); navigationChart = null; }
+        return;
+    }
+    graphCard.classList.remove('hidden');
+    const compassElement = document.querySelector('.leaflet-control-orientation-altitude');
+    graphCard.style.height = compassElement ? (compassElement.offsetHeight + 'px') : '157px';
+    isCarStoppedForGraph = false;
+    graphDataPoints = { speed: [], altitude: [] };
+    graphLabels = [];
+    minAverageSpeedInTrip = Infinity;
+    maxAverageSpeedInTrip = -Infinity;
+    graphPlotState = { 
+        lastPlotTime: Date.now(), 
+        lastPlotCoords: navigationCurrentLocation ? { ...navigationCurrentLocation } : null 
+    };
+    if (navigationChart) {
+        navigationChart.destroy();
+        navigationChart = null;
+    }
+    isGraphingActive = true;
+    const ctx = document.getElementById('navigation-chart')?.getContext('2d');
+    if (!ctx || !ctx.canvas) {
+        showToast("Error crítico: Canvas para gráfica no encontrado.", "error");
+        if (graphCard) graphCard.classList.add('hidden');
+        return;
+    }
     
+    const initialRouteDurationSec = navigationCurrentRouteData?.routes?.[0]?.duration || 0;
+    const initialRouteDistance = navigationCurrentRouteData?.routes?.[0]?.distance || 0;
+    
+    const graphWidth = ctx.canvas.clientWidth || 300;
+    const pixelsPerPoint = 3;
+    const maxPoints = Math.floor(graphWidth / pixelsPerPoint);
+    
+    if (initialRouteDurationSec > 0 && maxPoints > 0) {
+        const idealIntervalMs = (initialRouteDurationSec / maxPoints) * 1000;
+        graphIntervalDuration = Math.max(5000, idealIntervalMs); 
+    } else {
+        graphIntervalDuration = 30000;
+    }
+
+    graphExpectedAvgSpeed = (initialRouteDurationSec > 0 && initialRouteDistance > 0) ? (initialRouteDistance / initialRouteDurationSec) * 3.6 : 0;
+    
+    navigationChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: [],
+            datasets: [
+                {
+                    label: 'Velocidad Media Real', data: [],
+                    borderColor: 'rgba(75, 192, 192, 1)',
+                    backgroundColor: 'rgba(75, 192, 192, 0.2)',
+                    tension: 0.1, yAxisID: 'yPrimary', 
+                    pointRadius: 0, 
+                    order: 3,
+                    fill: false
+                },
+                {
+                    label: 'Área Desnivel', data: [],
+                    borderColor: 'rgba(255, 165, 0, 0.5)', 
+                    backgroundColor: 'rgba(255, 165, 0, 0.2)', 
+                    fill: 'origin',
+                    pointRadius: 0, yAxisID: 'yPrimary', hidden: true, order: 4
+                },
+                {
+                    label: 'Media ETA Inicial', data: [], 
+                    borderColor: '#D29BFD', 
+                    borderWidth: 3,          
+                    fill: false,
+                    pointRadius: 0, yAxisID: 'yPrimary', hidden: false, order: 2
+                },
+                {
+                    label: 'Media Mínima', data: [], borderColor: '#FFA500',
+                    borderWidth: 1.5, borderDash: [5, 5], fill: false,
+                    pointRadius: 0, yAxisID: 'yPrimary', hidden: false, order: 1
+                },
+                {
+                    label: 'Media Máxima', data: [], borderColor: '#28a745',
+                    borderWidth: 1.5, borderDash: [5, 5], fill: false,
+                    pointRadius: 0, yAxisID: 'yPrimary', hidden: false, order: 0
+                },
+                {
+                    label: 'Media Acumulada Real', data: [], 
+                    borderColor: 'yellow', 
+                    borderWidth: 3,        
+                    fill: false,
+                    pointRadius: 0, 
+                    yAxisID: 'yPrimary', 
+                    hidden: false, 
+                    order: 2
+                }
+            ]
+        },
+        options: {
+            responsive: true, maintainAspectRatio: false,
+            layout: {
+                padding: { top: 5, bottom: 2, left: 0, right: 2 }
+            },
+            scales: {
+                x: {
+                    type: 'category',
+                    ticks: {
+                        display: false 
+                    },
+                    grid: {
+                        drawOnChartArea: false
+                    }
+                },
+                yPrimary: {
+                    type: 'linear', position: 'left',
+                    min: Math.max(0, graphExpectedAvgSpeed - 3),
+                    max: graphExpectedAvgSpeed + 3,
+                    ticks: { color: 'white', font: { size: 11 }, callback: (v) => Math.round(Number(v)).toString(), stepSize: 0.2 },
+                    grid: { color: 'rgba(255,255,255,0.1)' }, title: { display: false }
+                }
+            },
+            plugins: {
+                legend: { display: false },
+                tooltip: { 
+                    callbacks: {
+                        label: function(context) {
+                            let label = context.dataset.label || '';
+                            if (label) { label += ': '; }
+                            if (context.parsed.y !== null) {
+                                label += context.parsed.y.toFixed(1);
+                                if (currentGraphMode === 'Desviación ETA') label += ' km/h';
+                                else if (currentGraphMode === 'Altitud') label += ' m';
+                            }
+                            return label;
+                        }
+                    }
+                 }
+            },
+            animation: { duration: 250 }
+        }
+    });
+    startGraphIntervalTimer();
+    updateNavigationGraphVisibilityAndMode();
+}
+
+// ===================================================================
+// NOMBRE: plotIntervalData
+// RESUMEN: Añade un nuevo punto de datos a la gráfica a intervalos regulares.
+// ===================================================================
+function plotIntervalData() {
+    if (!isGraphingActive || !isNavigating || !navigationChart || !navigationStartTimeForStats || !navigationCurrentLocation) {
+        return;
+    }
+
+    let currentAverageSpeed = 0;
+    const timeElapsedS = (Date.now() - navigationStartTimeForStats.getTime()) / 1000;
+
+    if (timeElapsedS > 0 && totalDistanceTravelledForStats > 0) {
+        const avgSpeedMs = totalDistanceTravelledForStats / timeElapsedS;
+        currentAverageSpeed = avgSpeedMs * 3.6;
+    }
+    
+    if (currentAverageSpeed > 1) { 
+        minAverageSpeedInTrip = Math.min(minAverageSpeedInTrip, currentAverageSpeed);
+        maxAverageSpeedInTrip = Math.max(maxAverageSpeedInTrip, currentAverageSpeed);
+        
+        const timeLabel = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        graphLabels.push(timeLabel);
+        graphDataPoints.speed.push(currentAverageSpeed);
+    }
+    
+    const currentAltitude = navigationCurrentLocation.altitude || 0;
+    
+    if (graphDataPoints.altitude.length < graphDataPoints.speed.length) {
+        graphDataPoints.altitude.push(currentAltitude);
+    }
+    
+    updateChartData();
+
+    const isCurrentlyStopped = (window.currentSpeedKmh || 0) < 1;
+    if (isCurrentlyStopped) {
+        if (isCarStoppedForGraph) return; 
+        isCarStoppedForGraph = true;
+    } else {
+        isCarStoppedForGraph = false;
+    }
+}
+
+// ===================================================================
+// NOMBRE: updateChartData
+// RESUMEN: Actualiza los datos y la configuración de la gráfica de navegación.
+// ===================================================================
+function updateChartData() {
+    if (!navigationChart) return;
+    const graphCard = document.getElementById('navigation-graph-card');
+    const isEnlarged = graphCard ? graphCard.classList.contains('enlarged') : false;
+    const valueStyle = "font-size: 1.2em; opacity: 1.0; line-height: 1.4; font-weight: bold; text-align: right; padding-right: 22px;";
+    const etaColor = "#D29BFD";
+    const avgColor = "yellow";
+    const maxColor = "#FFA420";
+    const minAvgLineColor = '#FFA500';
+    const maxAvgLineColor = '#28a745';
+
+    const mainDataset = navigationChart.data.datasets[0];
+    const altitudeFillDataset = navigationChart.data.datasets[1];
+    const referenceDataset = navigationChart.data.datasets[2];
+    const minAvgSpeedDataset = navigationChart.data.datasets[3];
+    const maxAvgSpeedDataset = navigationChart.data.datasets[4];
+    const accumulatedAvgSpeedDataset = navigationChart.data.datasets[5];
+
+    if (currentGraphMode === 'Desviación ETA') {
+        navigationChart.options.scales.yPrimary.ticks.callback = function(value) { return Math.round(value) + ' km/h'; };
+        
+        mainDataset.borderColor = 'rgba(129, 216, 208, 1)'; 
+        mainDataset.backgroundColor = 'rgba(37, 99, 235, 0.2)';
+        mainDataset.fill = false;
+        mainDataset.pointRadius = 0;
+
+        altitudeFillDataset.hidden = true; 
+        altitudeFillDataset.data = []; 
+        
+        const currentAvgSpeed = window.averageSpeedKmh || 0;
+        
+        const valuesToShow = [graphExpectedAvgSpeed];
+        if (currentAvgSpeed > 1) valuesToShow.push(currentAvgSpeed);
+        if (maxAverageSpeedInTrip > -Infinity) valuesToShow.push(maxAverageSpeedInTrip);
+        if (minAverageSpeedInTrip < Infinity) valuesToShow.push(minAverageSpeedInTrip);
+        
+        const maxVisibleValue = Math.max(...valuesToShow);
+        const minVisibleValue = Math.min(...valuesToShow);
+
+        const newYMax = maxVisibleValue + 3;
+        const newYMin = Math.max(0, minVisibleValue - 3);
+        
+        navigationChart.options.scales.yPrimary.min = newYMin;
+        navigationChart.options.scales.yPrimary.max = newYMax;
+
+        const yAxisRange = newYMax - newYMin;
+        const targetTickCount = isEnlarged ? 20 : 10;
+        let stepSize = yAxisRange > 0 ? yAxisRange / targetTickCount : 1;
+        const niceIntervals = [0.1, 0.2, 0.5, 1, 2, 5];
+        let bestFitStep = niceIntervals[niceIntervals.length - 1];
+        for (const interval of niceIntervals) {
+            if (stepSize <= interval) {
+                bestFitStep = interval;
+                break;
+            }
+        }
+        navigationChart.options.scales.yPrimary.ticks.stepSize = bestFitStep;
+
+        const graphTitleElement = document.getElementById('navigation-graph-title');
+        if (graphTitleElement) {
+            const etaVal = (graphExpectedAvgSpeed || 0).toFixed(1);
+            const avgVal = (window.averageSpeedKmh || 0).toFixed(1);
+            const maxVal = (maxSpeedDuringTrip || 0).toFixed(1);
+            graphTitleElement.innerHTML = `
+                <span style="font-size: 0.7em;">DATOS ETA</span> 
+                <small style="${valueStyle}">
+                    <span style="color:${etaColor};">ETA: ${etaVal}</span> 
+                    <span style="color:${avgColor};">   |  Med: ${avgVal}</span> 
+                    <span style="color:${maxColor};">   |  Máx: ${maxVal} Km/h</span>
+                </small>`;
+        }
+        
+        mainDataset.data = graphDataPoints.speed;
+        mainDataset.label = 'Velocidad Media Real';
+        
+        referenceDataset.data = graphLabels.map(() => graphExpectedAvgSpeed);
+        referenceDataset.label = 'Media ETA Inicial';
+        
+        minAvgSpeedDataset.data = graphLabels.map(() => minAverageSpeedInTrip === Infinity ? null : minAverageSpeedInTrip);
+        minAvgSpeedDataset.label = 'Media Mínima';
+        minAvgSpeedDataset.borderColor = minAvgLineColor;
+        
+        maxAvgSpeedDataset.data = graphLabels.map(() => maxAverageSpeedInTrip === -Infinity ? null : maxAverageSpeedInTrip);
+        maxAvgSpeedDataset.label = 'Media Máxima';
+        maxAvgSpeedDataset.borderColor = maxAvgLineColor;
+
+        accumulatedAvgSpeedDataset.data = graphLabels.map(() => window.averageSpeedKmh);
+        accumulatedAvgSpeedDataset.hidden = false;
+
+    } else if (currentGraphMode === 'Altitud') {
+        accumulatedAvgSpeedDataset.hidden = true;
+        accumulatedAvgSpeedDataset.data = [];
+
+        navigationChart.options.scales.yPrimary.ticks.callback = function(value) { return Math.round(value) + ' m'; };
+        navigationChart.options.scales.yPrimary.max = undefined;
+        navigationChart.options.scales.yPrimary.min = undefined;
+        
+        mainDataset.borderColor = 'rgba(129, 216, 208, 1)'; 
+        mainDataset.backgroundColor = 'transparent';
+        mainDataset.fill = false;
+        mainDataset.pointRadius = 0;
+
+        altitudeFillDataset.data = graphDataPoints.altitude;
+        altitudeFillDataset.hidden = false;
+        
+        const altitudeValues = graphDataPoints.altitude.length > 0 ? graphDataPoints.altitude : [0];
+        const minAlt = Math.min(...altitudeValues);
+        const maxAlt = Math.max(...altitudeValues);
+        const altRange = maxAlt - minAlt;
+        const targetTickCountAlt = isEnlarged ? 10 : 5;
+
+        if (altRange > 0) {
+            const rawStepAlt = altRange / targetTickCountAlt;
+            const niceIntervalsAlt = [2, 5, 10, 20, 50, 100];
+            let stepSizeAlt = niceIntervalsAlt[niceIntervalsAlt.length - 1];
+            for (const interval of niceIntervalsAlt) { if(rawStepAlt <= interval) { stepSizeAlt = interval; break; } }
+            navigationChart.options.scales.yPrimary.ticks.stepSize = stepSizeAlt;
+        } else {
+             navigationChart.options.scales.yPrimary.ticks.stepSize = undefined;
+        }
+        
+        const altitudePoints = graphDataPoints.altitude;
+        const avgAltitudeValue = altitudePoints.length > 0 ? altitudePoints.reduce((a, b) => a + b, 0) / altitudePoints.length : 0;
+        const graphTitleElement = document.getElementById('navigation-graph-title');
+        if (graphTitleElement) {
+            const maxAltVal = (maxAltitudeDuringTrip !== -Infinity ? maxAltitudeDuringTrip : 0).toFixed(0);
+            const avgAltVal = avgAltitudeValue.toFixed(0);
+            const minAltVal = (minAltitudeDuringTrip !== Infinity ? minAltitudeDuringTrip : 0).toFixed(0);
+            graphTitleElement.innerHTML = `
+                <span style="font-size: 0.7em;">DESNIVEL RUTA</span>
+                <small style="${valueStyle}">
+                    <span style="color:${maxColor};">Máx: ${maxAltVal}</span> 
+                    <span style="color:${etaColor};">   |  Med: ${avgAltVal}</span> 
+                    <span style="color:${avgColor};">   |  Mín: ${minAltVal}m</span>
+                </small>`;
+        }
+        
+        mainDataset.data = graphDataPoints.altitude;
+        mainDataset.label = 'Altitud';
+        
+        referenceDataset.data = graphLabels.map(() => avgAltitudeValue);
+        referenceDataset.label = 'Media';
+        
+        minAvgSpeedDataset.data = graphLabels.map(() => minAltitudeDuringTrip !== Infinity ? minAltitudeDuringTrip : null);
+        minAvgSpeedDataset.label = 'Mínima';
+        minAvgSpeedDataset.borderColor = '#FFA500';
+        
+        maxAvgSpeedDataset.data = graphLabels.map(() => maxAltitudeDuringTrip !== -Infinity ? maxAltitudeDuringTrip : null);
+        maxAvgSpeedDataset.label = 'Máxima';
+        maxAvgSpeedDataset.borderColor = '#28a745';
+    }
+    navigationChart.data.labels = graphLabels; 
+    navigationChart.update('none');
+}   
     
     
 
@@ -20871,45 +21221,6 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
 
 
     
-// ===================================================================
-// NOMBRE: plotIntervalData
-// RESUMEN: Añade un nuevo punto de datos a la gráfica a intervalos regulares.
-// ===================================================================
-function plotIntervalData() {
-    if (!isNavigating || !navigationChart || !navigationStartTimeForStats || !navigationCurrentLocation) {
-        return;
-    }
-
-    let currentAverageSpeed = 0;
-    const timeElapsedS = (Date.now() - navigationStartTimeForStats.getTime()) / 1000;
-
-    if (timeElapsedS > 0 && totalDistanceTravelledForStats > 0) {
-        const avgSpeedMs = totalDistanceTravelledForStats / timeElapsedS;
-        currentAverageSpeed = avgSpeedMs * 3.6;
-    }
-    
-    if (currentAverageSpeed > 0) { // Solo registrar cuando hay movimiento
-        minAverageSpeedInTrip = Math.min(minAverageSpeedInTrip, currentAverageSpeed);
-        maxAverageSpeedInTrip = Math.max(maxAverageSpeedInTrip, currentAverageSpeed);
-    }
-    
-    const currentAltitude = navigationCurrentLocation.altitude || 0;
-
-    const timeLabel = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    graphLabels.push(timeLabel);
-    graphDataPoints.speed.push(currentAverageSpeed); // Se usa la media acumulada real
-    graphDataPoints.altitude.push(currentAltitude);
-    
-    updateChartData();
-
-    const isCurrentlyStopped = (window.currentSpeedKmh || 0) < 1;
-    if (isCurrentlyStopped) {
-        if (isCarStoppedForGraph) return; 
-        isCarStoppedForGraph = true;
-    } else {
-        isCarStoppedForGraph = false;
-    }
-}
 
 
 
@@ -20923,320 +21234,7 @@ function plotIntervalData() {
     
 
 
-    
-// ===================================================================
-// NOMBRE: initializeNavigationGraph
-// RESUMEN: Inicializa el gráfico de Chart.js para la navegación.
-// ===================================================================
-function initializeNavigationGraph() {
-    const graphCard = document.getElementById('navigation-graph-card');
-    const graphContainer = document.getElementById('navigation-graph-container');
-    const graphTitleElement = document.getElementById('navigation-graph-title');
-    if (!graphCard || !graphContainer || !graphTitleElement || !isNavigating || currentGraphMode === 'Gráfica off') {
-        if (graphCard) graphCard.classList.add('hidden');
-        if (navigationChart) { navigationChart.destroy(); navigationChart = null; }
-        return;
-    }
-    graphCard.classList.remove('hidden');
-    const compassElement = document.querySelector('.leaflet-control-orientation-altitude');
-    graphCard.style.height = compassElement ? (compassElement.offsetHeight + 'px') : '157px';
-    isCarStoppedForGraph = false;
-    graphDataPoints = { speed: [], altitude: [] };
-    graphLabels = [];
-    minAverageSpeedInTrip = Infinity;
-    maxAverageSpeedInTrip = -Infinity;
-    graphPlotState = { 
-        lastPlotTime: Date.now(), 
-        lastPlotCoords: navigationCurrentLocation ? { ...navigationCurrentLocation } : null 
-    };
-    if (navigationChart) {
-        navigationChart.destroy();
-        navigationChart = null;
-    }
-    const ctx = document.getElementById('navigation-chart')?.getContext('2d');
-    if (!ctx || !ctx.canvas) {
-        showToast("Error crítico: Canvas para gráfica no encontrado.", "error");
-        if (graphCard) graphCard.classList.add('hidden');
-        return;
-    }
-    
-    const initialRouteDurationSec = navigationCurrentRouteData?.routes?.[0]?.duration || 0;
-    const initialRouteDistance = navigationCurrentRouteData?.routes?.[0]?.distance || 0;
-    
-    const graphWidth = ctx.canvas.clientWidth || 300;
-    const pixelsPerPoint = 3;
-    const maxPoints = Math.floor(graphWidth / pixelsPerPoint);
-    
-    if (initialRouteDurationSec > 0 && maxPoints > 0) {
-        const idealIntervalMs = (initialRouteDurationSec / maxPoints) * 1000;
-        graphIntervalDuration = Math.max(5000, idealIntervalMs); 
-    } else {
-        graphIntervalDuration = 30000;
-    }
-
-    graphExpectedAvgSpeed = (initialRouteDurationSec > 0 && initialRouteDistance > 0) ? (initialRouteDistance / initialRouteDurationSec) * 3.6 : 0;
-    
-    navigationChart = new Chart(ctx, {
-        type: 'line',
-        data: {
-            labels: [],
-            datasets: [
-                {
-                    label: 'Velocidad Media Real', data: [],
-                    borderColor: 'rgba(75, 192, 192, 1)',
-                    backgroundColor: 'rgba(75, 192, 192, 0.2)',
-                    tension: 0.1, yAxisID: 'yPrimary', 
-                    pointRadius: 0, 
-                    order: 3,
-                    fill: false
-                },
-                {
-                    label: 'Área Desnivel', data: [],
-                    borderColor: 'rgba(255, 165, 0, 0.5)', 
-                    backgroundColor: 'rgba(255, 165, 0, 0.2)', 
-                    fill: 'origin',
-                    pointRadius: 0, yAxisID: 'yPrimary', hidden: true, order: 4
-                },
-                {
-                    label: 'Media ETA Inicial', data: [], 
-                    borderColor: '#D29BFD', 
-                    borderWidth: 3,          
-                    fill: false,
-                    pointRadius: 0, yAxisID: 'yPrimary', hidden: false, order: 2
-                },
-                {
-                    label: 'Media Mínima', data: [], borderColor: '#FFA500',
-                    borderWidth: 1.5, borderDash: [5, 5], fill: false,
-                    pointRadius: 0, yAxisID: 'yPrimary', hidden: false, order: 1
-                },
-                {
-                    label: 'Media Máxima', data: [], borderColor: '#28a745',
-                    borderWidth: 1.5, borderDash: [5, 5], fill: false,
-                    pointRadius: 0, yAxisID: 'yPrimary', hidden: false, order: 0
-                },
-                {
-                    label: 'Media Acumulada Real', data: [], 
-                    borderColor: 'yellow', 
-                    borderWidth: 3,        
-                    fill: false,
-                    pointRadius: 0, 
-                    yAxisID: 'yPrimary', 
-                    hidden: false, 
-                    order: 2
-                }
-            ]
-        },
-        options: {
-            responsive: true, maintainAspectRatio: false,
-            layout: {
-                padding: { top: 5, bottom: 2, left: 0, right: 2 }
-            },
-            scales: {
-                x: {
-                    type: 'category',
-                    ticks: {
-                        display: false 
-                    },
-                    grid: {
-                        drawOnChartArea: false
-                    }
-                },
-                yPrimary: {
-                    type: 'linear', position: 'left',
-                    min: Math.max(0, graphExpectedAvgSpeed - 3),
-                    max: graphExpectedAvgSpeed + 3,
-                    ticks: { color: 'white', font: { size: 11 }, callback: (v) => Math.round(Number(v)).toString(), stepSize: 0.2 },
-                    grid: { color: 'rgba(255,255,255,0.1)' }, title: { display: false }
-                }
-            },
-            plugins: {
-                legend: { display: false },
-                tooltip: { 
-                    callbacks: {
-                        label: function(context) {
-                            let label = context.dataset.label || '';
-                            if (label) { label += ': '; }
-                            if (context.parsed.y !== null) {
-                                label += context.parsed.y.toFixed(1);
-                                if (currentGraphMode === 'Desviación ETA') label += ' km/h';
-                                else if (currentGraphMode === 'Altitud') label += ' m';
-                            }
-                            return label;
-                        }
-                    }
-                 }
-            },
-            animation: { duration: 250 }
-        }
-    });
-    startGraphIntervalTimer();
-    updateNavigationGraphVisibilityAndMode();
-}
-
-
-    
-        
-        
-
-// ===================================================================
-// NOMBRE: updateChartData
-// RESUMEN: Actualiza los datos y la configuración de la gráfica de navegación.
-// ===================================================================
-function updateChartData() {
-    if (!navigationChart) return;
-    const graphCard = document.getElementById('navigation-graph-card');
-    const isEnlarged = graphCard ? graphCard.classList.contains('enlarged') : false;
-    const valueStyle = "font-size: 1.2em; opacity: 1.0; line-height: 1.4; font-weight: bold; text-align: right; padding-right: 22px;";
-    const etaColor = "#D29BFD";
-    const avgColor = "yellow";
-    const maxColor = "#FFA420";
-    const minAvgLineColor = '#FFA500';
-    const maxAvgLineColor = '#28a745';
-
-    const mainDataset = navigationChart.data.datasets[0];
-    const altitudeFillDataset = navigationChart.data.datasets[1];
-    const referenceDataset = navigationChart.data.datasets[2];
-    const minAvgSpeedDataset = navigationChart.data.datasets[3];
-    const maxAvgSpeedDataset = navigationChart.data.datasets[4];
-    const accumulatedAvgSpeedDataset = navigationChart.data.datasets[5];
-
-    if (currentGraphMode === 'Desviación ETA') {
-        navigationChart.options.scales.yPrimary.ticks.callback = function(value) { return Math.round(value) + ' km/h'; };
-        
-        mainDataset.borderColor = 'rgba(129, 216, 208, 1)'; 
-        mainDataset.backgroundColor = 'rgba(37, 99, 235, 0.2)';
-        mainDataset.fill = false;
-        mainDataset.pointRadius = 0;
-
-        altitudeFillDataset.hidden = true; 
-        altitudeFillDataset.data = []; 
-        
-        const currentAvgSpeed = window.averageSpeedKmh || 0;
-        
-        const valuesToShow = [graphExpectedAvgSpeed];
-        if (currentAvgSpeed > 1) valuesToShow.push(currentAvgSpeed);
-        if (maxAverageSpeedInTrip > -Infinity) valuesToShow.push(maxAverageSpeedInTrip);
-        if (minAverageSpeedInTrip < Infinity) valuesToShow.push(minAverageSpeedInTrip);
-        
-        const maxVisibleValue = Math.max(...valuesToShow);
-        const minVisibleValue = Math.min(...valuesToShow);
-
-        const newYMax = maxVisibleValue + 3;
-        const newYMin = Math.max(0, minVisibleValue - 3);
-        
-        navigationChart.options.scales.yPrimary.min = newYMin;
-        navigationChart.options.scales.yPrimary.max = newYMax;
-
-        const yAxisRange = newYMax - newYMin;
-        const targetTickCount = isEnlarged ? 20 : 10;
-        let stepSize = yAxisRange > 0 ? yAxisRange / targetTickCount : 1;
-        const niceIntervals = [0.1, 0.2, 0.5, 1, 2, 5];
-        let bestFitStep = niceIntervals[niceIntervals.length - 1];
-        for (const interval of niceIntervals) {
-            if (stepSize <= interval) {
-                bestFitStep = interval;
-                break;
-            }
-        }
-        navigationChart.options.scales.yPrimary.ticks.stepSize = bestFitStep;
-
-        const graphTitleElement = document.getElementById('navigation-graph-title');
-        if (graphTitleElement) {
-            const etaVal = (graphExpectedAvgSpeed || 0).toFixed(1);
-            const avgVal = (window.averageSpeedKmh || 0).toFixed(1);
-            const maxVal = (maxSpeedDuringTrip || 0).toFixed(1);
-            graphTitleElement.innerHTML = `
-                <span style="font-size: 0.7em;">DATOS ETA</span> 
-                <small style="${valueStyle}">
-                    <span style="color:${etaColor};">ETA: ${etaVal}</span> 
-                    <span style="color:${avgColor};">   |  Med: ${avgVal}</span> 
-                    <span style="color:${maxColor};">   |  Máx: ${maxVal} Km/h</span>
-                </small>`;
-        }
-        
-        mainDataset.data = graphDataPoints.speed;
-        mainDataset.label = 'Velocidad Media Real';
-        
-        referenceDataset.data = graphLabels.map(() => graphExpectedAvgSpeed);
-        referenceDataset.label = 'Media ETA Inicial';
-        
-        minAvgSpeedDataset.data = graphLabels.map(() => minAverageSpeedInTrip === Infinity ? null : minAverageSpeedInTrip);
-        minAvgSpeedDataset.label = 'Media Mínima';
-        minAvgSpeedDataset.borderColor = minAvgLineColor;
-        
-        maxAvgSpeedDataset.data = graphLabels.map(() => maxAverageSpeedInTrip === -Infinity ? null : maxAverageSpeedInTrip);
-        maxAvgSpeedDataset.label = 'Media Máxima';
-        maxAvgSpeedDataset.borderColor = maxAvgLineColor;
-
-        accumulatedAvgSpeedDataset.data = graphLabels.map(() => window.averageSpeedKmh);
-        accumulatedAvgSpeedDataset.hidden = false;
-
-    } else if (currentGraphMode === 'Altitud') {
-        accumulatedAvgSpeedDataset.hidden = true;
-        accumulatedAvgSpeedDataset.data = [];
-
-        navigationChart.options.scales.yPrimary.ticks.callback = function(value) { return Math.round(value) + ' m'; };
-        navigationChart.options.scales.yPrimary.max = undefined;
-        navigationChart.options.scales.yPrimary.min = undefined;
-        
-        mainDataset.borderColor = 'rgba(129, 216, 208, 1)'; 
-        mainDataset.backgroundColor = 'transparent';
-        mainDataset.fill = false;
-        mainDataset.pointRadius = 0;
-
-        altitudeFillDataset.data = graphDataPoints.altitude;
-        altitudeFillDataset.hidden = false;
-        
-        const altitudeValues = graphDataPoints.altitude.length > 0 ? graphDataPoints.altitude : [0];
-        const minAlt = Math.min(...altitudeValues);
-        const maxAlt = Math.max(...altitudeValues);
-        const altRange = maxAlt - minAlt;
-        const targetTickCountAlt = isEnlarged ? 10 : 5;
-
-        if (altRange > 0) {
-            const rawStepAlt = altRange / targetTickCountAlt;
-            const niceIntervalsAlt = [2, 5, 10, 20, 50, 100];
-            let stepSizeAlt = niceIntervalsAlt[niceIntervalsAlt.length - 1];
-            for (const interval of niceIntervalsAlt) { if(rawStepAlt <= interval) { stepSizeAlt = interval; break; } }
-            navigationChart.options.scales.yPrimary.ticks.stepSize = stepSizeAlt;
-        } else {
-             navigationChart.options.scales.yPrimary.ticks.stepSize = undefined;
-        }
-        
-        const altitudePoints = graphDataPoints.altitude;
-        const avgAltitudeValue = altitudePoints.length > 0 ? altitudePoints.reduce((a, b) => a + b, 0) / altitudePoints.length : 0;
-        const graphTitleElement = document.getElementById('navigation-graph-title');
-        if (graphTitleElement) {
-            const maxAltVal = (maxAltitudeDuringTrip !== -Infinity ? maxAltitudeDuringTrip : 0).toFixed(0);
-            const avgAltVal = avgAltitudeValue.toFixed(0);
-            const minAltVal = (minAltitudeDuringTrip !== Infinity ? minAltitudeDuringTrip : 0).toFixed(0);
-            graphTitleElement.innerHTML = `
-                <span style="font-size: 0.7em;">DESNIVEL RUTA</span>
-                <small style="${valueStyle}">
-                    <span style="color:${maxColor};">Máx: ${maxAltVal}</span> 
-                    <span style="color:${etaColor};">   |  Med: ${avgAltVal}</span> 
-                    <span style="color:${avgColor};">   |  Mín: ${minAltVal}m</span>
-                </small>`;
-        }
-        
-        mainDataset.data = graphDataPoints.altitude;
-        mainDataset.label = 'Altitud';
-        
-        referenceDataset.data = graphLabels.map(() => avgAltitudeValue);
-        referenceDataset.label = 'Media';
-        
-        minAvgSpeedDataset.data = graphLabels.map(() => minAltitudeDuringTrip !== Infinity ? minAltitudeDuringTrip : null);
-        minAvgSpeedDataset.label = 'Mínima';
-        minAvgSpeedDataset.borderColor = '#FFA500';
-        
-        maxAvgSpeedDataset.data = graphLabels.map(() => maxAltitudeDuringTrip !== -Infinity ? maxAltitudeDuringTrip : null);
-        maxAvgSpeedDataset.label = 'Máxima';
-        maxAvgSpeedDataset.borderColor = '#28a745';
-    }
-    navigationChart.data.labels = graphLabels; 
-    navigationChart.update('none');
-}
-
+ 
 
     
 
