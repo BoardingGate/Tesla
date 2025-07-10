@@ -7130,8 +7130,249 @@ function showArrivalStatsModal() {
 
 
 
+// ===================================================================
+// NOMBRE: addRouteToRecents
+// RESUMEN: Añade una ruta al historial de rutas recientes en localStorage.
+// ===================================================================
+function addRouteToRecents(routeObject) {
+    if (!routeObject || !routeObject.waypoints || routeObject.waypoints.length < 2) {
+        return;
+    }
+    const RECENT_ROUTES_KEY = 'boardinggate_recent_routes';
+    const MAX_RECENT_ROUTES = 3;
+    let recentRoutes = [];
+    try {
+        recentRoutes = JSON.parse(localStorage.getItem(RECENT_ROUTES_KEY)) || [];
+    } catch (e) {
+        recentRoutes = [];
+    }
+    const simplifiedRoute = {
+        name: routeObject.name || `Ruta a ${routeObject.waypoints[routeObject.waypoints.length - 1].address || 'destino'}`,
+        waypoints: routeObject.waypoints.map(wp => ({
+            lat: wp.lat,
+            lng: wp.lng,
+            address: wp.address
+        })),
+        timestamp: new Date().toISOString()
+    };
+    recentRoutes.unshift(simplifiedRoute);
+    const uniqueRecentRoutes = recentRoutes.reduce((acc, current) => {
+        if (!acc.find(item => JSON.stringify(item.waypoints) === JSON.stringify(current.waypoints))) {
+            acc.push(current);
+        }
+        return acc;
+    }, []);
+    const finalRecentRoutes = uniqueRecentRoutes.slice(0, MAX_RECENT_ROUTES);
+    localStorage.setItem(RECENT_ROUTES_KEY, JSON.stringify(finalRecentRoutes));
+}
 
+// ===================================================================
+// NOMBRE: showLoadRouteModal
+// RESUMEN: Muestra el modal para cargar o borrar rutas guardadas, incluyendo rutas recientes.
+// ===================================================================
+function showLoadRouteModal() {
+    clearAllWaypointMarkersFromMap();
+    if (navigationMapInstance) {
+        if (navigationRouteLayer) try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch(e){}
+        if (completedRouteSegmentsLayer) completedRouteSegmentsLayer.clearLayers();
+    }
+    navigationWaypoints = [];
+    navigationRouteLayer = null;
+    navigationCurrentRouteData = null;
+    isNavigating = false;
+    lastValidCarDistanceForDisplay = 0;
+    tripInitialOverallEtaTime = null;
+    currentStageInitialExpectedEtaTime = null;
+    accumulatedDeviationMs = 0;
+    accumulatedDistanceBeforeCurrentSegment = 0;
+    totalDistanceTravelledForStats = 0;
+    maxSpeedDuringTrip = 0;
+    maxAltitudeDuringTrip = -Infinity;
+    minAltitudeDuringTrip = Infinity;
     
+    updateStartNavigationButtonState();
+    updateNavigationButtonColor();
+    hideNavigationUI();
+    hideMapInfoOverlay();
+    eliminarRadaresDeRuta();
+    actualizarContadorRadares(0);
+    eliminarTareasDeBarraProgreso();
+    actualizarContadorTareas(0);
+
+    const existingModal = document.getElementById('saved-routes-modal');
+    if (existingModal) existingModal.remove();
+
+    const modal = document.createElement('div');
+    modal.id = 'saved-routes-modal';
+    modal.className = 'ocm-modal-content'; // Usamos la clase para el estilo moderno
+    modal.style.cssText = `
+        max-width: 850px; 
+        width: 95%;
+        position: fixed;
+        top: 10px;
+        left: 50%;
+        transform: translateX(-50%);
+        max-height: calc(100vh - 20px);
+    `;
+
+    modal.innerHTML = `
+        <div class="ocm-modal-header" style="height: 150px; background-image: url('https://boardinggate.github.io/Tesla/modalrutas.png'); background-size: cover; background-position: center; display: flex; align-items: flex-end; padding: 12px;">
+             <h2 style="font-size: 1.8rem; font-weight: bold; color: white; text-shadow: 1px 1px 3px rgba(0,0,0,0.8); position: relative; z-index: 1;">Cargar Ruta</h2>
+        </div>
+        <div class="ocm-modal-body" style="padding: 15px;">
+            <div class="modal-top-buttons" style="justify-content: space-between; align-items: center; margin-bottom: 1rem;">
+                <input type="text" id="filter-saved-routes" placeholder="FILTRAR RUTAS..." style="flex-grow: 1; padding: 8px 12px; border: 1px solid #444; border-radius: 4px; font-size: 1rem; background-color: #3a3a3c; color: #f0f0f0;">
+                <button id="close-saved-routes-modal" class="ocm-modal-footer button" style="background-color: #5856d6; flex-grow: 0; min-width: 120px; margin-left:10px;">Cerrar</button>
+            </div>
+            <div id="routes-container" style="max-height: calc(100vh - 350px); overflow-y: auto;">
+                <h3 id="recent-routes-title" class="routes-section-title" style="color: #007aff; margin-top: 0; display:none;">Rutas Recientes</h3>
+                <ul id="recent-routes-list" class="routes-list"></ul>
+                <h3 class="routes-section-title" style="color: #007aff; border-top: 1px solid #444; padding-top: 15px; margin-top: 15px;">Rutas Guardadas (Máx. ${MAX_SAVED_ROUTES})</h3>
+                <ul id="saved-routes-list" class="routes-list"></ul>
+            </div>
+        </div>
+    `;
+    
+    // Estilos internos para la lista
+    const style = document.createElement('style');
+    style.textContent = `
+        .routes-list { list-style: none; padding: 0; margin: 0; }
+        .routes-list li { background-color: #3a3a3c; padding: 12px 15px; border-bottom: 1px solid #2c2c2e; display: flex; justify-content: space-between; align-items: center; font-size: 1.1rem; font-weight: 500; color: #f0f0f0; border-radius: 6px; margin-bottom: 8px; }
+        .routes-list li .route-name { flex-grow: 1; cursor: pointer; }
+        .routes-list li .route-actions { display: flex; gap: 10px; }
+        .routes-list li button { font-size: 0.85rem; padding: 5px 10px; border-radius: 4px; border: none; cursor: pointer; font-weight: bold; }
+        .routes-list li .return-route-btn { background-color: #34c759; color: white; }
+        .routes-list li .delete-route-btn { background-color: #ff3b30; color: white; }
+        .routes-section-title { font-size: 1.2rem; font-weight: bold; margin-bottom: 10px; }
+    `;
+    modal.appendChild(style);
+    
+    document.body.appendChild(modal);
+
+    const recentListElement = modal.querySelector('#recent-routes-list');
+    const savedListElement = modal.querySelector('#saved-routes-list');
+    const closeButton = modal.querySelector('#close-saved-routes-modal');
+    const filterInput = modal.querySelector('#filter-saved-routes');
+    const recentRoutesTitle = modal.querySelector('#recent-routes-title');
+
+    let recentRoutes = JSON.parse(localStorage.getItem('boardinggate_recent_routes') || "[]");
+    let savedRoutes = JSON.parse(localStorage.getItem(SAVED_ROUTES_KEY) || "[]");
+    savedRoutes.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+    const closeHandler = () => {
+        clearModalAutoCloseTimer(modal, closeButton, 'saved-routes-modal');
+        if (modal.parentNode) modal.remove();
+    };
+    closeButton.addEventListener('click', closeHandler);
+    addModalAutoCloseTimer(modal, closeButton, 'saved-routes-modal', 45000);
+
+    const displayRoutes = () => {
+        const filterText = filterInput.value.toUpperCase().trim();
+        
+        const renderList = (list, element, isRecent) => {
+            element.innerHTML = '';
+            const filtered = list.filter(route => route.name.toUpperCase().includes(filterText));
+            
+            if (filtered.length > 0) {
+                 if(isRecent) recentRoutesTitle.style.display = 'block';
+            } else if (isRecent) {
+                 recentRoutesTitle.style.display = 'none';
+            }
+
+            if (list.length === 0 && !isRecent){
+                 element.innerHTML = '<li>No hay rutas guardadas.</li>';
+                 return;
+            }
+            if (filtered.length === 0 && filterText){
+                 element.innerHTML = '<li>No hay rutas que coincidan con el filtro.</li>';
+                 return;
+            }
+
+            filtered.forEach(route => {
+                const li = document.createElement('li');
+                li.innerHTML = `
+                    <span class="route-name">${route.name}</span>
+                    <div class="route-actions">
+                        <button class="return-route-btn" title="Cargar ruta en sentido inverso">Ruta de vuelta</button>
+                        <button class="delete-route-btn" title="Borrar ruta">${isRecent ? 'Quitar' : 'Borrar'}</button>
+                    </div>
+                `;
+                
+                li.querySelector('.route-name').addEventListener('click', () => {
+                    const routeToLoad = isRecent ? route : savedRoutes.find(r => r.name === route.name);
+                    loadRouteByName(routeToLoad.name);
+                    closeHandler();
+                });
+
+                li.querySelector('.return-route-btn').addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    const sourceRoute = isRecent ? route : savedRoutes.find(r => r.name === route.name);
+                    if (!sourceRoute || !sourceRoute.waypoints || sourceRoute.waypoints.length === 0) return;
+
+                    let returnWaypoints = [];
+                    if (sourceRoute.waypoints.length === 2 && navigationCurrentLocation) {
+                        const originalStart = sourceRoute.waypoints[0];
+                        returnWaypoints = [
+                            { lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude, address: 'Posición Actual (GPS)'},
+                            { lat: originalStart.lat, lng: originalStart.lng, address: originalStart.address }
+                        ];
+                    } else {
+                        returnWaypoints = [...sourceRoute.waypoints].reverse();
+                    }
+                    
+                    const returnRouteObject = {
+                        name: `VUELTA: ${sourceRoute.name}`,
+                        waypoints: returnWaypoints
+                    };
+
+                    clearAllWaypointMarkersFromMap();
+                    navigationWaypoints = returnRouteObject.waypoints.map(wp => ({
+                        id: Date.now() + Math.random(),
+                        lat: wp.lat,
+                        lng: wp.lng,
+                        type: '', label: '',
+                        address: wp.address,
+                        visited: false, isCriticalForRecalc: true, isInternal: false, isRecalculatedStart: false
+                    }));
+                    
+                    updateWaypointTypesAndLabels();
+                    renderWaypointMarkers();
+                    recalculateAndDrawRoute().then(() => {
+                        const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+                        if (radaresRutaCheckbox && radaresRutaCheckbox.checked) toggleRadaresRuta(true);
+                    });
+                    
+                    closeHandler();
+                });
+
+                li.querySelector('.delete-route-btn').addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    if (isRecent) {
+                        recentRoutes = recentRoutes.filter(r => r.timestamp !== route.timestamp);
+                        localStorage.setItem('boardinggate_recent_routes', JSON.stringify(recentRoutes));
+                    } else {
+                        if (confirm(`¿Seguro que quieres borrar la ruta "${route.name}" permanentemente?`)) {
+                            savedRoutes = savedRoutes.filter(r => r.name !== route.name);
+                            localStorage.setItem(SAVED_ROUTES_KEY, JSON.stringify(savedRoutes));
+                            markCacheAsDirty();
+                            showToast(`Ruta "${route.name}" borrada`, "info");
+                        }
+                    }
+                    displayRoutes();
+                });
+
+                element.appendChild(li);
+            });
+        };
+        
+        renderList(recentRoutes, recentListElement, true);
+        renderList(savedRoutes, savedListElement, false);
+    };
+
+    filterInput.addEventListener('input', displayRoutes);
+    displayRoutes();
+}
+
 
 // ===================================================================
 // NOMBRE: saveCurrentRoute
@@ -7142,63 +7383,63 @@ async function saveCurrentRoute() {
         showToast("No hay ruta activa para guardar (se necesitan al menos 2 puntos)", "warning");
         return;
     }
+
     const isMultiStage = navigationWaypoints.length > 2;
     const lastWp = navigationWaypoints[navigationWaypoints.length - 1];
     let defaultRouteName = await getSuggestedRouteName(lastWp.lat, lastWp.lng, isMultiStage, navigationWaypoints.length);
     currentRouteNameForSaving = null;
+
     const existingModal = document.getElementById('save-route-prompt-modal');
     if (existingModal) existingModal.remove();
+
     const modal = document.createElement('div');
     modal.id = 'save-route-prompt-modal';
-    
-    // --- INICIO DE LA MODIFICACIÓN HTML ---
-    // Envolvemos el input y añadimos el botón de borrado
+    modal.className = 'ocm-modal-content'; // Usamos la clase para el estilo moderno
+    modal.style.cssText = `
+        max-width: 850px; 
+        width: 95%;
+        position: fixed;
+        top: 10px;
+        left: 50%;
+        transform: translateX(-50%);
+        max-height: calc(100vh - 20px);
+    `;
+
     modal.innerHTML = `
-        <h2>Guardar Ruta</h2>
-        <div class="modal-top-buttons">
-            <button id="confirm-save-route">Guardar <span class="button-countdown-timer"></span></button>
-            <button id="cancel-save-route">Cancelar</button>
+        <div class="ocm-modal-header" style="height: 150px; background-image: url('https://boardinggate.github.io/Tesla/modalrutas.png'); background-size: cover; background-position: center; display: flex; align-items: flex-end; padding: 12px;">
+             <h2 style="font-size: 1.8rem; font-weight: bold; color: white; text-shadow: 1px 1px 3px rgba(0,0,0,0.8); position: relative; z-index: 1;">Guardar Ruta Actual</h2>
         </div>
-        <label for="route-name-input">Nombre de la Ruta:</label>
-        <div class="input-with-clear-button">
-            <input type="text" id="route-name-input" value="${defaultRouteName.toUpperCase()}">
-            <button id="clear-route-name-btn" class="clear-input-btn" title="Limpiar nombre">×</button>
+        <div class="ocm-modal-body" style="padding: 15px;">
+            <label for="route-name-input" style="display: block; margin-bottom: 10px; font-weight: 500; color: #f0f0f0;">Nombre de la Ruta:</label>
+            <div class="input-with-clear-button" style="position: relative; margin-bottom: 20px;">
+                <input type="text" id="route-name-input" value="${defaultRouteName.toUpperCase()}" style="width: 100%; padding: 10px 40px 10px 10px; border: 1px solid #444; border-radius: 4px; font-size: 1.1rem; background-color: #3a3a3c; color: #f0f0f0; text-transform: uppercase; font-weight: bold;">
+                <button class="clear-input-btn" title="Limpiar nombre" style="position: absolute; right: 5px; top: 50%; transform: translateY(-50%); background: transparent; border: none; font-size: 1.8rem; color: #aaa; cursor: pointer; display: none;">×</button>
+            </div>
+            <div class="ocm-modal-footer" style="padding: 0;">
+                <button id="confirm-save-route" style="background-color: #34c759;">Guardar <span class="button-countdown-timer"></span></button>
+                <button id="cancel-save-route" style="background-color: #5856d6;">Cancelar</button>
+            </div>
         </div>
     `;
-    // --- FIN DE LA MODIFICACIÓN HTML ---
-    
+
     document.body.appendChild(modal);
     const nameInput = modal.querySelector('#route-name-input');
     const confirmButton = modal.querySelector('#confirm-save-route');
     const cancelButton = modal.querySelector('#cancel-save-route');
+    const clearBtn = modal.querySelector('.clear-input-btn');
     
-    // --- INICIO DE LA NUEVA LÓGICA JAVASCRIPT ---
-    const clearBtn = modal.querySelector('#clear-route-name-btn');
-
-    // Función para mostrar/ocultar el aspa
     const toggleClearButton = () => {
-        if (nameInput.value.trim().length > 0) {
-            clearBtn.style.display = 'block';
-        } else {
-            clearBtn.style.display = 'none';
-        }
+        clearBtn.style.display = nameInput.value.trim().length > 0 ? 'block' : 'none';
     };
 
-    // Listener para el input
     nameInput.addEventListener('input', toggleClearButton);
-    
-    // Listener para el botón de limpiar
     clearBtn.addEventListener('click', () => {
         nameInput.value = '';
         toggleClearButton();
         nameInput.focus();
     });
-
-    // Comprobación inicial al abrir el modal
     toggleClearButton();
-    // --- FIN DE LA NUEVA LÓGICA JAVASCRIPT ---
 
-    nameInput.style.textTransform = 'uppercase';
     nameInput.focus();
     const textLength = nameInput.value.length;
     nameInput.setSelectionRange(textLength, textLength);
@@ -7216,12 +7457,15 @@ async function saveCurrentRoute() {
             return;
         }
         currentRouteNameForSaving = routeName;
-        let waypointsToSave = navigationWaypoints.map(wp => (wp ? { id: wp.id, lat: wp.lat, lng: wp.lng, label:wp.label, type:wp.type, address: wp.address || '', visited: wp.visited || false, isCriticalForRecalc: wp.isCriticalForRecalc !== false, isInternal: wp.isInternal || false, isRecalculatedStart: wp.isRecalculatedStart || false } : null)).filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
-       if (waypointsToSave.length === 2 && !isMultiStage) {
+        let waypointsToSave = navigationWaypoints.map(wp => (wp ? {
+            id: wp.id, lat: wp.lat, lng: wp.lng, label: wp.label, type: wp.type, address: wp.address || '', visited: wp.visited || false, isCriticalForRecalc: wp.isCriticalForRecalc !== false, isInternal: wp.isInternal || false, isRecalculatedStart: wp.isRecalculatedStart || false
+        } : null)).filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
+
+        if (waypointsToSave.length === 2 && !isMultiStage) {
             const startPoint = waypointsToSave.find(wp => wp.type === 'S');
             const endPoint = waypointsToSave.find(wp => wp.type === 'F');
             if (startPoint && endPoint) {
-                 waypointsToSave = [endPoint];
+                waypointsToSave = [endPoint];
             }
         }
         const routeToSave = {
@@ -7230,7 +7474,7 @@ async function saveCurrentRoute() {
             createdAt: new Date().toISOString()
         };
         let savedRoutes = JSON.parse(localStorage.getItem(SAVED_ROUTES_KEY) || "[]");
-        const existingRouteIndex = savedRoutes.findIndex(r => r.name === routeName);
+        const existingRouteIndex = savedRoutes.findIndex(r => r.name.toUpperCase() === routeName);
         if (existingRouteIndex !== -1) {
             if (!confirm(`Ya existe una ruta llamada "${routeName}". ¿Sobreescribir?`)) {
                 showToast("Guardado cancelado", "info");
@@ -7242,21 +7486,25 @@ async function saveCurrentRoute() {
             savedRoutes.push(routeToSave);
         }
         if (savedRoutes.length > MAX_SAVED_ROUTES) {
-            savedRoutes.sort((a,b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+            savedRoutes.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
             savedRoutes = savedRoutes.slice(0, MAX_SAVED_ROUTES);
         }
         localStorage.setItem(SAVED_ROUTES_KEY, JSON.stringify(savedRoutes));
-        localStorage.setItem('lastCacheUpdateTimestamp', Date.now().toString());
-        markCacheAsDirty(); 
+        markCacheAsDirty();
+        
+        // También la añadimos a las rutas recientes
+        addRouteToRecents(routeToSave);
+
         closePrompt();
     };
 
     confirmButton.addEventListener('click', saveAction);
-    cancelButton.addEventListener('click', () => {
-        closePrompt();
-    });
-    addModalAutoCloseTimer(modal, confirmButton, 'save-route-prompt-modal', 15000);
+    cancelButton.addEventListener('click', closePrompt);
+    addModalAutoCloseTimer(modal, confirmButton, 'save-route-prompt-modal', 20000);
 }
+    
+
+
 
 
 
@@ -8660,135 +8908,11 @@ function showDeviationModal() {
     
     
 
-// ===================================================================
-// NOMBRE: showLoadRouteModal
-// RESUMEN: Muestra el modal para cargar o borrar rutas guardadas.
-// ===================================================================
-function showLoadRouteModal() {
-    clearAllWaypointMarkersFromMap();
-    if (navigationMapInstance) {
-        if (navigationRouteLayer) navigationMapInstance.removeLayer(navigationRouteLayer);
-        if (completedRouteSegmentsLayer) completedRouteSegmentsLayer.clearLayers();
-    }
-    navigationWaypoints = [];
-    navigationRouteLayer = null;
-    navigationCurrentRouteData = null;
-    isNavigating = false;
-    lastValidCarDistanceForDisplay = 0;
-    tripInitialOverallEtaTime = null; currentStageInitialExpectedEtaTime = null; accumulatedDeviationMs = 0;
-    accumulatedDistanceBeforeCurrentSegment = 0;
-    totalDistanceTravelledForStats = 0;
-    maxSpeedDuringTrip = 0; maxAltitudeDuringTrip = -Infinity; minAltitudeDuringTrip = Infinity;
 
-
-    updateStartNavigationButtonState();
-    updateNavigationButtonColor();
-    hideNavigationUI();
-    hideMapInfoOverlay();
-
-    eliminarRadaresDeRuta();
-    actualizarContadorRadares(0);
-    eliminarTareasDeBarraProgreso();
-    actualizarContadorTareas(0);
-
-
-    const existingModal = document.getElementById('saved-routes-modal');
-    if (existingModal) existingModal.remove();
-
-    const modal = document.createElement('div');
-    modal.id = 'saved-routes-modal';
-    modal.innerHTML = `
-        <h2>Cargar/Borrar Rutas Guardadas (Máx. ${MAX_SAVED_ROUTES})</h2>
-        <div class="modal-top-buttons" style="justify-content: flex-end;">
-             <button id="close-saved-routes-modal" style="flex: 0 1 auto; min-width: 120px;">Cerrar</button>
-        </div>
-        <div class="filter-container">
-            <input type="text" id="filter-saved-routes" placeholder="FILTRAR RUTAS...">
-            <button id="clear-filter-saved-routes" title="Limpiar filtro">X</button>
-        </div>
-        <ul id="saved-routes-list"></ul>
-    `;
-    document.body.appendChild(modal);
-
-    const listElement = modal.querySelector('#saved-routes-list');
-    const closeButton = modal.querySelector('#close-saved-routes-modal');
-    const filterInput = modal.querySelector('#filter-saved-routes');
-    const clearFilterButton = modal.querySelector('#clear-filter-saved-routes');
-
-    if(closeButton){
-        closeButton.style.backgroundColor = '#4A5568';
-        closeButton.style.color = 'white';
-        closeButton.style.border = '1px solid #2D3748';
-        closeButton.style.fontWeight = 'bold';
-        closeButton.onmouseover = () => closeButton.style.backgroundColor = '#2D3748';
-        closeButton.onmouseout = () => closeButton.style.backgroundColor = '#4A5568';
-    }
-
-
-    let savedRoutes = JSON.parse(localStorage.getItem(SAVED_ROUTES_KEY) || "[]");
-    savedRoutes.sort((a,b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-
-    function displayRoutes(routesToDisplay) {
-        listElement.innerHTML = '';
-        if (routesToDisplay.length === 0) {
-            listElement.innerHTML = '<li>No hay rutas que coincidan con el filtro.</li>';
-        } else {
-            routesToDisplay.forEach(route => {
-                const li = document.createElement('li');
-                li.textContent = route.name;
-                li.dataset.routeName = route.name;
-
-                const deleteBtn = document.createElement('button');
-                deleteBtn.textContent = 'Borrar';
-                deleteBtn.className = 'delete-route-btn';
-                deleteBtn.onclick = (e) => {
-                    e.stopPropagation();
-                    let currentSavedRoutes = JSON.parse(localStorage.getItem(SAVED_ROUTES_KEY) || "[]");
-                    currentSavedRoutes = currentSavedRoutes.filter(r => r.name !== route.name);
-                    localStorage.setItem(SAVED_ROUTES_KEY, JSON.stringify(currentSavedRoutes));
-                    savedRoutes = currentSavedRoutes;
-                    filterRoutes();
-                    markCacheAsDirty()
-                    showToast(`Ruta "${route.name}" borrada`, "info");
-                };
-                li.appendChild(deleteBtn);
-
-                li.addEventListener('click', () => {
-                    loadRouteByName(route.name, true);
-                    clearModalAutoCloseTimer(modal, closeButton, 'saved-routes-modal');
-                    if (modal.parentNode) modal.remove();
-                });
-                listElement.appendChild(li);
-            });
-        }
-    }
-
-    function filterRoutes() {
-        const filterText = filterInput.value.toUpperCase().trim();
-        if (!filterText) {
-            displayRoutes(savedRoutes);
-            clearFilterButton.style.display = 'none';
-            return;
-        }
-        clearFilterButton.style.display = 'inline-block';
-        const filtered = savedRoutes.filter(route => route.name.toUpperCase().includes(filterText));
-        displayRoutes(filtered);
-    }
-
-    filterInput.addEventListener('input', filterRoutes);
-    clearFilterButton.addEventListener('click', () => {
-        filterInput.value = '';
-        filterRoutes();
-    });
-    filterRoutes();
-
-    const closeHandler = () => {
-        clearModalAutoCloseTimer(modal, closeButton, 'saved-routes-modal');
-        if (modal.parentNode) modal.remove();
-    };
-    closeButton.addEventListener('click', closeHandler);
-    addModalAutoCloseTimer(modal, closeButton, 'saved-routes-modal', 30000);
-}
+    
+   
+ 
+   
 
 
     
