@@ -6369,6 +6369,7 @@ p.ocm-price-info {
         return originalToFixed.call(this, digits);
     };
 
+    let alternativeRoutesLayerGroup = null;
     
     let mapHeaderAutohideTimer = null;
     const OCM_API_KEY = "be9a78f7-0f5e-4f28-b742-4b7ab4b7eb5a";
@@ -11118,8 +11119,8 @@ async function saveCurrentRoute() {
 
 
 // ===================================================================
-// NOMBRE: recalculateAndDrawRoute (VERSIÓN CORREGIDA Y DEFINITIVA)
-// RESUMEN: Recalcula la ruta preservando el ETA inicial en los desvíos.
+// NOMBRE: recalculateAndDrawRoute (VERSIÓN MODIFICADA)
+// RESUMEN: Recalcula la ruta pidiendo alternativas a OSRM y las dibuja.
 // ===================================================================
 async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
     isRecalculatingRoute = true;
@@ -11135,7 +11136,6 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
         lastPositionForStats = null;
         if (isNavigating) navigationStartTimeForStats = new Date();
         
-        // El ETA inicial solo se resetea si NO es una desviación.
         tripInitialOverallEtaTime = null; 
         
         currentStageInitialExpectedEtaTime = null;
@@ -11205,7 +11205,7 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
         return;
     }
 
-    const url = `${OSRM_SERVICE_URL}/driving/${coordsString}?overview=full&geometries=geojson&steps=true&alternatives=false&annotations=true`;
+    const url = `${OSRM_SERVICE_URL}/driving/${coordsString}?overview=full&geometries=geojson&steps=true&alternatives=true&annotations=true`;
     try {
         const response = await fetch(url);
         if (!response.ok) {
@@ -11222,28 +11222,19 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
             navigationCurrentRouteData = data;
             if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
             drawRouteOnMap(data.routes[0]);
+            drawAlternativeRoutes(data.routes);
             currentLegIndexNav = 0;
             currentStepIndexNav = 0;
             lastProcessedStepManeuverLocation = null;
             
             if (data.routes[0]) {
-                // ===================================================================
-                // === INICIO DE LA CORRECCIÓN: LÓGICA DE ETA INICIAL RESTAURADA ===
-                // ===================================================================
-                // El ETA inicial TOTAL solo se debe establecer al principio de una ruta,
-                // no en cada recálculo por desvío.
                 if (!preserveAccumulatedStats && tripInitialOverallEtaTime === null) {
                     tripInitialOverallEtaTime = new Date(Date.now() + (data.routes[0].duration * 1000));
                 }
                 
-                // El ETA de la ETAPA SÍ se debe actualizar en cada recálculo, ya que la "siguiente etapa" puede cambiar.
                 if (data.routes[0].legs && data.routes[0].legs.length > 0) {
                      currentStageInitialExpectedEtaTime = new Date(Date.now() + (data.routes[0].legs[0].duration * 1000));
                 }
-                // ===================================================================
-                // === FIN DE LA CORRECCIÓN ===
-                // ===================================================================
-
                  const currentCarPosForRecalc = navigationCurrentLocation;
                  let carDistanceAlongRouteForInternalUse = 0;
                  if (currentCarPosForRecalc && navigationMapInstance && navigationRouteLayer && typeof turf !== 'undefined' && navigationRouteLayer.getLatLngs().length > 0) {
@@ -11298,12 +11289,83 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
         isRecalculatingRoute = false;
     }
 }
-
-
     
 
     
 
+
+
+
+
+
+
+// ===================================================================
+// NOMBRE: drawAlternativeRoutes (NUEVA FUNCIÓN)
+// RESUMEN: Dibuja las rutas alternativas en el mapa y les añade interactividad.
+// ===================================================================
+function drawAlternativeRoutes(routes) {
+    if (!navigationMapInstance || !routes || routes.length <= 1) {
+        if (alternativeRoutesLayerGroup) {
+            alternativeRoutesLayerGroup.clearLayers();
+        }
+        return;
+    }
+
+    if (alternativeRoutesLayerGroup) {
+        alternativeRoutesLayerGroup.clearLayers();
+    } else {
+        alternativeRoutesLayerGroup = L.layerGroup().addTo(navigationMapInstance);
+    }
+    
+    // Iteramos desde la segunda ruta (índice 1), ya que la 0 es la principal
+    for (let i = 1; i < routes.length; i++) {
+        const alternativeRoute = routes[i];
+        if (alternativeRoute.geometry && alternativeRoute.geometry.coordinates) {
+            const routeCoords = alternativeRoute.geometry.coordinates.map(coord => [coord[1], coord[0]]);
+            
+            const alternativePolyline = L.polyline(routeCoords, {
+                color: 'grey',
+                weight: 7,
+                opacity: 0.6,
+                dashArray: '10, 10'
+            }).addTo(alternativeRoutesLayerGroup);
+            
+            alternativePolyline.alternativeRouteData = alternativeRoute;
+            alternativePolyline.originalIndex = i; // Guardamos su índice original
+
+            alternativePolyline.on('click', function() {
+                // Hacemos una copia de las rutas para no modificar la respuesta original
+                const allRoutesCopy = [...navigationCurrentRouteData.routes];
+                
+                // La ruta clicada se convierte en la principal (índice 0)
+                const newMainRoute = this.alternativeRouteData;
+                
+                // La antigua ruta principal se convierte en una alternativa
+                const oldMainRoute = allRoutesCopy[0];
+
+                // Reconstruimos el array de rutas en el orden correcto
+                allRoutesCopy[0] = newMainRoute;
+                allRoutesCopy[this.originalIndex] = oldMainRoute;
+
+                // Actualizamos la variable global de navegación
+                navigationCurrentRouteData.routes = allRoutesCopy;
+
+                // Volvemos a dibujar todas las rutas con sus nuevos estilos
+                drawRouteOnMap(navigationCurrentRouteData.routes[0]);
+                drawAlternativeRoutes(navigationCurrentRouteData.routes);
+                
+                // Actualizamos la UI con los datos de la nueva ruta principal
+                updateTurnByTurnDisplay(navigationCurrentRouteData.routes[0], lastCarDistanceAlongRouteForNavLogic);
+                updateNavigationProgressDisplay(navigationCurrentRouteData.routes[0], lastCarDistanceAlongRouteForNavLogic);
+                showToast("Ruta alternativa seleccionada.", "success");
+            });
+        }
+    }
+}
+
+
+
+    
 
 
 
