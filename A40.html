@@ -11154,9 +11154,11 @@ function createAlternativeRouteButtonIcon(label, color) {
 
 
 
+
+    
 // ===================================================================
-// NOMBRE: recalculateAndDrawRoute (VERSIÓN CON ALTERNATIVAS (B) y (C))
-// RESUMEN: Recalcula la ruta pidiendo alternativas a OSRM y las dibuja.
+// NOMBRE: recalculateAndDrawRoute (VERSIÓN FINAL CON LÓGICA MULTI-ETAPA)
+// RESUMEN: Calcula la ruta principal y luego busca alternativas solo para el primer tramo.
 // ===================================================================
 async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
     isRecalculatingRoute = true;
@@ -11241,7 +11243,7 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
         return;
     }
 
-    const url = `${OSRM_SERVICE_URL}/driving/${coordsString}?overview=full&geometries=geojson&steps=true&alternatives=true&annotations=true`;
+    const url = `${OSRM_SERVICE_URL}/driving/${coordsString}?overview=full&geometries=geojson&steps=true&alternatives=false&annotations=true`;
     try {
         const response = await fetch(url);
         if (!response.ok) {
@@ -11258,7 +11260,29 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
             navigationCurrentRouteData = data;
             if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
             drawRouteOnMap(data.routes[0]);
-            drawAlternativeRoutes(data.routes); // Ahora gestiona polilíneas y botones
+            
+            // --- INICIO DE LA LÓGICA PARA ALTERNATIVAS DE TRAMO ---
+            // Limpiamos las alternativas viejas antes de buscar nuevas.
+            if (alternativeRoutesLayerGroup) alternativeRoutesLayerGroup.clearLayers();
+            alternativeRouteMarkers.forEach(marker => navigationMapInstance.removeLayer(marker));
+            alternativeRouteMarkers = [];
+            
+            // Si hay más de un punto de destino (ruta multi-etapa), buscamos alternativas solo para el primer tramo.
+            if (waypointsForRouteCalculation.length > 2) {
+                fetchAndDrawFirstLegAlternatives(waypointsForRouteCalculation, data.routes[0]);
+            } else {
+                 // Si es una ruta simple (A->B), buscamos alternativas para el viaje completo.
+                 const simpleRouteUrl = `${OSRM_SERVICE_URL}/driving/${coordsString}?overview=full&geometries=geojson&steps=true&alternatives=true&annotations=true`;
+                 const alternativesResponse = await fetch(simpleRouteUrl);
+                 if (alternativesResponse.ok) {
+                     const alternativesData = await alternativesResponse.json();
+                     if (alternativesData.routes && alternativesData.routes.length > 1) {
+                         drawAlternativeRoutes(alternativesData.routes, data.routes[0]);
+                     }
+                 }
+            }
+            // --- FIN DE LA LÓGICA PARA ALTERNATIVAS DE TRAMO ---
+
             currentLegIndexNav = 0;
             currentStepIndexNav = 0;
             lastProcessedStepManeuverLocation = null;
@@ -11326,23 +11350,46 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
     }
 }
 
+
+
+
+
+
+
+// ===================================================================
+// NOMBRE: fetchAndDrawFirstLegAlternatives (NUEVA FUNCIÓN)
+// RESUMEN: Llama a OSRM para obtener alternativas solo para el primer tramo.
+// ===================================================================
+async function fetchAndDrawFirstLegAlternatives(waypoints, mainRoute) {
+    if (waypoints.length < 2) return;
+
+    const firstLegWaypoints = waypoints.slice(0, 2);
+    const coordsString = firstLegWaypoints.map(wp => `${wp.lng},${wp.lat}`).join(';');
+    const url = `${OSRM_SERVICE_URL}/driving/${coordsString}?overview=full&geometries=geojson&steps=true&alternatives=true&annotations=true`;
+
+    try {
+        const response = await fetch(url);
+        if (!response.ok) return;
+        const data = await response.json();
+        if (data.routes && data.routes.length > 1) {
+            drawAlternativeRoutes(data.routes, mainRoute);
+        }
+    } catch (error) {
+        console.warn("No se pudieron obtener alternativas para el primer tramo:", error);
+    }
+}
+
     
-
-
-
-
-
-
 
     
     
 
 
 // ===================================================================
-// NOMBRE: drawAlternativeRoutes (VERSIÓN MODIFICADA CON BOTONES)
-// RESUMEN: Dibuja las rutas alternativas y sus botones de selección.
+// NOMBRE: drawAlternativeRoutes (VERSIÓN FINAL CON LÓGICA DE EMPALME)
+// RESUMEN: Dibuja rutas alternativas y maneja la selección del usuario.
 // ===================================================================
-function drawAlternativeRoutes(routes) {
+function drawAlternativeRoutes(alternativeRoutes, mainRoute) {
     if (alternativeRoutesLayerGroup) {
         alternativeRoutesLayerGroup.clearLayers();
     } else {
@@ -11351,21 +11398,21 @@ function drawAlternativeRoutes(routes) {
     alternativeRouteMarkers.forEach(marker => navigationMapInstance.removeLayer(marker));
     alternativeRouteMarkers = [];
 
-    if (!navigationMapInstance || !routes || routes.length <= 1) {
+    if (!navigationMapInstance || !alternativeRoutes || alternativeRoutes.length <= 1) {
         return;
     }
 
     const alternativeStyles = [
-        { label: 'B', color: '#E33BD3' },
-        { label: 'C', color: '#FF5733' }  
+        { label: 'B', color: '#556B2F' }, // Verde oliva oscuro
+        { label: 'C', color: '#696969' }  // Gris oscuro
     ];
     
-    for (let i = 1; i < routes.length && i < 3; i++) { // Máximo 2 alternativas (B y C)
-        const alternativeRoute = routes[i];
+    for (let i = 1; i < alternativeRoutes.length && i < 3; i++) {
+        const alternativeRouteData = alternativeRoutes[i];
         const style = alternativeStyles[i - 1];
 
-        if (alternativeRoute.geometry && alternativeRoute.geometry.coordinates) {
-            const routeCoords = alternativeRoute.geometry.coordinates.map(coord => [coord[1], coord[0]]);
+        if (alternativeRouteData.geometry && alternativeRouteData.geometry.coordinates) {
+            const routeCoords = alternativeRouteData.geometry.coordinates.map(coord => [coord[1], coord[0]]);
             
             const alternativePolyline = L.polyline(routeCoords, {
                 color: style.color,
@@ -11382,33 +11429,63 @@ function drawAlternativeRoutes(routes) {
             
             const buttonMarker = L.marker(buttonPosition, { 
                 icon: buttonIcon,
-                zIndexOffset: 1005 // Asegura que esté por encima de la ruta
+                zIndexOffset: 1005
             }).addTo(navigationMapInstance);
             
             alternativeRouteMarkers.push(buttonMarker);
 
-            buttonMarker.on('click', function() {
-                const allRoutesCopy = [...navigationCurrentRouteData.routes];
+            buttonMarker.on('click', async function() {
+                const toastId = "stitching-route-toast";
+                showToast("Cambiando a ruta alternativa...", "info", 0, false, toastId);
+
+                const currentMainRoute = navigationCurrentRouteData.routes[0];
                 
-                const newMainRoute = allRoutesCopy[i];
-                const oldMainRoute = allRoutesCopy[0];
-                allRoutesCopy[0] = newMainRoute;
-                allRoutesCopy[i] = oldMainRoute;
+                // Si es una ruta simple, simplemente intercambiamos
+                if (mainRoute.legs.length === 1) {
+                    const allRoutesCopy = [...navigationCurrentRouteData.routes];
+                    const newMainRoute = allRoutesCopy[i];
+                    const oldMainRoute = allRoutesCopy[0];
+                    allRoutesCopy[0] = newMainRoute;
+                    allRoutesCopy[i] = oldMainRoute;
+                    navigationCurrentRouteData.routes = allRoutesCopy;
+                } else {
+                    // Lógica de empalme para rutas multi-etapa
+                    const newFirstLeg = alternativeRouteData.legs[0];
+                    const oldFirstLeg = currentMainRoute.legs[0];
 
-                navigationCurrentRouteData.routes = allRoutesCopy;
+                    // Actualizar duración y distancia total
+                    currentMainRoute.duration = currentMainRoute.duration - oldFirstLeg.duration + newFirstLeg.duration;
+                    currentMainRoute.distance = currentMainRoute.distance - oldFirstLeg.distance + newFirstLeg.distance;
 
+                    // Reemplazar el primer tramo
+                    currentMainRoute.legs[0] = newFirstLeg;
+
+                    // Reconstruir la geometría completa
+                    let newFullGeometry = [...newFirstLeg.geometry.coordinates];
+                    for (let legIdx = 1; legIdx < currentMainRoute.legs.length; legIdx++) {
+                        const leg = currentMainRoute.legs[legIdx];
+                        leg.steps.forEach(step => {
+                            newFullGeometry.push(...step.geometry.coordinates);
+                        });
+                    }
+                    currentMainRoute.geometry.coordinates = newFullGeometry;
+                }
+
+                // Redibujar todo con la nueva ruta principal
                 drawRouteOnMap(navigationCurrentRouteData.routes[0]);
-                drawAlternativeRoutes(navigationCurrentRouteData.routes);
-                
+                drawAlternativeRoutes([], null); // Limpiar alternativas viejas
+
+                // Actualizar UI
                 updateTurnByTurnDisplay(navigationCurrentRouteData.routes[0], lastCarDistanceAlongRouteForNavLogic);
                 updateNavigationProgressDisplay(navigationCurrentRouteData.routes[0], lastCarDistanceAlongRouteForNavLogic);
+                
+                const existingToast = document.getElementById(toastId);
+                if (existingToast) existingToast.remove();
                 showToast(`Ruta ${style.label} seleccionada.`, "success");
             });
         }
     }
 }
-
-
 
 
     
@@ -19666,30 +19743,37 @@ function createWaypointMarkerIcon(label, type, visited, currentZoomLevel = null)
     
     
     
-    
-    
-    
-    // ===================================================================
-    // NOMBRE: clearAllWaypointMarkersFromMap
-    // RESUMEN: Elimina todos los marcadores de puntos de ruta del mapa.
-    // ===================================================================
-    function clearAllWaypointMarkersFromMap() {
-        if (!navigationMapInstance) {
-            navigationWaypoints.forEach(wp => { wp.marker = null; }); 
-            return;
-        }
-        navigationWaypoints.forEach(wp => {
-            if (wp && wp.marker) {
-                try {
-                    if (navigationMapInstance.hasLayer(wp.marker)) {
-                        navigationMapInstance.removeLayer(wp.marker);
-                    }
-                } catch (e) {
-                }
-                wp.marker = null;
-            }
-        });
+// ===================================================================
+// NOMBRE: clearAllWaypointMarkersFromMap (VERSIÓN MODIFICADA)
+// RESUMEN: Elimina todos los marcadores y las rutas alternativas del mapa.
+// ===================================================================
+function clearAllWaypointMarkersFromMap() {
+    if (alternativeRoutesLayerGroup && navigationMapInstance) {
+        alternativeRoutesLayerGroup.clearLayers();
     }
+    if (alternativeRouteMarkers && navigationMapInstance) {
+        alternativeRouteMarkers.forEach(marker => navigationMapInstance.removeLayer(marker));
+        alternativeRouteMarkers = [];
+    }
+
+    if (!navigationMapInstance) {
+        navigationWaypoints.forEach(wp => { wp.marker = null; }); 
+        return;
+    }
+    navigationWaypoints.forEach(wp => {
+        if (wp && wp.marker) {
+            try {
+                if (navigationMapInstance.hasLayer(wp.marker)) {
+                    navigationMapInstance.removeLayer(wp.marker);
+                }
+            } catch (e) {
+            }
+            wp.marker = null;
+        }
+    });
+} 
+    
+    
     
     
     
@@ -19919,91 +20003,93 @@ async function handleSendToTeslaClick(lat, lng, name) {
       
     
     
-    
-    
-    
-    // ===================================================================
-    // NOMBRE: handleDeleteWaypointClick
-    // RESUMEN: Elimina un punto de ruta de la ruta actual.
-    // ===================================================================
-    function handleDeleteWaypointClick(waypointId) {
-        if (isNavigating) {
-            showToast("No se pueden borrar puntos mientras se navega.", "warning");
-            return;
+  // ===================================================================
+// NOMBRE: handleDeleteWaypointClick (VERSIÓN MODIFICADA)
+// RESUMEN: Elimina un punto de ruta y limpia las rutas alternativas.
+// ===================================================================
+function handleDeleteWaypointClick(waypointId) {
+    if (isNavigating) {
+        showToast("No se pueden borrar puntos mientras se navega.", "warning");
+        return;
+    }
+    const waypointIndex = navigationWaypoints.findIndex(wp => wp && wp.id === waypointId);
+    if (waypointIndex === -1) {
+        return;
+    }
+    const waypointToDelete = navigationWaypoints[waypointIndex];
+    if (waypointToDelete.marker && navigationMapInstance) {
+        try { navigationMapInstance.removeLayer(waypointToDelete.marker); } catch (e) {}
+        waypointToDelete.marker = null;
+    }
+    navigationWaypoints.splice(waypointIndex, 1);
+    if (navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart).length < 1) { 
+        clearAllWaypointMarkersFromMap(); // Esta función ahora limpia todo
+        navigationWaypoints = [];
+        if (navigationRouteLayer && navigationMapInstance) {
+            try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {}
+            navigationRouteLayer = null;
         }
-        const waypointIndex = navigationWaypoints.findIndex(wp => wp && wp.id === waypointId);
-        if (waypointIndex === -1) {
-            return;
+        if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
+        navigationCurrentRouteData = null;
+        hideNavigationUI();
+        hideMapInfoOverlay();
+        const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+        if (radaresRutaCheckbox) {
+            eliminarRadaresDeRuta();
+            actualizarContadorRadares(0);
+            localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresRutaCheckbox.checked)); 
         }
-        const waypointToDelete = navigationWaypoints[waypointIndex];
-        if (waypointToDelete.marker && navigationMapInstance) {
-            try { navigationMapInstance.removeLayer(waypointToDelete.marker); } catch (e) {}
-            waypointToDelete.marker = null;
+         const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
+        if (tareasRutaCheckbox) {
+            eliminarTareasDeBarraProgreso();
+            actualizarContadorTareas(0);
+            localStorage.setItem(TAREAS_RUTA_CHECKED_KEY, String(tareasRutaCheckbox.checked));
         }
-        navigationWaypoints.splice(waypointIndex, 1);
-        if (navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart).length < 1) { 
-            clearAllWaypointMarkersFromMap(); 
-            navigationWaypoints = [];
+    } else {
+        updateWaypointTypesAndLabels();
+        renderWaypointMarkers();
+        if (navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart).length < 2) {
             if (navigationRouteLayer && navigationMapInstance) {
                 try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {}
                 navigationRouteLayer = null;
             }
-            if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
+            if (alternativeRoutesLayerGroup) alternativeRoutesLayerGroup.clearLayers();
+            alternativeRouteMarkers.forEach(marker => navigationMapInstance.removeLayer(marker));
+            alternativeRouteMarkers = [];
+             if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
             navigationCurrentRouteData = null;
-            hideNavigationUI();
             hideMapInfoOverlay();
-            const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+             const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
             if (radaresRutaCheckbox) {
                 eliminarRadaresDeRuta();
                 actualizarContadorRadares(0);
-                localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresRutaCheckbox.checked)); 
+                localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresRutaCheckbox.checked));
             }
-             const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
+            const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
             if (tareasRutaCheckbox) {
                 eliminarTareasDeBarraProgreso();
                 actualizarContadorTareas(0);
                 localStorage.setItem(TAREAS_RUTA_CHECKED_KEY, String(tareasRutaCheckbox.checked));
             }
         } else {
-            updateWaypointTypesAndLabels();
-            renderWaypointMarkers();
-            if (navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart).length < 2) {
-                if (navigationRouteLayer && navigationMapInstance) {
-                    try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {}
-                    navigationRouteLayer = null;
-                }
-                 if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
-                navigationCurrentRouteData = null;
-                hideMapInfoOverlay();
-                 const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
-                if (radaresRutaCheckbox) {
-                    eliminarRadaresDeRuta();
-                    actualizarContadorRadares(0);
-                    localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresRutaCheckbox.checked));
+            recalculateAndDrawRoute().then(() => {
+                const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+                if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
+                    toggleRadaresRuta(true);
                 }
                 const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
-                if (tareasRutaCheckbox) {
-                    eliminarTareasDeBarraProgreso();
-                    actualizarContadorTareas(0);
-                    localStorage.setItem(TAREAS_RUTA_CHECKED_KEY, String(tareasRutaCheckbox.checked));
+                if (tareasRutaCheckbox && tareasRutaCheckbox.checked) {
+                    toggleTareasRuta(true);
                 }
-            } else {
-                recalculateAndDrawRoute().then(() => {
-                    const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
-                    if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
-                        toggleRadaresRuta(true);
-                    }
-                    const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
-                    if (tareasRutaCheckbox && tareasRutaCheckbox.checked) {
-                        toggleTareasRuta(true);
-                    }
-                });
-            }
-            showToast("Etapa eliminada.", "info");
+            });
         }
-        updateStartNavigationButtonState();
-        updateNavigationButtonColor();
+        showToast("Etapa eliminada.", "info");
     }
+    updateStartNavigationButtonState();
+    updateNavigationButtonColor();
+}  
+    
+    
     
     
     
