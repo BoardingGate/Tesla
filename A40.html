@@ -9242,114 +9242,6 @@ function initializeConfigModalListeners() {
 
 
     
-// ===================================================================
-// NOMBRE: startGpsWatching
-// RESUMEN: Inicia el seguimiento GPS del dispositivo y gestiona los reintentos.
-// ===================================================================
-function startGpsWatching() {
-    if (gpsRetryTimeoutId) {
-        clearTimeout(gpsRetryTimeoutId);
-        gpsRetryTimeoutId = null;
-    }
-    if (locationWatchId !== null) {
-        return;
-    }
-    if (!('geolocation' in navigator) || !('watchPosition' in navigator.geolocation)) {
-        showToast("Geolocalización no soportada por este navegador.", "error", 5000);
-        return;
-    }
-    if (gpsRetryAttempt >= MAX_GPS_RETRIES) {
-        showToast("Error persistente: No se pudo conectar al GPS. Revisa la configuración del dispositivo.", "error", 0, false, "gps-persistent-error");
-        return;
-    }
-    gpsRetryAttempt++;
-    showToast(`Intentando conectar al GPS (Intento ${gpsRetryAttempt}/${MAX_GPS_RETRIES})...`, "info", GPS_RETRY_DELAY_MS, false, "gps-attempt-toast");
-    locationWatchId = navigator.geolocation.watchPosition(
-        (position) => {
-            if (isSimulatingGpsLocation) return;
-            const attemptToast = document.getElementById("gps-attempt-toast");
-            if (attemptToast) attemptToast.remove();
-            activeToasts = activeToasts.filter(t => t.id !== "gps-attempt-toast");
-            gpsRetryAttempt = 0;
-            const persistentErrorToast = document.getElementById("gps-persistent-error");
-            if (persistentErrorToast) persistentErrorToast.remove();
-            const coordsForUpdate = {
-                latitude: position.coords.latitude,
-                longitude: position.coords.longitude,
-                accuracy: position.coords.accuracy,
-                heading: position.coords.heading,
-                speed: position.coords.speed,
-                altitude: position.coords.altitude
-            };
-            navigationCurrentLocation = coordsForUpdate;
-
-            updateInitialUserPosition(coordsForUpdate, navigationMapInstance);
-
-            if (isNavigating && navigationCurrentRouteData && navigationCurrentRouteData.routes[0] && coordsForUpdate) {
-                const routeForDistCalc = navigationCurrentRouteData.routes[0];
-                let carDistTurf = 0;
-                if (navigationRouteLayer && typeof turf !== 'undefined' && navigationRouteLayer.getLatLngs().length > 0) {
-                    try {
-                        const carPointTurf = turf.point([coordsForUpdate.longitude, coordsForUpdate.latitude]);
-                        const routeLineStringTurf = turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat]));
-                        const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
-                        const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
-                        carDistTurf = turf.length(lineSliceToNearestTurf, { units: 'meters' });
-                    } catch (e) { }
-                }
-                const totalRouteLength = routeForDistCalc.distance;
-                if (carDistTurf >= 0 && carDistTurf <= totalRouteLength + 500) {
-                    if (carDistTurf > lastCarDistanceAlongRouteForNavLogic - 100) {
-                         lastCarDistanceAlongRouteForNavLogic = carDistTurf;
-                    }
-                } else if (carDistTurf > totalRouteLength + 500) {
-                    lastCarDistanceAlongRouteForNavLogic = totalRouteLength;
-                }
-
-                let cumulativeDistance = 0;
-                navigationWaypoints.forEach((wp, index) => {
-                    if (wp) {
-                        const isStartPoint = wp.type === 'S' || wp.isRecalculatedStart;
-                        const isIntermediate = wp.type === 'intermediate';
-                        const isFinal = wp.type === 'F';
-
-                        if (isStartPoint) {
-                            wp.visited = true;
-                        } else if (isIntermediate && routeForDistCalc.legs && (index - 1) < routeForDistCalc.legs.length) {
-                            const leg = routeForDistCalc.legs[index - 1];
-                            if (leg) {
-                                cumulativeDistance += (leg.distance || 0);
-                                if (carDistTurf >= cumulativeDistance - WAYPOINT_VISITED_THRESHOLD_METERS) {
-                                    wp.visited = true;
-                                }
-                            }
-                        } else if (isFinal) {
-                            if (carDistTurf >= routeForDistCalc.distance - WAYPOINT_VISITED_THRESHOLD_METERS) {
-                                wp.visited = true;
-                            }
-                        }
-                    }
-                });
-                renderWaypointMarkers();
-                
-                updateTurnByTurnDisplay(routeForDistCalc, lastCarDistanceAlongRouteForNavLogic);
-                updateNavigationProgressDisplay(routeForDistCalc, lastCarDistanceAlongRouteForNavLogic);
-            }
-        },
-        (error) => {
-            showToast(`Error GPS: ${error.message}`, "warning");
-            if (locationWatchId !== null) {
-                navigator.geolocation.clearWatch(locationWatchId);
-                locationWatchId = null;
-            }
-            gpsRetryTimeoutId = setTimeout(startGpsWatching, GPS_RETRY_DELAY_MS);
-        },
-        { enableHighAccuracy: true, timeout: 15000, maximumAge: 2000, distanceFilter: 3 }
-    );
-}
-
-    
-    
     
     
     
@@ -11795,51 +11687,197 @@ function addModalAutoCloseTimer(modalElement, closeButtonElement, modalId, durat
     
     
     
-    // ===================================================================
-    // NOMBRE: proceedWithRecalculation
-    // RESUMEN: Gestiona la lógica de recálculo de ruta según la acción del usuario.
-    // ===================================================================
-    async function proceedWithRecalculation(action) {
-        if (!isNavigating || !navigationCurrentLocation) {
-            showToast("No se puede recalcular: no se está navegando o la ubicación es desconocida.", "error");
-            return;
-        }
-        if (action === 'skip_one') {
-            const nextUnvisitedStageIndex = navigationWaypoints.findIndex(wp => wp && !wp.isInternal && !wp.isRecalculatedStart && !wp.visited && wp.type !== 'S' && wp.type !== 'S_Recalc');
-            if (nextUnvisitedStageIndex !== -1) {
-                navigationWaypoints[nextUnvisitedStageIndex].visited = true;
-                showToast(`Omitiendo etapa: ${navigationWaypoints[nextUnvisitedStageIndex].address || 'Siguiente' }`, "info");
-            } else {
-                showToast("No hay próximas etapas para omitir. Recalculando a destino.", "info");
-            }
-        } else if (action === 'skip_multiple') {
-            const stagesToSkip = [];
-            const currentHeading = navigationCurrentLocation.heading;
-            navigationWaypoints.forEach(wp => {
-                if (wp.visited || wp.type === 'S' || wp.type === 'S_Recalc') return;
-                const bearingToWp = turf.bearing(
-                    turf.point([navigationCurrentLocation.longitude, navigationCurrentLocation.latitude]),
-                    turf.point([wp.lng, wp.lat])
-                );
-                let angleDiff = Math.abs(currentHeading - (bearingToWp < 0 ? bearingToWp + 360 : bearingToWp));
-                if (angleDiff > 180) angleDiff = 360 - angleDiff;
-                if (angleDiff > 110) {
-                    stagesToSkip.push(wp.id);
-                }
-            });
-            if (stagesToSkip.length > 0) {
-                navigationWaypoints.forEach(wp => {
-                    if (stagesToSkip.includes(wp.id)) wp.visited = true;
-                });
-                showToast(`Saltando ${stagesToSkip.length} etapas que han quedado atrás.`, "info");
-            }
-        }
-        await recalculateAndDrawRoute(true);
+ // ===================================================================
+// NOMBRE: getRouteAsSingleLine (FUNCIÓN AUXILIAR)
+// RESUMEN: Reconstruye una única polilínea a partir del featureGroup.
+// ===================================================================
+function getRouteAsSingleLine() {
+    if (!navigationRouteLayer || typeof navigationRouteLayer.getLayers !== 'function') {
+        return null;
+    }
+    const layers = navigationRouteLayer.getLayers();
+    if (layers.length === 0) {
+        return null;
     }
     
-    
-    
-    
+    let allCoords = [];
+    layers.forEach(layer => {
+        if (typeof layer.getLatLngs === 'function') {
+            const layerCoords = layer.getLatLngs();
+            if (allCoords.length > 0 && layerCoords.length > 0) {
+                const lastPoint = allCoords[allCoords.length - 1];
+                const firstNewPoint = layerCoords[0];
+                if (lastPoint.lat === firstNewPoint.lat && lastPoint.lng === firstNewPoint.lng) {
+                    allCoords.push(...layerCoords.slice(1));
+                } else {
+                    allCoords.push(...layerCoords);
+                }
+            } else {
+                allCoords.push(...layerCoords);
+            }
+        }
+    });
+
+    return allCoords;
+}
+
+// ===================================================================
+// NOMBRE: startGpsWatching (CORREGIDA)
+// RESUMEN: Inicia el seguimiento GPS, usando la nueva función para obtener coordenadas de ruta.
+// ===================================================================
+function startGpsWatching() {
+    if (gpsRetryTimeoutId) {
+        clearTimeout(gpsRetryTimeoutId);
+        gpsRetryTimeoutId = null;
+    }
+    if (locationWatchId !== null) {
+        return;
+    }
+    if (!('geolocation' in navigator) || !('watchPosition' in navigator.geolocation)) {
+        showToast("Geolocalización no soportada por este navegador.", "error", 5000);
+        return;
+    }
+    if (gpsRetryAttempt >= MAX_GPS_RETRIES) {
+        showToast("Error persistente: No se pudo conectar al GPS. Revisa la configuración del dispositivo.", "error", 0, false, "gps-persistent-error");
+        return;
+    }
+    gpsRetryAttempt++;
+    showToast(`Intentando conectar al GPS (Intento ${gpsRetryAttempt}/${MAX_GPS_RETRIES})...`, "info", GPS_RETRY_DELAY_MS, false, "gps-attempt-toast");
+    locationWatchId = navigator.geolocation.watchPosition(
+        (position) => {
+            if (isSimulatingGpsLocation) return;
+            const attemptToast = document.getElementById("gps-attempt-toast");
+            if (attemptToast) attemptToast.remove();
+            activeToasts = activeToasts.filter(t => t.id !== "gps-attempt-toast");
+            gpsRetryAttempt = 0;
+            const persistentErrorToast = document.getElementById("gps-persistent-error");
+            if (persistentErrorToast) persistentErrorToast.remove();
+            const coordsForUpdate = {
+                latitude: position.coords.latitude,
+                longitude: position.coords.longitude,
+                accuracy: position.coords.accuracy,
+                heading: position.coords.heading,
+                speed: position.coords.speed,
+                altitude: position.coords.altitude
+            };
+            navigationCurrentLocation = coordsForUpdate;
+
+            updateInitialUserPosition(coordsForUpdate, navigationMapInstance);
+
+            if (isNavigating && navigationCurrentRouteData && navigationCurrentRouteData.routes[0]) {
+                const routeForDistCalc = navigationCurrentRouteData.routes[0];
+                let carDistTurf = 0;
+                
+                // --- INICIO DE LA CORRECCIÓN ---
+                const routeCoords = getRouteAsSingleLine();
+                if (routeCoords && routeCoords.length > 0 && typeof turf !== 'undefined') {
+                // --- FIN DE LA CORRECCIÓN ---
+                    try {
+                        const carPointTurf = turf.point([coordsForUpdate.longitude, coordsForUpdate.latitude]);
+                        const routeLineStringTurf = turf.lineString(routeCoords.map(ll => [ll.lng, ll.lat]));
+                        const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
+                        const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
+                        carDistTurf = turf.length(lineSliceToNearestTurf, { units: 'meters' });
+                    } catch (e) { }
+                }
+                const totalRouteLength = routeForDistCalc.distance;
+                if (carDistTurf >= 0 && carDistTurf <= totalRouteLength + 500) {
+                    if (carDistTurf > lastCarDistanceAlongRouteForNavLogic - 100) {
+                         lastCarDistanceAlongRouteForNavLogic = carDistTurf;
+                    }
+                } else if (carDistTurf > totalRouteLength + 500) {
+                    lastCarDistanceAlongRouteForNavLogic = totalRouteLength;
+                }
+
+                let cumulativeDistance = 0;
+                navigationWaypoints.forEach((wp, index) => {
+                    if (wp && !wp.visited) {
+                        const isStartPoint = wp.type === 'S' || wp.isRecalculatedStart;
+                        const isIntermediate = wp.type === 'intermediate';
+                        const isFinal = wp.type === 'F';
+                        if (isStartPoint) {
+                            wp.visited = true;
+                        } else if (isIntermediate && routeForDistCalc.legs && (index - 1) < routeForDistCalc.legs.length) {
+                            const leg = routeForDistCalc.legs[index - 1];
+                            if (leg) {
+                                cumulativeDistance += (leg.distance || 0);
+                                if (carDistTurf >= cumulativeDistance - WAYPOINT_VISITED_THRESHOLD_METERS) {
+                                    wp.visited = true;
+                                }
+                            }
+                        } else if (isFinal) {
+                            if (carDistTurf >= routeForDistCalc.distance - WAYPOINT_VISITED_THRESHOLD_METERS) {
+                                wp.visited = true;
+                            }
+                        }
+                    } else if (wp && wp.visited && wp.type === 'intermediate') {
+                        if (routeForDistCalc.legs && (index - 1) < routeForDistCalc.legs.length) {
+                            const leg = routeForDistCalc.legs[index - 1];
+                            if (leg) {
+                                cumulativeDistance += (leg.distance || 0);
+                            }
+                        }
+                    }
+                });
+                renderWaypointMarkers();
+                
+                updateTurnByTurnDisplay(routeForDistCalc, lastCarDistanceAlongRouteForNavLogic);
+                updateNavigationProgressDisplay(routeForDistCalc, lastCarDistanceAlongRouteForNavLogic);
+            }
+        },
+        (error) => {
+            showToast(`Error GPS: ${error.message}`, "warning");
+            if (locationWatchId !== null) {
+                navigator.geolocation.clearWatch(locationWatchId);
+                locationWatchId = null;
+            }
+            gpsRetryTimeoutId = setTimeout(startGpsWatching, GPS_RETRY_DELAY_MS);
+        },
+        { enableHighAccuracy: true, timeout: 15000, maximumAge: 2000, distanceFilter: 3 }
+    );
+}
+
+// ===================================================================
+// NOMBRE: proceedWithRecalculation (CORREGIDA)
+// RESUMEN: Gestiona la lógica de recálculo de ruta, ahora llamada desde un punto seguro.
+// ===================================================================
+async function proceedWithRecalculation(action) {
+    if (!isNavigating || !navigationCurrentLocation) {
+        showToast("No se puede recalcular: no se está navegando o la ubicación es desconocida.", "error");
+        return;
+    }
+    if (action === 'skip_one') {
+        const nextUnvisitedStageIndex = navigationWaypoints.findIndex(wp => wp && !wp.isInternal && !wp.isRecalculatedStart && !wp.visited && wp.type !== 'S' && wp.type !== 'S_Recalc');
+        if (nextUnvisitedStageIndex !== -1) {
+            navigationWaypoints[nextUnvisitedStageIndex].visited = true;
+            showToast(`Omitiendo etapa: ${navigationWaypoints[nextUnvisitedStageIndex].address || 'Siguiente' }`, "info");
+        } else {
+            showToast("No hay próximas etapas para omitir. Recalculando a destino.", "info");
+        }
+    } else if (action === 'skip_multiple') {
+        const stagesToSkip = [];
+        const currentHeading = navigationCurrentLocation.heading;
+        navigationWaypoints.forEach(wp => {
+            if (wp.visited || wp.type === 'S' || wp.type === 'S_Recalc') return;
+            const bearingToWp = turf.bearing(
+                turf.point([navigationCurrentLocation.longitude, navigationCurrentLocation.latitude]),
+                turf.point([wp.lng, wp.lat])
+            );
+            let angleDiff = Math.abs(currentHeading - (bearingToWp < 0 ? bearingToWp + 360 : bearingToWp));
+            if (angleDiff > 180) angleDiff = 360 - angleDiff;
+            if (angleDiff > 110) {
+                stagesToSkip.push(wp.id);
+            }
+        });
+        if (stagesToSkip.length > 0) {
+            navigationWaypoints.forEach(wp => {
+                if (stagesToSkip.includes(wp.id)) wp.visited = true;
+            });
+            showToast(`Saltando ${stagesToSkip.length} etapas que han quedado atrás.`, "info");
+        }
+    }
+    await recalculateAndDrawRoute(true);
+}   
     
     
     
