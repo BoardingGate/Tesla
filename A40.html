@@ -1,4 +1,4 @@
-G38
+G39
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -9211,11 +9211,6 @@ function getManeuverIconFilename(maneuver) {
 
 
 
-
-
-
-    
-
 // ===================================================================
 // NOMBRE: getSuggestedRouteName (CORREGIDA)
 // RESUMEN: Sugiere un nombre de ruta por defecto, ahora adaptado a los waypoints de OSRM.
@@ -9232,7 +9227,6 @@ async function getSuggestedRouteName(lat, lng, isMultiStage = false, totalWaypoi
                 if (road && city) baseName = `${road}, ${city}`;
                 else if (city) baseName = city;
                 else if (road) baseName = road;
-                // Si la respuesta de nominatim es muy larga, la acortamos
                 if (data.display_name && data.display_name.length < baseName.length) {
                     baseName = data.display_name.split(',')[0];
                 }
@@ -9248,6 +9242,8 @@ async function getSuggestedRouteName(lat, lng, isMultiStage = false, totalWaypoi
     }
 }
 
+
+    
 
 
     
@@ -18401,27 +18397,59 @@ function openNavigationMap() {
 
 
 
-
-
+    
 
 // ===================================================================
-// NOMBRE: saveCurrentRoute (VERSIÓN FINAL CORREGIDA)
-// RESUMEN: Guarda una versión "limpia" de los waypoints, obteniéndolos de la fuente correcta.
+// NOMBRE: saveCurrentRoute (VERSIÓN FINAL, CORREGIDA PARA GUARDAR RUTA SELECCIONADA)
+// RESUMEN: Guarda los waypoints que componen la ruta principal actual (la "A").
 // ===================================================================
 async function saveCurrentRoute() {
-    // --- INICIO DE LA CORRECCIÓN ---
-    // La fuente de la verdad son nuestros waypoints globales, no los de la respuesta de OSRM.
-    const waypointsToSave = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
-    // --- FIN DE LA CORRECCIÓN ---
-    
-    if (waypointsToSave.length < 2) {
-        showToast("No hay ruta activa para guardar (se necesitan al menos 2 puntos)", "warning");
+    if (!navigationCurrentRouteData || !navigationCurrentRouteData.routes || !navigationCurrentRouteData.routes[0].legs) {
+        showToast("No hay ruta activa para guardar", "warning");
         return;
     }
+    
+    // --- INICIO DE LA CORRECCIÓN ---
+    // Extraemos los waypoints directamente de la ruta "A" actualmente calculada y mostrada.
+    const routeLegs = navigationCurrentRouteData.routes[0].legs;
+    if (routeLegs.length === 0) {
+        showToast("La ruta a guardar no es válida (no tiene tramos).", "warning");
+        return;
+    }
+    
+    // Reconstruimos la lista de waypoints a partir de los tramos de la ruta principal.
+    const waypointsFromRoute = [];
+    // Añadimos el primer punto del primer tramo
+    const firstStep = routeLegs[0].steps[0];
+    waypointsFromRoute.push({
+        lat: firstStep.maneuver.location[1],
+        lng: firstStep.maneuver.location[0],
+        address: navigationWaypoints[0].address // Usamos la dirección original
+    });
 
-    const isMultiStage = waypointsToSave.length > 2;
-    const lastWp = waypointsToSave[waypointsToSave.length - 1];
-    let defaultRouteName = await getSuggestedRouteName(lastWp.lat, lastWp.lng, isMultiStage, waypointsToSave.length);
+    // Añadimos el último punto de cada tramo
+    for (const leg of routeLegs) {
+        const lastStep = leg.steps[leg.steps.length - 1];
+        const correspondingWp = navigationWaypoints.find(wp => 
+            Math.abs(wp.lat - lastStep.maneuver.location[1]) < 0.0001 &&
+            Math.abs(wp.lng - lastStep.maneuver.location[0]) < 0.0001
+        );
+        waypointsFromRoute.push({
+            lat: lastStep.maneuver.location[1],
+            lng: lastStep.maneuver.location[0],
+            address: correspondingWp ? correspondingWp.address : await getAddressForWaypoint(lastStep.maneuver.location[1], lastStep.maneuver.location[0])
+        });
+    }
+    
+    // Eliminamos duplicados por si acaso
+    const uniqueWaypoints = waypointsFromRoute.filter((wp, index, self) =>
+        index === self.findIndex(t => t.lat === wp.lat && t.lng === wp.lng)
+    );
+    // --- FIN DE LA CORRECCIÓN ---
+
+    const isMultiStage = uniqueWaypoints.length > 2;
+    const lastWp = uniqueWaypoints[uniqueWaypoints.length - 1];
+    let defaultRouteName = await getSuggestedRouteName(lastWp.lat, lastWp.lng, isMultiStage, uniqueWaypoints.length);
     
     const existingOverlay = document.getElementById('route-modal-save-overlay');
     if (existingOverlay) existingOverlay.remove();
@@ -18461,21 +18489,12 @@ async function saveCurrentRoute() {
     const cancelButton = modalContent.querySelector('#cancel-save-route');
     const clearBtn = modalContent.querySelector('.clear-input-btn');
     
-    const toggleClearButton = () => {
-        clearBtn.style.display = nameInput.value.trim().length > 0 ? 'block' : 'none';
-    };
-
+    const toggleClearButton = () => { clearBtn.style.display = nameInput.value.trim().length > 0 ? 'block' : 'none'; };
     nameInput.addEventListener('input', toggleClearButton);
-    clearBtn.addEventListener('click', () => {
-        nameInput.value = '';
-        toggleClearButton();
-        nameInput.focus();
-    });
+    clearBtn.addEventListener('click', () => { nameInput.value = ''; toggleClearButton(); nameInput.focus(); });
     toggleClearButton();
-
     nameInput.focus();
-    const textLength = nameInput.value.length;
-    nameInput.setSelectionRange(textLength, textLength);
+    nameInput.setSelectionRange(nameInput.value.length, nameInput.value.length);
 
     const closePrompt = () => {
         clearModalAutoCloseTimer(overlay, confirmButton, 'save-route-prompt-modal');
@@ -18489,19 +18508,9 @@ async function saveCurrentRoute() {
             return;
         }
         
-        // Creamos una copia "limpia" de los waypoints para evitar referencias circulares.
-        const cleanWaypoints = waypointsToSave.map(wp => ({
-            id: wp.id,
-            lat: wp.lat,
-            lng: wp.lng,
-            label: wp.label,
-            type: wp.type,
-            address: wp.address || '',
-        }));
-
         const routeToSave = {
             name: routeName,
-            waypoints: cleanWaypoints,
+            waypoints: uniqueWaypoints, // Guardamos la lista de waypoints reconstruida
             createdAt: new Date().toISOString()
         };
 
@@ -18528,13 +18537,6 @@ async function saveCurrentRoute() {
     cancelButton.addEventListener('click', closePrompt);
     addModalAutoCloseTimer(overlay, confirmButton, 'save-route-prompt-modal', 20000);
 }
-
-
-
-
-    
-
-
 
 
 
@@ -19784,15 +19786,9 @@ function createWaypointMarkerIcon(label, type, visited, currentZoomLevel = null)
     
     
     
-    
-    
-    
-    
-    
-
- // ===================================================================
-// NOMBRE: renderWaypointMarkers
-// RESUMEN: Dibuja o redibuja todos los marcadores de puntos de ruta en el mapa.
+// ===================================================================
+// NOMBRE: renderWaypointMarkers (CORREGIDA)
+// RESUMEN: Dibuja los marcadores y asigna el listener de drag correcto.
 // ===================================================================
 function renderWaypointMarkers() {
     if (!navigationMapInstance) return;
@@ -19959,7 +19955,10 @@ function renderWaypointMarkers() {
             wp.lat = newLatLng.lat;
             wp.lng = newLatLng.lng;
             wp.address = '';
-            recalculateAndDrawRoute().then(() => {
+            // --- INICIO DE LA CORRECCIÓN ---
+            // Llamamos a la función correcta que obtiene los datos de la API
+            fetchAndProcessRouteLegs().then(() => {
+            // --- FIN DE LA CORRECCIÓN ---
                 const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
                 if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
                     toggleRadaresRuta(true);
@@ -19971,7 +19970,12 @@ function renderWaypointMarkers() {
             });
         });
     });
-}   
+}    
+    
+    
+    
+    
+
     
     
     
