@@ -1,4 +1,4 @@
-G1
+G2
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -11124,35 +11124,6 @@ async function saveCurrentRoute() {
 
 
 
-// ===================================================================
-// NOMBRE: createAlternativeRouteButtonIcon (NUEVA FUNCIÓN)
-// RESUMEN: Crea un icono HTML para los botones de selección de ruta.
-// ===================================================================
-function createAlternativeRouteButtonIcon(label, color) {
-    const iconHtml = `
-        <div style="
-            background-color: ${color};
-            color: white;
-            font-size: 16px;
-            font-weight: bold;
-            text-align: center;
-            line-height: 28px;
-            width: 28px;
-            height: 28px;
-            border-radius: 50%;
-            border: 2px solid white;
-            box-shadow: 0 1px 5px rgba(0,0,0,0.6);
-            cursor: pointer;
-        ">
-            ${label}
-        </div>`;
-    return L.divIcon({
-        html: iconHtml,
-        className: 'alternative-route-button-icon',
-        iconSize: [32, 32],
-        iconAnchor: [16, 16]
-    });
-}
 
 
 
@@ -11161,199 +11132,6 @@ function createAlternativeRouteButtonIcon(label, color) {
 
 
 
-// ===================================================================
-// NOMBRE: recalculateAndDrawRoute (VERSIÓN FINAL CON LÓGICA MULTI-ETAPA)
-// RESUMEN: Calcula la ruta principal y luego busca alternativas solo para el primer tramo.
-// ===================================================================
-async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
-    isRecalculatingRoute = true;
-    lastAutoShownManeuverId = null;
-
-    if (preserveAccumulatedStats) {
-        accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
-    } else {
-        isArrivalSequenceStarted = false;
-        accumulatedDistanceBeforeCurrentSegment = 0;
-        totalDistanceTravelledForStats = 0;
-        maxDistanceReachedOnRoute = 0;
-        lastPositionForStats = null;
-        if (isNavigating) navigationStartTimeForStats = new Date();
-        
-        tripInitialOverallEtaTime = null; 
-        
-        currentStageInitialExpectedEtaTime = null;
-        accumulatedDeviationMs = 0;
-        maxSpeedDuringTrip = 0;
-        maxSpeedCoordinates = null;
-        maxAltitudeDuringTrip = -Infinity;
-        minAltitudeDuringTrip = Infinity;
-        minAverageSpeedInTrip = Infinity;
-        maxAverageSpeedInTrip = -Infinity;
-        if (compassAndModeControl) {
-            compassAndModeControl.updateMaxSpeed(maxSpeedDuringTrip);
-        }
-    }
-
-    const recalculateToastId = "recalculating-route-toast";
-    showToast("Recalculando ruta...", "info", 0, false, recalculateToastId);
-    
-    lastCarDistanceAlongRouteForNavLogic = 0;
-    lastValidCarDistanceForDisplay = 0;
-
-    let waypointsForRouteCalculation = [];
-    if (navigationCurrentLocation) {
-        const currentPositionAsWaypoint = { lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude };
-        waypointsForRouteCalculation.push(currentPositionAsWaypoint);
-    } else {
-        const firstUnvisited = navigationWaypoints.find(wp => wp && !wp.visited);
-        if (firstUnvisited) {
-            waypointsForRouteCalculation.push(firstUnvisited);
-        }
-    }
-    const remainingWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.visited);
-    waypointsForRouteCalculation.push(...remainingWaypoints);
-
-    if (waypointsForRouteCalculation.length < 2) {
-        const existingRecalcToast = document.getElementById(recalculateToastId);
-        if (existingRecalcToast) existingRecalcToast.remove();
-        activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
-        showToast("No hay suficientes etapas restantes para calcular una nueva ruta.", "warning");
-        if (navigationRouteLayer && navigationMapInstance) { try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {} navigationRouteLayer = null; }
-        if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
-        navigationCurrentRouteData = null;
-        hideMapInfoOverlay();
-        isRecalculatingRoute = false;
-        return;
-    }
-
-    const coordsString = waypointsForRouteCalculation.map(wp => {
-        if (typeof wp.lng !== 'number' || typeof wp.lat !== 'number' || isNaN(wp.lng) || isNaN(wp.lat) ) return null;
-        return `${wp.lng},${wp.lat}`;
-    }).filter(Boolean).join(';');
-
-    if (!coordsString || waypointsForRouteCalculation.filter(wp => wp && typeof wp.lng === 'number' && typeof wp.lat === 'number').length < 2) {
-        const existingRecalcToast = document.getElementById(recalculateToastId);
-        if (existingRecalcToast) existingRecalcToast.remove();
-        activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
-        showToast("No hay suficientes waypoints válidos para calcular la ruta.", "warning");
-        if (navigationRouteLayer && navigationMapInstance) { try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {} navigationRouteLayer = null; }
-        if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
-        navigationCurrentRouteData = null;
-        hideMapInfoOverlay();
-        isRecalculatingRoute = false;
-        recalculationAttempts = 0;
-        if (recalculationRetryTimeoutId) clearTimeout(recalculationRetryTimeoutId);
-        recalculationRetryTimeoutId = null;
-        updateStartNavigationButtonState();
-        return;
-    }
-
-    const url = `${OSRM_SERVICE_URL}/driving/${coordsString}?overview=full&geometries=geojson&steps=true&alternatives=false&annotations=true`;
-    try {
-        const response = await fetch(url);
-        if (!response.ok) {
-            let errorData = { message: `HTTP error ${response.status}` };
-            try { errorData = await response.json(); } catch (e) { errorData.message = response.statusText || errorData.message; }
-            throw new Error(`OSRM Error: ${errorData.code || errorData.message || response.statusText}`);
-        }
-        const data = await response.json();
-        const existingRecalcToastSuccess = document.getElementById(recalculateToastId);
-        if (existingRecalcToastSuccess) existingRecalcToastSuccess.remove();
-        activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
-
-        if (data.routes && data.routes.length > 0) {
-            navigationCurrentRouteData = data;
-            if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
-            drawRouteOnMap(data.routes[0]);
-            
-            if (alternativeRoutesLayerGroup) alternativeRoutesLayerGroup.clearLayers();
-            alternativeRouteMarkers.forEach(marker => navigationMapInstance.removeLayer(marker));
-            alternativeRouteMarkers = [];
-            
-            if (waypointsForRouteCalculation.length > 2) {
-                fetchAndDrawFirstLegAlternatives(waypointsForRouteCalculation, data.routes[0]);
-            } else {
-                 const simpleRouteUrl = `${OSRM_SERVICE_URL}/driving/${coordsString}?overview=full&geometries=geojson&steps=true&alternatives=true&annotations=true`;
-                 const alternativesResponse = await fetch(simpleRouteUrl);
-                 if (alternativesResponse.ok) {
-                     const alternativesData = await alternativesResponse.json();
-                     if (alternativesData.routes && alternativesData.routes.length > 1) {
-                         drawAlternativeRoutes(alternativesData.routes, data.routes[0]);
-                     }
-                 }
-            }
-
-            currentLegIndexNav = 0;
-            currentStepIndexNav = 0;
-            lastProcessedStepManeuverLocation = null;
-            
-            if (data.routes[0]) {
-                if (!preserveAccumulatedStats && tripInitialOverallEtaTime === null) {
-                    tripInitialOverallEtaTime = new Date(Date.now() + (data.routes[0].duration * 1000));
-                }
-                
-                if (data.routes[0].legs && data.routes[0].legs.length > 0) {
-                     currentStageInitialExpectedEtaTime = new Date(Date.now() + (data.routes[0].legs[0].duration * 1000));
-                }
-                 const currentCarPosForRecalc = navigationCurrentLocation;
-                 let carDistanceAlongRouteForInternalUse = 0;
-                 if (currentCarPosForRecalc && navigationMapInstance && navigationRouteLayer && typeof turf !== 'undefined' && navigationRouteLayer.getLatLngs().length > 0) {
-                    try {
-                        const carPointTurf = turf.point([currentCarPosForRecalc.longitude, currentCarPosForRecalc.latitude]);
-                        const routeLineStringTurf = turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat]));
-                        const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
-                        const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
-                        carDistanceAlongRouteForInternalUse = turf.length(lineSliceToNearestTurf, { units: 'meters' });
-                    } catch (turfError) {}
-                 }
-                 lastCarDistanceAlongRouteForNavLogic = carDistanceAlongRouteForInternalUse;
-                 updateNavigationProgressDisplay(data.routes[0], carDistanceAlongRouteForInternalUse);
-                 updateTurnByTurnDisplay(data.routes[0], carDistanceAlongRouteForInternalUse);
-                 showDestinationName();
-            }
-            showNavigationUIElementsForPlanning();
-            recalculationAttempts = 0;
-            if (recalculationRetryTimeoutId) clearTimeout(recalculationRetryTimeoutId);
-            recalculationRetryTimeoutId = null;
-
-            if (automatedSimulationIntervalId) {
-                stopAutomatedRouteSimulationInternal();
-                showToast("Ruta recalculada. Reiniciando simulación automática.", "info");
-                startAutomatedRouteSimulation(simulationSpeedKmph);
-            }
-
-        } else {
-            throw new Error("No se encontraron rutas.");
-        }
-    } catch (error) {
-        const existingRecalcToastError = document.getElementById(recalculateToastId);
-        if (existingRecalcToastError) existingRecalcToastError.remove();
-        activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
-        let errorMessageForToast = `Error al calcular ruta: ${error.message}`;
-        showToast(errorMessageForToast, "error");
-        if (navigationRouteLayer && navigationMapInstance) { try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch(e) {} navigationRouteLayer = null; }
-        if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
-        navigationCurrentRouteData = null;
-        lastValidCarDistanceForDisplay = 0;
-        hideMapInfoOverlay();
-        const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
-        if (radaresRutaCheckbox) { eliminarRadaresDeRuta(); actualizarContadorRadares(0); localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresRutaCheckbox.checked)); }
-        const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
-        if (tareasRutaCheckbox) { eliminarTareasDeBarraProgreso(); actualizarContadorTareas(0); localStorage.setItem(TAREAS_RUTA_CHECKED_KEY, String(tareasRutaCheckbox.checked)); }
-        if (recalculationRetryTimeoutId) clearTimeout(recalculationRetryTimeoutId);
-        recalculationRetryTimeoutId = setTimeout(() => recalculateAndDrawRoute(preserveAccumulatedStats), 2000);
-    }
-    
-    // Periodo de gracia para evitar recalculos por desvío inmediatos
-    isInitialRouteCalculation = true;
-    setTimeout(() => { isInitialRouteCalculation = false; }, 10000);
-
-    updateStartNavigationButtonState();
-    updateNavigationButtonColor();
-    if (!recalculationRetryTimeoutId) {
-        isRecalculatingRoute = false;
-    }
-}
 
 
 
@@ -11395,42 +11173,307 @@ async function fetchAndDrawFirstLegAlternatives(waypoints, mainRoute) {
 
 
 
-    // ===================================================================
-// NOMBRE: drawAlternativeRoutes (VERSIÓN CORREGIDA FINAL)
-// RESUMEN: Dibuja rutas alternativas y maneja la selección del usuario.
+ 
+
+
+
 // ===================================================================
-function drawAlternativeRoutes(alternativeRoutes, mainRoute) {
+// NOMBRE: clearAlternativeRoutes (NUEVA FUNCIÓN AUXILIAR)
+// RESUMEN: Limpia del mapa las rutas alternativas y sus botones.
+// ===================================================================
+function clearAlternativeRoutes() {
     if (alternativeRoutesLayerGroup) {
         alternativeRoutesLayerGroup.clearLayers();
-    } else {
-        alternativeRoutesLayerGroup = L.layerGroup().addTo(navigationMapInstance);
     }
-    alternativeRouteMarkers.forEach(marker => navigationMapInstance.removeLayer(marker));
+    alternativeRouteMarkers.forEach(marker => {
+        if (navigationMapInstance && navigationMapInstance.hasLayer(marker)) {
+            navigationMapInstance.removeLayer(marker);
+        }
+    });
     alternativeRouteMarkers = [];
+}
 
-    if (!navigationMapInstance || !alternativeRoutes || alternativeRoutes.length <= 1) {
+// ===================================================================
+// NOMBRE: createAlternativeRouteButtonIcon
+// RESUMEN: Crea un icono HTML para los botones de selección de ruta.
+// ===================================================================
+function createAlternativeRouteButtonIcon(label, color) {
+    const iconHtml = `
+        <div style="
+            background-color: ${color};
+            color: white;
+            font-size: 16px;
+            font-weight: bold;
+            text-align: center;
+            line-height: 28px;
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            border: 2px solid white;
+            box-shadow: 0 1px 5px rgba(0,0,0,0.6);
+            cursor: pointer;
+        ">
+            ${label}
+        </div>`;
+    return L.divIcon({
+        html: iconHtml,
+        className: 'alternative-route-button-icon',
+        iconSize: [32, 32],
+        iconAnchor: [16, 16]
+    });
+}
+
+// ===================================================================
+// NOMBRE: handleDeleteWaypointClick (MODIFICADA)
+// RESUMEN: Elimina un punto de ruta y limpia las alternativas.
+// ===================================================================
+function handleDeleteWaypointClick(waypointId) {
+    if (isNavigating) {
+        showToast("No se pueden borrar puntos mientras se navega.", "warning");
+        return;
+    }
+    const waypointIndex = navigationWaypoints.findIndex(wp => wp && wp.id === waypointId);
+    if (waypointIndex === -1) {
+        return;
+    }
+    const waypointToDelete = navigationWaypoints[waypointIndex];
+    if (waypointToDelete.marker && navigationMapInstance) {
+        try { navigationMapInstance.removeLayer(waypointToDelete.marker); } catch (e) {}
+        waypointToDelete.marker = null;
+    }
+    navigationWaypoints.splice(waypointIndex, 1);
+    
+    if (navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart).length < 2) {
+        clearAllWaypointMarkersFromMap(); 
+        navigationWaypoints = [];
+        if (navigationRouteLayer) {
+            try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {}
+            navigationRouteLayer = null;
+        }
+        if (completedRouteSegmentsLayer) completedRouteSegmentsLayer.clearLayers();
+        navigationCurrentRouteData = null;
+        hideNavigationUI();
+        hideMapInfoOverlay();
+        clearAlternativeRoutes(); // <-- LLAMADA PARA LIMPIAR RUTAS B Y C
+        const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+        if (radaresRutaCheckbox) {
+            eliminarRadaresDeRuta();
+            actualizarContadorRadares(0);
+            localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresRutaCheckbox.checked)); 
+        }
+        const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
+        if (tareasRutaCheckbox) {
+            eliminarTareasDeBarraProgreso();
+            actualizarContadorTareas(0);
+            localStorage.setItem(TAREAS_RUTA_CHECKED_KEY, String(tareasRutaCheckbox.checked));
+        }
+    } else {
+        updateWaypointTypesAndLabels();
+        renderWaypointMarkers();
+        recalculateAndDrawRoute().then(() => {
+            const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+            if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
+                toggleRadaresRuta(true);
+            }
+            const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
+            if (tareasRutaCheckbox && tareasRutaCheckbox.checked) {
+                toggleTareasRuta(true);
+            }
+        });
+    }
+    showToast("Etapa eliminada.", "info");
+    updateStartNavigationButtonState();
+    updateNavigationButtonColor();
+}
+
+// ===================================================================
+// NOMBRE: recalculateAndDrawRoute (NUEVA ARQUITECTURA POR TRAMOS)
+// RESUMEN: Calcula la ruta y sus alternativas por cada tramo.
+// ===================================================================
+async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
+    isRecalculatingRoute = true;
+    lastAutoShownManeuverId = null;
+    clearAlternativeRoutes(); 
+
+    if (preserveAccumulatedStats) {
+        accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
+    } else {
+        isArrivalSequenceStarted = false;
+        accumulatedDistanceBeforeCurrentSegment = 0;
+        totalDistanceTravelledForStats = 0;
+        maxDistanceReachedOnRoute = 0;
+        lastPositionForStats = null;
+        if (isNavigating) navigationStartTimeForStats = new Date();
+        tripInitialOverallEtaTime = null; 
+        currentStageInitialExpectedEtaTime = null;
+        accumulatedDeviationMs = 0;
+        maxSpeedDuringTrip = 0;
+        maxSpeedCoordinates = null;
+        maxAltitudeDuringTrip = -Infinity;
+        minAltitudeDuringTrip = Infinity;
+        minAverageSpeedInTrip = Infinity;
+        maxAverageSpeedInTrip = -Infinity;
+        if (compassAndModeControl) compassAndModeControl.updateMaxSpeed(maxSpeedDuringTrip);
+    }
+    
+    const recalculateToastId = "recalculating-route-toast";
+    showToast("Calculando ruta(s)...", "info", 0, false, recalculateToastId);
+    
+    let waypointsForCalc = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
+
+    if (waypointsForCalc.length < 2) {
+        if (navigationRouteLayer) try { navigationMapInstance.removeLayer(navigationRouteLayer); navigationRouteLayer = null; } catch (e) {}
+        const existingToast = document.getElementById(recalculateToastId);
+        if (existingToast) existingToast.remove();
+        isRecalculatingRoute = false;
         return;
     }
 
+    const apiCalls = [];
+    for (let i = 0; i < waypointsForCalc.length - 1; i++) {
+        const start = waypointsForCalc[i];
+        const end = waypointsForCalc[i+1];
+        const coordsString = `${start.lng},${start.lat};${end.lng},${end.lat}`;
+        const url = `${OSRM_SERVICE_URL}/driving/${coordsString}?overview=full&geometries=geojson&steps=true&alternatives=true&annotations=true`;
+        apiCalls.push(fetch(url).then(res => res.json()));
+    }
+
+    try {
+        const legResponses = await Promise.all(apiCalls);
+        
+        navigationCurrentRouteData = { legResponses };
+
+        const stitchedRoute = {
+            distance: 0,
+            duration: 0,
+            geometry: { type: "LineString", coordinates: [] },
+            legs: []
+        };
+
+        legResponses.forEach(legResponse => {
+            if (legResponse.routes && legResponse.routes.length > 0) {
+                const mainLegRoute = legResponse.routes[0];
+                stitchedRoute.distance += mainLegRoute.distance;
+                stitchedRoute.duration += mainLegRoute.duration;
+                stitchedRoute.geometry.coordinates.push(...mainLegRoute.geometry.coordinates);
+                stitchedRoute.legs.push(...mainLegRoute.legs);
+            }
+        });
+        
+        drawRouteOnMap({ routes: [stitchedRoute] });
+        
+        const existingToastSuccess = document.getElementById(recalculateToastId);
+        if (existingToastSuccess) existingToastSuccess.remove();
+
+        if (!preserveAccumulatedStats) tripInitialOverallEtaTime = new Date(Date.now() + stitchedRoute.duration * 1000);
+        if (stitchedRoute.legs.length > 0) currentStageInitialExpectedEtaTime = new Date(Date.now() + stitchedRoute.legs[0].duration * 1000);
+
+        updateNavigationProgressDisplay(stitchedRoute, 0);
+        updateTurnByTurnDisplay(stitchedRoute, 0);
+        showDestinationName();
+        showNavigationUIElementsForPlanning();
+
+    } catch (error) {
+        showToast(`Error al calcular tramos de ruta: ${error.message}`, "error");
+    } finally {
+        isRecalculatingRoute = false;
+        updateStartNavigationButtonState();
+        updateNavigationButtonColor();
+    }
+}
+
+// ===================================================================
+// NOMBRE: drawRouteOnMap (VERSIÓN FINAL CON BOTÓN 'A')
+// RESUMEN: Dibuja la ruta principal por tramos, haciendo cada uno clicable a través de un botón "A".
+// ===================================================================
+function drawRouteOnMap(stitchedRouteResponse) {
+    if (!navigationMapInstance) return;
+
+    if (navigationRouteLayer) {
+        try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {}
+    }
+    
+    navigationRouteLayer = L.featureGroup().addTo(navigationMapInstance);
+    
+    const route = stitchedRouteResponse.routes[0];
+    if (!route || !route.legs || !route.legs.length === 0) return;
+    
+    route.legs.forEach((leg, legIndex) => {
+        if (leg.steps) {
+            let legCoords = [];
+            leg.steps.forEach(step => {
+                legCoords.push(...step.geometry.coordinates.map(c => [c[1], c[0]]));
+            });
+
+            if (legCoords.length > 1) {
+                const legPolyline = L.polyline(legCoords, {
+                    color: 'yellow',
+                    weight: 10,
+                    opacity: 1.0
+                }).addTo(navigationRouteLayer);
+
+                const turfLine = turf.lineString(legCoords.map(c => [c[1], c[0]]));
+                const pointOnLine = turf.along(turfLine, turf.length(turfLine) * 0.4, { units: 'kilometers' });
+                const buttonPosition = [pointOnLine.geometry.coordinates[1], pointOnLine.geometry.coordinates[0]];
+                
+                const buttonIconA = createAlternativeRouteButtonIcon('A', '#FFD700');
+                
+                const buttonMarkerA = L.marker(buttonPosition, { 
+                    icon: buttonIconA,
+                    zIndexOffset: 1005 
+                }).addTo(navigationRouteLayer); 
+                
+                buttonMarkerA.on('click', (e) => {
+                    L.DomEvent.stopPropagation(e); 
+                    if (isNavigating) return;
+                    clearAlternativeRoutes();
+                    drawAlternativeRoutes(legIndex);
+                    showToast(`Mostrando alternativas para el tramo ${legIndex + 1}.`, "info");
+                });
+            }
+        }
+    });
+
+    if (navigationMapInstance.attributionControl) {
+        navigationMapInstance.attributionControl.addAttribution('Rutas © <a href="http://project-osrm.org/">OSRM</a>');
+    }
+}
+
+// ===================================================================
+// NOMBRE: drawAlternativeRoutes (VERSIÓN FINAL)
+// RESUMEN: Dibuja las alternativas y botones para un tramo específico.
+// ===================================================================
+function drawAlternativeRoutes(legIndex) {
+    clearAlternativeRoutes();
+    if (!navigationMapInstance || !navigationCurrentRouteData || !navigationCurrentRouteData.legResponses) return;
+    
+    const legResponse = navigationCurrentRouteData.legResponses[legIndex];
+    if (!legResponse || !legResponse.routes || legResponse.routes.length <= 1) {
+        showToast(`No hay rutas alternativas disponibles para este tramo.`, "info");
+        return;
+    }
+
+    alternativeRoutesLayerGroup = L.layerGroup().addTo(navigationMapInstance);
+    
     const alternativeStyles = [
-        { label: 'B', color: '#E33BD3' }, // Fucsia/Magenta
-        { label: 'C', color: '#FF5733' }  // Naranja-Rojizo
+        { label: 'B', color: '#E33BD3' },
+        { label: 'C', color: '#FF5733' }
     ];
     
-    for (let i = 1; i < alternativeRoutes.length && i < 3; i++) {
-        const alternativeRouteData = alternativeRoutes[i];
+    for (let i = 1; i < legResponse.routes.length && i < 3; i++) {
+        const alternativeRoute = legResponse.routes[i];
         const style = alternativeStyles[i - 1];
 
-        if (alternativeRouteData.geometry && alternativeRouteData.geometry.coordinates) {
-            const routeCoords = alternativeRouteData.geometry.coordinates.map(coord => [coord[1], coord[0]]);
+        if (alternativeRoute.geometry && alternativeRoute.geometry.coordinates) {
+            const routeCoords = alternativeRoute.geometry.coordinates.map(c => [c[1], c[0]]);
             
-            const alternativePolyline = L.polyline(routeCoords, {
+            L.polyline(routeCoords, {
                 color: style.color,
                 weight: 7,
                 opacity: 0.7,
                 dashArray: '10, 10'
             }).addTo(alternativeRoutesLayerGroup);
-
+            
             const turfLine = turf.lineString(routeCoords.map(c => [c[1], c[0]]));
             const pointOnLine = turf.along(turfLine, turf.length(turfLine) * 0.4, { units: 'kilometers' });
             const buttonPosition = [pointOnLine.geometry.coordinates[1], pointOnLine.geometry.coordinates[0]];
@@ -11439,71 +11482,30 @@ function drawAlternativeRoutes(alternativeRoutes, mainRoute) {
             
             const buttonMarker = L.marker(buttonPosition, { 
                 icon: buttonIcon,
-                zIndexOffset: 1005
-            }).addTo(navigationMapInstance);
+                zIndexOffset: 1005 
+            }).addTo(alternativeRoutesLayerGroup);
             
             alternativeRouteMarkers.push(buttonMarker);
 
-            buttonMarker.on('click', async function() {
-                const toastId = "stitching-route-toast";
-                showToast("Cambiando a ruta alternativa...", "info", 0, false, toastId);
-
-                const currentMainRoute = navigationCurrentRouteData.routes[0];
+            buttonMarker.on('click', async function(e) {
+                L.DomEvent.stopPropagation(e);
+                const legResponseToSwap = navigationCurrentRouteData.legResponses[legIndex];
                 
-                if (mainRoute.legs.length === 1) { // Ruta Simple A->B
-                    const allRoutesCopy = [...navigationCurrentRouteData.routes];
-                    const newMainRoute = allRoutesCopy[i];
-                    const oldMainRoute = allRoutesCopy[0];
-                    allRoutesCopy[0] = newMainRoute;
-                    allRoutesCopy[i] = oldMainRoute;
-                    navigationCurrentRouteData.routes = allRoutesCopy;
-                } else { // Ruta Multi-etapa A->B->C...
-                    const alternativeLeg = alternativeRouteData.legs[0];
-                    const oldFirstLeg = currentMainRoute.legs[0];
-
-                    const newLegs = [alternativeLeg, ...currentMainRoute.legs.slice(1)];
-                    const newTotalDistance = newLegs.reduce((sum, leg) => sum + (leg.distance || 0), 0);
-                    const newTotalDuration = newLegs.reduce((sum, leg) => sum + (leg.duration || 0), 0);
-
-                    let newFullGeometryCoords = [];
-                    newLegs.forEach(leg => {
-                        if (leg.steps) {
-                            leg.steps.forEach(step => {
-                                if (step.geometry && step.geometry.coordinates) {
-                                    newFullGeometryCoords.push(...step.geometry.coordinates);
-                                }
-                            });
-                        }
-                    });
-
-                    const newMainRouteObject = {
-                        ...currentMainRoute,
-                        distance: newTotalDistance,
-                        duration: newTotalDuration,
-                        legs: newLegs,
-                        geometry: {
-                            type: 'LineString',
-                            coordinates: newFullGeometryCoords
-                        }
-                    };
-                    navigationCurrentRouteData.routes[0] = newMainRouteObject;
-                }
-
-                drawRouteOnMap(navigationCurrentRouteData.routes[0]);
-                drawAlternativeRoutes([], null); // Limpiar alternativas viejas
-
-                updateTurnByTurnDisplay(navigationCurrentRouteData.routes[0], lastCarDistanceAlongRouteForNavLogic);
-                updateNavigationProgressDisplay(navigationCurrentRouteData.routes[0], lastCarDistanceAlongRouteForNavLogic);
+                const newMainRouteForLeg = legResponseToSwap.routes[i];
+                const oldMainRouteForLeg = legResponseToSwap.routes[0];
                 
-                const existingToast = document.getElementById(toastId);
-                if (existingToast) existingToast.remove();
-                showToast(`Ruta ${style.label} seleccionada.`, "success");
+                legResponseToSwap.routes[0] = newMainRouteForLeg;
+                legResponseToSwap.routes[i] = oldMainRouteForLeg;
+                
+                await recalculateAndDrawRoute(isNavigating);
+                
+                showToast(`Ruta del tramo ${legIndex + 1} cambiada a la opción ${style.label}.`, "success");
             });
         }
     }
 }
 
-
+    
 
 
     
@@ -19763,37 +19765,6 @@ function createWaypointMarkerIcon(label, type, visited, currentZoomLevel = null)
     
     
     
-// ===================================================================
-// NOMBRE: clearAllWaypointMarkersFromMap (VERSIÓN MODIFICADA)
-// RESUMEN: Elimina todos los marcadores y las rutas alternativas del mapa.
-// ===================================================================
-function clearAllWaypointMarkersFromMap() {
-    if (alternativeRoutesLayerGroup && navigationMapInstance) {
-        alternativeRoutesLayerGroup.clearLayers();
-    }
-    if (alternativeRouteMarkers && navigationMapInstance) {
-        alternativeRouteMarkers.forEach(marker => navigationMapInstance.removeLayer(marker));
-        alternativeRouteMarkers = [];
-    }
-
-    if (!navigationMapInstance) {
-        navigationWaypoints.forEach(wp => { wp.marker = null; }); 
-        return;
-    }
-    navigationWaypoints.forEach(wp => {
-        if (wp && wp.marker) {
-            try {
-                if (navigationMapInstance.hasLayer(wp.marker)) {
-                    navigationMapInstance.removeLayer(wp.marker);
-                }
-            } catch (e) {
-            }
-            wp.marker = null;
-        }
-    });
-} 
-    
-    
     
     
     
@@ -20023,91 +19994,6 @@ async function handleSendToTeslaClick(lat, lng, name) {
       
     
     
- // ===================================================================
-// NOMBRE: handleDeleteWaypointClick (VERSIÓN MODIFICADA)
-// RESUMEN: Elimina un punto de ruta y limpia las rutas alternativas.
-// ===================================================================
-function handleDeleteWaypointClick(waypointId) {
-    if (isNavigating) {
-        showToast("No se pueden borrar puntos mientras se navega.", "warning");
-        return;
-    }
-    const waypointIndex = navigationWaypoints.findIndex(wp => wp && wp.id === waypointId);
-    if (waypointIndex === -1) {
-        return;
-    }
-    const waypointToDelete = navigationWaypoints[waypointIndex];
-    if (waypointToDelete.marker && navigationMapInstance) {
-        try { navigationMapInstance.removeLayer(waypointToDelete.marker); } catch (e) {}
-        waypointToDelete.marker = null;
-    }
-    navigationWaypoints.splice(waypointIndex, 1);
-    if (navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart).length < 1) { 
-        clearAllWaypointMarkersFromMap();
-        navigationWaypoints = [];
-        if (navigationRouteLayer && navigationMapInstance) {
-            try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {}
-            navigationRouteLayer = null;
-        }
-        if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
-        navigationCurrentRouteData = null;
-        hideNavigationUI();
-        hideMapInfoOverlay();
-        const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
-        if (radaresRutaCheckbox) {
-            eliminarRadaresDeRuta();
-            actualizarContadorRadares(0);
-            localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresRutaCheckbox.checked)); 
-        }
-         const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
-        if (tareasRutaCheckbox) {
-            eliminarTareasDeBarraProgreso();
-            actualizarContadorTareas(0);
-            localStorage.setItem(TAREAS_RUTA_CHECKED_KEY, String(tareasRutaCheckbox.checked));
-        }
-    } else {
-        updateWaypointTypesAndLabels();
-        renderWaypointMarkers();
-        if (navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart).length < 2) {
-            if (navigationRouteLayer && navigationMapInstance) {
-                try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {}
-                navigationRouteLayer = null;
-            }
-            if (alternativeRoutesLayerGroup) alternativeRoutesLayerGroup.clearLayers();
-            alternativeRouteMarkers.forEach(marker => navigationMapInstance.removeLayer(marker));
-            alternativeRouteMarkers = [];
-             if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
-            navigationCurrentRouteData = null;
-            hideMapInfoOverlay();
-             const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
-            if (radaresRutaCheckbox) {
-                eliminarRadaresDeRuta();
-                actualizarContadorRadares(0);
-                localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresRutaCheckbox.checked));
-            }
-            const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
-            if (tareasRutaCheckbox) {
-                eliminarTareasDeBarraProgreso();
-                actualizarContadorTareas(0);
-                localStorage.setItem(TAREAS_RUTA_CHECKED_KEY, String(tareasRutaCheckbox.checked));
-            }
-        } else {
-            recalculateAndDrawRoute().then(() => {
-                const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
-                if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
-                    toggleRadaresRuta(true);
-                }
-                const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
-                if (tareasRutaCheckbox && tareasRutaCheckbox.checked) {
-                    toggleTareasRuta(true);
-                }
-            });
-        }
-        showToast("Etapa eliminada.", "info");
-    }
-    updateStartNavigationButtonState();
-    updateNavigationButtonColor();
-}  
     
     
     
@@ -20120,34 +20006,6 @@ function handleDeleteWaypointClick(waypointId) {
     
     
     
-    // ===================================================================
-    // NOMBRE: drawRouteOnMap
-    // RESUMEN: Dibuja la geometría de la ruta en el mapa.
-    // ===================================================================
-    function drawRouteOnMap(route) {
-        if (!navigationMapInstance) return;
-        if (navigationRouteLayer) {
-            try {
-                navigationMapInstance.removeLayer(navigationRouteLayer);
-            } catch(e) {
-            }
-            navigationRouteLayer = null;
-        }
-        if (!route || !route.geometry || !route.geometry.coordinates || route.geometry.coordinates.length < 2) {
-            showToast("Geometría de ruta inválida para dibujar.", "warning");
-            navigationRouteLayer = null;
-            return;
-        }
-        const routeCoords = route.geometry.coordinates.map(coord => [coord[1], coord[0]]);
-        navigationRouteLayer = L.polyline(routeCoords, {
-            color: 'yellow',
-            weight: 10,
-            opacity: 1.0
-        }).addTo(navigationMapInstance);
-        if (navigationMapInstance.attributionControl) {
-             navigationMapInstance.attributionControl.addAttribution('Rutas © <a href="http://project-osrm.org/">OSRM</a>');
-        }
-    }
     
     
     
