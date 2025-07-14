@@ -1,4 +1,4 @@
-G39
+G40
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -8614,60 +8614,108 @@ async function handleDeleteWaypointClick(waypointId) {
 
 
 
+
 // ===================================================================
-// NOMBRE: loadRouteByName (VERSIÓN FINAL LÓGICA)
-// RESUMEN: Carga una ruta a partir de sus waypoints y recalcula desde cero.
+// NOMBRE: loadRouteByName (VERSIÓN FINAL CON CARGA DE SELECCIÓN)
+// RESUMEN: Carga una ruta y aplica la selección de alternativas guardada.
 // ===================================================================
-function loadRouteByName(routeName, autoStartNavigation = false) {
+async function loadRouteByName(routeName, autoStartNavigation = false) {
     const savedRoutes = JSON.parse(localStorage.getItem(SAVED_ROUTES_KEY) || "[]");
     const routeToLoad = savedRoutes.find(r => r.name.toUpperCase() === routeName.toUpperCase());
 
-    if (routeToLoad && routeToLoad.waypoints) {
-        // Limpiamos todo el estado de navegación anterior
-        clearAllWaypointMarkersFromMap();
-        clearAlternativeRoutes();
-        navigationWaypoints = [];
-        navigationCurrentRouteData = null;
-        
-        // --- LÓGICA DE CARGA SIMPLIFICADA ---
-        // Simplemente copiamos los waypoints guardados a la variable global.
-        navigationWaypoints = routeToLoad.waypoints.map(wp => ({ ...wp, visited: false })); // Reseteamos el estado 'visited'
-        // --- FIN DE LA LÓGICA SIMPLIFICADA ---
-        
-        updateWaypointTypesAndLabels();
-        renderWaypointMarkers();
-        
-        // Forzamos un recálculo completo desde cero con los nuevos waypoints
-        fetchAndProcessRouteLegs().then(() => {
-            if (autoStartNavigation) {
-                if (autoStartNavTimer) clearTimeout(autoStartNavTimer);
-                let countdown = 3;
-                const startNavToastId = `start-nav-toast-${Date.now()}`;
-                const updateNavToast = () => {
-                    showToast(`Iniciando navegación automática en ${countdown} segundos... <button onclick="cancelAutoStartNav('${startNavToastId}')" style="background:rgba(255,255,255,0.2);border:1px solid white;padding:2px 5px;margin-left:10px;border-radius:3px;">Cancelar</button>`, 'info', countdown * 1000 + 500, false, startNavToastId);
-                };
-                updateNavToast();
-                autoStartNavTimer = setInterval(() => {
-                    countdown--;
-                    if (countdown > 0) {
-                        updateNavToast();
-                    } else {
-                        clearInterval(autoStartNavTimer);
-                        autoStartNavTimer = null;
-                        const existingToast = document.getElementById(startNavToastId);
-                        if (existingToast) existingToast.remove();
-                        if (navigationWaypoints.length >= 2 && !isNavigating) {
-                            toggleNavigationState();
-                        }
-                    }
-                }, 1000);
-            }
-        });
-        showToast(`Ruta "${routeName}" cargada.`, 'success');
-    } else {
+    if (!routeToLoad || !routeToLoad.waypoints) {
         showToast(`No se pudo cargar la ruta "${routeName}". No encontrada o corrupta.`, "error");
+        return;
+    }
+
+    // Limpiamos todo el estado de navegación anterior
+    clearAllWaypointMarkersFromMap();
+    clearAlternativeRoutes();
+    navigationWaypoints = [];
+    navigationCurrentRouteData = null;
+    isNavigating = false;
+    // ... otros reseteos ...
+    
+    // Copiamos los waypoints guardados a la variable global.
+    navigationWaypoints = routeToLoad.waypoints.map((wp, index) => ({ 
+        ...wp,
+        id: Date.now() + index, // Asignamos un nuevo ID único
+        visited: false,
+        marker: null,
+        type: index === 0 ? 'S' : (index === routeToLoad.waypoints.length - 1 ? 'F' : 'intermediate'),
+        label: index === 0 ? 'S' : (index === routeToLoad.waypoints.length - 1 ? 'F' : String(index))
+    }));
+    
+    renderWaypointMarkers();
+    
+    showToast(`Cargando ruta "${routeName}"...`, 'info', 0, false, "route-load-toast");
+    
+    // --- LÓGICA DE CARGA MEJORADA ---
+    const apiCalls = [];
+    for (let i = 0; i < navigationWaypoints.length - 1; i++) {
+        const start = navigationWaypoints[i];
+        const end = navigationWaypoints[i+1];
+        const coordsString = `${start.lng},${start.lat};${end.lng},${end.lat}`;
+        const url = `${OSRM_SERVICE_URL}/driving/${coordsString}?overview=full&geometries=geojson&steps=true&alternatives=true&annotations=true`;
+        apiCalls.push(fetch(url).then(res => res.json()));
+    }
+
+    try {
+        const legResponses = await Promise.all(apiCalls);
+        
+        // Aplicamos la selección guardada
+        if (routeToLoad.selections && routeToLoad.selections.length === legResponses.length) {
+            legResponses.forEach((legResponse, index) => {
+                const selectionIndex = routeToLoad.selections[index] || 0;
+                if (selectionIndex > 0 && legResponse.routes && legResponse.routes.length > selectionIndex) {
+                    // Intercambiamos para que la seleccionada sea la [0]
+                    const selectedRoute = legResponse.routes[selectionIndex];
+                    legResponse.routes[selectionIndex] = legResponse.routes[0];
+                    legResponse.routes[0] = selectedRoute;
+                }
+            });
+        }
+        
+        // Guardamos los datos y redibujamos
+        navigationCurrentRouteData = { legResponses };
+        rebuildAndDrawRoute();
+
+        const toast = document.getElementById("route-load-toast");
+        if (toast) toast.remove();
+        showToast(`Ruta "${routeName}" cargada.`, 'success');
+
+        if (autoStartNavigation) {
+            // Lógica de inicio automático...
+            if (autoStartNavTimer) clearTimeout(autoStartNavTimer);
+            let countdown = 3;
+            const startNavToastId = `start-nav-toast-${Date.now()}`;
+            const updateNavToast = () => {
+                showToast(`Iniciando navegación automática en ${countdown} segundos... <button onclick="cancelAutoStartNav('${startNavToastId}')" style="background:rgba(255,255,255,0.2);border:1px solid white;padding:2px 5px;margin-left:10px;border-radius:3px;">Cancelar</button>`, 'info', countdown * 1000 + 500, false, startNavToastId);
+            };
+            updateNavToast();
+            autoStartNavTimer = setInterval(() => {
+                countdown--;
+                if (countdown > 0) {
+                    updateNavToast();
+                } else {
+                    clearInterval(autoStartNavTimer);
+                    autoStartNavTimer = null;
+                    const existingToast = document.getElementById(startNavToastId);
+                    if (existingToast) existingToast.remove();
+                    if (navigationWaypoints.length >= 2 && !isNavigating) {
+                        toggleNavigationState();
+                    }
+                }
+            }, 1000);
+        }
+
+    } catch(error) {
+        const toast = document.getElementById("route-load-toast");
+        if (toast) toast.remove();
+        showToast(`Error al recalcular la ruta cargada: ${error.message}`, "error");
     }
 }
+    
 
 
 
@@ -10653,24 +10701,27 @@ function clearAlternativeRoutes() {
     alternativeRouteMarkers = [];
 }
 
+
+
+
 // ===================================================================
-// NOMBRE: createAlternativeRouteButtonIcon
-// RESUMEN: Crea un icono HTML para los botones de selección de ruta.
+// NOMBRE: createAlternativeRouteButtonIcon (CORREGIDA - TAMAÑO AJUSTADO)
+// RESUMEN: Crea un icono HTML para los botones de selección de ruta, ahora más grandes.
 // ===================================================================
 function createAlternativeRouteButtonIcon(label, color) {
     const iconHtml = `
         <div style="
             background-color: ${color};
             color: white;
-            font-size: 16px;
+            font-size: 22px; /* Aumentamos el tamaño de la letra */
             font-weight: bold;
             text-align: center;
-            line-height: 28px;
-            width: 28px;
-            height: 28px;
+            line-height: 41px; /* Ajustamos para centrar la letra verticalmente */
+            width: 41px;  /* Tamaño base 45px - 4px de borde */
+            height: 41px; /* Tamaño base 45px - 4px de borde */
             border-radius: 50%;
             border: 2px solid white;
-            box-shadow: 0 1px 5px rgba(0,0,0,0.6);
+            box-shadow: 0 2px 6px rgba(0,0,0,0.7);
             cursor: pointer;
         ">
             ${label}
@@ -10678,13 +10729,12 @@ function createAlternativeRouteButtonIcon(label, color) {
     return L.divIcon({
         html: iconHtml,
         className: 'alternative-route-button-icon',
-        iconSize: [32, 32],
-        iconAnchor: [16, 16]
+        iconSize: [45, 45], // Mismo tamaño base que los waypoints
+        iconAnchor: [22.5, 22.5] // Centrado
     });
 }
 
-
-
+    
     
 // ===================================================================
 // NOMBRE: getRouteAsSingleLine (FUNCIÓN AUXILIAR)
@@ -18399,74 +18449,56 @@ function openNavigationMap() {
 
     
 
+
+    
+
+    
 // ===================================================================
-// NOMBRE: saveCurrentRoute (VERSIÓN FINAL, CORREGIDA PARA GUARDAR RUTA SELECCIONADA)
-// RESUMEN: Guarda los waypoints que componen la ruta principal actual (la "A").
+// NOMBRE: saveCurrentRoute (VERSIÓN FINAL CON GUARDADO DE SELECCIÓN)
+// RESUMEN: Guarda los waypoints y la selección de alternativa (A, B, C) para cada tramo.
 // ===================================================================
 async function saveCurrentRoute() {
-    if (!navigationCurrentRouteData || !navigationCurrentRouteData.routes || !navigationCurrentRouteData.routes[0].legs) {
+    if (!navigationCurrentRouteData || !navigationCurrentRouteData.legResponses || navigationCurrentRouteData.legResponses.length === 0) {
         showToast("No hay ruta activa para guardar", "warning");
         return;
     }
-    
-    // --- INICIO DE LA CORRECCIÓN ---
-    // Extraemos los waypoints directamente de la ruta "A" actualmente calculada y mostrada.
-    const routeLegs = navigationCurrentRouteData.routes[0].legs;
-    if (routeLegs.length === 0) {
-        showToast("La ruta a guardar no es válida (no tiene tramos).", "warning");
+
+    const waypointsForSaving = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
+    if (waypointsForSaving.length < 2) {
+        showToast("No hay ruta activa para guardar (se necesitan al menos 2 puntos)", "warning");
         return;
     }
     
-    // Reconstruimos la lista de waypoints a partir de los tramos de la ruta principal.
-    const waypointsFromRoute = [];
-    // Añadimos el primer punto del primer tramo
-    const firstStep = routeLegs[0].steps[0];
-    waypointsFromRoute.push({
-        lat: firstStep.maneuver.location[1],
-        lng: firstStep.maneuver.location[0],
-        address: navigationWaypoints[0].address // Usamos la dirección original
+    const lastWp = waypointsForSaving[waypointsForSaving.length - 1];
+    let defaultRouteName = await getSuggestedRouteName(lastWp.lat, lastWp.lng, waypointsForSaving.length > 2, waypointsForSaving.length);
+    
+    // --- INICIO DE LA LÓGICA DE GUARDADO ---
+    // Extraemos la selección de ruta para cada tramo (0 para A, 1 para B, 2 para C)
+    const routeSelections = navigationCurrentRouteData.legResponses.map(leg => {
+        const mainRouteUuid = leg.routes[0].uuid; // OSRM da un uuid a cada ruta
+        return leg.routes.findIndex(r => r.uuid === mainRouteUuid);
     });
 
-    // Añadimos el último punto de cada tramo
-    for (const leg of routeLegs) {
-        const lastStep = leg.steps[leg.steps.length - 1];
-        const correspondingWp = navigationWaypoints.find(wp => 
-            Math.abs(wp.lat - lastStep.maneuver.location[1]) < 0.0001 &&
-            Math.abs(wp.lng - lastStep.maneuver.location[0]) < 0.0001
-        );
-        waypointsFromRoute.push({
-            lat: lastStep.maneuver.location[1],
-            lng: lastStep.maneuver.location[0],
-            address: correspondingWp ? correspondingWp.address : await getAddressForWaypoint(lastStep.maneuver.location[1], lastStep.maneuver.location[0])
-        });
-    }
-    
-    // Eliminamos duplicados por si acaso
-    const uniqueWaypoints = waypointsFromRoute.filter((wp, index, self) =>
-        index === self.findIndex(t => t.lat === wp.lat && t.lng === wp.lng)
-    );
-    // --- FIN DE LA CORRECCIÓN ---
+    // Creamos una versión limpia de los waypoints para no guardar objetos de Leaflet
+    const cleanWaypoints = waypointsForSaving.map(wp => ({
+        lat: wp.lat,
+        lng: wp.lng,
+        address: wp.address || ''
+    }));
+    // --- FIN DE LA LÓGICA DE GUARDADO ---
 
-    const isMultiStage = uniqueWaypoints.length > 2;
-    const lastWp = uniqueWaypoints[uniqueWaypoints.length - 1];
-    let defaultRouteName = await getSuggestedRouteName(lastWp.lat, lastWp.lng, isMultiStage, uniqueWaypoints.length);
-    
+    // El resto del modal funciona igual
     const existingOverlay = document.getElementById('route-modal-save-overlay');
     if (existingOverlay) existingOverlay.remove();
-
     const overlay = document.createElement('div');
     overlay.id = 'route-modal-save-overlay';
     overlay.className = 'route-modal-overlay';
-    
     const modalContent = document.createElement('div');
     modalContent.id = 'save-route-prompt-modal';
     modalContent.className = 'route-modal-container';
-    
     modalContent.innerHTML = `
         <div class="route-modal-header" style="background-image: url('https://boardinggate.github.io/Tesla/modalrutas.png');">
-            <div class="route-modal-title-card">
-                 <span class="route-modal-title">Guardar Ruta</span>
-            </div>
+            <div class="route-modal-title-card"><span class="route-modal-title">Guardar Ruta</span></div>
         </div>
         <div class="route-modal-body">
             <label for="route-name-input" class="route-label">Nombre de la Ruta:</label>
@@ -18478,9 +18510,7 @@ async function saveCurrentRoute() {
         <div class="route-modal-footer">
             <button id="confirm-save-route" class="btn-modal-save">Guardar <span class="button-countdown-timer"></span></button>
             <button id="cancel-save-route" class="btn-modal-cancel">Cancelar</button>
-        </div>
-    `;
-
+        </div>`;
     overlay.appendChild(modalContent);
     document.body.appendChild(overlay);
 
@@ -18510,7 +18540,8 @@ async function saveCurrentRoute() {
         
         const routeToSave = {
             name: routeName,
-            waypoints: uniqueWaypoints, // Guardamos la lista de waypoints reconstruida
+            waypoints: cleanWaypoints,
+            selections: routeSelections, // Guardamos el array de selecciones
             createdAt: new Date().toISOString()
         };
 
@@ -18537,13 +18568,6 @@ async function saveCurrentRoute() {
     cancelButton.addEventListener('click', closePrompt);
     addModalAutoCloseTimer(overlay, confirmButton, 'save-route-prompt-modal', 20000);
 }
-
-
-
-    
-
-    
-
 
     
 // ===================================================================
