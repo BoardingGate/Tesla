@@ -1,4 +1,4 @@
-G27
+G28
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -10748,106 +10748,121 @@ function createAlternativeRouteButtonIcon(label, color) {
 
 
 
+    
+// ===================================================================
+// NOMBRE: getRouteAsSingleLine (FUNCIÓN AUXILIAR)
+// RESUMEN: Reconstruye una única polilínea a partir del featureGroup.
+// ===================================================================
+function getRouteAsSingleLine() {
+    if (!navigationRouteLayer || typeof navigationRouteLayer.getLayers !== 'function') {
+        return null;
+    }
+    const layers = navigationRouteLayer.getLayers();
+    if (layers.length === 0) {
+        return null;
+    }
+    
+    let allCoords = [];
+    layers.forEach(layer => {
+        if (typeof layer.getLatLngs === 'function') {
+            const layerCoords = layer.getLatLngs();
+            if (allCoords.length > 0 && layerCoords.length > 0) {
+                const lastPoint = allCoords[allCoords.length - 1];
+                const firstNewPoint = layerCoords[0];
+                if (lastPoint.lat.toFixed(5) === firstNewPoint.lat.toFixed(5) && lastPoint.lng.toFixed(5) === firstNewPoint.lng.toFixed(5)) {
+                    allCoords.push(...layerCoords.slice(1));
+                } else {
+                    allCoords.push(...layerCoords);
+                }
+            } else {
+                allCoords.push(...layerCoords);
+            }
+        }
+    });
+
+    return allCoords;
+}
 
 // ===================================================================
-// NOMBRE: handleDeleteWaypointClick (VERSIÓN FINAL CON LIMPIEZA)
-// RESUMEN: Elimina un punto de ruta y limpia todos los artefactos de la ruta.
+// NOMBRE: rebuildAndDrawRoute (NUEVA FUNCIÓN DE PROCESADO)
+// RESUMEN: Usa los datos en memoria para construir y dibujar la ruta completa y sus alternativas.
 // ===================================================================
-function handleDeleteWaypointClick(waypointId) {
-    if (isNavigating) {
-        showToast("No se pueden borrar puntos mientras se navega.", "warning");
+function rebuildAndDrawRoute() {
+    if (!navigationCurrentRouteData || !navigationCurrentRouteData.legResponses) {
         return;
     }
-    const waypointIndex = navigationWaypoints.findIndex(wp => wp && wp.id === waypointId);
-    if (waypointIndex === -1) {
-        return;
-    }
-    const waypointToDelete = navigationWaypoints[waypointIndex];
-    if (waypointToDelete.marker && navigationMapInstance) {
-        try { navigationMapInstance.removeLayer(waypointToDelete.marker); } catch (e) {}
-        waypointToDelete.marker = null;
-    }
-    navigationWaypoints.splice(waypointIndex, 1);
+
+    const stitchedRoute = {
+        distance: 0,
+        duration: 0,
+        geometry: { type: "LineString", coordinates: [] },
+        legs: []
+    };
+
+    navigationCurrentRouteData.legResponses.forEach(legResponse => {
+        if (legResponse.routes && legResponse.routes.length > 0) {
+            const mainLegRoute = legResponse.routes[0];
+            stitchedRoute.distance += mainLegRoute.distance;
+            stitchedRoute.duration += mainLegRoute.duration;
+            if (mainLegRoute.geometry && mainLegRoute.geometry.coordinates) {
+                stitchedRoute.geometry.coordinates.push(...mainLegRoute.geometry.coordinates);
+            }
+            if (mainLegRoute.legs) {
+                stitchedRoute.legs.push(...mainLegRoute.legs);
+            }
+        }
+    });
     
-    if (navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart).length < 2) { 
-        clearAllWaypointMarkersFromMap(); 
-        navigationWaypoints = [];
-        if (navigationRouteLayer && navigationMapInstance) {
-            try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {}
-            navigationRouteLayer = null;
-        }
-        if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
-        if (maxSpeedMarkerLayer) maxSpeedMarkerLayer.clearLayers(); // <-- Limpieza añadida
-        if (speedMilestoneLayer) speedMilestoneLayer.clearLayers(); // <-- Limpieza añadida
-        navigationCurrentRouteData = null;
-        hideNavigationUI();
-        hideMapInfoOverlay();
-        clearAlternativeRoutes();
-        const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
-        if (radaresRutaCheckbox) {
-            eliminarRadaresDeRuta();
-            actualizarContadorRadares(0);
-            localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresRutaCheckbox.checked)); 
-        }
-        const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
-        if (tareasRutaCheckbox) {
-            eliminarTareasDeBarraProgreso();
-            actualizarContadorTareas(0);
-            localStorage.setItem(TAREAS_RUTA_CHECKED_KEY, String(tareasRutaCheckbox.checked));
-        }
-    } else {
-        updateWaypointTypesAndLabels();
-        renderWaypointMarkers();
-        recalculateAndDrawRoute().then(() => {
-            const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
-            if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
-                toggleRadaresRuta(true);
-            }
-            const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
-            if (tareasRutaCheckbox && tareasRutaCheckbox.checked) {
-                toggleTareasRuta(true);
-            }
-        });
+    navigationCurrentRouteData.routes = [stitchedRoute];
+    
+    drawRouteOnMap();
+    
+    // Si hay alternativas, las mostramos para el primer tramo por defecto
+    if (navigationCurrentRouteData.legResponses.length > 0) {
+        drawAlternativeRoutes(0);
     }
-    showToast("Etapa eliminada.", "info");
+
+    if (!isNavigating) { // El ETA inicial solo se establece si no estamos ya navegando
+        tripInitialOverallEtaTime = new Date(Date.now() + stitchedRoute.duration * 1000);
+        if (stitchedRoute.legs.length > 0) {
+            currentStageInitialExpectedEtaTime = new Date(Date.now() + stitchedRoute.legs[0].duration * 1000);
+        }
+    }
+
+    updateNavigationProgressDisplay(stitchedRoute, lastCarDistanceAlongRouteForNavLogic);
+    updateTurnByTurnDisplay(stitchedRoute, lastCarDistanceAlongRouteForNavLogic);
+    showDestinationName();
+    showNavigationUIElementsForPlanning();
     updateStartNavigationButtonState();
     updateNavigationButtonColor();
 }
 
-    
 
 // ===================================================================
-// NOMBRE: recalculateAndDrawRoute (VERSIÓN FINAL CORREGIDA)
-// RESUMEN: Calcula y dibuja la ruta, asegurando que se genera una ruta "completa" para el sistema.
+// NOMBRE: fetchAndProcessRouteLegs (ANTES recalculateAndDrawRoute)
+// RESUMEN: OBTIENE los datos de ruta por tramos de OSRM y LUEGO llama a la función de dibujo.
 // ===================================================================
-async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
+async function fetchAndProcessRouteLegs() {
     isRecalculatingRoute = true;
+    clearAlternativeRoutes();
     lastAutoShownManeuverId = null;
-    clearAlternativeRoutes(); 
 
-    if (preserveAccumulatedStats) {
-        accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
-    } else {
-        isArrivalSequenceStarted = false;
-        accumulatedDistanceBeforeCurrentSegment = 0;
-        totalDistanceTravelledForStats = 0;
-        maxDistanceReachedOnRoute = 0;
-        lastPositionForStats = null;
-        if (isNavigating) navigationStartTimeForStats = new Date();
-        tripInitialOverallEtaTime = null; 
-        currentStageInitialExpectedEtaTime = null;
-        accumulatedDeviationMs = 0;
-        maxSpeedDuringTrip = 0;
-        maxSpeedCoordinates = null;
-        maxAltitudeDuringTrip = -Infinity;
-        minAltitudeDuringTrip = Infinity;
-        minAverageSpeedInTrip = Infinity;
-        maxAverageSpeedInTrip = -Infinity;
-        if (compassAndModeControl) compassAndModeControl.updateMaxSpeed(maxSpeedDuringTrip);
-        if (maxSpeedMarkerLayer) maxSpeedMarkerLayer.clearLayers();
-        if (speedMilestoneLayer) speedMilestoneLayer.clearLayers();
-        lastSpeedMilestone = 0;
-    }
+    isArrivalSequenceStarted = false;
+    accumulatedDistanceBeforeCurrentSegment = 0;
+    totalDistanceTravelledForStats = 0;
+    maxDistanceReachedOnRoute = 0;
+    lastPositionForStats = null;
+    tripInitialOverallEtaTime = null; 
+    currentStageInitialExpectedEtaTime = null;
+    accumulatedDeviationMs = 0;
+    maxSpeedDuringTrip = 0;
+    maxSpeedCoordinates = null;
+    maxAltitudeDuringTrip = -Infinity;
+    minAltitudeDuringTrip = Infinity;
+    if (compassAndModeControl) compassAndModeControl.updateMaxSpeed(maxSpeedDuringTrip);
+    if (maxSpeedMarkerLayer) maxSpeedMarkerLayer.clearLayers();
+    if (speedMilestoneLayer) speedMilestoneLayer.clearLayers();
+    lastSpeedMilestone = 0;
     
     const recalculateToastId = "recalculating-route-toast";
     showToast("Calculando ruta(s)...", "info", 0, false, recalculateToastId);
@@ -10873,59 +10888,25 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
 
     try {
         const legResponses = await Promise.all(apiCalls);
-        
-        // --- INICIO DE LA CORRECCIÓN CLAVE ---
-        // Almacenamos las respuestas por tramo, pero también creamos una ruta "maestra"
-        const stitchedRoute = {
-            distance: 0,
-            duration: 0,
-            geometry: { type: "LineString", coordinates: [] },
-            legs: []
-        };
-
-        legResponses.forEach(legResponse => {
-            if (legResponse.routes && legResponse.routes.length > 0) {
-                const mainLegRoute = legResponse.routes[0]; // Siempre usamos la opción "A" de cada tramo
-                stitchedRoute.distance += mainLegRoute.distance;
-                stitchedRoute.duration += mainLegRoute.duration;
-                stitchedRoute.geometry.coordinates.push(...mainLegRoute.geometry.coordinates);
-                stitchedRoute.legs.push(...mainLegRoute.legs);
-            }
-        });
-        
-        // La variable global ahora contiene AMBAS cosas: la ruta completa y las respuestas por tramo.
-        navigationCurrentRouteData = {
-            routes: [stitchedRoute], // <-- Esto es lo que el resto del sistema espera
-            legResponses: legResponses
-        };
-        // --- FIN DE LA CORRECCIÓN CLAVE ---
-        
-        drawRouteOnMap(); // Ya no necesita parámetros
-        
         const existingToastSuccess = document.getElementById(recalculateToastId);
         if (existingToastSuccess) existingToastSuccess.remove();
-
-        if (!preserveAccumulatedStats) tripInitialOverallEtaTime = new Date(Date.now() + stitchedRoute.duration * 1000);
-        if (stitchedRoute.legs.length > 0) currentStageInitialExpectedEtaTime = new Date(Date.now() + stitchedRoute.legs[0].duration * 1000);
-
-        updateNavigationProgressDisplay(stitchedRoute, 0);
-        updateTurnByTurnDisplay(stitchedRoute, 0);
-        showDestinationName();
-        showNavigationUIElementsForPlanning();
+        
+        navigationCurrentRouteData = { legResponses };
+        rebuildAndDrawRoute();
 
     } catch (error) {
         showToast(`Error al calcular tramos de ruta: ${error.message}`, "error");
+        const existingToastError = document.getElementById(recalculateToastId);
+        if (existingToastError) existingToastError.remove();
     } finally {
         isRecalculatingRoute = false;
-        updateStartNavigationButtonState();
-        updateNavigationButtonColor();
     }
 }
 
-    
+
 // ===================================================================
-// NOMBRE: drawRouteOnMap (VERSIÓN FINAL CORREGIDA)
-// RESUMEN: Dibuja la ruta principal por tramos y añade el botón "A" para ver alternativas.
+// NOMBRE: drawRouteOnMap (CORREGIDA)
+// RESUMEN: Dibuja la ruta principal por tramos y añade el botón "A".
 // ===================================================================
 function drawRouteOnMap() {
     if (!navigationMapInstance || !navigationCurrentRouteData) return;
@@ -10936,16 +10917,15 @@ function drawRouteOnMap() {
     
     navigationRouteLayer = L.featureGroup().addTo(navigationMapInstance);
     
-    // Usamos las respuestas por tramo para dibujar cada segmento
     const legResponses = navigationCurrentRouteData.legResponses || [];
     
     legResponses.forEach((legResponse, legIndex) => {
-        const mainLegRoute = legResponse.routes[0]; // La ruta principal del tramo
+        const mainLegRoute = legResponse.routes[0];
         if (mainLegRoute && mainLegRoute.geometry && mainLegRoute.geometry.coordinates) {
             const legCoords = mainLegRoute.geometry.coordinates.map(c => [c[1], c[0]]);
 
             if (legCoords.length > 1) {
-                L.polyline(legCoords, {
+                const legPolyline = L.polyline(legCoords, {
                     color: 'yellow',
                     weight: 10,
                     opacity: 1.0
@@ -10979,10 +10959,9 @@ function drawRouteOnMap() {
 }
 
 
-    
 // ===================================================================
-// NOMBRE: drawAlternativeRoutes (VERSIÓN FINAL CORREGIDA)
-// RESUMEN: Dibuja las alternativas y botones para un tramo específico y fuerza el redibujo.
+// NOMBRE: drawAlternativeRoutes (CORREGIDA)
+// RESUMEN: Dibuja las alternativas y botones para un tramo específico y llama a la función de redibujo.
 // ===================================================================
 function drawAlternativeRoutes(legIndex) {
     clearAlternativeRoutes();
@@ -11028,32 +11007,93 @@ function drawAlternativeRoutes(legIndex) {
             
             alternativeRouteMarkers.push(buttonMarker);
 
-            buttonMarker.on('click', async function(e) {
+            buttonMarker.on('click', function(e) {
                 L.DomEvent.stopPropagation(e);
                 const legResponseToSwap = navigationCurrentRouteData.legResponses[legIndex];
                 
-                // Intercambia la ruta principal (A) con la alternativa seleccionada (B o C)
                 const newMainRouteForLeg = legResponseToSwap.routes[i];
                 const oldMainRouteForLeg = legResponseToSwap.routes[0];
                 
                 legResponseToSwap.routes[0] = newMainRouteForLeg;
                 legResponseToSwap.routes[i] = oldMainRouteForLeg;
                 
-                // --- CORRECCIÓN CLAVE ---
-                // Forzar un recálculo completo para que la `stitchedRoute` se regenere y la UI se actualice
-                await recalculateAndDrawRoute(isNavigating);
+                // Llamamos a la función que reconstruye y redibuja TODO
+                rebuildAndDrawRoute();
                 
                 showToast(`Ruta del tramo ${legIndex + 1} cambiada a la opción ${style.label}.`, "success");
             });
         }
     }
 }
+
+// ===================================================================
+// NOMBRE: handleDeleteWaypointClick (CORREGIDA)
+// RESUMEN: Elimina un punto de ruta y llama a la función correcta para recalcular.
+// ===================================================================
+function handleDeleteWaypointClick(waypointId) {
+    if (isNavigating) {
+        showToast("No se pueden borrar puntos mientras se navega.", "warning");
+        return;
+    }
+    const waypointIndex = navigationWaypoints.findIndex(wp => wp && wp.id === waypointId);
+    if (waypointIndex === -1) {
+        return;
+    }
+    const waypointToDelete = navigationWaypoints[waypointIndex];
+    if (waypointToDelete.marker && navigationMapInstance) {
+        try { navigationMapInstance.removeLayer(waypointToDelete.marker); } catch (e) {}
+        waypointToDelete.marker = null;
+    }
+    navigationWaypoints.splice(waypointIndex, 1);
+    
+    if (navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart).length < 2) { 
+        clearAllWaypointMarkersFromMap(); 
+        navigationWaypoints = [];
+        if (navigationRouteLayer && navigationMapInstance) {
+            try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {}
+            navigationRouteLayer = null;
+        }
+        if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
+        if (maxSpeedMarkerLayer) maxSpeedMarkerLayer.clearLayers();
+        if (speedMilestoneLayer) speedMilestoneLayer.clearLayers();
+        navigationCurrentRouteData = null;
+        hideNavigationUI();
+        hideMapInfoOverlay();
+        clearAlternativeRoutes();
+        const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+        if (radaresRutaCheckbox) {
+            eliminarRadaresDeRuta();
+            actualizarContadorRadares(0);
+            localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresRutaCheckbox.checked)); 
+        }
+        const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
+        if (tareasRutaCheckbox) {
+            eliminarTareasDeBarraProgreso();
+            actualizarContadorTareas(0);
+            localStorage.setItem(TAREAS_RUTA_CHECKED_KEY, String(tareasRutaCheckbox.checked));
+        }
+    } else {
+        updateWaypointTypesAndLabels();
+        renderWaypointMarkers();
+        fetchAndProcessRouteLegs().then(() => { // <-- Llamada a la función de obtención de datos
+            const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+            if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
+                toggleRadaresRuta(true);
+            }
+            const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
+            if (tareasRutaCheckbox && tareasRutaCheckbox.checked) {
+                toggleTareasRuta(true);
+            }
+        });
+    }
+    showToast("Etapa eliminada.", "info");
+    updateStartNavigationButtonState();
+    updateNavigationButtonColor();
+}
+
     
 
-
-    
-
-    
+   
 
 
 
@@ -11859,41 +11899,6 @@ function showNavigationUIElementsForPlanning() {
 }  
     
     
-// ===================================================================
-// NOMBRE: getRouteAsSingleLine (FUNCIÓN AUXILIAR)
-// RESUMEN: Reconstruye una única polilínea a partir del featureGroup.
-// ===================================================================
-function getRouteAsSingleLine() {
-    if (!navigationRouteLayer || typeof navigationRouteLayer.getLayers !== 'function') {
-        return null;
-    }
-    const layers = navigationRouteLayer.getLayers();
-    if (layers.length === 0) {
-        return null;
-    }
-    
-    let allCoords = [];
-    layers.forEach(layer => {
-        // Nos aseguramos de que la capa sea una polilínea antes de llamar a getLatLngs
-        if (typeof layer.getLatLngs === 'function') {
-            const layerCoords = layer.getLatLngs();
-            if (allCoords.length > 0 && layerCoords.length > 0) {
-                const lastPoint = allCoords[allCoords.length - 1];
-                const firstNewPoint = layerCoords[0];
-                // Evitar duplicados en las uniones de tramos
-                if (lastPoint.lat.toFixed(5) === firstNewPoint.lat.toFixed(5) && lastPoint.lng.toFixed(5) === firstNewPoint.lng.toFixed(5)) {
-                    allCoords.push(...layerCoords.slice(1));
-                } else {
-                    allCoords.push(...layerCoords);
-                }
-            } else {
-                allCoords.push(...layerCoords);
-            }
-        }
-    });
-
-    return allCoords;
-}
 
 // ===================================================================
 // NOMBRE: checkReminders (VERSIÓN FINAL CORREGIDA)
