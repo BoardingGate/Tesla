@@ -1,4 +1,4 @@
-R10
+R11
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -6155,8 +6155,6 @@ p.ocm-price-info {
         return originalToFixed.call(this, digits);
     };
 
-    
-    let isFetchingAlternatives = false;
     let alternativeRouteLayers = {
     short: null,
     alternative: null,
@@ -6383,69 +6381,75 @@ p.ocm-price-info {
             }
         }).join(', ');
     
-
-    
 // ===================================================================
-// [OSMR-ALT] NOMBRE: selectAlternativeRoute (VERSIÓN 3 - LÓGICA DE RECÁLCULO)
-// RESUMEN: Prepara los datos para un recálculo forzado a través de la ruta alternativa.
+// [OSMR-ALT] NOMBRE: selectAlternativeRoute (VERSIÓN 4 - MODIFICACIÓN DIRECTA)
+// RESUMEN: Procesa la selección de una ruta alternativa modificando directamente el objeto de la ruta principal.
 // ===================================================================
-async function selectAlternativeRoute(routeType) {
-    if (!currentAlternativeRouteData) {
-        showToast("Error: No hay datos de ruta alternativa para seleccionar.", "error");
+function selectAlternativeRoute(routeType) {
+    if (!currentAlternativeRouteData || !navigationCurrentRouteData) {
+        showToast("Error: No se pueden aplicar los datos de la ruta alternativa.", "error");
         return;
     }
 
-    const legIndex = currentAlternativeRouteData.legIndex;
-    const selectedRoute = currentAlternativeRouteData.allRoutesForLeg.find(r => r.routeType === routeType);
+    const selectedRouteObject = currentAlternativeRouteData.allRoutesForLeg.find(r => r.routeType === routeType);
+    const legIndexToUpdate = currentAlternativeRouteData.legIndex;
 
-    if (!selectedRoute || legIndex < 0) {
-        showToast("Error al seleccionar la ruta.", "error");
+    if (!selectedRouteObject || !selectedRouteObject.legs || selectedRouteObject.legs.length === 0 || legIndexToUpdate < 0 || legIndexToUpdate >= navigationCurrentRouteData.routes[0].legs.length) {
+        showToast("Error al seleccionar la ruta. Datos de la alternativa inválidos.", "error");
         return;
     }
 
-    // 1. Encontrar el punto de inicio y fin de este tramo en nuestro array principal de waypoints.
-    const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal);
-    const startWp = actualWaypoints[legIndex];
-    const endWp = actualWaypoints[legIndex + 1];
-
-    if (!startWp || !endWp) {
-        showToast("No se pudieron identificar las etapas del tramo.", "error");
-        return;
-    }
+    // 1. Obtener el nuevo tramo (leg) del objeto de la ruta alternativa.
+    const newRouteLegData = selectedRouteObject.legs[0];
     
-    // 2. Crear un waypoint invisible intermedio para forzar la ruta.
-    const routeGeometry = selectedRoute.geometry.coordinates;
-    const midPointIndex = Math.floor(routeGeometry.length / 2);
-    const midPointCoords = routeGeometry[midPointIndex];
+    // 2. Reemplazar el tramo antiguo por el nuevo en la ruta principal.
+    const mainRoute = navigationCurrentRouteData.routes[0];
+    mainRoute.legs[legIndexToUpdate] = newRouteLegData;
+
+    // 3. Recalcular la distancia total, duración total y geometría COMPLETA de la ruta principal.
+    let newTotalDistance = 0;
+    let newTotalDuration = 0;
+    let newFullGeometryCoords = [];
+
+    mainRoute.legs.forEach(leg => {
+        newTotalDistance += leg.distance;
+        newTotalDuration += leg.duration;
+        if (leg.steps) {
+            leg.steps.forEach(step => {
+                if (step.geometry && step.geometry.coordinates) {
+                    // Evitar duplicar el primer punto de cada nuevo segmento de geometría
+                    const coordsToAdd = newFullGeometryCoords.length === 0 ? step.geometry.coordinates : step.geometry.coordinates.slice(1);
+                    newFullGeometryCoords.push(...coordsToAdd);
+                }
+            });
+        }
+    });
+
+    mainRoute.distance = newTotalDistance;
+    mainRoute.duration = newTotalDuration;
+    mainRoute.geometry.coordinates = newFullGeometryCoords;
+
+    // 4. Redibujar la ruta principal en el mapa con la nueva geometría.
+    drawRouteOnMap(mainRoute);
     
-    const intermediateInvisibleWp = {
-        id: Date.now() + Math.random(),
-        lat: midPointCoords[1],
-        lng: midPointCoords[0],
-        isInternal: true, // Marcador para que no se muestre ni se guarde
-        address: 'Punto de paso alternativo'
-    };
-
-    // 3. Insertar el waypoint invisible en la posición correcta.
-    const endWpGlobalIndex = navigationWaypoints.findIndex(wp => wp.id === endWp.id);
-    if (endWpGlobalIndex !== -1) {
-        // Primero, limpiamos cualquier waypoint invisible anterior
-        navigationWaypoints = navigationWaypoints.filter(wp => !wp.isInternal);
-        // Luego insertamos el nuevo
-        navigationWaypoints.splice(endWpGlobalIndex, 0, intermediateInvisibleWp);
-    } else {
-        showToast("Error al actualizar la lista de etapas.", "error");
-        return;
-    }
-
-    // 4. Limpiar las alternativas visuales del mapa
+    // 5. Limpiar las alternativas visuales del mapa.
     removeAlternativeRouteLayers();
     
-    // 5. Lanzar un recálculo completo, preservando estadísticas.
-    showToast(`Cambiando a ruta ${routeType === 'short' ? 'corta' : (routeType === 'fastest' ? 'rápida' : 'alternativa')}...`, "info");
-    await recalculateAndDrawRoute(true);
+    // 6. Actualizar la UI y los datos dependientes.
+    if (isNavigating) {
+        updateNavigationProgressDisplay(mainRoute, lastCarDistanceAlongRouteForNavLogic);
+        showToast(`Ruta cambiada. ETA actualizado.`, "info");
+    }
+    
+    if (document.getElementById('radares-ruta-checkbox')?.checked) {
+        toggleRadaresRuta(true);
+    }
+    if (document.getElementById('tareas-ruta-checkbox')?.checked) {
+        toggleTareasRuta(true);
+    }
+    
+    showToast(`Ruta cambiada a la más ${routeType === 'short' ? 'corta' : (routeType === 'fastest' ? 'rápida' : 'alternativa')}.`, "success");
 }
-
     
 
 // ===================================================================
@@ -18048,15 +18052,22 @@ function positionTurnHelpers() {
    }
 
 
+
 // ===================================================================
-// [OSMR-ALT] NOMBRE: fetchAndDisplayAlternativeRoutes (VERSIÓN 6 - CON CONTROL DE ESTADO)
+// [OSMR-ALT] NOMBRE: fetchAndDisplayAlternativeRoutes (VERSIÓN FINAL)
 // RESUMEN: Obtiene y muestra rutas alternativas para un tramo específico.
 // ===================================================================
 async function fetchAndDisplayAlternativeRoutes(startWaypoint, endWaypoint) {
-    if (!startWaypoint || !endWaypoint || !navigationMapInstance) return;
-    if (isFetchingAlternatives) return; // [OSMR-ALT] Evitar ejecuciones simultáneas
-
-    isFetchingAlternatives = true; // [OSMR-ALT] Bloquear nuevas peticiones
+    if (!startWaypoint || !endWaypoint || !navigationMapInstance) {
+        return;
+    }
+    
+    if (isRecalculatingRoute || isFetchingAlternatives) {
+        showToast("Calculando ruta, por favor espere...", "info");
+        return;
+    }
+    
+    isFetchingAlternatives = true;
     
     try {
         removeAlternativeRouteLayers();
@@ -18127,11 +18138,9 @@ async function fetchAndDisplayAlternativeRoutes(startWaypoint, endWaypoint) {
         showToast("Error al obtener rutas alternativas.", "error");
         console.error("Error en fetchAndDisplayAlternativeRoutes:", error);
     } finally {
-        isFetchingAlternatives = false; // [OSMR-ALT] Desbloquear para futuras peticiones
+        isFetchingAlternatives = false;
     }
 }
-
-
     
 
 // ===================================================================
