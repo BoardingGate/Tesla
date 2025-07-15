@@ -1,4 +1,4 @@
-R6
+R7
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -6383,74 +6383,66 @@ p.ocm-price-info {
     
 
     
-
-
 // ===================================================================
-// [OSMR-ALT] NOMBRE: selectAlternativeRoute (VERSIÓN 2 CORREGIDA)
-// RESUMEN: Procesa la selección de una ruta alternativa por parte del usuario.
+// [OSMR-ALT] NOMBRE: selectAlternativeRoute (VERSIÓN 3 - LÓGICA DE RECÁLCULO)
+// RESUMEN: Prepara los datos para un recálculo forzado a través de la ruta alternativa.
 // ===================================================================
-function selectAlternativeRoute(routeType) {
-    if (!currentAlternativeRouteData || !navigationCurrentRouteData) {
-        showToast("Error: No se pueden aplicar los datos de la ruta alternativa.", "error");
+async function selectAlternativeRoute(routeType) {
+    if (!currentAlternativeRouteData) {
+        showToast("Error: No hay datos de ruta alternativa para seleccionar.", "error");
+        return;
+    }
+
+    const legIndex = currentAlternativeRouteData.legIndex;
+    const selectedRoute = currentAlternativeRouteData.allRoutesForLeg.find(r => r.routeType === routeType);
+
+    if (!selectedRoute || legIndex < 0) {
+        showToast("Error al seleccionar la ruta.", "error");
+        return;
+    }
+
+    // 1. Encontrar el punto de inicio y fin de este tramo en nuestro array principal de waypoints.
+    const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal);
+    const startWp = actualWaypoints[legIndex];
+    const endWp = actualWaypoints[legIndex + 1];
+
+    if (!startWp || !endWp) {
+        showToast("No se pudieron identificar las etapas del tramo.", "error");
         return;
     }
     
-    // [OSMR-ALT] CORRECCIÓN: Buscar la ruta seleccionada por su tipo dentro del array guardado.
-    const newAlternativeRouteObject = currentAlternativeRouteData.allRoutesForLeg.find(r => r.routeType === routeType);
-    const legIndexToUpdate = currentAlternativeRouteData.legIndex;
+    // 2. Crear un waypoint invisible intermedio para forzar la ruta.
+    const routeGeometry = selectedRoute.geometry.coordinates;
+    const midPointIndex = Math.floor(routeGeometry.length / 2);
+    const midPointCoords = routeGeometry[midPointIndex];
+    
+    const intermediateInvisibleWp = {
+        id: Date.now() + Math.random(),
+        lat: midPointCoords[1],
+        lng: midPointCoords[0],
+        isInternal: true, // Marcador para que no se muestre ni se guarde
+        address: 'Punto de paso alternativo'
+    };
 
-    if (!newAlternativeRouteObject || !newAlternativeRouteObject.legs || newAlternativeRouteObject.legs.length === 0 || legIndexToUpdate < 0 || legIndexToUpdate >= navigationCurrentRouteData.routes[0].legs.length) {
-        showToast("Error al seleccionar la ruta. Datos de la alternativa inválidos.", "error");
+    // 3. Insertar el waypoint invisible en la posición correcta.
+    const endWpGlobalIndex = navigationWaypoints.findIndex(wp => wp.id === endWp.id);
+    if (endWpGlobalIndex !== -1) {
+        // Primero, limpiamos cualquier waypoint invisible anterior
+        navigationWaypoints = navigationWaypoints.filter(wp => !wp.isInternal);
+        // Luego insertamos el nuevo
+        navigationWaypoints.splice(endWpGlobalIndex, 0, intermediateInvisibleWp);
+    } else {
+        showToast("Error al actualizar la lista de etapas.", "error");
         return;
     }
-    
-    const newRouteLegData = newAlternativeRouteObject.legs[0];
-    
-    const mainRoute = navigationCurrentRouteData.routes[0];
-    mainRoute.legs[legIndexToUpdate] = newRouteLegData;
 
-    let newTotalDistance = 0;
-    let newTotalDuration = 0;
-    let newRouteGeometry = [];
-
-    mainRoute.legs.forEach(leg => {
-        if (leg && leg.steps) {
-            leg.steps.forEach(step => {
-                if (step && step.geometry && step.geometry.coordinates) {
-                    const coordsToAdd = newRouteGeometry.length === 0 ? step.geometry.coordinates : step.geometry.coordinates.slice(1);
-                    newRouteGeometry.push(...coordsToAdd);
-                }
-            });
-        }
-        newTotalDistance += leg.distance;
-        newTotalDuration += leg.duration;
-    });
-
-    mainRoute.distance = newTotalDistance;
-    mainRoute.duration = newTotalDuration;
-    mainRoute.geometry.coordinates = newRouteGeometry;
-
-    drawRouteOnMap(mainRoute);
-    
+    // 4. Limpiar las alternativas visuales del mapa
     removeAlternativeRouteLayers();
     
-    if (isNavigating) {
-        showToast(`Ruta cambiada. Recalculando ETA...`, "info");
-    }
-    
-    if (document.getElementById('radares-ruta-checkbox')?.checked) {
-        toggleRadaresRuta(true);
-    }
-    if (document.getElementById('tareas-ruta-checkbox')?.checked) {
-        toggleTareasRuta(true);
-    }
-    
-    if (isNavigating) {
-        updateNavigationProgressDisplay(mainRoute, lastCarDistanceAlongRouteForNavLogic);
-    }
-    
-    showToast(`Ruta cambiada a la más ${routeType === 'short' ? 'corta' : (routeType === 'fastest' ? 'rápida' : 'alternativa')}.`, "success");
-}    
+    // 5. Lanzar un recálculo completo, preservando estadísticas.
+    showToast(`Cambiando a ruta ${routeType === 'short' ? 'corta' : (routeType === 'fastest' ? 'rápida' : 'alternativa')}...`, "info");
+    await recalculateAndDrawRoute(true);
+}
 
     
 
@@ -11068,14 +11060,17 @@ async function saveCurrentRoute() {
              
   
 // ===================================================================
-// NOMBRE: recalculateAndDrawRoute (VERSIÓN CORREGIDA Y DEFINITIVA)
+// NOMBRE: recalculateAndDrawRoute (VERSIÓN CON LIMPIEZA DE WAYPOINTS INTERNOS)
 // RESUMEN: Recalcula la ruta preservando el ETA inicial en los desvíos.
 // ===================================================================
 async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
     isRecalculatingRoute = true;
     lastAutoShownManeuverId = null;
-    // [OSMR-ALT] Añade esta línea para limpiar alternativas en cualquier recálculo
     removeAlternativeRouteLayers();
+
+    // [OSMR-ALT] CORRECCIÓN: Limpiar waypoints invisibles antes de cada recálculo
+    navigationWaypoints = navigationWaypoints.filter(wp => !wp.isInternal);
+    updateWaypointTypesAndLabels(); // Re-etiquetar por si acaso
 
     if (preserveAccumulatedStats) {
         accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
@@ -11087,7 +11082,6 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
         lastPositionForStats = null;
         if (isNavigating) navigationStartTimeForStats = new Date();
         
-        // El ETA inicial solo se resetea si NO es una desviación.
         tripInitialOverallEtaTime = null; 
         
         currentStageInitialExpectedEtaTime = null;
@@ -11119,7 +11113,7 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
             waypointsForRouteCalculation.push(firstUnvisited);
         }
     }
-    const remainingWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.visited);
+    const remainingWaypoints = navigationWaypoints.filter(wp => wp && !wp.visited);
     waypointsForRouteCalculation.push(...remainingWaypoints);
 
     if (waypointsForRouteCalculation.length < 2) {
@@ -11172,6 +11166,12 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
 
         if (data.routes && data.routes.length > 0) {
             navigationCurrentRouteData = data;
+            // [OSMR-ALT] Limpiamos de nuevo los waypoints invisibles después del cálculo
+            // para que no interfieran con la lógica de etapas.
+            navigationWaypoints = navigationWaypoints.filter(wp => !wp.isInternal);
+            updateWaypointTypesAndLabels();
+            renderWaypointMarkers();
+
             if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
             drawRouteOnMap(data.routes[0]);
             currentLegIndexNav = 0;
@@ -11179,22 +11179,13 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
             lastProcessedStepManeuverLocation = null;
             
             if (data.routes[0]) {
-                // ===================================================================
-                // === INICIO DE LA CORRECCIÓN: LÓGICA DE ETA INICIAL RESTAURADA ===
-                // ===================================================================
-                // El ETA inicial TOTAL solo se debe establecer al principio de una ruta,
-                // no en cada recálculo por desvío.
                 if (!preserveAccumulatedStats && tripInitialOverallEtaTime === null) {
                     tripInitialOverallEtaTime = new Date(Date.now() + (data.routes[0].duration * 1000));
                 }
                 
-                // El ETA de la ETAPA SÍ se debe actualizar en cada recálculo, ya que la "siguiente etapa" puede cambiar.
                 if (data.routes[0].legs && data.routes[0].legs.length > 0) {
                      currentStageInitialExpectedEtaTime = new Date(Date.now() + (data.routes[0].legs[0].duration * 1000));
                 }
-                // ===================================================================
-                // === FIN DE LA CORRECCIÓN ===
-                // ===================================================================
 
                  const currentCarPosForRecalc = navigationCurrentLocation;
                  let carDistanceAlongRouteForInternalUse = 0;
@@ -11249,10 +11240,7 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
     if (!recalculationRetryTimeoutId) {
         isRecalculatingRoute = false;
     }
-}
-
-
-    
+} 
 
     
 
