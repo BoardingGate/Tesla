@@ -5801,6 +5801,30 @@ p.ocm-price-info {
     font-weight: normal;
 }
 
+    /* =================================================================== */
+/* === INICIO: ESTILOS PARA ETIQUETAS DE RUTAS ALTERNATIVAS (NUEVO) === */
+/* =================================================================== */
+.route-label-marker {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    color: white;
+    font-weight: bold;
+    font-size: 14px;
+    font-family: Arial, sans-serif;
+    text-align: center;
+    box-shadow: 0 0 5px rgba(0,0,0,0.7);
+    border: 2px solid white;
+    cursor: pointer;
+    transition: transform 0.2s ease;
+    width: 40px;
+    height: 40px;
+}
+
+.route-label-marker:hover {
+    transform: scale(1.1);
+}
     
 </style>
 
@@ -6155,6 +6179,9 @@ p.ocm-price-info {
         return originalToFixed.call(this, digits);
     };
 
+
+    let alternativeRoutesCache = new Map();
+    let alternativeRouteLayers = [];
     let realtimeSpeedUpdateInterval = null;
     let tripInitialDurationSec = null;
     let tripInitialDistanceMeters = null;
@@ -6376,7 +6403,195 @@ p.ocm-price-info {
     
     
 
+// ===================================================================
+// NOMBRE: createRouteLabelMarker (NUEVA FUNCIÓN)
+// RESUMEN: Crea un icono de etiqueta personalizado para las rutas alternativas.
+// ===================================================================
+function createRouteLabelMarker(text, color) {
+    const iconHtml = `<div class="route-label-marker" style="background-color: ${color};">${text}</div>`;
+    return L.divIcon({
+        html: iconHtml,
+        className: '', // La clase ya está en el div
+        iconSize: [44, 44], // Tamaño total incluyendo borde
+        iconAnchor: [22, 22] // Centrado
+    });
+}
 
+
+// ===================================================================
+// NOMBRE: clearAlternativeRoutesDisplay (NUEVA FUNCIÓN)
+// RESUMEN: Limpia del mapa todas las capas de rutas alternativas y sus etiquetas.
+// ===================================================================
+function clearAlternativeRoutesDisplay() {
+    if (navigationMapInstance && alternativeRouteLayers.length > 0) {
+        alternativeRouteLayers.forEach(layer => {
+            if (navigationMapInstance.hasLayer(layer)) {
+                navigationMapInstance.removeLayer(layer);
+            }
+        });
+    }
+    alternativeRouteLayers = [];
+}
+
+// ===================================================================
+// NOMBRE: selectAlternativeRoute (NUEVA FUNCIÓN)
+// RESUMEN: Se ejecuta al seleccionar una ruta alternativa. Actualiza la ruta principal y recalcula.
+// ===================================================================
+async function selectAlternativeRoute(waypointId, routeType) {
+    if (!alternativeRoutesCache.has(waypointId)) return;
+
+    const routesData = alternativeRoutesCache.get(waypointId);
+    const selectedRoute = routesData[routeType];
+
+    if (!selectedRoute) {
+        showToast("Error: no se encontraron los datos de la ruta seleccionada.", "error");
+        return;
+    }
+
+    // Encuentra los waypoints de inicio y fin de esta etapa
+    const endWaypointIndex = navigationWaypoints.findIndex(wp => wp && wp.id === waypointId);
+    if (endWaypointIndex === -1) return;
+
+    let startWaypointIndex = -1;
+    for (let i = endWaypointIndex - 1; i >= 0; i--) {
+        if (navigationWaypoints[i] && !navigationWaypoints[i].isInternal) {
+            startWaypointIndex = i;
+            break;
+        }
+    }
+    if (startWaypointIndex === -1) return;
+
+    // Eliminar cualquier waypoint interno anterior entre estos dos puntos
+    navigationWaypoints = navigationWaypoints.filter((wp, index) => {
+        return !(wp.isInternal && index > startWaypointIndex && index < endWaypointIndex);
+    });
+
+    // Insertar nuevos waypoints internos basados en la geometría de la ruta seleccionada
+    // Se omiten el primer y último punto que ya se corresponden con los waypoints de la etapa.
+    const geometryPoints = selectedRoute.geometry.coordinates;
+    const internalWaypoints = geometryPoints.slice(1, -1).map((coord, i) => ({
+        id: Date.now() + Math.random() + i,
+        lat: coord[1],
+        lng: coord[0],
+        type: 'internal',
+        label: '',
+        address: 'Punto de paso interno',
+        isInternal: true,
+        visited: false,
+        isCriticalForRecalc: false // No es crítico para futuros recálculos
+    }));
+
+    // El índice de inserción necesita recalcularse después del filtrado
+    const newEndWaypointIndex = navigationWaypoints.findIndex(wp => wp && wp.id === waypointId);
+    navigationWaypoints.splice(newEndWaypointIndex, 0, ...internalWaypoints);
+    
+    // Limpiar visualmente las alternativas ANTES de recalcular
+    clearAlternativeRoutesDisplay();
+
+    // Recalcular la ruta completa forzando el paso por los nuevos puntos
+    await recalculateAndDrawRoute(isNavigating);
+    
+    showToast(`Ruta actualizada a la opción: ${routeType.toUpperCase()}.`, "success");
+}
+
+// ===================================================================
+// NOMBRE: drawAlternativeRoutes (NUEVA FUNCIÓN)
+// RESUMEN: Dibuja en el mapa las polilíneas y etiquetas de las rutas alternativas.
+// ===================================================================
+function drawAlternativeRoutes(waypointId, routesData) {
+    clearAlternativeRoutesDisplay();
+    if (!navigationMapInstance) return;
+
+    const routeConfigs = [
+        { type: 'fastest', data: routesData.fastest, color: '#0066FF', label: 'RAP' }, // Azul para la rápida
+        { type: 'shortest', data: routesData.shortest, color: '#BA6BFF', label: 'COR' }, // Morado para la corta
+        { type: 'alternative', data: routesData.alternative, color: '#FF5900', label: 'ALT' } // Naranja para la alternativa
+    ];
+
+    routeConfigs.forEach(config => {
+        if (config.data && config.data.geometry) {
+            const routeCoords = config.data.geometry.coordinates.map(coord => [coord[1], coord[0]]);
+            const polyline = L.polyline(routeCoords, {
+                color: config.color,
+                weight: 6,
+                opacity: 0.8
+            }).addTo(navigationMapInstance);
+
+            // Colocar la etiqueta en el punto medio de la polilínea
+            const midPointIndex = Math.floor(routeCoords.length / 2);
+            const labelPosition = routeCoords[midPointIndex];
+
+            const labelMarker = L.marker(labelPosition, {
+                icon: createRouteLabelMarker(config.label, config.color),
+                zIndexOffset: 1010
+            }).addTo(navigationMapInstance);
+            
+            labelMarker.on('click', () => selectAlternativeRoute(waypointId, config.type));
+
+            alternativeRouteLayers.push(polyline, labelMarker);
+        }
+    });
+}
+
+// ===================================================================
+// NOMBRE: fetchAndDisplayAlternativeRoutes (NUEVA FUNCIÓN)
+// RESUMEN: Obtiene y muestra las rutas alternativas para una etapa específica.
+// ===================================================================
+async function fetchAndDisplayAlternativeRoutes(waypointId) {
+    if (alternativeRoutesCache.has(waypointId)) {
+        drawAlternativeRoutes(waypointId, alternativeRoutesCache.get(waypointId));
+        return;
+    }
+
+    const endWaypointIndex = navigationWaypoints.findIndex(wp => wp && wp.id === waypointId);
+    if (endWaypointIndex < 1) return;
+
+    let startWaypoint = null;
+    for (let i = endWaypointIndex - 1; i >= 0; i--) {
+        if (navigationWaypoints[i] && !navigationWaypoints[i].isInternal) {
+            startWaypoint = navigationWaypoints[i];
+            break;
+        }
+    }
+    
+    if (!startWaypoint) return;
+    const endWaypoint = navigationWaypoints[endWaypointIndex];
+
+    const url = `${OSRM_SERVICE_URL}/driving/${startWaypoint.lng},${startWaypoint.lat};${endWaypoint.lng},${endWaypoint.lat}?alternatives=true&overview=full&geometries=geojson&steps=false`;
+
+    try {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error('Respuesta de red no fue OK');
+        const data = await response.json();
+
+        if (!data.routes || data.routes.length < 1) {
+             showToast("NO HAY RUTAS ALTERNATIVAS", "info");
+            return;
+        }
+
+        const fastestRoute = data.routes[0]; // OSRM devuelve la más rápida primero
+        const shortestRoute = [...data.routes].sort((a, b) => a.distance - b.distance)[0];
+        const alternativeRoute = data.routes.find(r => r !== fastestRoute && r !== shortestRoute) || null;
+        
+        // Si la más rápida y la más corta son la misma, no mostramos duplicados
+        if (fastestRoute === shortestRoute && !alternativeRoute) {
+            showToast("NO HAY RUTAS ALTERNATIVAS", "info");
+            return;
+        }
+
+        const routesData = {
+            fastest: fastestRoute,
+            shortest: fastestRoute === shortestRoute ? null : shortestRoute, // No mostrar si es la misma que la rápida
+            alternative: alternativeRoute
+        };
+
+        alternativeRoutesCache.set(waypointId, routesData);
+        drawAlternativeRoutes(waypointId, routesData);
+
+    } catch (error) {
+        showToast("Error al obtener rutas alternativas", "error");
+    }
+}
 
 
     
@@ -10359,9 +10574,11 @@ function showDeviationModal() {
 
 
     
+    
+
 // ===================================================================
-// NOMBRE: toggleNavigationState (VERSIÓN CORREGIDA Y DEFINITIVA)
-// RESUMEN: Inicia o detiene la navegación, guardando el ETA inicial al comenzar.
+// NOMBRE: toggleNavigationState (MODIFICADA)
+// RESUMEN: Inicia o detiene la navegación, gestionando las rutas alternativas.
 // ===================================================================
 async function toggleNavigationState(isRecalculationStop = false) {
     const startNavButton = document.getElementById('start-navigation-button');
@@ -10370,6 +10587,9 @@ async function toggleNavigationState(isRecalculationStop = false) {
 
     if (isNavigating) {
         // --- Lógica para DETENER la navegación ---
+        clearAlternativeRoutesDisplay(); // Limpiar alternativas al parar
+        alternativeRoutesCache.clear(); // Limpiar caché
+
         isNavigating = false;
         navigationFollowUser = false;
         tripStartLocationForStats = null;
@@ -10526,15 +10746,20 @@ async function toggleNavigationState(isRecalculationStop = false) {
         if (tareasCheckbox && tareasCheckbox.checked) {
             toggleTareasRuta(true);
         }
+
+        // --- INICIO LÓGICA MODIFICADA ---
+        // Mostrar alternativas de la primera etapa al iniciar
+        const firstDestination = navigationWaypoints.find(wp => wp && !wp.isInternal && wp.type !== 'S');
+        if (firstDestination) {
+            fetchAndDisplayAlternativeRoutes(firstDestination.id);
+        }
+        // --- FIN LÓGICA MODIFICADA ---
     } 
     updateStartNavigationButtonState();
     updateNavigationButtonColor();
     actualizarContadorRadares(radaresEnRutaActual.length);
     actualizarContadorTareas(tareasEnRutaActual.length);
-}    
-    
-
-
+}
 
 
 
@@ -10938,15 +11163,20 @@ async function saveCurrentRoute() {
                 
              
   
-
-
 // ===================================================================
-// NOMBRE: recalculateAndDrawRoute (VERSIÓN CORREGIDA Y DEFINITIVA)
-// RESUMEN: Recalcula la ruta preservando el ETA inicial en los desvíos.
+// NOMBRE: recalculateAndDrawRoute (MODIFICADA)
+// RESUMEN: Recalcula la ruta y muestra alternativas para la etapa actual.
 // ===================================================================
 async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
     isRecalculatingRoute = true;
     lastAutoShownManeuverId = null;
+
+    // --- INICIO LÓGICA MODIFICADA ---
+    // Limpiar siempre las alternativas visuales y la caché al recalcular
+    clearAlternativeRoutesDisplay();
+    // No limpiamos la caché aquí para poder re-mostrar si es la misma etapa.
+    // La caché se limpiará de forma más controlada.
+    // --- FIN LÓGICA MODIFICADA ---
 
     if (preserveAccumulatedStats) {
         accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
@@ -10958,15 +11188,13 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
         lastPositionForStats = null;
         if (isNavigating) navigationStartTimeForStats = new Date();
         
-        // El ETA inicial solo se resetea si NO es una desviación.
         tripInitialOverallEtaTime = null; 
-        
         currentStageInitialExpectedEtaTime = null;
         accumulatedDeviationMs = 0;
         maxSpeedDuringTrip = 0;
         maxSpeedCoordinates = null;
-        maxAltitudeDuringTrip = -Infinity;
-        minAltitudeDuringTrip = Infinity;
+        maxAltitudeDuringTrip = -Infinity; 
+        minAltitudeDuringTrip = Infinity; 
         minAverageSpeedInTrip = Infinity;
         maxAverageSpeedInTrip = -Infinity;
         if (compassAndModeControl) {
@@ -11050,22 +11278,13 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
             lastProcessedStepManeuverLocation = null;
             
             if (data.routes[0]) {
-                // ===================================================================
-                // === INICIO DE LA CORRECCIÓN: LÓGICA DE ETA INICIAL RESTAURADA ===
-                // ===================================================================
-                // El ETA inicial TOTAL solo se debe establecer al principio de una ruta,
-                // no en cada recálculo por desvío.
                 if (!preserveAccumulatedStats && tripInitialOverallEtaTime === null) {
                     tripInitialOverallEtaTime = new Date(Date.now() + (data.routes[0].duration * 1000));
                 }
                 
-                // El ETA de la ETAPA SÍ se debe actualizar en cada recálculo, ya que la "siguiente etapa" puede cambiar.
                 if (data.routes[0].legs && data.routes[0].legs.length > 0) {
                      currentStageInitialExpectedEtaTime = new Date(Date.now() + (data.routes[0].legs[0].duration * 1000));
                 }
-                // ===================================================================
-                // === FIN DE LA CORRECCIÓN ===
-                // ===================================================================
 
                  const currentCarPosForRecalc = navigationCurrentLocation;
                  let carDistanceAlongRouteForInternalUse = 0;
@@ -11082,6 +11301,16 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
                  updateNavigationProgressDisplay(data.routes[0], carDistanceAlongRouteForInternalUse);
                  updateTurnByTurnDisplay(data.routes[0], carDistanceAlongRouteForInternalUse);
                  showDestinationName();
+
+                // --- INICIO LÓGICA MODIFICADA ---
+                // Tras recalcular, si estamos navegando, mostramos las alternativas de la etapa actual.
+                if (isNavigating) {
+                    const firstDestination = navigationWaypoints.find(wp => wp && !wp.isInternal && wp.type !== 'S');
+                    if (firstDestination) {
+                        fetchAndDisplayAlternativeRoutes(firstDestination.id);
+                    }
+                }
+                // --- FIN LÓGICA MODIFICADA ---
             }
             showNavigationUIElementsForPlanning();
             recalculationAttempts = 0;
@@ -17669,9 +17898,11 @@ function handleMapClickToAddReminder(e) {
 
     
     
-// ===================================================================
+    
+
+ // ===================================================================
 // NOMBRE: updateTurnByTurnDisplay (MODIFICADA)
-// RESUMEN: Actualiza la barra de información de giro en la navegación.
+// RESUMEN: Actualiza la barra de giro, y gestiona la visualización de alternativas al cambiar de etapa.
 // ===================================================================
 function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     const topInfoBar = document.getElementById('navigation-top-info-bar');
@@ -17714,6 +17945,9 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     let currentLegIndex = -1, currentStepIndex = -1;
     let nextStepToDisplay = null, distanceToEndOfCurrentStepForProgress = 0;
     let previousStepForPath = null;
+    
+    const previousLegIndex = currentLegIndexNav; // Guardamos el índice anterior
+
     for (let i = 0; i < route.legs.length; i++) {
         const leg = route.legs[i];
         for (let j = 0; j < leg.steps.length; j++) {
@@ -17735,6 +17969,18 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     }
     currentLegIndexNav = currentLegIndex;
     currentStepIndexNav = currentStepIndex;
+
+    // --- INICIO LÓGICA MODIFICADA ---
+    // Detectar cambio de etapa para mostrar nuevas alternativas
+    if (isNavigating && currentLegIndexNav > previousLegIndex) {
+        clearAlternativeRoutesDisplay(); // Limpiar las de la etapa anterior
+        const nextDestinationWaypoint = navigationWaypoints.filter(wp => !wp.isInternal)[currentLegIndexNav + 1];
+        if (nextDestinationWaypoint) {
+            fetchAndDisplayAlternativeRoutes(nextDestinationWaypoint.id);
+        }
+    }
+    // --- FIN LÓGICA MODIFICADA ---
+
     const currentLeg = route.legs[currentLegIndex];
     if (currentStepIndex + 1 < currentLeg.steps.length) { nextStepToDisplay = currentLeg.steps[currentStepIndex + 1]; } 
     else if (currentLegIndex + 1 < route.legs.length) { nextStepToDisplay = route.legs[currentLegIndex + 1].steps[0]; } 
@@ -17835,10 +18081,7 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
             turnIconContainer.style.backgroundColor = 'white';
         }
     }
-}
-    
-
-    
+}   
 
 
  
@@ -19478,11 +19721,8 @@ function createWaypointMarkerIcon(label, type, visited, currentZoomLevel = null)
     
     
     
-    
-    
-
- // ===================================================================
-// NOMBRE: renderWaypointMarkers
+// ===================================================================
+// NOMBRE: renderWaypointMarkers (MODIFICADA)
 // RESUMEN: Dibuja o redibuja todos los marcadores de puntos de ruta en el mapa.
 // ===================================================================
 function renderWaypointMarkers() {
@@ -19521,6 +19761,18 @@ function renderWaypointMarkers() {
         const popup = L.popup({ maxWidth: 250, autoPanPadding: L.point(50, 50), closeButton: true }).setContent(popupContent);
         wp.marker.bindPopup(popup);
         wp.marker.on('click', async (e) => {
+            // --- INICIO LÓGICA MODIFICADA ---
+            // Si estamos navegando, un clic en el marcador muestra las alternativas
+            if (isNavigating) {
+                L.DomEvent.stopPropagation(e); // Prevenir que el mapa reciba el clic
+                const waypoint = navigationWaypoints.find(w => w && w.id === wp.id);
+                if (waypoint && (waypoint.type === 'F' || waypoint.type === 'intermediate')) {
+                    fetchAndDisplayAlternativeRoutes(waypoint.id);
+                }
+                return; // No abrir popup en modo navegación
+            }
+            // --- FIN LÓGICA MODIFICADA ---
+            
             if (!navigationMapInstance) return;
             const waypoint = navigationWaypoints.find(w => w && w.id === wp.id);
             if (!waypoint) return;
@@ -19602,6 +19854,11 @@ function renderWaypointMarkers() {
                 tiempoTexto = `${String(waypointHours).padStart(2, '0')}:${String(waypointMinutes).padStart(2, '0')}`;
             }
             const showDeleteButtonInPopup = waypoint.type !== 'S_Recalc';
+            // --- INICIO LÓGICA MODIFICADA ---
+            // Añadido botón "OTRAS RUTAS" si el punto no es el de salida
+            const showAlternativesButton = waypoint.type !== 'S' && waypoint.type !== 'S_Recalc';
+            const alternativesButtonHtml = showAlternativesButton ? `<button data-waypoint-id="${waypoint.id}" class="show-alternatives-btn" style="margin-top: 8px; margin-right: 5px; padding: 4px 8px; font-size: 0.8rem; background-color: #ff9800; color: white; border: none; border-radius: 3px; cursor: pointer;">OTRAS RUTAS</button>` : '';
+            // --- FIN LÓGICA MODIFICADA ---
             const finalPopupContent = `
                 <div style="font-family: sans-serif; font-size: 0.9rem; max-width: 230px;">
                     <strong style="font-size: 1rem; color: #333; display: block; margin-bottom: 3px;">Punto ${waypoint.label}: ${address || 'Dirección no disponible'}</strong>
@@ -19610,6 +19867,7 @@ function renderWaypointMarkers() {
                     <p style="margin: 2px 0;"><strong>Tiempo:</strong> ${tiempoTexto}</p>
                     <p style="margin: 2px 0;"><strong>Llegada (ETA):</strong> ${etaToWaypoint || '--:--'}</p>
                     <button data-waypoint-id="${waypoint.id}" class="share-waypoint-from-popup" style="margin-top: 8px; margin-right: 5px; padding: 4px 8px; font-size: 0.8rem; background-color: #007bff; color: white; border: none; border-radius: 3px; cursor: pointer;">Compartir</button>
+                    ${alternativesButtonHtml}
                     ${showDeleteButtonInPopup ? `<button data-waypoint-id="${waypoint.id}" class="delete-waypoint-from-popup" style="margin-top: 8px; padding: 4px 8px; font-size: 0.8rem; background-color: #EF4444; color: white; border: none; border-radius: 3px; cursor: pointer;">BORRAR PUNTO</button>` : ''}
                 </div>`;
             popup.setContent(finalPopupContent).update();
@@ -19627,6 +19885,24 @@ function renderWaypointMarkers() {
                     }
                 });
             }
+
+            // --- INICIO LÓGICA MODIFICADA ---
+            // Listener para el nuevo botón de alternativas
+            const alternativesButtonPopup = popup.getElement().querySelector('.show-alternatives-btn');
+            if (alternativesButtonPopup) {
+                L.DomEvent.on(alternativesButtonPopup, 'click', function(ev) {
+                    L.DomEvent.stopPropagation(ev);
+                    const wpIdForAlts = parseInt(this.dataset.waypointId);
+                    const waypointForAlts = navigationWaypoints.find(w => w && w.id === wpIdForAlts);
+                    if (waypointForAlts) {
+                        fetchAndDisplayAlternativeRoutes(wpIdForAlts);
+                        if (popup.isOpen()) popup.remove();
+                    } else {
+                        showToast('Error: No se pudo encontrar el punto para buscar alternativas.', 'error');
+                    }
+                });
+            }
+            // --- FIN LÓGICA MODIFICADA ---
 
             const deleteButtonPopup = popup.getElement().querySelector('.delete-waypoint-from-popup');
             if (deleteButtonPopup) {
@@ -19662,7 +19938,9 @@ function renderWaypointMarkers() {
             });
         });
     });
-}   
+}    
+    
+
     
     
     
@@ -19701,92 +19979,93 @@ async function handleSendToTeslaClick(lat, lng, name) {
 
       
     
-    
-    
-    
-    
     // ===================================================================
-    // NOMBRE: handleDeleteWaypointClick
-    // RESUMEN: Elimina un punto de ruta de la ruta actual.
-    // ===================================================================
-    function handleDeleteWaypointClick(waypointId) {
-        if (isNavigating) {
-            showToast("No se pueden borrar puntos mientras se navega.", "warning");
-            return;
+// NOMBRE: handleDeleteWaypointClick (MODIFICADA)
+// RESUMEN: Elimina un punto de ruta de la ruta actual y limpia las alternativas.
+// ===================================================================
+function handleDeleteWaypointClick(waypointId) {
+    if (isNavigating) {
+        showToast("No se pueden borrar puntos mientras se navega.", "warning");
+        return;
+    }
+
+    clearAlternativeRoutesDisplay(); // Limpiar alternativas al modificar la ruta
+    alternativeRoutesCache.clear(); // Limpiar caché
+
+    const waypointIndex = navigationWaypoints.findIndex(wp => wp && wp.id === waypointId);
+    if (waypointIndex === -1) {
+        return;
+    }
+    const waypointToDelete = navigationWaypoints[waypointIndex];
+    if (waypointToDelete.marker && navigationMapInstance) {
+        try { navigationMapInstance.removeLayer(waypointToDelete.marker); } catch (e) {}
+        waypointToDelete.marker = null;
+    }
+    navigationWaypoints.splice(waypointIndex, 1);
+    if (navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart).length < 1) { 
+        clearAllWaypointMarkersFromMap(); 
+        navigationWaypoints = [];
+        if (navigationRouteLayer && navigationMapInstance) {
+            try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {}
+            navigationRouteLayer = null;
         }
-        const waypointIndex = navigationWaypoints.findIndex(wp => wp && wp.id === waypointId);
-        if (waypointIndex === -1) {
-            return;
+        if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
+        navigationCurrentRouteData = null;
+        hideNavigationUI();
+        hideMapInfoOverlay();
+        const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+        if (radaresRutaCheckbox) {
+            eliminarRadaresDeRuta();
+            actualizarContadorRadares(0);
+            localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresRutaCheckbox.checked)); 
         }
-        const waypointToDelete = navigationWaypoints[waypointIndex];
-        if (waypointToDelete.marker && navigationMapInstance) {
-            try { navigationMapInstance.removeLayer(waypointToDelete.marker); } catch (e) {}
-            waypointToDelete.marker = null;
+         const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
+        if (tareasRutaCheckbox) {
+            eliminarTareasDeBarraProgreso();
+            actualizarContadorTareas(0);
+            localStorage.setItem(TAREAS_RUTA_CHECKED_KEY, String(tareasRutaCheckbox.checked));
         }
-        navigationWaypoints.splice(waypointIndex, 1);
-        if (navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart).length < 1) { 
-            clearAllWaypointMarkersFromMap(); 
-            navigationWaypoints = [];
+    } else {
+        updateWaypointTypesAndLabels();
+        renderWaypointMarkers();
+        if (navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart).length < 2) {
             if (navigationRouteLayer && navigationMapInstance) {
                 try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {}
                 navigationRouteLayer = null;
             }
-            if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
+             if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
             navigationCurrentRouteData = null;
-            hideNavigationUI();
             hideMapInfoOverlay();
-            const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+             const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
             if (radaresRutaCheckbox) {
                 eliminarRadaresDeRuta();
                 actualizarContadorRadares(0);
-                localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresRutaCheckbox.checked)); 
+                localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresRutaCheckbox.checked));
             }
-             const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
+            const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
             if (tareasRutaCheckbox) {
                 eliminarTareasDeBarraProgreso();
                 actualizarContadorTareas(0);
                 localStorage.setItem(TAREAS_RUTA_CHECKED_KEY, String(tareasRutaCheckbox.checked));
             }
         } else {
-            updateWaypointTypesAndLabels();
-            renderWaypointMarkers();
-            if (navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart).length < 2) {
-                if (navigationRouteLayer && navigationMapInstance) {
-                    try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {}
-                    navigationRouteLayer = null;
-                }
-                 if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
-                navigationCurrentRouteData = null;
-                hideMapInfoOverlay();
-                 const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
-                if (radaresRutaCheckbox) {
-                    eliminarRadaresDeRuta();
-                    actualizarContadorRadares(0);
-                    localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresRutaCheckbox.checked));
+            recalculateAndDrawRoute().then(() => {
+                const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+                if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
+                    toggleRadaresRuta(true);
                 }
                 const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
-                if (tareasRutaCheckbox) {
-                    eliminarTareasDeBarraProgreso();
-                    actualizarContadorTareas(0);
-                    localStorage.setItem(TAREAS_RUTA_CHECKED_KEY, String(tareasRutaCheckbox.checked));
+                if (tareasRutaCheckbox && tareasRutaCheckbox.checked) {
+                    toggleTareasRuta(true);
                 }
-            } else {
-                recalculateAndDrawRoute().then(() => {
-                    const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
-                    if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
-                        toggleRadaresRuta(true);
-                    }
-                    const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
-                    if (tareasRutaCheckbox && tareasRutaCheckbox.checked) {
-                        toggleTareasRuta(true);
-                    }
-                });
-            }
-            showToast("Etapa eliminada.", "info");
+            });
         }
-        updateStartNavigationButtonState();
-        updateNavigationButtonColor();
+        showToast("Etapa eliminada.", "info");
     }
+    updateStartNavigationButtonState();
+    updateNavigationButtonColor();
+}
+    
     
     
     
