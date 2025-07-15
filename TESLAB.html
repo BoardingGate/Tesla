@@ -1,4 +1,4 @@
-R13
+R14
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -6156,6 +6156,10 @@ p.ocm-price-info {
     };
 
 
+// ===================================================================
+// [OSMR-ALT] INICIO: VARIABLES GLOBALES PARA RUTAS ALTERNATIVAS (SIMPLIFICADO)
+// ===================================================================
+    let lastAlternativeResponse = null; 
     let isFetchingAlternatives = false;
     let alternativeRouteLayers = {
     short: null,
@@ -6383,90 +6387,163 @@ p.ocm-price-info {
             }
         }).join(', ');
     
+
+
+
 // ===================================================================
-// [OSMR-ALT] NOMBRE: selectAlternativeRoute (VERSIÓN 4 - MODIFICACIÓN DIRECTA)
-// RESUMEN: Procesa la selección de una ruta alternativa modificando directamente el objeto de la ruta principal.
+// [OSMR-ALT] NOMBRE: fetchAndDisplayAlternativeRoutes (VERSIÓN FINAL)
+// RESUMEN: Obtiene y muestra rutas alternativas para un tramo.
 // ===================================================================
-function selectAlternativeRoute(routeType) {
-    if (!currentAlternativeRouteData || !navigationCurrentRouteData) {
-        showToast("Error: No se pueden aplicar los datos de la ruta alternativa.", "error");
+async function fetchAndDisplayAlternativeRoutes(startWaypoint, endWaypoint) {
+    if (!startWaypoint || !endWaypoint || !navigationMapInstance || isFetchingAlternatives) {
+        if (isFetchingAlternatives) showToast("Ya se está buscando una alternativa, espere...", "info");
         return;
     }
 
-    const selectedRouteObject = currentAlternativeRouteData.allRoutesForLeg.find(r => r.routeType === routeType);
-    const legIndexToUpdate = currentAlternativeRouteData.legIndex;
-
-    if (!selectedRouteObject || !selectedRouteObject.legs || selectedRouteObject.legs.length === 0 || legIndexToUpdate < 0 || legIndexToUpdate >= navigationCurrentRouteData.routes[0].legs.length) {
-        showToast("Error al seleccionar la ruta. Datos de la alternativa inválidos.", "error");
-        return;
-    }
-
-    // 1. Obtener el nuevo tramo (leg) del objeto de la ruta alternativa.
-    const newRouteLegData = selectedRouteObject.legs[0];
+    isFetchingAlternatives = true;
+    showToast("Buscando rutas alternativas...", "info", 2000, false, "alt-route-toast");
     
-    // 2. Reemplazar el tramo antiguo por el nuevo en la ruta principal.
-    const mainRoute = navigationCurrentRouteData.routes[0];
-    mainRoute.legs[legIndexToUpdate] = newRouteLegData;
+    try {
+        removeAlternativeRouteLayers();
 
-    // 3. Recalcular la distancia total, duración total y geometría COMPLETA de la ruta principal.
-    let newTotalDistance = 0;
-    let newTotalDuration = 0;
-    let newFullGeometryCoords = [];
+        const coordsString = `${startWaypoint.lng},${startWaypoint.lat};${endWaypoint.lng},${endWaypoint.lat}`;
+        const url = `${OSRM_SERVICE_URL}/driving/${coordsString}?overview=full&geometries=geojson&steps=true&alternatives=true&annotations=true`;
+        
+        const response = await fetch(url);
+        if (!response.ok) throw new Error('OSRM no respondió correctamente.');
+        
+        const data = await response.json();
+        const existingToast = document.getElementById("alt-route-toast");
+        if (existingToast) existingToast.remove();
 
-    mainRoute.legs.forEach(leg => {
-        newTotalDistance += leg.distance;
-        newTotalDuration += leg.duration;
-        if (leg.steps) {
-            leg.steps.forEach(step => {
-                if (step.geometry && step.geometry.coordinates) {
-                    // Evitar duplicar el primer punto de cada nuevo segmento de geometría
-                    const coordsToAdd = newFullGeometryCoords.length === 0 ? step.geometry.coordinates : step.geometry.coordinates.slice(1);
-                    newFullGeometryCoords.push(...coordsToAdd);
-                }
-            });
+        if (!data.routes || data.routes.length === 0) {
+            showToast("No se encontraron rutas para este tramo.", "info");
+            return;
         }
-    });
 
-    mainRoute.distance = newTotalDistance;
-    mainRoute.duration = newTotalDuration;
-    mainRoute.geometry.coordinates = newFullGeometryCoords;
+        // Guardamos la respuesta completa para usarla en la selección.
+        lastAlternativeResponse = {
+            routes: data.routes,
+            startWaypointId: startWaypoint.id,
+            endWaypointId: endWaypoint.id
+        };
+        
+        if (data.routes.length <= 1) {
+            showToast("No hay rutas alternativas disponibles.", "info");
+            return;
+        }
 
-    // 4. Redibujar la ruta principal en el mapa con la nueva geometría.
-    drawRouteOnMap(mainRoute);
+        const routes = data.routes;
+        const fastestRoute = routes[0];
+        let otherRoutes = routes.slice(1).sort((a, b) => a.distance - b.distance);
+        const shortRoute = otherRoutes[0];
+        const alternativeRoute = otherRoutes.length > 1 ? otherRoutes[1] : null;
+
+        if (!alternativeRouteLayers.short) alternativeRouteLayers.short = L.layerGroup().addTo(navigationMapInstance);
+        if (!alternativeRouteLayers.alternative) alternativeRouteLayers.alternative = L.layerGroup().addTo(navigationMapInstance);
+        if (!alternativeRouteLayers.labels) alternativeRouteLayers.labels = L.layerGroup().addTo(navigationMapInstance);
+
+        // Ruta RÁPIDA (la que ya está dibujada) - solo ponemos etiqueta
+        const mainRoutePolyline = L.polyline(fastestRoute.geometry.coordinates.map(c=>[c[1],c[0]]));
+        L.marker(mainRoutePolyline.getCenter(), { icon: createRouteLabelIcon('RAP', '#3388ff') })
+            .on('click', () => selectAlternativeRoute(0))
+            .addTo(alternativeRouteLayers.labels);
+        
+        // Ruta CORTA
+        const shortRoutePolyline = L.polyline(shortRoute.geometry.coordinates.map(c=>[c[1],c[0]]), { color: '#BA6BFF', weight: 6, opacity: 0.8 })
+            .on('click', () => selectAlternativeRoute(routes.indexOf(shortRoute)))
+            .addTo(alternativeRouteLayers.short);
+        L.marker(shortRoutePolyline.getCenter(), { icon: createRouteLabelIcon('COR', '#BA6BFF') })
+            .on('click', () => selectAlternativeRoute(routes.indexOf(shortRoute)))
+            .addTo(alternativeRouteLayers.labels);
+
+        // Ruta ALTERNATIVA
+        if (alternativeRoute) {
+            const altRoutePolyline = L.polyline(alternativeRoute.geometry.coordinates.map(c=>[c[1],c[0]]), { color: '#FF5900', weight: 6, opacity: 0.8 })
+                .on('click', () => selectAlternativeRoute(routes.indexOf(alternativeRoute)))
+                .addTo(alternativeRouteLayers.alternative);
+            L.marker(altRoutePolyline.getCenter(), { icon: createRouteLabelIcon('ALT', '#FF5900') })
+                .on('click', () => selectAlternativeRoute(routes.indexOf(alternativeRoute)))
+                .addTo(alternativeRouteLayers.labels);
+        }
+
+    } catch (error) {
+        showToast("Error al obtener rutas alternativas.", "error");
+        console.error("Error en fetchAndDisplayAlternativeRoutes:", error);
+    } finally {
+        isFetchingAlternatives = false;
+    }
+}
+
+// ===================================================================
+// [OSMR-ALT] NOMBRE: selectAlternativeRoute (VERSIÓN FINAL REESCRITA)
+// RESUMEN: Reemplaza la ruta principal por la alternativa seleccionada.
+// ===================================================================
+async function selectAlternativeRoute(selectedRouteIndex) {
+    if (!lastAlternativeResponse || !lastAlternativeResponse.routes[selectedRouteIndex]) {
+        showToast("Error: No se pueden aplicar los datos de la ruta.", "error");
+        return;
+    }
     
-    // 5. Limpiar las alternativas visuales del mapa.
+    const selectedRoute = lastAlternativeResponse.routes[selectedRouteIndex];
+    
+    // Si se selecciona la ruta rápida (índice 0), simplemente limpiamos las alternativas.
+    if (selectedRouteIndex === 0) {
+        removeAlternativeRouteLayers();
+        showToast("Ruta rápida seleccionada.", "info");
+        return;
+    }
+
+    // 1. Tomamos una copia de los waypoints originales.
+    const originalWaypoints = [...navigationWaypoints];
+    
+    // 2. Reemplazamos el objeto de ruta principal por el de la alternativa.
+    navigationCurrentRouteData = {
+        ...navigationCurrentRouteData, // Copiamos propiedades como 'code'
+        routes: [selectedRoute]
+    };
+    
+    // 3. Ajustamos los waypoints del nuevo objeto de ruta.
+    // OSRM devuelve los waypoints que usó, los reemplazamos por los nuestros para mantener los IDs y direcciones.
+    const startWp = originalWaypoints.find(wp => wp.id === lastAlternativeResponse.startWaypointId);
+    const endWp = originalWaypoints.find(wp => wp.id === lastAlternativeResponse.endWaypointId);
+    
+    if (startWp && endWp && navigationCurrentRouteData.routes[0].waypoints.length === 2) {
+        navigationCurrentRouteData.routes[0].waypoints[0] = { ...navigationCurrentRouteData.routes[0].waypoints[0], name: startWp.address, location: [startWp.lng, startWp.lat] };
+        navigationCurrentRouteData.routes[0].waypoints[1] = { ...navigationCurrentRouteData.routes[0].waypoints[1], name: endWp.address, location: [endWp.lng, endWp.lat] };
+    }
+    
+    // 4. Redibujar la ruta principal y limpiar alternativas
+    drawRouteOnMap(selectedRoute);
     removeAlternativeRouteLayers();
     
-    // 6. Actualizar la UI y los datos dependientes.
+    // 5. Actualizar la UI
+    showToast("Cambiando a ruta alternativa...", "success");
     if (isNavigating) {
-        updateNavigationProgressDisplay(mainRoute, lastCarDistanceAlongRouteForNavLogic);
-        showToast(`Ruta cambiada. ETA actualizado.`, "info");
+        await recalculateAndDrawRoute(true); // Forzamos un recálculo para que todo el sistema se entere del cambio
+    } else {
+        updateNavigationProgressDisplay(selectedRoute);
     }
     
     if (document.getElementById('radares-ruta-checkbox')?.checked) {
         toggleRadaresRuta(true);
     }
-    if (document.getElementById('tareas-ruta-checkbox')?.checked) {
-        toggleTareasRuta(true);
-    }
-    
-    showToast(`Ruta cambiada a la más ${routeType === 'short' ? 'corta' : (routeType === 'fastest' ? 'rápida' : 'alternativa')}.`, "success");
 }
-    
+
 
 // ===================================================================
-// [OSMR-ALT] NOMBRE: removeAlternativeRouteLayers
+// [OSMR-ALT] NOMBRE: removeAlternativeRouteLayers (Sin cambios, pero necesaria)
 // RESUMEN: Elimina las capas de rutas alternativas y sus etiquetas del mapa.
 // ===================================================================
 function removeAlternativeRouteLayers() {
     if (alternativeRouteLayers.short) alternativeRouteLayers.short.clearLayers();
     if (alternativeRouteLayers.alternative) alternativeRouteLayers.alternative.clearLayers();
     if (alternativeRouteLayers.labels) alternativeRouteLayers.labels.clearLayers();
-    currentAlternativeRouteData = null;
+    lastAlternativeResponse = null;
 }
 
 // ===================================================================
-// [OSMR-ALT] NOMBRE: createRouteLabelIcon
+// [OSMR-ALT] NOMBRE: createRouteLabelIcon (Sin cambios, pero necesaria)
 // RESUMEN: Crea un icono personalizado para las etiquetas de ruta (RAP, COR, ALT).
 // ===================================================================
 function createRouteLabelIcon(text, color) {
@@ -6491,13 +6568,15 @@ function createRouteLabelIcon(text, color) {
     `;
     return L.divIcon({
         html: iconHtml,
-        className: '', // Sin clase extra
+        className: '',
         iconSize: [34, 34],
         iconAnchor: [17, 17]
     });
 }
 
 
+
+    
     
 // ===================================================================
 // NOMBRE: vehicleIcon (const)
@@ -16958,9 +17037,8 @@ function handleLocateMeClick(locateMeButton) {
     
     
     
-    
-   // ===================================================================
-// NOMBRE: handleLoadOrDeleteRouteClick (VERSIÓN CORREGIDA)
+ // ===================================================================
+// NOMBRE: handleLoadOrDeleteRouteClick (VERSIÓN FINAL)
 // RESUMEN: Borra la ruta actual del mapa.
 // ===================================================================
 function handleLoadOrDeleteRouteClick(button) {
@@ -16972,8 +17050,7 @@ function handleLoadOrDeleteRouteClick(button) {
         stopAutomatedRouteSimulation();
     }
     
-    // [OSMR-ALT] CORRECCIÓN: Limpiar las rutas alternativas visibles
-    removeAlternativeRouteLayers();
+    removeAlternativeRouteLayers(); // Limpia trazados alternativos
 
     clearNavigationGraph();
     clearAllWaypointMarkersFromMap();
@@ -16988,6 +17065,7 @@ function handleLoadOrDeleteRouteClick(button) {
     if (maxSpeedMarkerLayer) maxSpeedMarkerLayer.clearLayers();
     if (speedMilestoneLayer) speedMilestoneLayer.clearLayers();
     navigationCurrentRouteData = null;
+    lastAlternativeResponse = null; // [OSMR-ALT] Limpiar estado
     hideNavigationUI();
     hideMapInfoOverlay();
     eliminarRadaresDeRuta();
@@ -16998,16 +17076,7 @@ function handleLoadOrDeleteRouteClick(button) {
     showToast("Ruta actual borrada del mapa", "info");
     updateStartNavigationButtonState();
     updateNavigationButtonColor();
-} 
-    
-
-
-    
-    
-    
-    
-    
-    
+}   
     
     
     
@@ -18054,100 +18123,8 @@ function positionTurnHelpers() {
    }
 
 
-// ===================================================================
-// [OSMR-ALT] NOMBRE: fetchAndDisplayAlternativeRoutes (VERSIÓN 7 - LÓGICA FINAL)
-// RESUMEN: Obtiene y muestra rutas alternativas para un tramo específico, independientemente del estado actual.
-// ===================================================================
-async function fetchAndDisplayAlternativeRoutes(startWaypoint, endWaypoint) {
-    if (!startWaypoint || !endWaypoint || !navigationMapInstance) {
-        return;
-    }
-    
-    if (isRecalculatingRoute || isFetchingAlternatives) {
-        showToast("Calculando ruta, por favor espere...", "info");
-        return;
-    }
-    
-    isFetchingAlternatives = true;
-    
-    try {
-        removeAlternativeRouteLayers();
 
-        const coordsString = `${startWaypoint.lng},${startWaypoint.lat};${endWaypoint.lng},${endWaypoint.lat}`;
-        const url = `${OSRM_SERVICE_URL}/driving/${coordsString}?overview=full&geometries=geojson&steps=true&alternatives=true&annotations=true`;
-        
-        const response = await fetch(url);
-        if (!response.ok) throw new Error('OSRM no pudo devolver una respuesta válida.');
-        
-        const data = await response.json();
-        if (!data.routes || data.routes.length <= 1) {
-            showToast("No hay rutas alternativas disponibles para este tramo.", "info");
-            return;
-        }
 
-        const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal);
-        const startIndexInActual = actualWaypoints.findIndex(wp => wp.id === startWaypoint.id);
-        const legIndex = startIndexInActual;
-
-        if (legIndex < 0) {
-            console.error("Error: No se pudo encontrar el índice del tramo inicial.");
-            return;
-        }
-
-        currentAlternativeRouteData = {
-            allRoutesForLeg: data.routes,
-            legIndex: legIndex
-        };
-
-        const fastestRoute = data.routes[0];
-        let potentialAlternatives = data.routes.slice(1);
-        potentialAlternatives.sort((a, b) => a.distance - b.distance);
-        
-        const shortRoute = potentialAlternatives[0];
-        const alternativeRoute = potentialAlternatives.length > 1 ? potentialAlternatives[1] : null;
-
-        if(fastestRoute) fastestRoute.routeType = 'fastest';
-        if(shortRoute) shortRoute.routeType = 'short';
-        if(alternativeRoute) alternativeRoute.routeType = 'alternative';
-        
-        if (!alternativeRouteLayers.short) alternativeRouteLayers.short = L.layerGroup().addTo(navigationMapInstance);
-        if (!alternativeRouteLayers.alternative) alternativeRouteLayers.alternative = L.layerGroup().addTo(navigationMapInstance);
-        if (!alternativeRouteLayers.labels) alternativeRouteLayers.labels = L.layerGroup().addTo(navigationMapInstance);
-        
-        // DIBUJAR RUTA CORTA
-        if (shortRoute) {
-            const shortRouteCoords = shortRoute.geometry.coordinates.map(coord => [coord[1], coord[0]]);
-            const shortPolyline = L.polyline(shortRouteCoords, { color: '#BA6BFF', weight: 6, opacity: 0.8 }).on('click', () => selectAlternativeRoute('short')).addTo(alternativeRouteLayers.short);
-            const shortLabelPos = shortPolyline.getCenter();
-            L.marker(shortLabelPos, { icon: createRouteLabelIcon('COR', '#BA6BFF') }).on('click', () => selectAlternativeRoute('short')).addTo(alternativeRouteLayers.labels);
-        }
-
-        // DIBUJAR RUTA ALTERNATIVA
-        if (alternativeRoute) {
-            const altRouteCoords = alternativeRoute.geometry.coordinates.map(coord => [coord[1], coord[0]]);
-            const altPolyline = L.polyline(altRouteCoords, { color: '#FF5900', weight: 6, opacity: 0.8 }).on('click', () => selectAlternativeRoute('alternative')).addTo(alternativeRouteLayers.alternative);
-            const altLabelPos = altPolyline.getCenter();
-            L.marker(altLabelPos, { icon: createRouteLabelIcon('ALT', '#FF5900') }).on('click', () => selectAlternativeRoute('alternative')).addTo(alternativeRouteLayers.labels);
-        }
-        
-        // [OSMR-ALT] CORRECCIÓN FINAL: DIBUJAR ETIQUETA RUTA RÁPIDA
-        // Se dibuja la ruta rápida (que está en la capa principal) y se le pone su etiqueta.
-        // La etiqueta para la ruta rápida se basa SIEMPRE en la primera ruta devuelta por la API en ESTA llamada.
-        if (fastestRoute) {
-            const currentMainRoutePolyline = L.polyline(fastestRoute.geometry.coordinates.map(c => [c[1], c[0]]));
-            const mainLabelPos = currentMainRoutePolyline.getCenter();
-            L.marker(mainLabelPos, { icon: createRouteLabelIcon('RAP', '#3388ff') }).on('click', () => {
-                 selectAlternativeRoute('fastest');
-            }).addTo(alternativeRouteLayers.labels);
-        }
-
-    } catch (error) {
-        showToast("Error al obtener rutas alternativas.", "error");
-        console.error("Error en fetchAndDisplayAlternativeRoutes:", error);
-    } finally {
-        isFetchingAlternatives = false;
-    }
-}
 
     
     
