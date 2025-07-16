@@ -1,4 +1,4 @@
-L19
+L20
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -11122,21 +11122,16 @@ async function saveCurrentRoute() {
 }      
 
 
+
 // ===================================================================
-// NOMBRE: selectAlternativeRoute (VERSIÓN FINAL Y DEFINITIVA 2)
-// RESUMEN: Actualiza la ruta principal sin llamar a un recálculo completo.
+// NOMBRE: selectAlternativeRoute (VERSIÓN FINAL Y DEFINITIVA 3 - SIN RECALCULAR)
+// RESUMEN: Actualiza la ruta principal con la alternativa seleccionada sin llamar a la API.
 // ===================================================================
 async function selectAlternativeRoute(waypointId, routeType) {
-    if (!alternativeRoutesCache.has(waypointId)) {
-        showToast("Error de caché: No se encontraron datos para la ruta seleccionada.", "error");
-        return;
-    }
+    if (!alternativeRoutesCache.has(waypointId)) return;
     if (!navigationCurrentRouteData || !navigationRouteLayer) return;
 
-    // --- INICIO LÓGICA CORREGIDA: Bloqueo de estado ---
-    isRecalculatingRoute = true;
-    showToast("Cambiando trazado de etapa...", "info", 1500);
-    // --- FIN LÓGICA CORREGIDA ---
+    isRecalculatingRoute = true; // Bloquear otras operaciones mientras se actualiza
 
     const routesData = alternativeRoutesCache.get(waypointId);
     const selectedRouteData = routesData[routeType];
@@ -11146,50 +11141,45 @@ async function selectAlternativeRoute(waypointId, routeType) {
         isRecalculatingRoute = false;
         return;
     }
+    
+    // Obtener el índice del leg que corresponde a esta etapa
+    const endWaypointIndex = navigationWaypoints.findIndex(wp => wp && wp.id === waypointId);
+    const legIndex = navigationWaypoints.filter((wp, i) => wp && !wp.isInternal && i < endWaypointIndex).length - 1;
 
-    selectedStageRoutes.set(waypointId, routeType);
-    
-    // El núcleo del problema: NO se llama a recalculateAndDrawRoute.
-    // En su lugar, se actualiza directamente el objeto de datos y la capa del mapa.
-    const allWaypoints = [...navigationWaypoints];
-    const coordsString = allWaypoints.map(wp => `${wp.lng},${wp.lat}`).join(';');
-    
-    // Simulamos una llamada a OSRM para obtener la nueva ruta completa
-    const url = `${OSRM_SERVICE_URL}/driving/${coordsString}?overview=full&geometries=geojson&steps=true&alternatives=false&annotations=true`;
-    
-    // Esta parte es una "re-implementación" manual de lo que hacía recalculate, pero sin efectos secundarios
-    try {
-        const response = await fetch(url);
-        if (!response.ok) throw new Error('Fallo al obtener la nueva ruta completa');
-        const data = await response.json();
-        
-        if (data.routes && data.routes.length > 0) {
-            // Actualizamos los datos principales
-            navigationCurrentRouteData = data;
-            
-            // Actualizamos la capa visual
-            const newRouteCoords = data.routes[0].geometry.coordinates.map(coord => [coord[1], coord[0]]);
-            navigationRouteLayer.setLatLngs(newRouteCoords);
-            
-            // Refrescamos la UI con los nuevos datos
-            if (isNavigating) {
-                const route = data.routes[0];
-                if (route.legs && route.legs.length > 0) {
-                    currentStageInitialExpectedEtaTime = new Date(Date.now() + route.legs[0].duration * 1000);
-                }
-                updateNavigationProgressDisplay(route, lastCarDistanceAlongRouteForNavLogic);
-                updateTurnByTurnDisplay(route, lastCarDistanceAlongRouteForNavLogic);
-            } else {
-                updateTurnByTurnDisplay(data.routes[0], 0);
-                updateNavigationProgressDisplay(data.routes[0], 0);
-            }
-        } else {
-            throw new Error("OSRM no devolvió rutas válidas");
-        }
-    } catch (error) {
-        showToast("Error al reconstruir la ruta: " + error.message, "error");
-        isRecalculatingRoute = false; // Desbloquear en caso de error
+    if (legIndex < 0 || legIndex >= navigationCurrentRouteData.routes[0].legs.length) {
+        showToast("Error: No se pudo identificar la etapa en la ruta actual.", "error");
+        isRecalculatingRoute = false;
         return;
+    }
+
+    // Reemplazar solo el 'leg' correspondiente en los datos de la ruta principal
+    navigationCurrentRouteData.routes[0].legs[legIndex] = selectedRouteData;
+
+    // Recalcular la geometría completa de la ruta a partir de los 'legs' actualizados
+    let fullRouteCoords = [];
+    navigationCurrentRouteData.routes[0].legs.forEach(leg => {
+        const legCoords = leg.geometry.coordinates.map(c => [c[1], c[0]]);
+        // Evitar duplicar el punto de unión
+        if (fullRouteCoords.length > 0) {
+            fullRouteCoords.pop();
+        }
+        fullRouteCoords.push(...legCoords);
+    });
+
+    // Actualizar la capa visual del mapa con la nueva geometría
+    navigationRouteLayer.setLatLngs(fullRouteCoords);
+    
+    // Recalcular la distancia y duración total de la ruta
+    navigationCurrentRouteData.routes[0].distance = navigationCurrentRouteData.routes[0].legs.reduce((sum, leg) => sum + leg.distance, 0);
+    navigationCurrentRouteData.routes[0].duration = navigationCurrentRouteData.routes[0].legs.reduce((sum, leg) => sum + leg.duration, 0);
+
+    // Refrescar la UI
+    if (isNavigating) {
+        updateNavigationProgressDisplay(navigationCurrentRouteData.routes[0], lastCarDistanceAlongRouteForNavLogic);
+        updateTurnByTurnDisplay(navigationCurrentRouteData.routes[0], lastCarDistanceAlongRouteForNavLogic);
+    } else {
+        updateTurnByTurnDisplay(navigationCurrentRouteData.routes[0], 0);
+        updateNavigationProgressDisplay(navigationCurrentRouteData.routes[0], 0);
     }
 
     clearAlternativeRoutesDisplay();
@@ -11204,10 +11194,9 @@ async function selectAlternativeRoute(waypointId, routeType) {
     const translatedType = routeTypeTranslations[routeType] || routeType.toUpperCase();
     showToast(`Ruta para esta etapa cambiada a: ${translatedType}.`, "success");
 
-    // --- INICIO LÓGICA CORREGIDA: Desbloqueo de estado ---
-    isRecalculatingRoute = false;
-    // --- FIN LÓGICA CORREGIDA ---
+    isRecalculatingRoute = false; // Desbloquear estado
 }
+    
     
 
 // ===================================================================
@@ -11452,8 +11441,7 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
         compassAndModeControl.updateMaxSpeed(maxSpeedDuringTrip);
     }
 
-    // --- INICIO DE LA LÓGICA CORREGIDA ---
-    if (isNavigating && !isRecalculatingRoute) { // Comprobación clave
+    if (isNavigating && !isRecalculatingRoute) {
         const route = navigationCurrentRouteData?.routes?.[0];
         if (route && typeof turf !== 'undefined' && navigationRouteLayer) {
             const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal);
@@ -11475,7 +11463,6 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
                 }
             }
         }
-        // --- FIN DE LA LÓGICA CORREGIDA ---
 
         if (!navigationStartTimeForStats && tripStartLocationForStats) {
             const distanceFromTripStart = calculateDistance(
@@ -11547,6 +11534,8 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
     navigationTargetZoom = null;
 }
 
+
+    
     
 
 
@@ -19785,7 +19774,7 @@ function createWaypointMarkerIcon(label, type, visited, currentZoomLevel = null)
 
 // ===================================================================
 // NOMBRE: renderWaypointMarkers (VERSIÓN FINAL Y DEFINITIVA 2)
-// RESUMEN: Corrige el error de referencia del popup.
+// RESUMEN: Implementa correctamente la pulsación corta y larga en marcadores.
 // ===================================================================
 function renderWaypointMarkers() {
     if (!navigationMapInstance) return;
@@ -19823,7 +19812,7 @@ function renderWaypointMarkers() {
         let pressTimer = null;
         let isLongPressTriggered = false;
 
-        const handlePressStart = () => {
+        const handlePressStart = (e) => {
             isLongPressTriggered = false;
             pressTimer = setTimeout(() => {
                 isLongPressTriggered = true;
@@ -19846,16 +19835,15 @@ function renderWaypointMarkers() {
         wp.marker.on('touchend', handlePressEnd);
         wp.marker.on('dragstart', () => clearTimeout(pressTimer));
         
-        // --- INICIO DE LA CORRECCIÓN: Definición de 'popup' en el ámbito correcto ---
         const popup = L.popup({ maxWidth: 250, autoPanPadding: L.point(50, 50), closeButton: true });
         wp.marker.bindPopup(popup);
-        // --- FIN DE LA CORRECCIÓN ---
-
+        
         wp.marker.on('click', async (e) => {
             if (isLongPressTriggered) return;
 
             if (isNavigating) {
                 L.DomEvent.stopPropagation(e);
+                // En navegación, el clic largo ya muestra las alternativas. El clic corto no hace nada.
                 return;
             }
             
@@ -19863,7 +19851,6 @@ function renderWaypointMarkers() {
             const waypoint = navigationWaypoints.find(w => w && w.id === wp.id);
             if (!waypoint) return;
 
-            // Rellenar el popup con un mensaje de carga inicial
             popup.setContent(`<strong>Punto ${waypoint.label}</strong><br>Cargando datos...`).update();
             
             let address = waypoint.address || "Calculando dirección...";
@@ -19958,7 +19945,6 @@ function renderWaypointMarkers() {
         });
     });
 }
-
 
     
     
