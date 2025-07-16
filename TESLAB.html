@@ -1,4 +1,4 @@
-L16
+L17
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -11110,79 +11110,91 @@ async function saveCurrentRoute() {
 
 
 // ===================================================================
-// NOMBRE: selectAlternativeRoute (VERSIÓN CORREGIDA 4)
-// RESUMEN: Asocia puntos internos a su etapa y recalcula la ruta.
+// NOMBRE: selectAlternativeRoute (VERSIÓN FINAL Y DEFINITIVA 2)
+// RESUMEN: Actualiza la ruta principal sin llamar a un recálculo completo.
 // ===================================================================
 async function selectAlternativeRoute(waypointId, routeType) {
     if (!alternativeRoutesCache.has(waypointId)) {
         showToast("Error de caché: No se encontraron datos para la ruta seleccionada.", "error");
         return;
     }
+    if (!navigationCurrentRouteData || !navigationRouteLayer) return;
+
+    // --- INICIO LÓGICA CORREGIDA: Bloqueo de estado ---
+    isRecalculatingRoute = true;
+    showToast("Cambiando trazado de etapa...", "info", 1500);
+    // --- FIN LÓGICA CORREGIDA ---
 
     const routesData = alternativeRoutesCache.get(waypointId);
     const selectedRouteData = routesData[routeType];
 
-    if (!selectedRouteData || !selectedRouteData.geometry || !selectedRouteData.geometry.coordinates) {
-        showToast("Error: La ruta alternativa seleccionada no tiene geometría válida.", "error");
+    if (!selectedRouteData) {
+        showToast("Error: No se encontraron los datos de la ruta seleccionada.", "error");
+        isRecalculatingRoute = false;
         return;
     }
 
     selectedStageRoutes.set(waypointId, routeType);
-
-    const endWaypointIndex = navigationWaypoints.findIndex(wp => wp && wp.id === waypointId);
-    if (endWaypointIndex < 1) return;
-
-    let startWaypointIndex = -1;
-    for (let i = endWaypointIndex - 1; i >= 0; i--) {
-        if (navigationWaypoints[i] && !navigationWaypoints[i].isInternal) {
-            startWaypointIndex = i;
-            break;
+    
+    // El núcleo del problema: NO se llama a recalculateAndDrawRoute.
+    // En su lugar, se actualiza directamente el objeto de datos y la capa del mapa.
+    const allWaypoints = [...navigationWaypoints];
+    const coordsString = allWaypoints.map(wp => `${wp.lng},${wp.lat}`).join(';');
+    
+    // Simulamos una llamada a OSRM para obtener la nueva ruta completa
+    const url = `${OSRM_SERVICE_URL}/driving/${coordsString}?overview=full&geometries=geojson&steps=true&alternatives=false&annotations=true`;
+    
+    // Esta parte es una "re-implementación" manual de lo que hacía recalculate, pero sin efectos secundarios
+    try {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error('Fallo al obtener la nueva ruta completa');
+        const data = await response.json();
+        
+        if (data.routes && data.routes.length > 0) {
+            // Actualizamos los datos principales
+            navigationCurrentRouteData = data;
+            
+            // Actualizamos la capa visual
+            const newRouteCoords = data.routes[0].geometry.coordinates.map(coord => [coord[1], coord[0]]);
+            navigationRouteLayer.setLatLngs(newRouteCoords);
+            
+            // Refrescamos la UI con los nuevos datos
+            if (isNavigating) {
+                const route = data.routes[0];
+                if (route.legs && route.legs.length > 0) {
+                    currentStageInitialExpectedEtaTime = new Date(Date.now() + route.legs[0].duration * 1000);
+                }
+                updateNavigationProgressDisplay(route, lastCarDistanceAlongRouteForNavLogic);
+                updateTurnByTurnDisplay(route, lastCarDistanceAlongRouteForNavLogic);
+            } else {
+                updateTurnByTurnDisplay(data.routes[0], 0);
+                updateNavigationProgressDisplay(data.routes[0], 0);
+            }
+        } else {
+            throw new Error("OSRM no devolvió rutas válidas");
         }
+    } catch (error) {
+        showToast("Error al reconstruir la ruta: " + error.message, "error");
+        isRecalculatingRoute = false; // Desbloquear en caso de error
+        return;
     }
-    if (startWaypointIndex === -1) return;
-
-    // Limpiar puntos internos ANTERIORES de ESTA etapa específica
-    navigationWaypoints = navigationWaypoints.filter(wp => !(wp.isInternal && wp.parentWaypointId === waypointId));
-    
-    const geometryPoints = selectedRouteData.geometry.coordinates;
-    const totalPoints = geometryPoints.length;
-    const maxInternalPoints = 10;
-    const step = totalPoints > maxInternalPoints + 2 ? Math.floor((totalPoints - 2) / maxInternalPoints) : 1;
-    
-    const internalWaypoints = [];
-    for (let i = step; i < totalPoints - 1; i += step) {
-         const coord = geometryPoints[i];
-         internalWaypoints.push({
-            id: Date.now() + Math.random() + i,
-            lat: coord[1],
-            lng: coord[0],
-            type: 'internal',
-            label: '',
-            address: 'Punto de paso interno',
-            isInternal: true,
-            // --- LÍNEA CLAVE AÑADIDA ---
-            parentWaypointId: waypointId, // Asocia este punto a su etapa
-            visited: false,
-            isCriticalForRecalc: true
-        });
-    }
-
-    const newEndIndex = navigationWaypoints.findIndex(wp => wp && wp.id === waypointId);
-    navigationWaypoints.splice(newEndIndex, 0, ...internalWaypoints);
 
     clearAlternativeRoutesDisplay();
-    await recalculateAndDrawRoute(isNavigating);
+
+    const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+    if (radaresRutaCheckbox && radaresRutaCheckbox.checked) toggleRadaresRuta(true);
     
-    const routeTypeTranslations = {
-        'fastest': 'RÁPIDA',
-        'shortest': 'CORTA',
-        'alternative': 'ALTERNATIVA'
-    };
+    const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
+    if (tareasRutaCheckbox && tareasRutaCheckbox.checked) toggleTareasRuta(true);
+    
+    const routeTypeTranslations = {'fastest': 'RÁPIDA', 'shortest': 'CORTA', 'alternative': 'ALTERNATIVA'};
     const translatedType = routeTypeTranslations[routeType] || routeType.toUpperCase();
-    showToast(`Ruta para esta etapa cambiada a: ${translatedType}. Recalculando...`, "success");
+    showToast(`Ruta para esta etapa cambiada a: ${translatedType}.`, "success");
+
+    // --- INICIO LÓGICA CORREGIDA: Desbloqueo de estado ---
+    isRecalculatingRoute = false;
+    // --- FIN LÓGICA CORREGIDA ---
 }
-
-
     
 
 // ===================================================================
@@ -11369,8 +11381,8 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
 
 
 // ===================================================================
-// NOMBRE: updateInitialUserPosition (VERSIÓN FINAL Y DEFINITIVA 2)
-// RESUMEN: Marca etapas como visitadas estrictamente por proximidad.
+// NOMBRE: updateInitialUserPosition (VERSIÓN FINAL Y DEFINITIVA 3)
+// RESUMEN: Marca etapas como visitadas solo si no se está recalculando.
 // ===================================================================
 function updateInitialUserPosition(coords, mapInstanceToUse) {
     if (!mapInstanceToUse || !coords || typeof coords.latitude !== 'number' || typeof coords.longitude !== 'number') {
@@ -11427,7 +11439,8 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
         compassAndModeControl.updateMaxSpeed(maxSpeedDuringTrip);
     }
 
-    if (isNavigating) {
+    // --- INICIO DE LA LÓGICA CORREGIDA ---
+    if (isNavigating && !isRecalculatingRoute) { // Comprobación clave
         const route = navigationCurrentRouteData?.routes?.[0];
         if (route && typeof turf !== 'undefined' && navigationRouteLayer) {
             const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal);
@@ -11449,6 +11462,7 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
                 }
             }
         }
+        // --- FIN DE LA LÓGICA CORREGIDA ---
 
         if (!navigationStartTimeForStats && tripStartLocationForStats) {
             const distanceFromTripStart = calculateDistance(
@@ -11518,8 +11532,9 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
         currentSmoothedMapCenter = null;
     }
     navigationTargetZoom = null;
-} 
+}
 
+    
 
 
 
@@ -19754,9 +19769,9 @@ function createWaypointMarkerIcon(label, type, visited, currentZoomLevel = null)
     
     
     
-// ===================================================================
-// NOMBRE: renderWaypointMarkers (MODIFICADA 3 - TOQUE LARGO TÁCTIL)
-// RESUMEN: Añade listeners táctiles para la pulsación larga en marcadores.
+ // ===================================================================
+// NOMBRE: renderWaypointMarkers (VERSIÓN FINAL Y DEFINITIVA)
+// RESUMEN: Implementa correctamente la pulsación corta y larga en marcadores.
 // ===================================================================
 function renderWaypointMarkers() {
     if (!navigationMapInstance) return;
@@ -19791,56 +19806,42 @@ function renderWaypointMarkers() {
             }
         }
         
+        // --- LÓGICA DE PULSACIÓN LARGA Y CORTA REVISADA ---
         let pressTimer = null;
-        let isLongPress = false;
+        let isLongPressTriggered = false;
 
-        const handlePressStart = () => {
-            isLongPress = false;
+        const handlePressStart = (e) => {
+            isLongPressTriggered = false;
             pressTimer = setTimeout(() => {
-                isLongPress = true;
-                wp.marker.closePopup();
-                fetchAndDisplayAlternativeRoutes(wp.id);
-            }, 500);
+                isLongPressTriggered = true;
+                wp.marker.closePopup(); // Cierra el popup si estuviera abierto
+                // Acción de pulsación larga: mostrar alternativas
+                if (wp.type !== 'S' && wp.type !== 'S_Recalc') {
+                    fetchAndDisplayAlternativeRoutes(wp.id);
+                }
+            }, 600); // Umbral de 600ms para la pulsación larga
         };
 
         const handlePressEnd = () => {
             clearTimeout(pressTimer);
-            if (!isLongPress) {
-                wp.marker.fire('click');
-            }
         };
 
         wp.marker.on('mousedown', handlePressStart);
         wp.marker.on('mouseup', handlePressEnd);
-        wp.marker.on('touchstart', (e) => {
-            L.DomEvent.preventDefault(e.originalEvent);
-            L.DomEvent.stopPropagation(e.originalEvent);
-            handlePressStart();
-        });
-        wp.marker.on('touchend', (e) => {
-            L.DomEvent.preventDefault(e.originalEvent);
-            L.DomEvent.stopPropagation(e.originalEvent);
-            handlePressEnd();
-        });
-        
+        wp.marker.on('touchstart', handlePressStart);
+        wp.marker.on('touchend', handlePressEnd);
         wp.marker.on('dragstart', () => clearTimeout(pressTimer));
         
-        let popupContent = `<strong>Punto ${wp.label}</strong><br>Cargando datos...`;
-        const popup = L.popup({ maxWidth: 250, autoPanPadding: L.point(50, 50), closeButton: true }).setContent(popupContent);
-        wp.marker.bindPopup(popup);
-
+        // El evento 'click' ahora solo gestiona la apertura del popup
         wp.marker.on('click', async (e) => {
-            if (isLongPress) return;
+            if (isLongPressTriggered) return; // Si se disparó la pulsación larga, no hacemos nada más
 
             if (isNavigating) {
                 L.DomEvent.stopPropagation(e);
-                const waypoint = navigationWaypoints.find(w => w && w.id === wp.id);
-                if (waypoint && (waypoint.type === 'F' || waypoint.type === 'intermediate')) {
-                    fetchAndDisplayAlternativeRoutes(waypoint.id);
-                }
-                return;
+                return; // En navegación, el clic simple no hace nada, solo la pulsación larga
             }
             
+            // Lógica para rellenar el contenido del popup
             if (!navigationMapInstance) return;
             const waypoint = navigationWaypoints.find(w => w && w.id === wp.id);
             if (!waypoint) return;
@@ -19863,20 +19864,7 @@ function renderWaypointMarkers() {
                 const route = navigationCurrentRouteData.routes[0];
                 let cumulativeDistanceToThisWp = 0;
                 let cumulativeDurationToThisWp = 0;
-                if (actualWaypointIndexInRoute === 0) {
-                    if (isNavigating) {
-                        distanceToWaypoint = 0;
-                        timeToWaypoint = 0;
-                    } else {
-                         if (typeof waypoint.lat === 'number' && typeof waypoint.lng === 'number') {
-                            const tempRouteToS = await getRouteForSingleLeg(currentCarPosForPopup.longitude, currentCarPosForPopup.latitude, waypoint.lng, waypoint.lat);
-                            if (tempRouteToS) {
-                                distanceToWaypoint = tempRouteToS.distance;
-                                timeToWaypoint = tempRouteToS.duration;
-                            }
-                        }
-                    }
-                } else if (actualWaypointIndexInRoute > 0) {
+                if (actualWaypointIndexInRoute > 0) {
                     for (let i = 0; i < actualWaypointIndexInRoute && i < route.legs.length; i++) {
                         if (route.legs[i]) {
                            cumulativeDistanceToThisWp += (route.legs[i].distance || 0);
@@ -19885,29 +19873,9 @@ function renderWaypointMarkers() {
                     }
                     distanceToWaypoint = cumulativeDistanceToThisWp;
                     timeToWaypoint = cumulativeDurationToThisWp;
-                    if (isNavigating && navigationMapInstance && typeof L.GeometryUtil !== 'undefined' && L.GeometryUtil) {
-                        let distanceCoveredOnRoute = lastCarDistanceAlongRouteForNavLogic;
-                        distanceToWaypoint = Math.max(0, cumulativeDistanceToThisWp - distanceCoveredOnRoute);
-                        if (route.distance && route.distance > 0) {
-                            timeToWaypoint = route.duration * (distanceToWaypoint / route.distance);
-                        } else {
-                            timeToWaypoint = 0;
-                        }
-                    }
                 }
                  if (typeof timeToWaypoint === 'number' && !isNaN(timeToWaypoint)) {
                     etaToWaypoint = new Date(Date.now() + timeToWaypoint * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-                }
-            } else if (currentCarPosForPopup) {
-                 if (typeof waypoint.lat === 'number' && typeof waypoint.lng === 'number') {
-                    const tempRoute = await getRouteForSingleLeg(currentCarPosForPopup.longitude, currentCarPosForPopup.latitude, waypoint.lng, waypoint.lat);
-                    if (tempRoute) {
-                        distanceToWaypoint = tempRoute.distance;
-                        timeToWaypoint = tempRoute.duration;
-                        if (typeof timeToWaypoint === 'number' && !isNaN(timeToWaypoint)) {
-                           etaToWaypoint = new Date(Date.now() + timeToWaypoint * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-                        }
-                    }
                 }
             }
             let distanciaTexto = "-- km";
@@ -19935,49 +19903,28 @@ function renderWaypointMarkers() {
                     ${alternativesButtonHtml}
                     ${showDeleteButtonInPopup ? `<button data-waypoint-id="${waypoint.id}" class="delete-waypoint-from-popup" style="margin-top: 8px; padding: 4px 8px; font-size: 0.8rem; background-color: #EF4444; color: white; border: none; border-radius: 3px; cursor: pointer;">BORRAR PUNTO</button>` : ''}
                 </div>`;
+            
+            const popup = wp.marker.getPopup();
             popup.setContent(finalPopupContent).update();
             
             const shareButtonPopup = popup.getElement().querySelector('.share-waypoint-from-popup');
             if (shareButtonPopup) {
-                L.DomEvent.on(shareButtonPopup, 'click', function(ev) {
-                    L.DomEvent.stopPropagation(ev);
-                    const wpIdToShare = parseInt(this.dataset.waypointId);
-                    const waypointToShare = navigationWaypoints.find(w => w && w.id === wpIdToShare);
-                    if (waypointToShare) {
-                        handleSendToTeslaClick(waypointToShare.lat, waypointToShare.lng, waypointToShare.address);
-                    } else {
-                        showToast('Error: No se pudo encontrar el punto para compartir.', 'error');
-                    }
-                });
+                L.DomEvent.on(shareButtonPopup, 'click', function(ev) { L.DomEvent.stopPropagation(ev); handleSendToTeslaClick(wp.lat, wp.lng, wp.address); });
             }
 
             const alternativesButtonPopup = popup.getElement().querySelector('.show-alternatives-btn');
             if (alternativesButtonPopup) {
-                L.DomEvent.on(alternativesButtonPopup, 'click', function(ev) {
-                    L.DomEvent.stopPropagation(ev);
-                    const wpIdForAlts = parseInt(this.dataset.waypointId);
-                    const waypointForAlts = navigationWaypoints.find(w => w && w.id === wpIdForAlts);
-                    if (waypointForAlts) {
-                        fetchAndDisplayAlternativeRoutes(wpIdForAlts);
-                        if (popup.isOpen()) popup.remove();
-                    } else {
-                        showToast('Error: No se pudo encontrar el punto para buscar alternativas.', 'error');
-                    }
-                });
+                L.DomEvent.on(alternativesButtonPopup, 'click', function(ev) { L.DomEvent.stopPropagation(ev); fetchAndDisplayAlternativeRoutes(wp.id); wp.marker.closePopup(); });
             }
 
             const deleteButtonPopup = popup.getElement().querySelector('.delete-waypoint-from-popup');
             if (deleteButtonPopup) {
-                L.DomEvent.on(deleteButtonPopup, 'click', function(ev) {
-                    L.DomEvent.stopPropagation(ev);
-                    const wpIdToDelete = parseInt(this.dataset.waypointId);
-                    if (!isNaN(wpIdToDelete)) {
-                         if(popup.isOpen()) popup.remove();
-                         handleDeleteWaypointClick(wpIdToDelete);
-                    }
-                });
+                L.DomEvent.on(deleteButtonPopup, 'click', function(ev) { L.DomEvent.stopPropagation(ev); wp.marker.closePopup(); handleDeleteWaypointClick(wp.id); });
             }
         });
+
+        wp.marker.bindPopup(popup);
+
         wp.marker.on('dragend', function(event) {
             if (isNavigating) return;
             const newLatLng = event.target.getLatLng();
@@ -19986,18 +19933,13 @@ function renderWaypointMarkers() {
             wp.address = '';
             recalculateAndDrawRoute().then(() => {
                 const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
-                if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
-                    toggleRadaresRuta(true);
-                }
+                if (radaresRutaCheckbox && radaresRutaCheckbox.checked) toggleRadaresRuta(true);
                 const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
-                if (tareasRutaCheckbox && tareasRutaCheckbox.checked) {
-                    toggleTareasRuta(true);
-                }
+                if (tareasRutaCheckbox && tareasRutaCheckbox.checked) toggleTareasRuta(true);
             });
         });
     });
-}
-    
+}   
     
     
     
