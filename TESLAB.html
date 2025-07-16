@@ -1,4 +1,4 @@
-L15
+L16
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -11368,9 +11368,9 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
     
 
 
- // ===================================================================
-// NOMBRE: updateInitialUserPosition (MODIFICADA)
-// RESUMEN: Actualiza el icono del coche y gestiona la visita a etapas solo por proximidad.
+// ===================================================================
+// NOMBRE: updateInitialUserPosition (VERSIÓN FINAL Y DEFINITIVA 2)
+// RESUMEN: Marca etapas como visitadas estrictamente por proximidad.
 // ===================================================================
 function updateInitialUserPosition(coords, mapInstanceToUse) {
     if (!mapInstanceToUse || !coords || typeof coords.latitude !== 'number' || typeof coords.longitude !== 'number') {
@@ -11428,29 +11428,27 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
     }
 
     if (isNavigating) {
-        // --- INICIO DE LA LÓGICA CORREGIDA ---
-        // La lógica de visita se basa solo en proximidad, no en el inicio de la navegación.
         const route = navigationCurrentRouteData?.routes?.[0];
-        if (route) {
-            let distanceToLegEnd = 0;
-            // Usamos un bucle for tradicional para poder usar break
-            for (let i = 0; i < route.legs.length; i++) {
-                const leg = route.legs[i];
-                distanceToLegEnd += leg.distance;
-                const waypointForThisLeg = navigationWaypoints.filter(wp => !wp.isInternal)[i + 1];
+        if (route && typeof turf !== 'undefined' && navigationRouteLayer) {
+            const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal);
+            const routeLineString = turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat]));
+            const startOfRoute = turf.point(routeLineString.geometry.coordinates[0]);
 
-                if (waypointForThisLeg && !waypointForThisLeg.visited) {
-                    if (lastCarDistanceAlongRouteForNavLogic >= distanceToLegEnd - WAYPOINT_VISITED_THRESHOLD_METERS) {
-                        waypointForThisLeg.visited = true;
-                        renderWaypointMarkers(); // Actualizar el estado visual del marcador
+            for (let i = 0; i < actualWaypoints.length; i++) {
+                const waypoint = actualWaypoints[i];
+                if (waypoint && !waypoint.visited) {
+                    const waypointPoint = turf.point([waypoint.lng, waypoint.lat]);
+                    const nearestPointOnLine = turf.nearestPointOnLine(routeLineString, waypointPoint, { units: 'meters' });
+                    const lineSliceToWaypoint = turf.lineSlice(startOfRoute, nearestPointOnLine, routeLineString);
+                    const distanceToWaypoint = turf.length(lineSliceToWaypoint, { units: 'meters' });
+                    
+                    if (lastCarDistanceAlongRouteForNavLogic >= distanceToWaypoint - WAYPOINT_VISITED_THRESHOLD_METERS) {
+                        waypoint.visited = true;
+                        renderWaypointMarkers();
                     }
-                    // Una vez que encontramos la primera etapa no visitada, paramos.
-                    // Esto evita que se marquen como visitadas etapas futuras por error.
-                    break;
                 }
             }
         }
-        // --- FIN DE LA LÓGICA CORREGIDA ---
 
         if (!navigationStartTimeForStats && tripStartLocationForStats) {
             const distanceFromTripStart = calculateDistance(
@@ -11473,7 +11471,7 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
                 }
             }
         }
-    } else if (navigationWaypoints.length >= 2) { // Auto-inicio de navegación
+    } else if (navigationWaypoints.length >= 2) {
         const startWp = navigationWaypoints.find(wp => wp.type === 'S');
         if (startWp && !isNavigating) {
              const distanceFromStart = calculateDistance(coords.latitude, coords.longitude, startWp.lat, startWp.lng);
@@ -11520,8 +11518,7 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
         currentSmoothedMapCenter = null;
     }
     navigationTargetZoom = null;
-}   
-
+} 
 
 
 
@@ -19758,8 +19755,8 @@ function createWaypointMarkerIcon(label, type, visited, currentZoomLevel = null)
     
     
 // ===================================================================
-// NOMBRE: renderWaypointMarkers (MODIFICADA 2)
-// RESUMEN: Añade listeners para pulsación corta y larga en los marcadores.
+// NOMBRE: renderWaypointMarkers (MODIFICADA 3 - TOQUE LARGO TÁCTIL)
+// RESUMEN: Añade listeners táctiles para la pulsación larga en marcadores.
 // ===================================================================
 function renderWaypointMarkers() {
     if (!navigationMapInstance) return;
@@ -19794,38 +19791,46 @@ function renderWaypointMarkers() {
             }
         }
         
-        // --- INICIO DE LA LÓGICA MODIFICADA: Pulsación Larga ---
         let pressTimer = null;
         let isLongPress = false;
 
-        wp.marker.on('mousedown', () => {
+        const handlePressStart = () => {
             isLongPress = false;
             pressTimer = setTimeout(() => {
                 isLongPress = true;
                 wp.marker.closePopup();
                 fetchAndDisplayAlternativeRoutes(wp.id);
-            }, 500); // 500ms para considerar pulsación larga
-        });
+            }, 500);
+        };
 
-        wp.marker.on('mouseup', () => {
+        const handlePressEnd = () => {
             clearTimeout(pressTimer);
             if (!isLongPress) {
-                // Si no fue pulsación larga, abrimos el popup (comportamiento de clic normal)
                 wp.marker.fire('click');
             }
+        };
+
+        wp.marker.on('mousedown', handlePressStart);
+        wp.marker.on('mouseup', handlePressEnd);
+        wp.marker.on('touchstart', (e) => {
+            L.DomEvent.preventDefault(e.originalEvent);
+            L.DomEvent.stopPropagation(e.originalEvent);
+            handlePressStart();
+        });
+        wp.marker.on('touchend', (e) => {
+            L.DomEvent.preventDefault(e.originalEvent);
+            L.DomEvent.stopPropagation(e.originalEvent);
+            handlePressEnd();
         });
         
-        wp.marker.on('dragstart', () => {
-            clearTimeout(pressTimer); // Cancelar si empieza a arrastrar
-        });
-        // --- FIN DE LA LÓGICA MODIFICADA ---
-
+        wp.marker.on('dragstart', () => clearTimeout(pressTimer));
+        
         let popupContent = `<strong>Punto ${wp.label}</strong><br>Cargando datos...`;
         const popup = L.popup({ maxWidth: 250, autoPanPadding: L.point(50, 50), closeButton: true }).setContent(popupContent);
         wp.marker.bindPopup(popup);
 
         wp.marker.on('click', async (e) => {
-            if (isLongPress) return; // Si ya se ejecutó la acción de pulsación larga, no hacemos nada
+            if (isLongPress) return;
 
             if (isNavigating) {
                 L.DomEvent.stopPropagation(e);
@@ -19991,8 +19996,7 @@ function renderWaypointMarkers() {
             });
         });
     });
-}    
-
+}
     
     
     
