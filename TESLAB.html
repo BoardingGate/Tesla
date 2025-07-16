@@ -1,4 +1,4 @@
-L6
+L7
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -11103,8 +11103,8 @@ async function saveCurrentRoute() {
 }
 
 // ===================================================================
-// NOMBRE: selectAlternativeRoute (VERSIÓN CORREGIDA 3)
-// RESUMEN: Inserta puntos de paso de la ruta alternativa y recalcula la ruta completa.
+// NOMBRE: selectAlternativeRoute (VERSIÓN CORREGIDA 4)
+// RESUMEN: Asocia puntos internos a su etapa y recalcula la ruta.
 // ===================================================================
 async function selectAlternativeRoute(waypointId, routeType) {
     if (!alternativeRoutesCache.has(waypointId)) {
@@ -11120,10 +11120,8 @@ async function selectAlternativeRoute(waypointId, routeType) {
         return;
     }
 
-    // Guardar la elección del usuario para esta etapa
     selectedStageRoutes.set(waypointId, routeType);
 
-    // 1. Encontrar la etapa correspondiente en navigationWaypoints
     const endWaypointIndex = navigationWaypoints.findIndex(wp => wp && wp.id === waypointId);
     if (endWaypointIndex < 1) return;
 
@@ -11136,22 +11134,15 @@ async function selectAlternativeRoute(waypointId, routeType) {
     }
     if (startWaypointIndex === -1) return;
 
-    // 2. Limpiar CUALQUIER punto interno previo de ESTA etapa para evitar duplicados
-    navigationWaypoints = navigationWaypoints.filter((wp, index) => {
-        return !(wp.isInternal && index > startWaypointIndex && index < endWaypointIndex);
-    });
+    // Limpiar puntos internos ANTERIORES de ESTA etapa específica
+    navigationWaypoints = navigationWaypoints.filter(wp => !(wp.isInternal && wp.parentWaypointId === waypointId));
     
-    // 3. Crear nuevos puntos de paso internos desde la geometría de la ruta seleccionada
     const geometryPoints = selectedRouteData.geometry.coordinates;
     const totalPoints = geometryPoints.length;
-    
-    // Añadimos puntos de paso para forzar el trazado, pero sin sobrecargar.
-    // Tomamos hasta un máximo de 10 puntos intermedios.
     const maxInternalPoints = 10;
     const step = totalPoints > maxInternalPoints + 2 ? Math.floor((totalPoints - 2) / maxInternalPoints) : 1;
     
     const internalWaypoints = [];
-    // Omitimos el primer y último punto de la geometría, que ya corresponden a los waypoints de la etapa.
     for (let i = step; i < totalPoints - 1; i += step) {
          const coord = geometryPoints[i];
          internalWaypoints.push({
@@ -11161,21 +11152,18 @@ async function selectAlternativeRoute(waypointId, routeType) {
             type: 'internal',
             label: '',
             address: 'Punto de paso interno',
-            isInternal: true, // Marcar como interno para que no se muestre
+            isInternal: true,
+            // --- LÍNEA CLAVE AÑADIDA ---
+            parentWaypointId: waypointId, // Asocia este punto a su etapa
             visited: false,
-            isCriticalForRecalc: true // Es crítico para este recálculo
+            isCriticalForRecalc: true
         });
     }
 
-    // 4. Insertar los nuevos puntos de paso en el array de waypoints
-    // El índice de inserción necesita recalcularse después del filtrado
     const newEndIndex = navigationWaypoints.findIndex(wp => wp && wp.id === waypointId);
     navigationWaypoints.splice(newEndIndex, 0, ...internalWaypoints);
 
-    // 5. Limpiar la visualización de alternativas
     clearAlternativeRoutesDisplay();
-
-    // 6. Recalcular la ruta completa con los nuevos puntos de paso
     await recalculateAndDrawRoute(isNavigating);
     
     const routeTypeTranslations = {
@@ -11185,8 +11173,10 @@ async function selectAlternativeRoute(waypointId, routeType) {
     };
     const translatedType = routeTypeTranslations[routeType] || routeType.toUpperCase();
     showToast(`Ruta para esta etapa cambiada a: ${translatedType}. Recalculando...`, "success");
-}    
-             
+}
+
+
+    
 
 // ===================================================================
 // NOMBRE: recalculateAndDrawRoute (VERSIÓN CORREGIDA 3)
@@ -19999,12 +19989,9 @@ async function handleSendToTeslaClick(lat, lng, name) {
 
 
 
-      
-    
-    
-  // ===================================================================
-// NOMBRE: handleDeleteWaypointClick (MODIFICADA)
-// RESUMEN: Elimina un punto de ruta de la ruta actual, esperando la actualización de etiquetas.
+// ===================================================================
+// NOMBRE: handleDeleteWaypointClick (VERSIÓN CORREGIDA 3)
+// RESUMEN: Elimina una etapa Y SUS PUNTOS INTERNOS ASOCIADOS.
 // ===================================================================
 async function handleDeleteWaypointClick(waypointId) {
     if (isNavigating) {
@@ -20015,15 +20002,24 @@ async function handleDeleteWaypointClick(waypointId) {
     alternativeRoutesCache.clear();
 
     const waypointIndex = navigationWaypoints.findIndex(wp => wp && wp.id === waypointId);
-    if (waypointIndex === -1) {
-        return;
+    if (waypointIndex === -1) return;
+    
+    // --- INICIO DE LA LÓGICA CORREGIDA ---
+    // Antes de borrar el waypoint principal, limpiamos sus hijos internos
+    navigationWaypoints = navigationWaypoints.filter(wp => !(wp.isInternal && wp.parentWaypointId === waypointId));
+    
+    // Ahora buscamos de nuevo el índice (puede haber cambiado) y borramos el principal
+    const finalWaypointIndex = navigationWaypoints.findIndex(wp => wp && wp.id === waypointId);
+    if (finalWaypointIndex !== -1) {
+        const waypointToDelete = navigationWaypoints[finalWaypointIndex];
+        if (waypointToDelete.marker && navigationMapInstance) {
+            try { navigationMapInstance.removeLayer(waypointToDelete.marker); } catch (e) {}
+            waypointToDelete.marker = null;
+        }
+        navigationWaypoints.splice(finalWaypointIndex, 1);
     }
-    const waypointToDelete = navigationWaypoints[waypointIndex];
-    if (waypointToDelete.marker && navigationMapInstance) {
-        try { navigationMapInstance.removeLayer(waypointToDelete.marker); } catch (e) {}
-        waypointToDelete.marker = null;
-    }
-    navigationWaypoints.splice(waypointIndex, 1);
+    // --- FIN DE LA LÓGICA CORREGIDA ---
+
     if (navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart).length < 1) { 
         clearAllWaypointMarkersFromMap(); 
         navigationWaypoints = [];
@@ -20048,7 +20044,6 @@ async function handleDeleteWaypointClick(waypointId) {
             localStorage.setItem(TAREAS_RUTA_CHECKED_KEY, String(tareasCheckbox.checked));
         }
     } else {
-        // --- LÍNEA MODIFICADA: Se añade 'await' ---
         await updateWaypointTypesAndLabels();
         renderWaypointMarkers();
         if (navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart).length < 2) {
@@ -20087,7 +20082,7 @@ async function handleDeleteWaypointClick(waypointId) {
     }
     updateStartNavigationButtonState();
     updateNavigationButtonColor();
-}  
+}      
     
     
     
@@ -20709,12 +20704,9 @@ async function findChargingPointsOnRoute(powerFilters, searchConfig) {
  
 
 
-
-
-
 // ===================================================================
-// NOMBRE: updateNavigationProgressDisplay (VERSIÓN FINAL CORREGIDA)
-// RESUMEN: Actualiza la barra de progreso, mostrando la desviación ETA para la ruta completa.
+// NOMBRE: updateNavigationProgressDisplay (VERSIÓN FINAL CORREGIDA 2)
+// RESUMEN: Actualiza la barra de progreso, ignorando los puntos internos.
 // ===================================================================
 function updateNavigationProgressDisplay(route, carDistanceAlongTheRoute = 0) {
     const progressBarContainer = document.getElementById('navigation-bottom-progress-bar');
@@ -20859,7 +20851,10 @@ function updateNavigationProgressDisplay(route, carDistanceAlongTheRoute = 0) {
 
     overallProgressContainer.querySelectorAll('.waypoint-dot-on-progress-bar, .radar-marker-on-progress-bar, .task-marker-on-progress-bar').forEach(dot => dot.remove());
 
-    if (navigationWaypoints.length > 2 && totalJourneyDistanceForBar > 0 && route.legs) {
+    // --- INICIO DE LA LÓGICA CORREGIDA ---
+    // Filtrar para mostrar solo waypoints REALES en la barra de progreso
+    const realWaypointsForBar = navigationWaypoints.filter(wp => wp && !wp.isInternal);
+    if (realWaypointsForBar.length > 2 && totalJourneyDistanceForBar > 0 && route.legs) {
         let distanceLegOsrm = 0;
         for (let i = 0; i < route.legs.length - 1; i++) { 
             if (route.legs[i] && typeof route.legs[i].distance === 'number') {
@@ -20871,13 +20866,15 @@ function updateNavigationProgressDisplay(route, carDistanceAlongTheRoute = 0) {
                     const dot = document.createElement('div');
                     dot.className = 'waypoint-dot-on-progress-bar';
                     dot.style.left = `calc(${percent}% - 7px)`;
-                    const stageIndex = navigationWaypoints.filter(wp => wp && !wp.isInternal).findIndex(wp => wp.type === 'intermediate' && parseInt(wp.label) === i + 1);
-                    if(stageIndex !== -1) dot.title = `Etapa ${navigationWaypoints.filter(wp => wp && !wp.isInternal)[stageIndex].label}`;
+                    // La lógica para el título debe encontrar el waypoint real correspondiente
+                    const realWp = realWaypointsForBar[i + 1]; // +1 porque el primero es el de salida
+                    if (realWp) dot.title = `Etapa ${realWp.label}`;
                     overallProgressContainer.appendChild(dot);
                 }
             }
         }
     }
+    // --- FIN DE LA LÓGICA CORREGIDA ---
 
     const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
     if (radaresRutaCheckbox && radaresRutaCheckbox.checked && radaresEnRutaActual.length > 0 && totalJourneyDistanceForBar > 0) {
@@ -20948,6 +20945,8 @@ function updateNavigationProgressDisplay(route, carDistanceAlongTheRoute = 0) {
         }
     }
 }
+
+
     
     
     
