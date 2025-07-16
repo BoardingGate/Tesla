@@ -1,4 +1,4 @@
-L5
+L6
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -6179,7 +6179,7 @@ p.ocm-price-info {
         return originalToFixed.call(this, digits);
     };
 
-
+    let selectedStageRoutes = new Map();
     let alternativeRoutesCache = new Map();
     let alternativeRouteLayers = [];
     let realtimeSpeedUpdateInterval = null;
@@ -11102,68 +11102,95 @@ async function saveCurrentRoute() {
     addModalAutoCloseTimer(overlay, confirmButton, 'save-route-prompt-modal', 20000);
 }
 
-    
 // ===================================================================
 // NOMBRE: selectAlternativeRoute (VERSIÓN CORREGIDA 3)
-// RESUMEN: Actualiza la ruta principal y muestra el toast en castellano.
+// RESUMEN: Inserta puntos de paso de la ruta alternativa y recalcula la ruta completa.
 // ===================================================================
 async function selectAlternativeRoute(waypointId, routeType) {
-    if (!alternativeRoutesCache.has(waypointId)) return;
-    if (!navigationCurrentRouteData || !navigationRouteLayer) return;
+    if (!alternativeRoutesCache.has(waypointId)) {
+        showToast("Error de caché: No se encontraron datos para la ruta seleccionada.", "error");
+        return;
+    }
 
     const routesData = alternativeRoutesCache.get(waypointId);
     const selectedRouteData = routesData[routeType];
 
-    if (!selectedRouteData) {
-        showToast("Error: No se encontraron los datos de la ruta seleccionada.", "error");
+    if (!selectedRouteData || !selectedRouteData.geometry || !selectedRouteData.geometry.coordinates) {
+        showToast("Error: La ruta alternativa seleccionada no tiene geometría válida.", "error");
         return;
     }
-    
-    navigationCurrentRouteData.routes[0] = selectedRouteData;
 
-    const newRouteCoords = selectedRouteData.geometry.coordinates.map(coord => [coord[1], coord[0]]);
-    navigationRouteLayer.setLatLngs(newRouteCoords);
-    
-    if (isNavigating) {
-        const route = navigationCurrentRouteData.routes[0];
-        if (route.legs && route.legs.length > 0) {
-            currentStageInitialExpectedEtaTime = new Date(Date.now() + route.legs[0].duration * 1000);
+    // Guardar la elección del usuario para esta etapa
+    selectedStageRoutes.set(waypointId, routeType);
+
+    // 1. Encontrar la etapa correspondiente en navigationWaypoints
+    const endWaypointIndex = navigationWaypoints.findIndex(wp => wp && wp.id === waypointId);
+    if (endWaypointIndex < 1) return;
+
+    let startWaypointIndex = -1;
+    for (let i = endWaypointIndex - 1; i >= 0; i--) {
+        if (navigationWaypoints[i] && !navigationWaypoints[i].isInternal) {
+            startWaypointIndex = i;
+            break;
         }
-        updateNavigationProgressDisplay(route, lastCarDistanceAlongRouteForNavLogic);
-        updateTurnByTurnDisplay(route, lastCarDistanceAlongRouteForNavLogic);
-    } else {
-        updateTurnByTurnDisplay(navigationCurrentRouteData.routes[0], 0);
-        updateNavigationProgressDisplay(navigationCurrentRouteData.routes[0], 0);
+    }
+    if (startWaypointIndex === -1) return;
+
+    // 2. Limpiar CUALQUIER punto interno previo de ESTA etapa para evitar duplicados
+    navigationWaypoints = navigationWaypoints.filter((wp, index) => {
+        return !(wp.isInternal && index > startWaypointIndex && index < endWaypointIndex);
+    });
+    
+    // 3. Crear nuevos puntos de paso internos desde la geometría de la ruta seleccionada
+    const geometryPoints = selectedRouteData.geometry.coordinates;
+    const totalPoints = geometryPoints.length;
+    
+    // Añadimos puntos de paso para forzar el trazado, pero sin sobrecargar.
+    // Tomamos hasta un máximo de 10 puntos intermedios.
+    const maxInternalPoints = 10;
+    const step = totalPoints > maxInternalPoints + 2 ? Math.floor((totalPoints - 2) / maxInternalPoints) : 1;
+    
+    const internalWaypoints = [];
+    // Omitimos el primer y último punto de la geometría, que ya corresponden a los waypoints de la etapa.
+    for (let i = step; i < totalPoints - 1; i += step) {
+         const coord = geometryPoints[i];
+         internalWaypoints.push({
+            id: Date.now() + Math.random() + i,
+            lat: coord[1],
+            lng: coord[0],
+            type: 'internal',
+            label: '',
+            address: 'Punto de paso interno',
+            isInternal: true, // Marcar como interno para que no se muestre
+            visited: false,
+            isCriticalForRecalc: true // Es crítico para este recálculo
+        });
     }
 
+    // 4. Insertar los nuevos puntos de paso en el array de waypoints
+    // El índice de inserción necesita recalcularse después del filtrado
+    const newEndIndex = navigationWaypoints.findIndex(wp => wp && wp.id === waypointId);
+    navigationWaypoints.splice(newEndIndex, 0, ...internalWaypoints);
+
+    // 5. Limpiar la visualización de alternativas
     clearAlternativeRoutesDisplay();
 
-    const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
-    if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
-        toggleRadaresRuta(true);
-    }
-    const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
-    if (tareasRutaCheckbox && tareasRutaCheckbox.checked) {
-        toggleTareasRuta(true);
-    }
+    // 6. Recalcular la ruta completa con los nuevos puntos de paso
+    await recalculateAndDrawRoute(isNavigating);
     
-    // --- LÍNEA MODIFICADA: Texto de la tostada en castellano ---
     const routeTypeTranslations = {
         'fastest': 'RÁPIDA',
         'shortest': 'CORTA',
         'alternative': 'ALTERNATIVA'
     };
     const translatedType = routeTypeTranslations[routeType] || routeType.toUpperCase();
-    showToast(`Ruta cambiada a la opción: ${translatedType}.`, "success");
-    // --- FIN DE LA MODIFICACIÓN ---
-}                
+    showToast(`Ruta para esta etapa cambiada a: ${translatedType}. Recalculando...`, "success");
+}    
              
 
-
-    
 // ===================================================================
-// NOMBRE: recalculateAndDrawRoute (VERSIÓN CORREGIDA Y DEFINITIVA 2)
-// RESUMEN: Recalcula la ruta, manejando correctamente el cálculo inicial y los desvíos.
+// NOMBRE: recalculateAndDrawRoute (VERSIÓN CORREGIDA 3)
+// RESUMEN: Recalcula la ruta usando TODOS los waypoints, incluidos los internos.
 // ===================================================================
 async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
     isRecalculatingRoute = true;
@@ -11201,21 +11228,17 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
     lastCarDistanceAlongRouteForNavLogic = 0;
     lastValidCarDistanceForDisplay = 0;
 
-    // --- INICIO DE LA LÓGICA CORREGIDA ---
+    // --- LÓGICA CORREGIDA: Incluir puntos internos en el cálculo ---
     let waypointsForRouteCalculation = [];
-    if (isNavigating) {
-        // Escenario 1: Recálculo DURANTE la navegación (por desvío, etc.)
-        if (navigationCurrentLocation) {
-            waypointsForRouteCalculation.push({ lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude });
-        }
-        const unvisitedWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.visited);
+    if (isNavigating && navigationCurrentLocation) {
+        waypointsForRouteCalculation.push({ lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude });
+        const unvisitedWaypoints = navigationWaypoints.filter(wp => !wp.visited); // Incluye internos no visitados
         waypointsForRouteCalculation.push(...unvisitedWaypoints);
     } else {
-        // Escenario 2: Cálculo inicial o modificación ANTES de navegar.
-        // Se usan todos los puntos principales, sin importar si están "visitados".
-        waypointsForRouteCalculation = navigationWaypoints.filter(wp => wp && !wp.isInternal);
+        // Al planificar, se usan todos los waypoints, incluidos los internos que se hayan añadido.
+        waypointsForRouteCalculation = [...navigationWaypoints];
     }
-    // --- FIN DE LA LÓGICA CORREGIDA ---
+    // --- FIN LÓGICA CORREGIDA ---
 
     if (waypointsForRouteCalculation.length < 2) {
         const existingRecalcToast = document.getElementById(recalculateToastId);
@@ -11344,6 +11367,7 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
         isRecalculatingRoute = false;
     }
 }
+    
     
 
 
