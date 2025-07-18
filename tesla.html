@@ -1,4 +1,4 @@
-b1
+b2
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -6029,6 +6029,41 @@ p.ocm-price-info {
     width: 100%;
     margin-top: 0;
 }    
+
+
+.mapbox-control {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0.3rem 0.6rem;
+    background-color: rgba(200,200,180,0.7);
+    border-radius: 5px;
+    height: 60px;
+    min-width: 70px;
+    box-sizing: border-box;
+    gap: 4px;
+}
+#mapbox-primary-checkbox {
+    margin-right: 0px;
+    margin-bottom: 0px;
+    transform: scale(1.1);
+}
+.mapbox-label-container {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+}
+#mapbox-primary-checkbox + .mapbox-label-container > label {
+    font-weight: bold;
+    font-size: 0.85rem;
+    color: #333;
+    cursor: pointer;
+    text-align: center;
+    line-height: 1.1;
+    margin-bottom: 1px;
+}
+
     
 </style>
  </head>
@@ -6640,6 +6675,819 @@ p.ocm-price-info {
         }).join(', ');
 
 
+
+// ===================================================================
+// NOMBRE: adaptMapboxRouteToOSRMFormat (NUEVA FUNCIÓN)
+// RESUMEN: Convierte la respuesta de la API de Mapbox al formato de OSRM.
+// ===================================================================
+function adaptMapboxRouteToOSRMFormat(mapboxRoute) {
+    const adaptedLegs = mapboxRoute.legs.map(leg => {
+        const adaptedSteps = leg.steps.map(step => {
+            return {
+                distance: step.distance,
+                duration: step.duration,
+                geometry: step.geometry,
+                maneuver: {
+                    bearing_after: step.maneuver.bearing_after,
+                    bearing_before: step.maneuver.bearing_before,
+                    location: step.maneuver.location,
+                    modifier: step.maneuver.modifier,
+                    type: step.maneuver.type,
+                },
+                name: step.name,
+            };
+        });
+        return {
+            distance: leg.distance,
+            duration: leg.duration,
+            steps: adaptedSteps,
+            summary: leg.summary,
+        };
+    });
+    return {
+        distance: mapboxRoute.distance,
+        duration: mapboxRoute.duration,
+        geometry: mapboxRoute.geometry,
+        legs: adaptedLegs,
+    };
+}
+
+// ===================================================================
+// NOMBRE: fetchRouteData (MODIFICADA)
+// RESUMEN: Obtiene la ruta del servicio primario (OSRM o Mapbox) y usa el otro como respaldo.
+// ===================================================================
+async function fetchRouteData(coordsString) {
+    const MAPBOX_PRIMARY_KEY = 'boardinggate_useMapboxAsPrimary';
+    const useMapboxAsPrimary = localStorage.getItem(MAPBOX_PRIMARY_KEY) === 'true';
+
+    const osrmService = {
+        name: 'OSRM',
+        buildUrl: (coords) => `${OSRM_SERVICE_URL}/driving/${coords}?overview=full&geometries=geojson&steps=true&alternatives=false&annotations=true`,
+        processResponse: async (response) => {
+            if (!response.ok) {
+                let errorData = { message: `OSRM HTTP error ${response.status}` };
+                try { errorData = await response.json(); } catch (e) {}
+                throw new Error(errorData.code || errorData.message || response.statusText);
+            }
+            const data = await response.json();
+            if (data.code !== 'Ok' || !data.routes || data.routes.length === 0) {
+                throw new Error(data.message || "No se encontraron rutas en OSRM.");
+            }
+            return data;
+        }
+    };
+
+    const mapboxService = {
+        name: 'Mapbox',
+        buildUrl: (coords) => `https://api.mapbox.com/directions/v5/mapbox/driving/${coords}?alternatives=false&geometries=geojson&overview=full&steps=true&access_token=${MAPBOX_ACCESS_TOKEN}`,
+        processResponse: async (response) => {
+            if (!response.ok) {
+                let errorData = { message: `Mapbox HTTP error ${response.status}` };
+                try { errorData = await response.json(); } catch (e) {}
+                throw new Error(errorData.message || response.statusText);
+            }
+            const data = await response.json();
+            if (data.code !== 'Ok' || !data.routes || data.routes.length === 0) {
+                throw new Error(data.message || "No se encontraron rutas en Mapbox.");
+            }
+            const adaptedRoute = adaptMapboxRouteToOSRMFormat(data.routes[0]);
+            const adaptedWaypoints = data.waypoints.map(wp => ({
+                distance: wp.distance,
+                hint: wp.hint,
+                location: wp.location,
+                name: wp.name,
+            }));
+            return {
+                code: 'Ok',
+                routes: [adaptedRoute],
+                waypoints: adaptedWaypoints
+            };
+        }
+    };
+
+    const primaryService = useMapboxAsPrimary ? mapboxService : osrmService;
+    const fallbackService = useMapboxAsPrimary ? osrmService : mapboxService;
+
+    try {
+        const primaryUrl = primaryService.buildUrl(coordsString);
+        const primaryResponse = await fetch(primaryUrl);
+        return await primaryService.processResponse(primaryResponse);
+    } catch (primaryError) {
+        showToast(`Servicio principal (${primaryService.name}) falló. Intentando con respaldo (${fallbackService.name})...`, "warning", 4000);
+        
+        try {
+            const fallbackUrl = fallbackService.buildUrl(coordsString);
+            const fallbackResponse = await fetch(fallbackUrl);
+            const fallbackData = await fallbackService.processResponse(fallbackResponse);
+            
+            showToast(`Ruta calculada con el servicio auxiliar ${fallbackService.name}.`, "info", 3000);
+            return fallbackData;
+        } catch (fallbackError) {
+            showToast(`El servicio de respaldo (${fallbackService.name}) también falló: ${fallbackError.message}`, "error", 5000);
+            throw fallbackError;
+        }
+    }
+}
+
+// ===================================================================
+// NOMBRE: recalculateAndDrawRoute (MODIFICADA)
+// RESUMEN: Recalcula la ruta usando TODOS los waypoints, incluidos los internos.
+// ===================================================================
+async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
+    isRecalculatingRoute = true;
+    lastAutoShownManeuverId = null;
+
+    clearAlternativeRoutesDisplay();
+    
+    if (preserveAccumulatedStats) {
+        accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
+    } else {
+        isArrivalSequenceStarted = false;
+        accumulatedDistanceBeforeCurrentSegment = 0;
+        totalDistanceTravelledForStats = 0;
+        maxDistanceReachedOnRoute = 0;
+        lastPositionForStats = null;
+        if (isNavigating) navigationStartTimeForStats = new Date();
+        
+        tripInitialOverallEtaTime = null; 
+        currentStageInitialExpectedEtaTime = null;
+        accumulatedDeviationMs = 0;
+        maxSpeedDuringTrip = 0;
+        maxSpeedCoordinates = null;
+        maxAltitudeDuringTrip = -Infinity; 
+        minAltitudeDuringTrip = Infinity; 
+        minAverageSpeedInTrip = Infinity;
+        maxAverageSpeedInTrip = -Infinity;
+        if (compassAndModeControl) {
+            compassAndModeControl.updateMaxSpeed(maxSpeedDuringTrip);
+        }
+        tripInitialDurationSec = null;
+        tripInitialDistanceMeters = null;
+    }
+
+    const recalculateToastId = "recalculating-route-toast";
+    showToast("Recalculando ruta...", "info", 0, false, recalculateToastId);
+    
+    lastCarDistanceAlongRouteForNavLogic = 0;
+    lastValidCarDistanceForDisplay = 0;
+
+    let waypointsForRouteCalculation = [];
+    if (isNavigating && navigationCurrentLocation) {
+        waypointsForRouteCalculation.push({ lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude });
+        const unvisitedWaypoints = navigationWaypoints.filter(wp => !wp.visited);
+        waypointsForRouteCalculation.push(...unvisitedWaypoints);
+    } else {
+        waypointsForRouteCalculation = [...navigationWaypoints];
+    }
+ 
+    if (waypointsForRouteCalculation.length < 2) {
+        const existingRecalcToast = document.getElementById(recalculateToastId);
+        if (existingRecalcToast) existingRecalcToast.remove();
+        activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
+        showToast("No hay suficientes etapas restantes para calcular una nueva ruta.", "warning");
+        if (navigationRouteLayer && navigationMapInstance) { try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {} navigationRouteLayer = null; }
+        if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
+        navigationCurrentRouteData = null;
+        hideMapInfoOverlay();
+        isRecalculatingRoute = false;
+        return;
+    }
+
+    const coordsString = waypointsForRouteCalculation.map(wp => {
+        if (typeof wp.lng !== 'number' || typeof wp.lat !== 'number' || isNaN(wp.lng) || isNaN(wp.lat) ) return null;
+        return `${wp.lng},${wp.lat}`;
+    }).filter(Boolean).join(';');
+
+    if (!coordsString || waypointsForRouteCalculation.filter(wp => wp && typeof wp.lng === 'number' && typeof wp.lat === 'number').length < 2) {
+        const existingRecalcToast = document.getElementById(recalculateToastId);
+        if (existingRecalcToast) existingRecalcToast.remove();
+        activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
+        showToast("No hay suficientes waypoints válidos para calcular la ruta.", "warning");
+        if (navigationRouteLayer && navigationMapInstance) { try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {} navigationRouteLayer = null; }
+        if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
+        navigationCurrentRouteData = null;
+        hideMapInfoOverlay();
+        isRecalculatingRoute = false;
+        recalculationAttempts = 0;
+        if (recalculationRetryTimeoutId) clearTimeout(recalculationRetryTimeoutId);
+        recalculationRetryTimeoutId = null;
+        updateStartNavigationButtonState();
+        return;
+    }
+
+    try {
+        const data = await fetchRouteData(coordsString);
+        const existingRecalcToastSuccess = document.getElementById(recalculateToastId);
+        if (existingRecalcToastSuccess) existingRecalcToastSuccess.remove();
+        activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
+
+        if (data.routes && data.routes.length > 0) {
+            navigationCurrentRouteData = data;
+            if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
+            drawRouteOnMap(data.routes[0]);
+            currentLegIndexNav = 0;
+            currentStepIndexNav = 0;
+            lastProcessedStepManeuverLocation = null;
+            
+            if (data.routes[0]) {
+                const newRouteData = data.routes[0];
+                
+                if (newRouteData.legs && newRouteData.legs.length > 0) {
+                     currentStageInitialExpectedEtaTime = new Date(Date.now() + newRouteData.legs[0].duration * 1000);
+                }
+
+                 const currentCarPosForRecalc = navigationCurrentLocation;
+                 let carDistanceAlongRouteForInternalUse = 0;
+                 if (currentCarPosForRecalc && navigationMapInstance && navigationRouteLayer && typeof turf !== 'undefined' && navigationRouteLayer.getLatLngs().length > 0) {
+                    try {
+                        const carPointTurf = turf.point([currentCarPosForRecalc.longitude, currentCarPosForRecalc.latitude]);
+                        const routeLineStringTurf = turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat]));
+                        const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
+                        const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
+                        carDistanceAlongRouteForInternalUse = turf.length(lineSliceToNearestTurf, { units: 'meters' });
+                    } catch (turfError) {}
+                 }
+                 lastCarDistanceAlongRouteForNavLogic = carDistanceAlongRouteForInternalUse;
+                 updateNavigationProgressDisplay(newRouteData, carDistanceAlongRouteForInternalUse);
+                 updateTurnByTurnDisplay(newRouteData, carDistanceAlongRouteForInternalUse);
+                 showDestinationName();
+
+                if (isNavigating) {
+                    const firstDestination = navigationWaypoints.find(wp => wp && !wp.isInternal && wp.type !== 'S' && !wp.visited);
+                    if (firstDestination) {
+                        alternativeRoutesCache.delete(firstDestination.id);
+                        fetchAndDisplayAlternativeRoutes(firstDestination.id);
+                    }
+                }
+            }
+            showNavigationUIElementsForPlanning();
+            recalculationAttempts = 0;
+            if (recalculationRetryTimeoutId) clearTimeout(recalculationRetryTimeoutId);
+            recalculationRetryTimeoutId = null;
+
+            if (automatedSimulationIntervalId) {
+                stopAutomatedRouteSimulationInternal();
+                showToast("Ruta recalculada. Reiniciando simulación automática.", "info");
+                startAutomatedRouteSimulation(simulationSpeedKmph, true);
+            }
+
+            const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+            if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
+                toggleRadaresRuta(true);
+            }
+            const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
+            if (tareasRutaCheckbox && tareasRutaCheckbox.checked) {
+                toggleTareasRuta(true);
+            }
+
+        } else {
+            throw new Error("No se encontraron rutas.");
+        }
+    } catch (error) {
+        const existingRecalcToastError = document.getElementById(recalculateToastId);
+        if (existingRecalcToastError) existingRecalcToastError.remove();
+        activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
+        let errorMessageForToast = `Error al calcular ruta: ${error.message}`;
+        showToast(errorMessageForToast, "error");
+        if (navigationRouteLayer && navigationMapInstance) { try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch(e) {} navigationRouteLayer = null; }
+        if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
+        navigationCurrentRouteData = null;
+        lastValidCarDistanceForDisplay = 0;
+        hideMapInfoOverlay();
+        const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+        if (radaresRutaCheckbox) { eliminarRadaresDeRuta(); actualizarContadorRadares(0); localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresRutaCheckbox.checked)); }
+        const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
+        if (tareasRutaCheckbox) { eliminarTareasDeBarraProgreso(); actualizarContadorTareas(0); localStorage.setItem(TAREAS_RUTA_CHECKED_KEY, String(tareasRutaCheckbox.checked)); }
+        if (recalculationRetryTimeoutId) clearTimeout(recalculationRetryTimeoutId);
+        recalculationRetryTimeoutId = setTimeout(() => recalculateAndDrawRoute(preserveAccumulatedStats), 2000);
+    }
+    updateStartNavigationButtonState();
+    updateNavigationButtonColor();
+    if (!recalculationRetryTimeoutId) {
+        isRecalculatingRoute = false;
+    }
+}
+
+// ===================================================================
+// NOMBRE: openNavigationMap (MODIFICADA)
+// RESUMEN: Abre y inicializa el mapa principal de navegación, incluyendo el nuevo checkbox para Mapbox.
+// ===================================================================
+function openNavigationMap() {
+    const mainContent = document.querySelector('main');
+    if (mainContent) mainContent.style.display = 'none';
+    const footer = document.querySelector('footer');
+    if (footer) footer.style.display = 'none';
+    const noticesContainer = document.querySelector('.notices-icon-container');
+    if (noticesContainer) noticesContainer.style.display = 'none';
+    const sideControls = document.querySelectorAll('.toggle-image, .toggle-sign, .scroll-toggle-button');
+    sideControls.forEach(el => el.style.display = 'none');
+    document.querySelectorAll('#config-button, #personal-button, #radar-button, #home-button, #reload-button, #keyword-assignment-button, #password-toggle-button, #versions-button, #info-button, #accident-alert-button').forEach(el => el.style.display = 'none');
+    const gridFilter = document.getElementById('grid-filter-container');
+    if (gridFilter) gridFilter.style.display = 'none';
+
+    isNavigationMapActive = true;
+    sessionStorage.setItem('mapContext', 'navigation');
+
+    closeOtherModals('reminders-location-map-modal');
+    
+    const mapModal = document.createElement('div');
+    mapModal.id = 'reminders-location-map-modal';
+    mapModal.innerHTML = `
+        <div id="toggle-map-header-buttons-panel">
+             <img src="Coche_Sat.PNG" alt="Toggle Panel Mapa">
+        </div>
+        <div id="reminders-location-map-content-wrapper">
+            <div id="reminders-location-map-header">
+                 <div class="button-row">
+                    <button id="close-reminders-location-map" class="reminders-map-button-action" title="Cerrar mapa y navegación"><img src="SALIR.PNG" alt="Salir"></button>
+                    <button id="locate-me-on-reminders-map" class="reminders-map-button-action" title="Mostrar mi posición actual y activar seguimiento"><img src="ESTASAQUI.PNG" alt="Estás Aquí"></button>
+                    <button id="nav-map-zoomtoggle-button" class="reminders-map-button-action" style="background-color: white;" data-zoom-state="waypoints" title="Alternar zoom entre vista de ruta y coche"><img src="ZOOM+.PNG" alt="Zoom" style="width:30px; height:30px;"></button>
+                    <button id="start-navigation-button" class="reminders-map-button-action hidden" title="Iniciar/Terminar Navegación"><img src="INICIARNAVEGACION.PNG" alt="Iniciar Navegación"></button>
+                    <button id="save-route-button" class="reminders-map-button-action hidden" title="Guardar Ruta Actual"><img src="GUARDARRUTA.PNG" alt="Guardar Ruta"></button>
+                    <button id="load-saved-route-button" class="reminders-map-button-action" title="Cargar Ruta Guardada"><img src="CARGARRUTA.PNG" alt="Cargar Ruta"></button>
+                    <button id="delete-current-route-button" class="reminders-map-button-action hidden" title="Borrar Ruta Actual del Mapa"><img src="BORRARRUTA.PNG" alt="Borrar Ruta"></button>
+                    <button id="add-radar-here" class="reminders-map-button-action" title="Crear RADAR en mi posición actual (radio 350m)"><img src="RADARAQUI.PNG" alt="Radar Aquí"></button>
+                    <button id="accident-alert-button-map" class="reminders-map-button-action" title="Informar de una incidencia de tráfico"><img src="https://boardinggate.github.io/Tesla/AACCIDENTE.png" alt="Informar Incidencia"></button>
+                    <button id="pdrs-ruta-button" class="reminders-map-button-action" title="Buscar Puntos de Recarga en Ruta"><img src="pdrs.png" alt="PDRs"></button>
+                     <div class="radares-ruta-control">
+                        <input type="checkbox" id="radares-ruta-checkbox">
+                        <div class="radares-ruta-label-container">
+                            <label for="radares-ruta-checkbox">Radares<br>Ruta</label>
+                            <span id="radares-ruta-count" class="hidden">0</span>
+                        </div>
+                    </div>
+                    <div class="tareas-ruta-control">
+                        <input type="checkbox" id="tareas-ruta-checkbox">
+                        <div class="tareas-ruta-label-container">
+                            <label for="tareas-ruta-checkbox">Tareas<br>Ruta</label>
+                            <span id="tareas-ruta-count" class="hidden">0</span>
+                        </div>
+                    </div>
+                    <div class="mapbox-control">
+                        <input type="checkbox" id="mapbox-primary-checkbox">
+                        <div class="mapbox-label-container">
+                            <label for="mapbox-primary-checkbox">Usar<br>Mapbox</label>
+                        </div>
+                    </div>
+                    <button id="add-reminder-at-location-button" class="reminders-map-button-action" title="Añadir recordatorio en punto del mapa">
+                        <img src="https://boardinggate.github.io/Tesla/IMG_4197.jpg" alt="Añadir Recordatorio">
+                    </button>
+                     <button id="toggle-simulate-gps-button" class="reminders-map-button-action" title="Activar/Desactivar Simulación GPS (recorrido o clic)"><img src="GPS.PNG" alt="Simular Recorrido"></button>
+                    <button id="simulate-route-button" class="reminders-map-button-action" title="Simular interacciones de ruta"><img src="SIMULAR.PNG" alt="Simular Ruta"></button>
+                 </div>
+                 <div class="button-row" id="search-row-map-header">
+                    <button id="reorder-route-stages-button" title="Ordenar Etapas de Ruta"><img src="./MOVER.PNG" alt="Ordenar Etapas"></button>
+                    <button id="map-location-search-button" class="reminders-map-button-action"><img src="./ANADIRPUNTO.PNG" alt="Añadir Punto Ruta"></button>
+                    <button id="clear-map-search-input-button" title="Limpiar búsqueda">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="red" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                    </button>
+                    <input type="text" id="map-location-search-input" placeholder="Dirección,sitio,zona /Negocio /Ciudad /CP+Provincia (28001 Madrid /Lidl Lugo)">
+                    <input type="text" id="filter-input" placeholder="Filtro"> 
+                    <button id="navigation-map-help-button" class="reminders-map-button-action" title="Ayuda del mapa de navegación/radares"><img src="IMG_4326.PNG" alt="Ayuda"></button>
+                 </div>
+            </div>
+             <div id="reminders-location-map-div">
+                <div id="leaflet-map-actual-container"></div>
+                <div id="direction-card-izquierda"></div>
+                <div id="direction-card-derecha"></div>
+                 <div id="map-info-overlay"></div>
+                 <div id="navigation-bottom-progress-bar" style="display: none;">
+                    <div style="flex-grow: 1; margin-left: 8px;">
+                        <div id="navigation-top-info-bar">
+                            <div id="turn-icon-container-styled">
+                                <span id="turn-icon-display" class="turn-icon-display"></span>
+                            </div>
+                            <div class="maneuver-text-container">
+                               <div>
+                                   <span id="maneuver-text-display" class="maneuver-text"></span>
+                                   <span id="street-name-display" class="street-name"></span>
+                               </div>
+                               <div id="distance-to-turn-formatted"></div>
+                            </div>
+                        </div>
+                        <div id="distance-progress-bar-to-turn-container"> <div id="distance-progress-bar-to-turn"></div> </div>
+                        <hr>
+                        <div id="route-overall-progress-container">
+                             <div id="route-overall-progress">
+                                 <img id="route-progress-icon" src="AVANCE.PNG" alt="Avance" style="display:none;">
+                                 <span id="route-progress-text"></span>
+                             </div>
+                        </div>
+                        <div id="navigation-eta-info">
+                            <div id="next-stage-info">
+                                <strong id="next-stage-label">Próxima Etapa</strong>
+                                <span id="next-stage-distance">-- km</span>   |  
+                                <span id="next-stage-time">-- min</span>   |   ETA:
+                                <span id="next-stage-eta">--:--</span>
+                                <span id="next-stage-eta-deviation" class="eta-deviation"></span>
+                            </div>
+                            <div id="final-destination-info">
+                                <strong> Destino</strong>
+                                <span id="final-destination-distance">-- km</span>   |  
+                                <span id="final-destination-time">-- min</span>   |   ETA:
+                                <span id="final-destination-eta">--:--</span>
+                                <span id="final-destination-eta-deviation" class="eta-deviation"></span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(mapModal);
+
+    const MAPBOX_PRIMARY_KEY = 'boardinggate_useMapboxAsPrimary';
+    const radaresCheckbox = document.getElementById('radares-ruta-checkbox');
+    if (radaresCheckbox) radaresCheckbox.checked = localStorage.getItem(RADARES_RUTA_CHECKED_KEY) === 'true';
+    const tareasCheckbox = document.getElementById('tareas-ruta-checkbox');
+    if (tareasCheckbox) tareasCheckbox.checked = localStorage.getItem(TAREAS_RUTA_CHECKED_KEY) === 'true';
+    const mapboxCheckbox = document.getElementById('mapbox-primary-checkbox');
+    if (mapboxCheckbox) mapboxCheckbox.checked = localStorage.getItem(MAPBOX_PRIMARY_KEY) === 'true';
+    currentGraphMode = localStorage.getItem(GRAPH_STATE_KEY) || 'Desviación ETA';
+
+    toggleMapHeaderRowsVisibility(mapHeaderButtonsVisible);
+
+    requestAnimationFrame(() => {
+        const mapActualContainer = document.getElementById('leaflet-map-actual-container');
+        if (!mapActualContainer) {
+            isNavigationMapActive = false;
+            sessionStorage.removeItem('mapContext');
+            if (mapModal.parentNode) mapModal.remove();
+            showToast("Error crítico: No se pudo crear el contenedor del mapa.", "error");
+            return;
+        }
+
+        initDirectionWarningCards();
+        assignMapButtonListeners();
+
+        const mapLocationSearchInput = document.getElementById('map-location-search-input');
+        const mapFilterInput = document.getElementById('filter-input');
+        if (mapLocationSearchInput) mapLocationSearchInput.value = '';
+        if (mapFilterInput) mapFilterInput.value = localStorage.getItem(MAP_FILTER_INPUT_KEY) || 'España';
+        if (mapLocationSearchInput) mapLocationSearchInput.dispatchEvent(new Event('input'));
+
+        try {
+            if (navigationMapInstance) navigationMapInstance.remove();
+            if (mapLayersControl) mapLayersControl.remove();
+            if (compassAndModeControl) compassAndModeControl.remove();
+
+            navigationMapInstance = L.map(mapActualContainer, { zoomControl: false, attributionControl: false }).setView([40.416775, -3.703790], 6);
+            
+            L.control.attribution({ prefix: '<a href="https://leafletjs.com" title="A JS library for interactive maps">Leaflet</a>', position: 'bottomright' }).addTo(navigationMapInstance);
+
+            const osmLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© <a href="https://www.openstreetmap.org/copyright">OSM</a>' });
+            const satelliteLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { attribution: 'Tiles © Esri' });
+            const satelliteWithLabels = L.layerGroup([
+                L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { attribution: 'Tiles © Esri' }),
+                L.tileLayer('https://{s}.basemaps.cartocdn.com/light_only_labels/{z}/{x}/{y}{r}.png', { attribution: '© OSM © CARTO', pane: 'labels' })
+            ]);
+            if (!navigationMapInstance.getPane('labels')) {
+                navigationMapInstance.createPane('labels');
+                navigationMapInstance.getPane('labels').style.zIndex = 650;
+                navigationMapInstance.getPane('labels').style.pointerEvents = 'none';
+            }
+            const baseMaps = { "Mapa Normal": osmLayer, "Satélite Puro": satelliteLayer, "Satélite + Calles": satelliteWithLabels };
+            const savedLayerName = localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "Satélite + Calles";
+            let initialLayer = baseMaps[savedLayerName] || satelliteWithLabels;
+            initialLayer.addTo(navigationMapInstance);
+            mapLayersControl = L.control.layers(baseMaps, null, { position: 'topright', collapsed: true }).addTo(navigationMapInstance);
+            compassAndModeControl = L.control.compassAndMode({ position: 'bottomleft' }).addTo(navigationMapInstance);
+            completedRouteSegmentsLayer = L.layerGroup().addTo(navigationMapInstance);
+            maxSpeedMarkerLayer = L.layerGroup().addTo(navigationMapInstance);
+            speedMilestoneLayer = L.layerGroup().addTo(navigationMapInstance);
+
+            navigationMapInstance.on('baselayerchange', function(e) {
+                localStorage.setItem(ACTIVE_MAP_LAYER_KEY, e.name);
+                updateRouteAndCarIconStyle();
+                updateNavigationGraphVisibilityAndMode();
+            });
+
+            navigationMapInstance.on('zoomend', () => {
+                displayAlertsOnMap();
+                renderWaypointMarkers();
+                updateDirectionWarningCardsVisibility();
+                displayChargingPointsOnMap(); 
+            });
+            
+            let centerAction = null;
+
+            navigationMapInstance.on('load', function() {
+                toggleMapHeaderRowsVisibility(mapHeaderButtonsVisible); 
+                const loadingToast = document.getElementById("map-loading-toast");
+                if (loadingToast) {
+                    loadingToast.remove();
+                    activeToasts = activeToasts.filter(t => t.id !== "map-loading-toast");
+                }
+                if(centerAction) {
+                    centerAction();
+                }
+            });
+
+            getCurrentLocation(
+                (currentPos) => {
+                    navigationCurrentLocation = currentPos;
+                    updateInitialUserPosition(currentPos, navigationMapInstance);
+                    const gpsCenterAction = () => {
+                         if (navigationWaypoints.length === 0) {
+                            navigationMapInstance.setView([currentPos.latitude, currentPos.longitude], 15);
+                        }
+                    };
+                    if (navigationMapInstance._loaded) {
+                        gpsCenterAction();
+                    } else {
+                        centerAction = gpsCenterAction;
+                    }
+                    startGpsWatching(); 
+                },
+                (errorMsg) => {
+                    showToast("No se pudo obtener tu ubicación actual. Algunas funciones pueden estar limitadas", "warning");
+                    if (compassAndModeControl) { compassAndModeControl.updateOrientation(null); compassAndModeControl.updateAltitude(null); }
+                    
+                    const fallbackCenterAction = () => {
+                        const remindersWithLocation = JSON.parse(localStorage.getItem('reminders') || '[]').filter(r => r.isLocationEnabled && r.locationCoordinates);
+                        if (navigationWaypoints.length === 0 && remindersWithLocation.length > 0) {
+                            const bounds = L.latLngBounds(remindersWithLocation.map(r => [r.locationCoordinates.latitude, r.locationCoordinates.longitude]));
+                            if (bounds.isValid()) {
+                                 navigationMapInstance.fitBounds(bounds.pad(0.15));
+                            }
+                        }
+                    };
+
+                    if (navigationMapInstance._loaded) {
+                        fallbackCenterAction();
+                    } else {
+                        centerAction = fallbackCenterAction;
+                    }
+                    startGpsWatching(); 
+                }
+            );
+            
+            updateRouteAndCarIconStyle();
+            plotRemindersOnNavigationMap();
+            forceProcessTrafficAlerts();
+            setNavigationMapClickHandler();
+        } catch (error) {
+             const errorContainer = document.getElementById('leaflet-map-actual-container') || mapActualContainer;
+             if (errorContainer) errorContainer.innerHTML = `<p style="color:red; text-align:center; padding:20px;">Error al cargar el mapa: ${error.message}</p>`;
+             isNavigationMapActive = false;
+        }
+
+        updateStartNavigationButtonState();
+        updateNavigationButtonColor();
+        toggleMapLocationSearchVisibility(!isNavigating);
+        actualizarContadorRadares(radaresEnRutaActual.length);
+        actualizarContadorTareas(tareasEnRutaActual.length);
+        updateNavigationGraphVisibilityAndMode();
+    });
+}
+
+// ===================================================================
+// NOMBRE: assignMapButtonListeners (MODIFICADA)
+// RESUMEN: Asigna listeners a los botones del mapa, incluyendo el nuevo checkbox de Mapbox.
+// ===================================================================
+function assignMapButtonListeners() {
+    const header = document.getElementById('reminders-location-map-header');
+    const togglePanelButton = document.getElementById('toggle-map-header-buttons-panel');
+    if (!header || !togglePanelButton) return;
+
+    let swipeStartX = 0;
+    let swipeStartY = 0;
+    let isSwiping = false;
+    let pressTimer = null;
+
+    const handleGestureStart = (e) => {
+        isSwiping = false;
+        swipeStartX = e.touches ? e.touches[0].clientX : e.clientX;
+        swipeStartY = e.touches ? e.touches[0].clientY : e.clientY;
+        
+        clearTimeout(pressTimer);
+        pressTimer = setTimeout(() => {
+            openAlertModal();
+            swipeStartX = 0;
+            swipeStartY = 0;
+        }, 800);
+
+        if(e.type === 'touchstart') e.preventDefault();
+    };
+
+    const handleGestureMove = (e) => {
+        if (swipeStartX === 0) return;
+        const moveX = e.touches ? e.touches[0].clientX : e.clientX;
+        const moveY = e.touches ? e.touches[0].clientY : e.clientY;
+        if (Math.abs(moveX - swipeStartX) > 10 || Math.abs(moveY - swipeStartY) > 10) {
+            isSwiping = true;
+            clearTimeout(pressTimer);
+        }
+    };
+
+    const handleGestureEnd = (e) => {
+        clearTimeout(pressTimer);
+        if (swipeStartX === 0) return;
+
+        const endX = e.changedTouches ? e.changedTouches[0].clientX : e.clientX;
+        const endY = e.changedTouches ? e.changedTouches[0].clientY : e.clientY;
+        const deltaX = endX - swipeStartX;
+        const deltaY = endY - swipeStartY;
+        const swipeThreshold = 50;
+
+        if (!isSwiping) {
+            toggleMapHeaderRowsVisibility(!mapHeaderButtonsVisible);
+        } else {
+            if (Math.abs(deltaY) > Math.abs(deltaX) && Math.abs(deltaY) > swipeThreshold) {
+                if (deltaY < 0) {
+                    toggleNavigationState();
+                } else {
+                    loadRouteByName("TRABAJO", true);
+                }
+            } else if (Math.abs(deltaX) > Math.abs(deltaY) && Math.abs(deltaX) > swipeThreshold) {
+                if (deltaX < 0) {
+                    toggleMapImmersiveMode();
+                } else {
+                    loadRouteByName("CASA", true);
+                }
+            }
+        }
+        
+        swipeStartX = 0;
+        swipeStartY = 0;
+        isSwiping = false;
+    };
+
+    togglePanelButton.removeEventListener('mousedown', handleGestureStart);
+    togglePanelButton.removeEventListener('mousemove', handleGestureMove);
+    togglePanelButton.removeEventListener('mouseup', handleGestureEnd);
+    togglePanelButton.removeEventListener('mouseleave', handleGestureEnd);
+    togglePanelButton.removeEventListener('touchstart', handleGestureStart);
+    togglePanelButton.removeEventListener('touchmove', handleGestureMove);
+    togglePanelButton.removeEventListener('touchend', handleGestureEnd);
+    togglePanelButton.addEventListener('mousedown', handleGestureStart);
+    togglePanelButton.addEventListener('mousemove', handleGestureMove);
+    togglePanelButton.addEventListener('mouseup', handleGestureEnd);
+    togglePanelButton.addEventListener('mouseleave', handleGestureEnd);
+    togglePanelButton.addEventListener('touchstart', handleGestureStart, { passive: false });
+    togglePanelButton.addEventListener('touchmove', handleGestureMove, { passive: false });
+    togglePanelButton.addEventListener('touchend', handleGestureEnd);
+    header.addEventListener('click', (event) => {
+        const button = event.target.closest('button');
+        if (!button) return;
+        if (button.id !== 'toggle-map-header-buttons-panel') {
+            event.stopPropagation();
+        }
+        switch (button.id) {
+            case 'close-reminders-location-map':
+                closeNavigationMap(false);
+                break;
+            case 'locate-me-on-reminders-map':
+                handleLocateMeClick(button);
+                break;
+            case 'nav-map-zoomtoggle-button':
+                handleZoomToggleButtonClick(button);
+                break;
+            case 'start-navigation-button':
+                toggleNavigationState();
+                break;
+            case 'save-route-button':
+                saveCurrentRoute();
+                break;
+            case 'delete-current-route-button':
+                handleLoadOrDeleteRouteClick(button);
+                break;
+            case 'load-saved-route-button':
+                showLoadRouteModal();
+                break;
+            case 'add-radar-here':
+                handleAddRadarHereClick(button);
+                break;
+            case 'accident-alert-button-map':
+                openAlertModal();
+                break;
+            case 'pdrs-ruta-button':
+                handlePdrSearchButtonClick();
+                break;
+            case 'add-reminder-at-location-button':
+                toggleAddReminderAtLocationMode();
+                break;
+            case 'toggle-simulate-gps-button':
+                handleGpsSimulationToggle();
+                break;
+            case 'simulate-route-button':
+                showSimulationModal();
+                break;
+            case 'reorder-route-stages-button':
+                showReorderStagesModal();
+                break;
+            case 'navigation-map-help-button':
+                showNavigationMapHelpModal();
+                break;
+            case 'map-location-search-button':
+                const mapSearchInput = document.getElementById('map-location-search-input');
+                const mapFilterInput = document.getElementById('filter-input');
+                const mainTerm = mapSearchInput?.value.trim() || '';
+                if (!mainTerm) {
+                    showToast("El campo de búsqueda principal no puede estar vacío.", "warning");
+                    return;
+                }
+                const filterTerm = mapFilterInput?.value.trim() || '';
+                let combinedSearchTerm = mainTerm;
+                if (filterTerm) {
+                    combinedSearchTerm += ' ' + filterTerm;
+                }
+                searchAndAddWaypoint(combinedSearchTerm);
+                break;
+            case 'clear-map-search-input-button':
+                const mapSearchInputToClear = document.getElementById('map-location-search-input');
+                if (mapSearchInputToClear) {
+                    mapSearchInputToClear.value = '';
+                }
+                mapSearchInputToClear?.dispatchEvent(new Event('input'));
+                mapSearchInputToClear?.focus();
+                hideAddressSuggestionsModal();
+                break;
+        }
+    });
+    document.getElementById('radares-ruta-checkbox')?.addEventListener('change', (e) => toggleRadaresRuta(e.target.checked));
+    document.getElementById('tareas-ruta-checkbox')?.addEventListener('change', (e) => toggleTareasRuta(e.target.checked));
+    
+    const mapboxCheckbox = document.getElementById('mapbox-primary-checkbox');
+    if (mapboxCheckbox) {
+        mapboxCheckbox.addEventListener('change', (e) => {
+            const MAPBOX_PRIMARY_KEY = 'boardinggate_useMapboxAsPrimary';
+            localStorage.setItem(MAPBOX_PRIMARY_KEY, e.target.checked);
+            markCacheAsDirty();
+            const serviceName = e.target.checked ? 'Mapbox' : 'OSRM';
+            showToast(`Servicio primario cambiado a ${serviceName}. Recalculando ruta...`, 'success');
+            if (navigationWaypoints.length >= 2) {
+                recalculateAndDrawRoute(true);
+            }
+        });
+    }
+
+    const mapLocationSearchInput = document.getElementById('map-location-search-input');
+    const mapFilterInput = document.getElementById('filter-input');
+    if (mapLocationSearchInput) {
+        let searchDebounceTimer;
+        const handleSearchInput = () => {
+            const hasMainText = mapLocationSearchInput.value.trim() !== '';
+            document.getElementById('map-location-search-button').style.display = hasMainText ? 'inline-flex' : 'none';
+            document.getElementById('clear-map-search-input-button').style.display = hasMainText ? 'inline-flex' : 'none';
+            clearTimeout(searchDebounceTimer);
+            const mainTerm = mapLocationSearchInput.value.trim();
+            if (mainTerm) {
+                const filterTerm = mapFilterInput.value.trim();
+                let combinedSearchTerm = mainTerm;
+                if (filterTerm) {
+                    combinedSearchTerm += ' ' + filterTerm;
+                }
+                searchDebounceTimer = setTimeout(() => fetchAddressSuggestions(combinedSearchTerm), 300);
+            } else {
+                hideAddressSuggestionsModal();
+            }
+            localStorage.setItem(MAP_FILTER_INPUT_KEY, mapFilterInput.value);
+        };
+        mapLocationSearchInput.addEventListener('input', handleSearchInput);
+        if (mapFilterInput) {
+            mapFilterInput.addEventListener('input', handleSearchInput);
+        }
+        mapLocationSearchInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                const mainTerm = mapLocationSearchInput.value.trim();
+                if (!mainTerm) {
+                    showToast("El campo de búsqueda principal no puede estar vacío.", "warning");
+                    return;
+                }
+                const filterTerm = mapFilterInput?.value.trim() || '';
+                let combinedSearchTerm = mainTerm;
+                if (filterTerm) {
+                    combinedSearchTerm += ' ' + filterTerm;
+                }
+                hideAddressSuggestionsModal();
+                searchAndAddWaypoint(combinedSearchTerm);
+            }
+        });
+    }
+    document.getElementById('turn-icon-container-styled')?.addEventListener('click', (event) => {
+        event.stopPropagation();
+        if (navigationCurrentRouteData?.routes?.[0]) {
+            const route = navigationCurrentRouteData.routes[0];
+            const currentLeg = route.legs?.[currentLegIndexNav];
+            let nextStep = null;
+            if (currentLeg && currentStepIndexNav + 1 < currentLeg.steps.length) {
+                nextStep = currentLeg.steps[currentStepIndexNav + 1];
+            } else if (route.legs && currentLegIndexNav + 1 < route.legs.length) {
+                nextStep = route.legs[currentLegIndexNav + 1].steps[0];
+            } else {
+                nextStep = currentLeg?.steps?.[currentStepIndexNav];
+            }
+            if (nextStep) {
+                showIntersectionPreviewMap(nextStep, route, true, 7000);
+            } else {
+                showToast("No hay maniobra siguiente para mostrar detalle.", "info");
+            }
+        }
+    });
+}
+    
 
 // ===================================================================
 // NOMBRE: startEditMessage (NUEVA FUNCIÓN)
@@ -11754,193 +12602,6 @@ async function selectAlternativeRoute(waypointId, routeType) {
     showToast(`Ruta para esta etapa cambiada a: ${translatedType}. Recalculando...`, "success");
 }
     
-// ===================================================================
-// NOMBRE: recalculateAndDrawRoute (VERSIÓN FINAL Y DEFINITIVA 3)
-// RESUMEN: Recalcula la ruta usando TODOS los waypoints, incluidos los internos.
-// ===================================================================
-async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
-    isRecalculatingRoute = true;
-    lastAutoShownManeuverId = null;
-
-    clearAlternativeRoutesDisplay();
-    
-    if (preserveAccumulatedStats) {
-        accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
-    } else {
-        isArrivalSequenceStarted = false;
-        accumulatedDistanceBeforeCurrentSegment = 0;
-        totalDistanceTravelledForStats = 0;
-        maxDistanceReachedOnRoute = 0;
-        lastPositionForStats = null;
-        if (isNavigating) navigationStartTimeForStats = new Date();
-        
-        tripInitialOverallEtaTime = null; 
-        currentStageInitialExpectedEtaTime = null;
-        accumulatedDeviationMs = 0;
-        maxSpeedDuringTrip = 0;
-        maxSpeedCoordinates = null;
-        maxAltitudeDuringTrip = -Infinity; 
-        minAltitudeDuringTrip = Infinity; 
-        minAverageSpeedInTrip = Infinity;
-        maxAverageSpeedInTrip = -Infinity;
-        if (compassAndModeControl) {
-            compassAndModeControl.updateMaxSpeed(maxSpeedDuringTrip);
-        }
-        tripInitialDurationSec = null;
-        tripInitialDistanceMeters = null;
-    }
-
-    const recalculateToastId = "recalculating-route-toast";
-    showToast("Recalculando ruta...", "info", 0, false, recalculateToastId);
-    
-    lastCarDistanceAlongRouteForNavLogic = 0;
-    lastValidCarDistanceForDisplay = 0;
-
-    let waypointsForRouteCalculation = [];
-    if (isNavigating && navigationCurrentLocation) {
-        waypointsForRouteCalculation.push({ lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude });
-        const unvisitedWaypoints = navigationWaypoints.filter(wp => !wp.visited);
-        waypointsForRouteCalculation.push(...unvisitedWaypoints);
-    } else {
-        waypointsForRouteCalculation = [...navigationWaypoints];
-    }
- 
-    if (waypointsForRouteCalculation.length < 2) {
-        const existingRecalcToast = document.getElementById(recalculateToastId);
-        if (existingRecalcToast) existingRecalcToast.remove();
-        activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
-        showToast("No hay suficientes etapas restantes para calcular una nueva ruta.", "warning");
-        if (navigationRouteLayer && navigationMapInstance) { try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {} navigationRouteLayer = null; }
-        if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
-        navigationCurrentRouteData = null;
-        hideMapInfoOverlay();
-        isRecalculatingRoute = false;
-        return;
-    }
-
-    const coordsString = waypointsForRouteCalculation.map(wp => {
-        if (typeof wp.lng !== 'number' || typeof wp.lat !== 'number' || isNaN(wp.lng) || isNaN(wp.lat) ) return null;
-        return `${wp.lng},${wp.lat}`;
-    }).filter(Boolean).join(';');
-
-    if (!coordsString || waypointsForRouteCalculation.filter(wp => wp && typeof wp.lng === 'number' && typeof wp.lat === 'number').length < 2) {
-        const existingRecalcToast = document.getElementById(recalculateToastId);
-        if (existingRecalcToast) existingRecalcToast.remove();
-        activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
-        showToast("No hay suficientes waypoints válidos para calcular la ruta.", "warning");
-        if (navigationRouteLayer && navigationMapInstance) { try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {} navigationRouteLayer = null; }
-        if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
-        navigationCurrentRouteData = null;
-        hideMapInfoOverlay();
-        isRecalculatingRoute = false;
-        recalculationAttempts = 0;
-        if (recalculationRetryTimeoutId) clearTimeout(recalculationRetryTimeoutId);
-        recalculationRetryTimeoutId = null;
-        updateStartNavigationButtonState();
-        return;
-    }
-
-    const url = `${OSRM_SERVICE_URL}/driving/${coordsString}?overview=full&geometries=geojson&steps=true&alternatives=false&annotations=true`;
-    try {
-        const response = await fetch(url);
-        if (!response.ok) {
-            let errorData = { message: `HTTP error ${response.status}` };
-            try { errorData = await response.json(); } catch (e) { errorData.message = response.statusText || errorData.message; }
-            throw new Error(`OSRM Error: ${errorData.code || errorData.message || response.statusText}`);
-        }
-        const data = await response.json();
-        const existingRecalcToastSuccess = document.getElementById(recalculateToastId);
-        if (existingRecalcToastSuccess) existingRecalcToastSuccess.remove();
-        activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
-
-        if (data.routes && data.routes.length > 0) {
-            navigationCurrentRouteData = data;
-            if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
-            drawRouteOnMap(data.routes[0]);
-            currentLegIndexNav = 0;
-            currentStepIndexNav = 0;
-            lastProcessedStepManeuverLocation = null;
-            
-            if (data.routes[0]) {
-                const newRouteData = data.routes[0];
-                
-                if (newRouteData.legs && newRouteData.legs.length > 0) {
-                     currentStageInitialExpectedEtaTime = new Date(Date.now() + newRouteData.legs[0].duration * 1000);
-                }
-
-                 const currentCarPosForRecalc = navigationCurrentLocation;
-                 let carDistanceAlongRouteForInternalUse = 0;
-                 if (currentCarPosForRecalc && navigationMapInstance && navigationRouteLayer && typeof turf !== 'undefined' && navigationRouteLayer.getLatLngs().length > 0) {
-                    try {
-                        const carPointTurf = turf.point([currentCarPosForRecalc.longitude, currentCarPosForRecalc.latitude]);
-                        const routeLineStringTurf = turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat]));
-                        const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
-                        const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
-                        carDistanceAlongRouteForInternalUse = turf.length(lineSliceToNearestTurf, { units: 'meters' });
-                    } catch (turfError) {}
-                 }
-                 lastCarDistanceAlongRouteForNavLogic = carDistanceAlongRouteForInternalUse;
-                 updateNavigationProgressDisplay(newRouteData, carDistanceAlongRouteForInternalUse);
-                 updateTurnByTurnDisplay(newRouteData, carDistanceAlongRouteForInternalUse);
-                 showDestinationName();
-
-                if (isNavigating) {
-                    const firstDestination = navigationWaypoints.find(wp => wp && !wp.isInternal && wp.type !== 'S' && !wp.visited);
-                    if (firstDestination) {
-                        alternativeRoutesCache.delete(firstDestination.id);
-                        fetchAndDisplayAlternativeRoutes(firstDestination.id);
-                    }
-                }
-            }
-            showNavigationUIElementsForPlanning();
-            recalculationAttempts = 0;
-            if (recalculationRetryTimeoutId) clearTimeout(recalculationRetryTimeoutId);
-            recalculationRetryTimeoutId = null;
-
-            if (automatedSimulationIntervalId) {
-                stopAutomatedRouteSimulationInternal();
-                showToast("Ruta recalculada. Reiniciando simulación automática.", "info");
-                startAutomatedRouteSimulation(simulationSpeedKmph, true);
-            }
-
-            // --- INICIO: Lógica añadida para recalcular POIs en ruta ---
-            const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
-            if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
-                toggleRadaresRuta(true);
-            }
-            const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
-            if (tareasRutaCheckbox && tareasRutaCheckbox.checked) {
-                toggleTareasRuta(true);
-            }
-            // --- FIN: Lógica añadida ---
-
-        } else {
-            throw new Error("No se encontraron rutas.");
-        }
-    } catch (error) {
-        const existingRecalcToastError = document.getElementById(recalculateToastId);
-        if (existingRecalcToastError) existingRecalcToastError.remove();
-        activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
-        let errorMessageForToast = `Error al calcular ruta: ${error.message}`;
-        showToast(errorMessageForToast, "error");
-        if (navigationRouteLayer && navigationMapInstance) { try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch(e) {} navigationRouteLayer = null; }
-        if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
-        navigationCurrentRouteData = null;
-        lastValidCarDistanceForDisplay = 0;
-        hideMapInfoOverlay();
-        const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
-        if (radaresRutaCheckbox) { eliminarRadaresDeRuta(); actualizarContadorRadares(0); localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresRutaCheckbox.checked)); }
-        const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
-        if (tareasRutaCheckbox) { eliminarTareasDeBarraProgreso(); actualizarContadorTareas(0); localStorage.setItem(TAREAS_RUTA_CHECKED_KEY, String(tareasRutaCheckbox.checked)); }
-        if (recalculationRetryTimeoutId) clearTimeout(recalculationRetryTimeoutId);
-        recalculationRetryTimeoutId = setTimeout(() => recalculateAndDrawRoute(preserveAccumulatedStats), 2000);
-    }
-    updateStartNavigationButtonState();
-    updateNavigationButtonColor();
-    if (!recalculationRetryTimeoutId) {
-        isRecalculatingRoute = false;
-    }
-}
 
     
 // ===================================================================
@@ -17737,503 +18398,7 @@ function positionTurnHelpers() {
    }
 
 
-// ===================================================================
-// NOMBRE: openNavigationMap (MODIFICADA)
-// RESUMEN: Abre y inicializa el mapa principal de navegación.
-// ===================================================================
-function openNavigationMap() {
-    const mainContent = document.querySelector('main');
-    if (mainContent) mainContent.style.display = 'none';
-    const footer = document.querySelector('footer');
-    if (footer) footer.style.display = 'none';
-    const noticesContainer = document.querySelector('.notices-icon-container');
-    if (noticesContainer) noticesContainer.style.display = 'none';
-    const sideControls = document.querySelectorAll('.toggle-image, .toggle-sign, .scroll-toggle-button');
-    sideControls.forEach(el => el.style.display = 'none');
-    document.querySelectorAll('#config-button, #personal-button, #radar-button, #home-button, #reload-button, #keyword-assignment-button, #password-toggle-button, #versions-button, #info-button, #accident-alert-button').forEach(el => el.style.display = 'none');
-    const gridFilter = document.getElementById('grid-filter-container');
-    if (gridFilter) gridFilter.style.display = 'none';
-
-    isNavigationMapActive = true;
-    sessionStorage.setItem('mapContext', 'navigation');
-
-    closeOtherModals('reminders-location-map-modal');
     
-    const mapModal = document.createElement('div');
-    mapModal.id = 'reminders-location-map-modal';
-    mapModal.innerHTML = `
-        <div id="toggle-map-header-buttons-panel">
-             <img src="Coche_Sat.PNG" alt="Toggle Panel Mapa">
-        </div>
-        <div id="reminders-location-map-content-wrapper">
-            <div id="reminders-location-map-header">
-                 <div class="button-row">
-                    <button id="close-reminders-location-map" class="reminders-map-button-action" title="Cerrar mapa y navegación"><img src="SALIR.PNG" alt="Salir"></button>
-                    <button id="locate-me-on-reminders-map" class="reminders-map-button-action" title="Mostrar mi posición actual y activar seguimiento"><img src="ESTASAQUI.PNG" alt="Estás Aquí"></button>
-                    <button id="nav-map-zoomtoggle-button" class="reminders-map-button-action" style="background-color: white;" data-zoom-state="waypoints" title="Alternar zoom entre vista de ruta y coche"><img src="ZOOM+.PNG" alt="Zoom" style="width:30px; height:30px;"></button>
-                    <button id="start-navigation-button" class="reminders-map-button-action hidden" title="Iniciar/Terminar Navegación"><img src="INICIARNAVEGACION.PNG" alt="Iniciar Navegación"></button>
-                    <button id="save-route-button" class="reminders-map-button-action hidden" title="Guardar Ruta Actual"><img src="GUARDARRUTA.PNG" alt="Guardar Ruta"></button>
-                    <button id="load-saved-route-button" class="reminders-map-button-action" title="Cargar Ruta Guardada"><img src="CARGARRUTA.PNG" alt="Cargar Ruta"></button>
-                    <button id="delete-current-route-button" class="reminders-map-button-action hidden" title="Borrar Ruta Actual del Mapa"><img src="BORRARRUTA.PNG" alt="Borrar Ruta"></button>
-                    <button id="add-radar-here" class="reminders-map-button-action" title="Crear RADAR en mi posición actual (radio 350m)"><img src="RADARAQUI.PNG" alt="Radar Aquí"></button>
-                    <button id="accident-alert-button-map" class="reminders-map-button-action" title="Informar de una incidencia de tráfico"><img src="https://boardinggate.github.io/Tesla/AACCIDENTE.png" alt="Informar Incidencia"></button>
-                    <button id="pdrs-ruta-button" class="reminders-map-button-action" title="Buscar Puntos de Recarga en Ruta"><img src="pdrs.png" alt="PDRs"></button>
-                     <div class="radares-ruta-control">
-                        <input type="checkbox" id="radares-ruta-checkbox">
-                        <div class="radares-ruta-label-container">
-                            <label for="radares-ruta-checkbox">Radares<br>Ruta</label>
-                            <span id="radares-ruta-count" class="hidden">0</span>
-                        </div>
-                    </div>
-                    <div class="tareas-ruta-control">
-                        <input type="checkbox" id="tareas-ruta-checkbox">
-                        <div class="tareas-ruta-label-container">
-                            <label for="tareas-ruta-checkbox">Tareas<br>Ruta</label>
-                            <span id="tareas-ruta-count" class="hidden">0</span>
-                        </div>
-                    </div>
-                    <button id="add-reminder-at-location-button" class="reminders-map-button-action" title="Añadir recordatorio en punto del mapa">
-                        <img src="https://boardinggate.github.io/Tesla/IMG_4197.jpg" alt="Añadir Recordatorio">
-                    </button>
-                     <button id="toggle-simulate-gps-button" class="reminders-map-button-action" title="Activar/Desactivar Simulación GPS (recorrido o clic)"><img src="GPS.PNG" alt="Simular Recorrido"></button>
-                    <button id="simulate-route-button" class="reminders-map-button-action" title="Simular interacciones de ruta"><img src="SIMULAR.PNG" alt="Simular Ruta"></button>
-                 </div>
-                 <div class="button-row" id="search-row-map-header">
-                    <button id="reorder-route-stages-button" title="Ordenar Etapas de Ruta"><img src="./MOVER.PNG" alt="Ordenar Etapas"></button>
-                    <button id="map-location-search-button" class="reminders-map-button-action"><img src="./ANADIRPUNTO.PNG" alt="Añadir Punto Ruta"></button>
-                    <button id="clear-map-search-input-button" title="Limpiar búsqueda">
-                        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="red" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
-                    </button>
-                    <input type="text" id="map-location-search-input" placeholder="Dirección,sitio,zona /Negocio /Ciudad /CP+Provincia (28001 Madrid /Lidl Lugo)">
-                    <input type="text" id="filter-input" placeholder="Filtro"> 
-                    <button id="navigation-map-help-button" class="reminders-map-button-action" title="Ayuda del mapa de navegación/radares"><img src="IMG_4326.PNG" alt="Ayuda"></button>
-                 </div>
-            </div>
-             <div id="reminders-location-map-div">
-                <div id="leaflet-map-actual-container"></div>
-                <div id="direction-card-izquierda"></div>
-                <div id="direction-card-derecha"></div>
-                 <div id="map-info-overlay"></div>
-                 <div id="navigation-bottom-progress-bar" style="display: none;">
-                    <div style="flex-grow: 1; margin-left: 8px;">
-                        <div id="navigation-top-info-bar">
-                            <div id="turn-icon-container-styled">
-                                <span id="turn-icon-display" class="turn-icon-display"></span>
-                            </div>
-                            <div class="maneuver-text-container">
-                               <div>
-                                   <span id="maneuver-text-display" class="maneuver-text"></span>
-                                   <span id="street-name-display" class="street-name"></span>
-                               </div>
-                               <div id="distance-to-turn-formatted"></div>
-                            </div>
-                        </div>
-                        <div id="distance-progress-bar-to-turn-container"> <div id="distance-progress-bar-to-turn"></div> </div>
-                        <hr>
-                        <div id="route-overall-progress-container">
-                             <div id="route-overall-progress">
-                                 <img id="route-progress-icon" src="AVANCE.PNG" alt="Avance" style="display:none;">
-                                 <span id="route-progress-text"></span>
-                             </div>
-                        </div>
-                        <div id="navigation-eta-info">
-                            <div id="next-stage-info">
-                                <strong id="next-stage-label">Próxima Etapa</strong>
-                                <span id="next-stage-distance">-- km</span>   |  
-                                <span id="next-stage-time">-- min</span>   |   ETA:
-                                <span id="next-stage-eta">--:--</span>
-                                <span id="next-stage-eta-deviation" class="eta-deviation"></span>
-                            </div>
-                            <div id="final-destination-info">
-                                <strong> Destino</strong>
-                                <span id="final-destination-distance">-- km</span>   |  
-                                <span id="final-destination-time">-- min</span>   |   ETA:
-                                <span id="final-destination-eta">--:--</span>
-                                <span id="final-destination-eta-deviation" class="eta-deviation"></span>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-    `;
-    document.body.appendChild(mapModal);
-
-    const radaresCheckbox = document.getElementById('radares-ruta-checkbox');
-    if (radaresCheckbox) radaresCheckbox.checked = localStorage.getItem(RADARES_RUTA_CHECKED_KEY) === 'true';
-    const tareasCheckbox = document.getElementById('tareas-ruta-checkbox');
-    if (tareasCheckbox) tareasCheckbox.checked = localStorage.getItem(TAREAS_RUTA_CHECKED_KEY) === 'true';
-    currentGraphMode = localStorage.getItem(GRAPH_STATE_KEY) || 'Desviación ETA';
-
-    toggleMapHeaderRowsVisibility(mapHeaderButtonsVisible);
-
-    requestAnimationFrame(() => {
-        const mapActualContainer = document.getElementById('leaflet-map-actual-container');
-        if (!mapActualContainer) {
-            isNavigationMapActive = false;
-            sessionStorage.removeItem('mapContext');
-            if (mapModal.parentNode) mapModal.remove();
-            showToast("Error crítico: No se pudo crear el contenedor del mapa.", "error");
-            return;
-        }
-
-        initDirectionWarningCards();
-        assignMapButtonListeners();
-
-        const mapLocationSearchInput = document.getElementById('map-location-search-input');
-        const mapFilterInput = document.getElementById('filter-input');
-        if (mapLocationSearchInput) mapLocationSearchInput.value = '';
-        if (mapFilterInput) mapFilterInput.value = localStorage.getItem(MAP_FILTER_INPUT_KEY) || 'España';
-        if (mapLocationSearchInput) mapLocationSearchInput.dispatchEvent(new Event('input'));
-
-        try {
-            if (navigationMapInstance) navigationMapInstance.remove();
-            if (mapLayersControl) mapLayersControl.remove();
-            if (compassAndModeControl) compassAndModeControl.remove();
-
-            navigationMapInstance = L.map(mapActualContainer, { zoomControl: false, attributionControl: false }).setView([40.416775, -3.703790], 6);
-            
-            L.control.attribution({ prefix: '<a href="https://leafletjs.com" title="A JS library for interactive maps">Leaflet</a>', position: 'bottomright' }).addTo(navigationMapInstance);
-
-            const osmLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© <a href="https://www.openstreetmap.org/copyright">OSM</a>' });
-            const satelliteLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { attribution: 'Tiles © Esri' });
-            const satelliteWithLabels = L.layerGroup([
-                L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { attribution: 'Tiles © Esri' }),
-                L.tileLayer('https://{s}.basemaps.cartocdn.com/light_only_labels/{z}/{x}/{y}{r}.png', { attribution: '© OSM © CARTO', pane: 'labels' })
-            ]);
-            if (!navigationMapInstance.getPane('labels')) {
-                navigationMapInstance.createPane('labels');
-                navigationMapInstance.getPane('labels').style.zIndex = 650;
-                navigationMapInstance.getPane('labels').style.pointerEvents = 'none';
-            }
-            const baseMaps = { "Mapa Normal": osmLayer, "Satélite Puro": satelliteLayer, "Satélite + Calles": satelliteWithLabels };
-            const savedLayerName = localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "Satélite + Calles";
-            let initialLayer = baseMaps[savedLayerName] || satelliteWithLabels;
-            initialLayer.addTo(navigationMapInstance);
-            mapLayersControl = L.control.layers(baseMaps, null, { position: 'topright', collapsed: true }).addTo(navigationMapInstance);
-            compassAndModeControl = L.control.compassAndMode({ position: 'bottomleft' }).addTo(navigationMapInstance);
-            completedRouteSegmentsLayer = L.layerGroup().addTo(navigationMapInstance);
-            maxSpeedMarkerLayer = L.layerGroup().addTo(navigationMapInstance);
-            speedMilestoneLayer = L.layerGroup().addTo(navigationMapInstance);
-
-            navigationMapInstance.on('baselayerchange', function(e) {
-                localStorage.setItem(ACTIVE_MAP_LAYER_KEY, e.name);
-                updateRouteAndCarIconStyle();
-                updateNavigationGraphVisibilityAndMode();
-            });
-
-            navigationMapInstance.on('zoomend', () => {
-                displayAlertsOnMap();
-                renderWaypointMarkers();
-                updateDirectionWarningCardsVisibility();
-                displayChargingPointsOnMap(); 
-            });
-            
-            let centerAction = null;
-
-            navigationMapInstance.on('load', function() {
-                toggleMapHeaderRowsVisibility(mapHeaderButtonsVisible); 
-                const loadingToast = document.getElementById("map-loading-toast");
-                if (loadingToast) {
-                    loadingToast.remove();
-                    activeToasts = activeToasts.filter(t => t.id !== "map-loading-toast");
-                }
-                if(centerAction) {
-                    centerAction();
-                }
-            });
-
-            getCurrentLocation(
-                (currentPos) => {
-                    navigationCurrentLocation = currentPos;
-                    updateInitialUserPosition(currentPos, navigationMapInstance);
-                    const gpsCenterAction = () => {
-                         if (navigationWaypoints.length === 0) {
-                            navigationMapInstance.setView([currentPos.latitude, currentPos.longitude], 15);
-                        }
-                    };
-                    if (navigationMapInstance._loaded) {
-                        gpsCenterAction();
-                    } else {
-                        centerAction = gpsCenterAction;
-                    }
-                    startGpsWatching(); 
-                },
-                (errorMsg) => {
-                    showToast("No se pudo obtener tu ubicación actual. Algunas funciones pueden estar limitadas", "warning");
-                    if (compassAndModeControl) { compassAndModeControl.updateOrientation(null); compassAndModeControl.updateAltitude(null); }
-                    
-                    const fallbackCenterAction = () => {
-                        const remindersWithLocation = JSON.parse(localStorage.getItem('reminders') || '[]').filter(r => r.isLocationEnabled && r.locationCoordinates);
-                        if (navigationWaypoints.length === 0 && remindersWithLocation.length > 0) {
-                            const bounds = L.latLngBounds(remindersWithLocation.map(r => [r.locationCoordinates.latitude, r.locationCoordinates.longitude]));
-                            if (bounds.isValid()) {
-                                 navigationMapInstance.fitBounds(bounds.pad(0.15));
-                            }
-                        }
-                    };
-
-                    if (navigationMapInstance._loaded) {
-                        fallbackCenterAction();
-                    } else {
-                        centerAction = fallbackCenterAction;
-                    }
-                    startGpsWatching(); 
-                }
-            );
-            
-            updateRouteAndCarIconStyle();
-            plotRemindersOnNavigationMap();
-            forceProcessTrafficAlerts();
-            setNavigationMapClickHandler();
-        } catch (error) {
-             const errorContainer = document.getElementById('leaflet-map-actual-container') || mapActualContainer;
-             if (errorContainer) errorContainer.innerHTML = `<p style="color:red; text-align:center; padding:20px;">Error al cargar el mapa: ${error.message}</p>`;
-             isNavigationMapActive = false;
-        }
-
-        updateStartNavigationButtonState();
-        updateNavigationButtonColor();
-        toggleMapLocationSearchVisibility(!isNavigating);
-        actualizarContadorRadares(radaresEnRutaActual.length);
-        actualizarContadorTareas(tareasEnRutaActual.length);
-        updateNavigationGraphVisibilityAndMode();
-    });
-}
-
-
-    
-// ===================================================================
-// NOMBRE: assignMapButtonListeners
-// RESUMEN: Asigna todos los listeners a los botones de acción del mapa de navegación.
-// ===================================================================
-function assignMapButtonListeners() {
-    const header = document.getElementById('reminders-location-map-header');
-    const togglePanelButton = document.getElementById('toggle-map-header-buttons-panel');
-    if (!header || !togglePanelButton) return;
-
-    let swipeStartX = 0;
-    let swipeStartY = 0;
-    let isSwiping = false;
-    let pressTimer = null;
-
-    const handleGestureStart = (e) => {
-        isSwiping = false;
-        swipeStartX = e.touches ? e.touches[0].clientX : e.clientX;
-        swipeStartY = e.touches ? e.touches[0].clientY : e.clientY;
-        
-        clearTimeout(pressTimer);
-        pressTimer = setTimeout(() => {
-            openAlertModal();
-            swipeStartX = 0;
-            swipeStartY = 0;
-        }, 800);
-
-        if(e.type === 'touchstart') e.preventDefault();
-    };
-
-    const handleGestureMove = (e) => {
-        if (swipeStartX === 0) return;
-        const moveX = e.touches ? e.touches[0].clientX : e.clientX;
-        const moveY = e.touches ? e.touches[0].clientY : e.clientY;
-        if (Math.abs(moveX - swipeStartX) > 10 || Math.abs(moveY - swipeStartY) > 10) {
-            isSwiping = true;
-            clearTimeout(pressTimer);
-        }
-    };
-
-    const handleGestureEnd = (e) => {
-        clearTimeout(pressTimer);
-        if (swipeStartX === 0) return;
-
-        const endX = e.changedTouches ? e.changedTouches[0].clientX : e.clientX;
-        const endY = e.changedTouches ? e.changedTouches[0].clientY : e.clientY;
-        const deltaX = endX - swipeStartX;
-        const deltaY = endY - swipeStartY;
-        const swipeThreshold = 50;
-
-        if (!isSwiping) {
-            toggleMapHeaderRowsVisibility(!mapHeaderButtonsVisible);
-        } else {
-            if (Math.abs(deltaY) > Math.abs(deltaX) && Math.abs(deltaY) > swipeThreshold) {
-                if (deltaY < 0) {
-                    toggleNavigationState();
-                } else {
-                    loadRouteByName("TRABAJO", true);
-                }
-            } else if (Math.abs(deltaX) > Math.abs(deltaY) && Math.abs(deltaX) > swipeThreshold) {
-                if (deltaX < 0) {
-                    toggleMapImmersiveMode();
-                } else {
-                    loadRouteByName("CASA", true);
-                }
-            }
-        }
-        
-        swipeStartX = 0;
-        swipeStartY = 0;
-        isSwiping = false;
-    };
-
-    togglePanelButton.removeEventListener('mousedown', handleGestureStart);
-    togglePanelButton.removeEventListener('mousemove', handleGestureMove);
-    togglePanelButton.removeEventListener('mouseup', handleGestureEnd);
-    togglePanelButton.removeEventListener('mouseleave', handleGestureEnd);
-    togglePanelButton.removeEventListener('touchstart', handleGestureStart);
-    togglePanelButton.removeEventListener('touchmove', handleGestureMove);
-    togglePanelButton.removeEventListener('touchend', handleGestureEnd);
-    togglePanelButton.addEventListener('mousedown', handleGestureStart);
-    togglePanelButton.addEventListener('mousemove', handleGestureMove);
-    togglePanelButton.addEventListener('mouseup', handleGestureEnd);
-    togglePanelButton.addEventListener('mouseleave', handleGestureEnd);
-    togglePanelButton.addEventListener('touchstart', handleGestureStart, { passive: false });
-    togglePanelButton.addEventListener('touchmove', handleGestureMove, { passive: false });
-    togglePanelButton.addEventListener('touchend', handleGestureEnd);
-    header.addEventListener('click', (event) => {
-        const button = event.target.closest('button');
-        if (!button) return;
-        if (button.id !== 'toggle-map-header-buttons-panel') {
-            event.stopPropagation();
-        }
-        switch (button.id) {
-            case 'close-reminders-location-map':
-                closeNavigationMap(false);
-                break;
-            case 'locate-me-on-reminders-map':
-                handleLocateMeClick(button);
-                break;
-            case 'nav-map-zoomtoggle-button':
-                handleZoomToggleButtonClick(button);
-                break;
-            case 'start-navigation-button':
-                toggleNavigationState();
-                break;
-            case 'save-route-button':
-                saveCurrentRoute();
-                break;
-            case 'delete-current-route-button':
-                handleLoadOrDeleteRouteClick(button);
-                break;
-            case 'load-saved-route-button':
-                showLoadRouteModal();
-                break;
-            case 'add-radar-here':
-                handleAddRadarHereClick(button);
-                break;
-            case 'accident-alert-button-map':
-                openAlertModal();
-                break;
-            case 'pdrs-ruta-button':
-                handlePdrSearchButtonClick();
-                break;
-            case 'add-reminder-at-location-button':
-                toggleAddReminderAtLocationMode();
-                break;
-            case 'toggle-simulate-gps-button':
-                handleGpsSimulationToggle();
-                break;
-            case 'simulate-route-button':
-                showSimulationModal();
-                break;
-            case 'reorder-route-stages-button':
-                showReorderStagesModal();
-                break;
-            case 'navigation-map-help-button':
-                showNavigationMapHelpModal();
-                break;
-            case 'map-location-search-button':
-                const mapSearchInput = document.getElementById('map-location-search-input');
-                const mapFilterInput = document.getElementById('filter-input');
-                const mainTerm = mapSearchInput?.value.trim() || '';
-                if (!mainTerm) {
-                    showToast("El campo de búsqueda principal no puede estar vacío.", "warning");
-                    return;
-                }
-                const filterTerm = mapFilterInput?.value.trim() || '';
-                let combinedSearchTerm = mainTerm;
-                if (filterTerm) {
-                    combinedSearchTerm += ' ' + filterTerm;
-                }
-                searchAndAddWaypoint(combinedSearchTerm);
-                break;
-            case 'clear-map-search-input-button':
-                const mapSearchInputToClear = document.getElementById('map-location-search-input');
-                if (mapSearchInputToClear) {
-                    mapSearchInputToClear.value = '';
-                }
-                mapSearchInputToClear?.dispatchEvent(new Event('input'));
-                mapSearchInputToClear?.focus();
-                hideAddressSuggestionsModal();
-                break;
-        }
-    });
-    document.getElementById('radares-ruta-checkbox')?.addEventListener('change', (e) => toggleRadaresRuta(e.target.checked));
-    document.getElementById('tareas-ruta-checkbox')?.addEventListener('change', (e) => toggleTareasRuta(e.target.checked));
-    const mapLocationSearchInput = document.getElementById('map-location-search-input');
-    const mapFilterInput = document.getElementById('filter-input');
-    if (mapLocationSearchInput) {
-        let searchDebounceTimer;
-        const handleSearchInput = () => {
-            const hasMainText = mapLocationSearchInput.value.trim() !== '';
-            document.getElementById('map-location-search-button').style.display = hasMainText ? 'inline-flex' : 'none';
-            document.getElementById('clear-map-search-input-button').style.display = hasMainText ? 'inline-flex' : 'none';
-            clearTimeout(searchDebounceTimer);
-            const mainTerm = mapLocationSearchInput.value.trim();
-            if (mainTerm) {
-                const filterTerm = mapFilterInput.value.trim();
-                let combinedSearchTerm = mainTerm;
-                if (filterTerm) {
-                    combinedSearchTerm += ' ' + filterTerm;
-                }
-                searchDebounceTimer = setTimeout(() => fetchAddressSuggestions(combinedSearchTerm), 300);
-            } else {
-                hideAddressSuggestionsModal();
-            }
-            localStorage.setItem(MAP_FILTER_INPUT_KEY, mapFilterInput.value);
-        };
-        mapLocationSearchInput.addEventListener('input', handleSearchInput);
-        if (mapFilterInput) {
-            mapFilterInput.addEventListener('input', handleSearchInput);
-        }
-        mapLocationSearchInput.addEventListener('keypress', (e) => {
-            if (e.key === 'Enter') {
-                e.preventDefault();
-                const mainTerm = mapLocationSearchInput.value.trim();
-                if (!mainTerm) {
-                    showToast("El campo de búsqueda principal no puede estar vacío.", "warning");
-                    return;
-                }
-                const filterTerm = mapFilterInput?.value.trim() || '';
-                let combinedSearchTerm = mainTerm;
-                if (filterTerm) {
-                    combinedSearchTerm += ' ' + filterTerm;
-                }
-                hideAddressSuggestionsModal();
-                searchAndAddWaypoint(combinedSearchTerm);
-            }
-        });
-    }
-    document.getElementById('turn-icon-container-styled')?.addEventListener('click', (event) => {
-        event.stopPropagation();
-        if (navigationCurrentRouteData?.routes?.[0]) {
-            const route = navigationCurrentRouteData.routes[0];
-            const currentLeg = route.legs?.[currentLegIndexNav];
-            let nextStep = null;
-            if (currentLeg && currentStepIndexNav + 1 < currentLeg.steps.length) {
-                nextStep = currentLeg.steps[currentStepIndexNav + 1];
-            } else if (route.legs && currentLegIndexNav + 1 < route.legs.length) {
-                nextStep = route.legs[currentLegIndexNav + 1].steps[0];
-            } else {
-                nextStep = currentLeg?.steps?.[currentStepIndexNav];
-            }
-            if (nextStep) {
-                showIntersectionPreviewMap(nextStep, route, true, 7000);
-            } else {
-                showToast("No hay maniobra siguiente para mostrar detalle.", "info");
-            }
-        }
-    });
-}
 
 
 
