@@ -6114,7 +6114,7 @@ p.ocm-price-info {
     background-color: #3d3a4b;
     align-self: stretch;
     max-width: 95%;
-    margin: 0 auto;
+    margin: 25px auto;
     border-radius: 12px;
     border: 1px solid #5a576b;
     position: relative;
@@ -6227,7 +6227,7 @@ p.ocm-price-info {
     display: flex;
     gap: 20px;
     background-color: rgba(0,0,0,0.3);
-    padding: 4px;
+    padding: 10px;
     border-radius: 6px;
 }
 
@@ -6954,8 +6954,207 @@ async function startEditPollQuestion(pollId, currentQuestion) {
 }
 
 // ===================================================================
-// NOMBRE: renderPollBubble (MODIFICADA V2)
-// RESUMEN: Construye el HTML para una encuesta, con la fecha junto al nombre de usuario.
+// NOMBRE: openChatModal (MODIFICADA V2)
+// RESUMEN: Abre el modal, añade la delegación de eventos y el placeholder completo.
+// ===================================================================
+function openChatModal() {
+    const modalOverlay = document.getElementById('chat-modal-overlay');
+    if (!modalOverlay) return;
+    
+    document.body.classList.add('chat-open');
+    modalOverlay.classList.remove('hidden');
+
+    const sendButton = document.getElementById('chat-send-button');
+    const messageInput = document.getElementById('chat-message-input');
+    const charCounter = document.getElementById('chat-char-counter');
+    const permissionWarning = document.getElementById('chat-permission-warning');
+    const messagesContainer = document.getElementById('chat-messages-container');
+    
+    const originalPlaceholder = "Escribe un mensaje... (antecede @usuario para mensaje privado, o pulsa en el lateral. Para referirse simplemente nómbralo). Vida de los mensajes 96 horas. En el coche usa los comandos de voz. Elon cree en la humanidad, the White Monkey y yo también, ser educad@s.";
+    const pollPlaceholder = "Para encuestas/votaciones, usa el formato: #COMUNIDAD#Pregunta#Opción1 $ Opción2...#";
+    messageInput.placeholder = `${originalPlaceholder} ${pollPlaceholder}`;
+
+    const currentUserId = localStorage.getItem('userData_userId');
+    const currentUserDmsAllowed = JSON.parse(localStorage.getItem('userData_allowDMs') || 'false');
+    
+    if (currentUserId === 'BoardingGate' && !sessionStorage.getItem('chatCleanupSessionDone')) {
+        sessionStorage.setItem('chatCleanupSessionDone', 'true');
+        showToast("Hola Admin. Realizando limpieza de mensajes antiguos...", "info");
+        cleanUpOldChatMessages();
+    }
+
+    if (!currentUserId) {
+        permissionWarning.textContent = "Debes configurar un ID de Usuario para poder chatear.";
+        permissionWarning.classList.remove('hidden');
+        sendButton.disabled = true;
+        messageInput.disabled = true;
+    } else if (!currentUserDmsAllowed) {
+        permissionWarning.innerHTML = `Si quiere recibir mensajes o poder enviar mensajes tanto públicos como dirigidos a un usuario concreto debe activar en <strong>Configuración > Usuario > Permitir MDs (vía admin)</strong>`;
+        permissionWarning.classList.remove('hidden');
+        sendButton.disabled = true;
+        messageInput.disabled = true;
+    } else {
+        permissionWarning.classList.add('hidden');
+        sendButton.disabled = false;
+        messageInput.disabled = false;
+    }
+    
+    charCounter.textContent = messageInput.maxLength;
+    
+    if (!messageInput.listenerAdded) {
+        messageInput.addEventListener('input', () => {
+            const remaining = messageInput.maxLength - messageInput.value.length;
+            charCounter.textContent = remaining;
+        });
+        messageInput.listenerAdded = true;
+    }
+
+    const newExitButton = document.getElementById('chat-exit-button').cloneNode(true);
+    document.getElementById('chat-exit-button').parentNode.replaceChild(newExitButton, document.getElementById('chat-exit-button'));
+    newExitButton.addEventListener('click', closeChatModal);
+
+    const newSendButton = sendButton.cloneNode(true);
+    sendButton.parentNode.replaceChild(newSendButton, sendButton);
+    newSendButton.addEventListener('click', sendMessage);
+
+    if (!messagesContainer.listenerAdded) {
+        messagesContainer.addEventListener('click', (event) => {
+            const target = event.target.closest('[data-action]');
+            if (!target) return;
+
+            event.stopPropagation();
+            const action = target.dataset.action;
+            const id = target.dataset.id;
+            
+            switch (action) {
+                case 'vote-poll':
+                    const optionIndex = parseInt(target.dataset.optionIndex, 10);
+                    handlePollVote(id, optionIndex);
+                    break;
+                case 'edit-message':
+                    const content = target.dataset.content;
+                    startEditMessage(id, content);
+                    break;
+                case 'delete-message':
+                    deleteChatMessage(id);
+                    break;
+                case 'edit-poll':
+                    const question = target.dataset.question;
+                    startEditPollQuestion(id, question);
+                    break;
+                case 'delete-poll':
+                    deletePollMessage(id);
+                    break;
+            }
+        });
+        messagesContainer.listenerAdded = true;
+    }
+
+    fetchAndRenderChatUsers();
+    fetchAndRenderChatMessages();
+    updateTotalMessageCount();
+
+    if (chatUpdateInterval) clearInterval(chatUpdateInterval);
+    chatUpdateInterval = setInterval(() => {
+        if (!modalOverlay.classList.contains('hidden')) {
+            updateTotalMessageCount();
+        }
+    }, 15000);
+}
+
+
+// ===================================================================
+// NOMBRE: fetchAndRenderChatMessages (MODIFICADA V2)
+// RESUMEN: Construye un único string HTML para evitar problemas con los eventos.
+// ===================================================================
+async function fetchAndRenderChatMessages() {
+    const messagesContainer = document.getElementById('chat-messages-container');
+    if (!messagesContainer || !window.db) return;
+
+    const currentUserId = (localStorage.getItem('userData_userId') || '').trim();
+    if (!currentUserId) {
+        messagesContainer.innerHTML = '<p class="chat-system-message">Configura tu ID de usuario para ver el chat.</p>';
+        return;
+    }
+    
+    const currentUserIdLower = currentUserId.toLowerCase();
+
+    try {
+        const oneHundredTwentyHoursAgo = new Date(Date.now() - 120 * 60 * 60 * 1000);
+        const messagesQuery = window.query(window.collection(window.db, 'chatMessages'), window.where('timestamp', '>', oneHundredTwentyHoursAgo), window.orderBy('timestamp', 'desc'));
+        const pollsQuery = window.query(window.collection(window.db, 'chatPolls'), window.orderBy('timestamp', 'desc'));
+        
+        const [messagesSnapshot, pollsSnapshot] = await Promise.all([
+            window.getDocs(messagesQuery),
+            window.getDocs(pollsQuery)
+        ]);
+
+        let combinedItems = [];
+        messagesSnapshot.forEach(doc => combinedItems.push({ id: doc.id, ...doc.data(), isPoll: false }));
+        pollsSnapshot.forEach(doc => combinedItems.push({ id: doc.id, ...doc.data(), isPoll: true }));
+
+        combinedItems.sort((a, b) => (b.timestamp?.toMillis() || 0) - (a.timestamp?.toMillis() || 0));
+
+        let finalHtml = '';
+        
+        combinedItems.forEach(item => {
+            if (item.isPoll) {
+                finalHtml += renderPollBubble(item, currentUserId);
+            } else {
+                const isPublic = item.recipientId.toLowerCase() === 'public';
+                const isForMe = item.recipientId.toLowerCase() === currentUserIdLower;
+                const iSentIt = item.senderId.toLowerCase() === currentUserIdLower;
+
+                if (isPublic || isForMe || iSentIt) {
+                    let bubbleClass = '';
+                    let style = '';
+                    if (iSentIt && isPublic) { style = 'background-color: #DF6565 !important;'; bubbleClass = 'public-msg'; }
+                    else if (isForMe && !iSentIt) { bubbleClass = 'private-msg'; }
+                    else if (isPublic) { bubbleClass = 'public-msg'; }
+                    else if (iSentIt && !isPublic) { bubbleClass = 'private-msg-sent'; }
+                    else { return; }
+
+                    const senderHtml = `<span class="chat-message-sender">${item.senderId + (item.recipientId.toLowerCase() !== 'public' ? ` a ${item.recipientId}` : '')}</span>`;
+                    const contentHtml = `<span class="chat-message-content">${item.content.replace(/</g, "<").replace(/>/g, ">")}</span>`;
+                    const timeText = item.timestamp?.toDate ? `${item.timestamp.toDate().toLocaleDateString([], {day:'2-digit', month:'2-digit'})} - ${item.timestamp.toDate().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}` : '';
+                    
+                    let actionsHtml = '';
+                    if (iSentIt || currentUserId === 'BoardingGate') {
+                        const escapedContent = item.content.replace(/"/g, '"').replace(/'/g, ''');
+                        actionsHtml = `
+                            <div class="chat-message-actions">
+                                <img src="https://boardinggate.github.io/Tesla/PNG/editmsg.png" class="chat-action-icon" title="Editar mensaje"
+                                     data-action="edit-message" data-id="${item.id}" data-content="${escapedContent}">
+                                <img src="https://boardinggate.github.io/Tesla/PNG/erasemsg.png" class="chat-action-icon" title="Eliminar mensaje"
+                                     data-action="delete-message" data-id="${item.id}">
+                            </div>`;
+                    }
+                    
+                    finalHtml += `
+                        <div class="chat-message-bubble ${iSentIt ? 'sent' : 'received'} ${bubbleClass}" style="${style}">
+                            ${senderHtml}
+                            ${contentHtml}
+                            <span class="chat-message-time">
+                                <span>${timeText}</span>
+                                ${actionsHtml}
+                            </span>
+                        </div>`;
+                }
+            }
+        });
+        
+        messagesContainer.innerHTML = finalHtml || '<p class="chat-system-message">No hay mensajes recientes. ¡Sé el primero en escribir!</p>';
+        messagesContainer.scrollTop = 0;
+
+    } catch (error) {
+        messagesContainer.innerHTML = `<p class="chat-system-message">Error al cargar el chat: ${error.message}</p>`;
+    }
+}
+
+
+// ===================================================================
+// NOMBRE: renderPollBubble (MODIFICADA V3)
+// RESUMEN: Usa data-* attributes para la delegación de eventos.
 // ===================================================================
 function renderPollBubble(poll, currentUserId) {
     const totalVotes = Object.keys(poll.votes || {}).length;
@@ -6973,18 +7172,13 @@ function renderPollBubble(poll, currentUserId) {
             .map(([userId, _]) => userId);
         
         const votersHtml = voters.length > 0
-            ? `<div class="poll-voters-container">
-                 <ul class="poll-voter-list">
-                   ${voters.map(user => `<li class="poll-voter-name">${user}</li>`).join('')}
-                 </ul>
-               </div>`
+            ? `<div class="poll-voters-container"><ul class="poll-voter-list">${voters.map(user => `<li class="poll-voter-name">${user}</li>`).join('')}</ul></div>`
             : '<div class="poll-voters-container"><ul class="poll-voter-list"></ul></div>';
 
         return `
             <li class="poll-option-item" data-option-index="${index}">
-                <button 
-                    class="poll-option-button ${hasVotedThis ? 'voted' : ''}" 
-                    onclick="handlePollVote('${poll.id}', ${index})">
+                <button class="poll-option-button ${hasVotedThis ? 'voted' : ''}" 
+                        data-action="vote-poll" data-id="${poll.id}" data-option-index="${index}">
                     <div class="poll-option-text">${option}</div>
                     <div class="poll-vote-count">${voteCount}</div>
                 </button>
@@ -6997,14 +7191,17 @@ function renderPollBubble(poll, currentUserId) {
     }).join('');
 
     const isBoardingGate = currentUserId === 'BoardingGate';
+    const escapedQuestion = poll.question.replace(/"/g, '"').replace(/'/g, ''');
     const moderationIconsHtml = isBoardingGate ? `
         <div class="poll-moderation-icons">
-            <img src="https://boardinggate.github.io/Tesla/PNG/editmsg.png" class="chat-action-icon" title="Editar pregunta" onclick="startEditPollQuestion('${poll.id}', '${poll.question.replace(/'/g, "\\'")}')">
-            <img src="https://boardinggate.github.io/Tesla/PNG/erasemsg.png" class="chat-action-icon" title="Eliminar encuesta" onclick="deletePollMessage('${poll.id}')">
+            <img src="https://boardinggate.github.io/Tesla/PNG/editmsg.png" class="chat-action-icon" title="Editar pregunta"
+                 data-action="edit-poll" data-id="${poll.id}" data-question="${escapedQuestion}">
+            <img src="https://boardinggate.github.io/Tesla/PNG/erasemsg.png" class="chat-action-icon" title="Eliminar encuesta"
+                 data-action="delete-poll" data-id="${poll.id}">
         </div>
     ` : '';
     
-    const senderTime = poll.timestamp && poll.timestamp.toDate
+    const senderTime = poll.timestamp?.toDate 
         ? `${poll.timestamp.toDate().toLocaleDateString([], {day: '2-digit', month: '2-digit'})} - ${poll.timestamp.toDate().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
         : 'enviando...';
 
@@ -7015,12 +7212,11 @@ function renderPollBubble(poll, currentUserId) {
                 <span class="chat-message-sender">${poll.senderId}</span>
                 <span class="poll-time">${senderTime}</span>
             </div>
-            <p class="poll-question">${poll.question}</p>
+            <p class="poll-question">${poll.question.replace(/</g, "<").replace(/>/g, ">")}</p>
             <ul class="poll-options-list">${optionsHtml}</ul>
         </div>
     `;
 }
-
     
 // ===================================================================
 // NOMBRE: adaptMapboxRouteToOSRMFormat (NUEVA FUNCIÓN)
@@ -7944,135 +8140,6 @@ function closeChatModal() {
     }
 }
 
-// ===================================================================
-// NOMBRE: fetchAndRenderChatMessages (MODIFICADA Y CORREGIDA)
-// RESUMEN: Muestra mensajes, scroll al inicio y los iconos de acción.
-// ===================================================================
-async function fetchAndRenderChatMessages() {
-    const messagesContainer = document.getElementById('chat-messages-container');
-    if (!messagesContainer || !window.db) return;
-
-    const currentUserId = (localStorage.getItem('userData_userId') || '').trim();
-    if (!currentUserId) {
-        messagesContainer.innerHTML = '<p class="chat-system-message">Configura tu ID de usuario para ver el chat.</p>';
-        return;
-    }
-
-    const currentUserIdLower = currentUserId.toLowerCase();
-    const isBoardingGateUser = currentUserId === 'BoardingGate';
-
-    try {
-        const oneHundredTwentyHoursAgo = new Date(Date.now() - 120 * 60 * 60 * 1000);
-        const messagesRef = window.collection(window.db, 'chatMessages');
-        const q = window.query(messagesRef, window.where('timestamp', '>', oneHundredTwentyHoursAgo), window.orderBy('timestamp', 'desc'));
-
-        const querySnapshot = await window.getDocs(q);
-        
-        messagesContainer.innerHTML = '';
-        let messageCount = 0;
-
-        querySnapshot.forEach(doc => {
-            const msg = doc.data();
-            const messageId = doc.id;
-            
-            if (!msg.senderId || !msg.recipientId) return; // Ignorar mensajes corruptos
-
-            const isPublic = msg.recipientId.toLowerCase() === 'public';
-            const isForMe = msg.recipientId.toLowerCase() === currentUserIdLower;
-            const iSentIt = msg.senderId.toLowerCase() === currentUserIdLower;
-
-            if (isPublic || isForMe || iSentIt) {
-                const messageElement = document.createElement('div');
-                messageElement.classList.add('chat-message-bubble');
-
-                if (iSentIt && isPublic) {
-                    messageElement.style.backgroundColor = '#DF6565';
-                    messageElement.classList.add('public-msg'); // Añadimos clase para consistencia
-                } else if (isForMe && !iSentIt) {
-                    messageElement.classList.add('private-msg');
-                } else if (isPublic) {
-                    messageElement.classList.add('public-msg');
-                } else if (iSentIt && !isPublic) {
-                    messageElement.classList.add('private-msg-sent');
-                } else {
-                    return;
-                }
-
-                if (iSentIt) {
-                    messageElement.classList.add('sent');
-                } else {
-                    messageElement.classList.add('received');
-                }
-                
-                const senderSpan = document.createElement('span');
-                senderSpan.className = 'chat-message-sender';
-                senderSpan.textContent = msg.senderId + (msg.recipientId.toLowerCase() !== 'public' ? ` a ${msg.recipientId}` : '');
-
-                const contentSpan = document.createElement('span');
-                contentSpan.className = 'chat-message-content';
-                contentSpan.textContent = msg.content;
-                
-                const timeSpan = document.createElement('span');
-                timeSpan.className = 'chat-message-time';
-                
-                const timeText = document.createElement('span');
-                if (msg.timestamp && msg.timestamp.toDate) {
-                    const messageDate = msg.timestamp.toDate();
-                    timeText.textContent = `${messageDate.toLocaleDateString([], {day: '2-digit', month: '2-digit'})} - ${messageDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
-                }
-                timeSpan.appendChild(timeText);
-                
-                const showActions = iSentIt || isBoardingGateUser;
-                if (showActions) {
-                    const actionsContainer = document.createElement('div');
-                    actionsContainer.className = 'chat-message-actions';
-
-                    const editIcon = document.createElement('img');
-                    editIcon.src = 'https://boardinggate.github.io/Tesla/PNG/editmsg.png'; // RUTA ABSOLUTA
-                    editIcon.className = 'chat-action-icon';
-                    editIcon.title = 'Editar mensaje';
-                    editIcon.dataset.messageId = messageId;
-                    editIcon.dataset.messageContent = msg.content;
-                    editIcon.addEventListener('click', (e) => {
-                        e.stopPropagation();
-                        startEditMessage(e.currentTarget.dataset.messageId, e.currentTarget.dataset.messageContent);
-                    });
-                    
-                    const eraseIcon = document.createElement('img');
-                    eraseIcon.src = 'https://boardinggate.github.io/Tesla/PNG/erasemsg.png'; // RUTA ABSOLUTA
-                    eraseIcon.className = 'chat-action-icon';
-                    eraseIcon.title = 'Eliminar mensaje';
-                    eraseIcon.dataset.messageId = messageId;
-                    eraseIcon.addEventListener('click', (e) => {
-                        e.stopPropagation();
-                        deleteChatMessage(e.currentTarget.dataset.messageId);
-                    });
-
-                    actionsContainer.appendChild(editIcon);
-                    actionsContainer.appendChild(eraseIcon);
-                    timeSpan.appendChild(actionsContainer);
-                }
-                
-                messageElement.appendChild(senderSpan);
-                messageElement.appendChild(contentSpan);
-                messageElement.appendChild(timeSpan);
-                
-                messagesContainer.appendChild(messageElement);
-                messageCount++;
-            }
-        });
-        
-        if (messageCount === 0) {
-            messagesContainer.innerHTML = '<p class="chat-system-message">No hay mensajes recientes. ¡Sé el primero en escribir!</p>';
-        }
-
-        // <<-- LA SOLUCIÓN AL PROBLEMA DEL SCROLL -->>
-        messagesContainer.scrollTop = 0;
-
-    } catch (error) {
-        messagesContainer.innerHTML = `<p class="chat-system-message">Error al cargar los mensajes del chat: ${error.message}</p>`;
-    }
-}
     
     
 // ===================================================================
@@ -8455,80 +8522,6 @@ async function fetchAndRenderChatMessages() {
     }
 }
 
-// ===================================================================
-// NOMBRE: openChatModal (MODIFICADA)
-// RESUMEN: Abre el modal y añade una clase al body para bloquear el scroll, con el nuevo placeholder.
-// ===================================================================
-function openChatModal() {
-    const modalOverlay = document.getElementById('chat-modal-overlay');
-    if (!modalOverlay) return;
-    
-    document.body.classList.add('chat-open');
-    modalOverlay.classList.remove('hidden');
-
-    const sendButton = document.getElementById('chat-send-button');
-    const messageInput = document.getElementById('chat-message-input');
-    const charCounter = document.getElementById('chat-char-counter');
-    const permissionWarning = document.getElementById('chat-permission-warning');
-    
-    const originalPlaceholder = "Escribe un mensaje... (antecede @usuario para mensaje privado, o pulsa en el lateral. Para referirse simplemente nómbralo). Vida de los mensajes 96 horas. En el coche usa los comandos de voz. Elon cree en la humanidad, the White Monkey y yo también, ser educad@s.";
-    const pollPlaceholder = "   Para encuestas/votaciones, usa el formato: #COMUNIDAD#Pregunta#Opción1 $ Opción2 hasta 6...#";
-    messageInput.placeholder = `${originalPlaceholder} ${pollPlaceholder}`;
-
-    const currentUserId = localStorage.getItem('userData_userId');
-    const currentUserDmsAllowed = JSON.parse(localStorage.getItem('userData_allowDMs') || 'false');
-    
-    if (currentUserId === 'BoardingGate' && !sessionStorage.getItem('chatCleanupSessionDone')) {
-        sessionStorage.setItem('chatCleanupSessionDone', 'true');
-        showToast("Hola Admin. Realizando limpieza de mensajes antiguos...", "info");
-        cleanUpOldChatMessages();
-    }
-
-    if (!currentUserId) {
-        permissionWarning.textContent = "Debes configurar un ID de Usuario para poder chatear.";
-        permissionWarning.classList.remove('hidden');
-        sendButton.disabled = true;
-        messageInput.disabled = true;
-    } else if (!currentUserDmsAllowed) {
-        permissionWarning.innerHTML = `Si quiere recibir mensajes o poder enviar mensajes tanto públicos como dirigidos a un usuario concreto debe activar en <strong>Configuración > Usuario > Permitir MDs (vía admin)</strong>`;
-        permissionWarning.classList.remove('hidden');
-        sendButton.disabled = true;
-        messageInput.disabled = true;
-    } else {
-        permissionWarning.classList.add('hidden');
-        sendButton.disabled = false;
-        messageInput.disabled = false;
-    }
-    
-    charCounter.textContent = messageInput.maxLength;
-    
-    if (!messageInput.listenerAdded) {
-        messageInput.addEventListener('input', () => {
-            const remaining = messageInput.maxLength - messageInput.value.length;
-            charCounter.textContent = remaining;
-        });
-        messageInput.listenerAdded = true;
-    }
-
-    const newExitButton = document.getElementById('chat-exit-button').cloneNode(true);
-    document.getElementById('chat-exit-button').parentNode.replaceChild(newExitButton, document.getElementById('chat-exit-button'));
-    newExitButton.addEventListener('click', closeChatModal);
-
-    const newSendButton = sendButton.cloneNode(true);
-    sendButton.parentNode.replaceChild(newSendButton, sendButton);
-    newSendButton.addEventListener('click', sendMessage);
-
-    fetchAndRenderChatUsers();
-    fetchAndRenderChatMessages();
-    updateTotalMessageCount();
-
-    if (chatUpdateInterval) clearInterval(chatUpdateInterval);
-    chatUpdateInterval = setInterval(() => {
-        if (!modalOverlay.classList.contains('hidden')) {
-            updateTotalMessageCount();
-        }
-    }, 15000);
-}
 
 // ===================================================================
 // NOMBRE: cleanUpOldChatMessages (MODIFICADA)
