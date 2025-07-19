@@ -1,4 +1,4 @@
-r13
+op1
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -6635,6 +6635,9 @@ p.ocm-price-info {
         return originalToFixed.call(this, digits);
     };
 
+    window.radarsCache = null;
+    window.radarsSpatialIndex = null;
+    let isRadarCacheInitializing = false;
     let lastDisplayedManeuverIcon = null;
     let chatUpdateInterval = null;
     let zoomLevelBeforeInitialOverview = null;
@@ -6862,6 +6865,88 @@ p.ocm-price-info {
         }).join(', ');
 
 
+// ===================================================================
+// NOMBRE: getGridCellId
+// RESUMEN: Calcula el ID de una celda de la cuadrícula espacial para un punto geográfico.
+// ===================================================================
+function getGridCellId(lat, lon) {
+    const GRID_SIZE = 0.1; // Tamaño de la celda en grados (aprox. 11km)
+    const latIndex = Math.floor(lat / GRID_SIZE);
+    const lonIndex = Math.floor(lon / GRID_SIZE);
+    return `cell_${latIndex}_${lonIndex}`;
+}
+
+// ===================================================================
+// NOMBRE: initializeRadarCache
+// RESUMEN: Carga, procesa y cachea todos los radares KML en memoria y en un índice espacial.
+// ===================================================================
+async function initializeRadarCache() {
+    if (window.radarsCache) return;
+    if (isRadarCacheInitializing) {
+        // Si ya hay una inicialización en curso, espera a que termine
+        await new Promise(resolve => {
+            const interval = setInterval(() => {
+                if (!isRadarCacheInitializing) {
+                    clearInterval(interval);
+                    resolve();
+                }
+            }, 100);
+        });
+        return;
+    }
+
+    isRadarCacheInitializing = true;
+    showToast("Optimizando datos de radares por primera vez. Espere un momento...", "info", 0, false, "radar-cache-init");
+
+    try {
+        let filesToProcess = await fetchKMLFilesList(KML_FILES_LIST_STANDARD);
+        const extraFiles = await fetchKMLFilesList(KML_FILES_LIST_EXTRA);
+        filesToProcess = filesToProcess.concat(extraFiles.filter(f => !filesToProcess.includes(f)));
+
+        const allRadars = [];
+        const spatialIndex = {};
+
+        for (const kmlFileName of filesToProcess) {
+            const placemarks = await fetchAndParseKML(KML_BASE_PATH + kmlFileName);
+            placemarks.forEach(placemark => {
+                const coords = placemark.coordinates;
+                if (coords) {
+                    const [lonStr, latStr] = coords.split(',');
+                    const lon = parseFloat(lonStr);
+                    const lat = parseFloat(latStr);
+                    if (!isNaN(lat) && !isNaN(lon)) {
+                        const radarData = { name: placemark.name, lat: lat, lon: lon };
+                        allRadars.push(radarData);
+                        
+                        const cellId = getGridCellId(lat, lon);
+                        if (!spatialIndex[cellId]) {
+                            spatialIndex[cellId] = [];
+                        }
+                        spatialIndex[cellId].push(radarData);
+                    }
+                }
+            });
+        }
+        
+        window.radarsCache = allRadars;
+        window.radarsSpatialIndex = spatialIndex;
+        
+        const existingToast = document.getElementById("radar-cache-init");
+        if (existingToast) existingToast.remove();
+        showToast(`Datos de ${allRadars.length} radares optimizados.`, "success");
+
+    } catch (error) {
+        showToast("Error al inicializar la caché de radares. La función puede ser lenta.", "error");
+        window.radarsCache = []; // Evita reintentos fallidos
+        window.radarsSpatialIndex = {};
+    } finally {
+        isRadarCacheInitializing = false;
+    }
+}
+
+
+
+    
 // ===================================================================
 // NOMBRE: deletePollMessage (NUEVA FUNCIÓN)
 // RESUMEN: Permite al administrador borrar una encuesta permanentemente.
@@ -10635,68 +10720,6 @@ function plotSingleReminderOnMap(reminder, mapInstance) {
     return { reminderId: reminder.id, marker, circle, isFromRuta: reminder.isFromRuta || false, isFromTarea: reminder.isFromTarea || false };
 }   
 
-// ===================================================================
-// NOMBRE: toggleTareasRuta (MODIFICADA)
-// RESUMEN: Muestra tareas en la ruta y DIBUJA en el mapa las que sean tipo RADAR.
-// ===================================================================
-async function toggleTareasRuta(activo) {
-    const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
-    const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
-    localStorage.setItem(TAREAS_RUTA_CHECKED_KEY, String(activo));
-    
-    if (actualWaypoints.length < 2) {
-        if (activo) {
-            showToast("Ruta inválida o inexistente. No se pueden buscar tareas en ruta.", "warning");
-        }
-        eliminarTareasDeBarraProgreso();
-        actualizarContadorTareas(0);
-        return;
-    }
-    
-    eliminarTareasDeBarraProgreso(); // Esto ahora también llama a eliminarTareasDeMapa()
-    tareasEnRutaActual = [];
-
-    if (activo && navigationMapInstance && navigationRouteLayer) {
-        try {
-            const routeLineString = turf.lineString(navigationRouteLayer.getLatLngs().map(latlng => [latlng.lng, latlng.lat]));
-            const allReminders = JSON.parse(localStorage.getItem('reminders') || '[]');
-            const locationReminders = allReminders.filter(r => r.isLocationEnabled && r.locationCoordinates);
-
-            locationReminders.forEach(reminder => {
-                const taskPoint = turf.point([reminder.locationCoordinates.longitude, reminder.locationCoordinates.latitude]);
-                const nearestPointOnRoute = turf.nearestPointOnLine(routeLineString, taskPoint, { units: 'meters' });
-                const radius = reminder.radiusMeters || DEFAULT_LOCATION_RADIUS;
-                
-                if (nearestPointOnRoute && nearestPointOnRoute.properties.dist !== undefined && nearestPointOnRoute.properties.dist <= radius) {
-                    const taskData = {
-                        ...reminder,
-                        distanceOnRoute: nearestPointOnRoute.properties.location
-                    };
-                    tareasEnRutaActual.push(taskData);
-                    
-                    const isRadarTask = reminder.text.toUpperCase().includes("RADAR:");
-                    if (isRadarTask) {
-                        const existingMapObject = reminderMapObjects.find(obj => obj.reminderId === reminder.id);
-                        if (!existingMapObject) {
-                           const mapObject = plotSingleReminderOnMap({...reminder, isFromTarea: true}, navigationMapInstance);
-                           if (mapObject) reminderMapObjects.push(mapObject);
-                        }
-                    }
-                }
-            });
-        } catch (error) {
-             showToast("Error al procesar tareas en ruta: " + error.message, "error");
-        }
-    }
-
-    actualizarContadorTareas(tareasEnRutaActual.length);
-    if (navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0]) {
-        updateNavigationProgressDisplay(navigationCurrentRouteData.routes[0], lastCarDistanceAlongRouteForNavLogic);
-    }
-    if (tareasRutaCheckbox) {
-        tareasRutaCheckbox.checked = activo;
-    }
-}
 
 // ===================================================================
 // NOMBRE: eliminarTareasDeBarraProgreso (MODIFICADA)
@@ -21380,110 +21403,6 @@ function clearAllLocalData() {
 
 
 
-// ===================================================================
-// NOMBRE: importRadars
-// RESUMEN: Importa radares y otros POIs desde archivos KML externos.
-// ===================================================================
-async function importRadars() {
-    const latFilterValue = document.getElementById('radar-filter-lat').value.trim();
-    const lonFilterValue = document.getElementById('radar-filter-lon').value.trim();
-    const keywordsFilterRaw = document.getElementById('radar-filter-keywords').value.trim().toUpperCase();
-    const keywordsFilter = keywordsFilterRaw ? keywordsFilterRaw.split(/\s+/).filter(k => k) : [];
-    const importExtra = document.getElementById('import-extra-radars-checkbox').checked;
-    const progressBar = document.getElementById('radar-import-progress-bar');
-    const statusMessage = document.getElementById('radar-import-status');
-    const progressContainer = document.getElementById('radar-import-progress-container');
-    progressContainer.style.display = 'block';
-    progressBar.value = 0;
-    statusMessage.textContent = 'Iniciando importación...';
-    statusMessage.style.color = '';
-    try {
-        let filesToProcess = await fetchKMLFilesList(KML_FILES_LIST_STANDARD);
-        if (importExtra) {
-            const extraFiles = await fetchKMLFilesList(KML_FILES_LIST_EXTRA);
-            filesToProcess = filesToProcess.concat(extraFiles.filter(f => !filesToProcess.includes(f)));
-        }
-        if (filesToProcess.length === 0) {
-            statusMessage.textContent = 'No se encontraron listas de archivos KML para procesar.';
-            progressBar.value = 100;
-            showToast('No hay archivos KML en las listas.', 'warning');
-            setTimeout(() => { progressContainer.style.display = 'none'; }, 3000);
-            return;
-        }
-        statusMessage.textContent = `Encontrados ${filesToProcess.length} archivos KML. Procesando...`;
-        let reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
-        let newRadarsCount = 0;
-        let totalFilesProcessed = 0;
-        for (const kmlFileName of filesToProcess) {
-            try {
-                statusMessage.textContent = `Procesando ${kmlFileName}... (${totalFilesProcessed + 1}/${filesToProcess.length})`;
-                const placemarks = await fetchAndParseKML(KML_BASE_PATH + kmlFileName);
-                placemarks.forEach(placemark => {
-                    const name = placemark.name.toUpperCase();
-                    const coords = placemark.coordinates;
-                    const matchesKeywords = keywordsFilter.length === 0 || keywordsFilter.some(kw => name.includes(kw));
-                    if (coords && matchesKeywords) {
-                        const [lonStr, latStr] = coords.split(',');
-                        const lon = parseFloat(lonStr);
-                        const lat = parseFloat(latStr);
-                        if (isNaN(lat) || isNaN(lon)) return;
-                        const matchesLat = parseCoordinateFilter(latFilterValue, lat);
-                        const matchesLon = parseCoordinateFilter(lonFilterValue, lon);
-                        if (matchesLat && matchesLon) {
-                            const existingRadar = reminders.find(r =>
-                                r.isLocationEnabled &&
-                                r.locationCoordinates &&
-                                Math.abs(r.locationCoordinates.latitude - lat) < COORD_EPSILON &&
-                                Math.abs(r.locationCoordinates.longitude - lon) < COORD_EPSILON &&
-                                (r.text.toUpperCase().includes("RADAR:") || r.excludeFromList)
-                            );
-                            if (!existingRadar) {
-                                const now = new Date();
-                                const newRadar = {
-                                    id: Date.now() + Math.random() + newRadarsCount,
-                                    text: `<b>RADAR: ${placemark.name}</b>`,
-                                    type: 'simple',
-                                    time: '00:01',
-                                    date: `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`,
-                                    createdAt: now.toISOString(),
-                                    managedByUser: false,
-                                    isLocationEnabled: true,
-                                    locationCoordinates: { latitude: lat, longitude: lon },
-                                    radiusMeters: 400,
-                                    excludeFromList: true
-                                };
-                                reminders.push(newRadar);
-                                newRadarsCount++;
-                            }
-                        }
-                    }
-                });
-            } catch (fileError) {
-                statusMessage.textContent = `Error en ${kmlFileName}: ${fileError.message}. Continuando...`;
-                statusMessage.style.color = 'orange';
-                await new Promise(resolve => setTimeout(resolve, 1500));
-            }
-            totalFilesProcessed++;
-            progressBar.value = (totalFilesProcessed / filesToProcess.length) * 100;
-        }
-        localStorage.setItem('reminders', JSON.stringify(reminders));
-        statusMessage.textContent = `Importación completa. ${newRadarsCount} nuevos radares/POIs añadidos.`;
-        statusMessage.style.color = '#28a745';
-        showToast(`${newRadarsCount} nuevos radares/POIs añadidos.`, 'success');
-        updateReminderCount();
-        updateButtonStyles();
-        checkReminders();
-    } catch (error) {
-        statusMessage.textContent = `Error general: ${error.message}`;
-        statusMessage.style.color = 'red';
-        showToast('Error durante la importación.', 'error');
-    } finally {
-         setTimeout(() => {
-            progressContainer.style.display = 'none';
-            statusMessage.style.color = '';
-        }, 5000);
-    }
-}
 
 
 
@@ -21586,11 +21505,283 @@ function parseKML(kmlText) {
 }
 
 
+
 // ===================================================================
-// NOMBRE: deleteFilteredRadars
-// RESUMEN: Borra los recordatorios de tipo RADAR/POI según los filtros especificados.
+// NOMBRE: toggleRadaresRuta (VERSIÓN OPTIMIZADA)
+// RESUMEN: Activa/desactiva la visualización de radares en la ruta actual usando la caché y el índice espacial.
+// ===================================================================
+async function toggleRadaresRuta(activo) {
+    const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+    const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
+    localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(activo));
+
+    if (actualWaypoints.length < 2) {
+        if (activo) showToast("Ruta inválida o inexistente. No se pueden buscar radares.", "warning");
+        eliminarRadaresDeRuta();
+        actualizarContadorRadares(0);
+        return;
+    }
+    
+    eliminarRadaresDeRuta();
+    radaresEnRutaActual = [];
+
+    if (activo && navigationMapInstance && navigationRouteLayer) {
+        try {
+            if (!window.radarsCache) {
+                await initializeRadarCache();
+            }
+            if (!window.radarsCache || !window.radarsSpatialIndex) {
+                 showToast("No se pudo cargar la base de datos de radares para la búsqueda.", "error");
+                 return;
+            }
+
+            const routeLineString = turf.lineString(navigationRouteLayer.getLatLngs().map(latlng => [latlng.lng, latlng.lat]));
+            
+            // 1. Identificar celdas de la cuadrícula que intersectan con la ruta
+            const intersectingCells = new Set();
+            const routeCoords = routeLineString.geometry.coordinates;
+            for (let i = 0; i < routeCoords.length; i++) {
+                intersectingCells.add(getGridCellId(routeCoords[i][1], routeCoords[i][0]));
+            }
+            // Añadir celdas vecinas para cubrir el buffer de proximidad
+            const cellsToSearch = new Set(intersectingCells);
+            intersectingCells.forEach(cellId => {
+                const [_, latIdx, lonIdx] = cellId.split('_').map(Number);
+                for(let i = -1; i <= 1; i++) {
+                    for (let j = -1; j <= 1; j++) {
+                        cellsToSearch.add(`cell_${latIdx + i}_${lonIdx + j}`);
+                    }
+                }
+            });
+
+            // 2. Obtener solo los radares candidatos de esas celdas
+            const candidateRadars = [];
+            cellsToSearch.forEach(cellId => {
+                if (window.radarsSpatialIndex[cellId]) {
+                    candidateRadars.push(...window.radarsSpatialIndex[cellId]);
+                }
+            });
+            const uniqueCandidates = [...new Set(candidateRadars)]; // Eliminar duplicados si un radar está en varias celdas
+
+            // 3. Realizar el cálculo de distancia solo sobre los candidatos
+            uniqueCandidates.forEach(radar => {
+                const radarPoint = turf.point([radar.lon, radar.lat]);
+                const nearestPointOnRoute = turf.nearestPointOnLine(routeLineString, radarPoint, { units: 'meters' });
+                
+                if (nearestPointOnRoute && nearestPointOnRoute.properties.dist !== undefined && nearestPointOnRoute.properties.dist <= RUTA_RADAR_PROXIMITY_THRESHOLD) {
+                    const now = new Date();
+                    const radarData = {
+                        id: Date.now() + Math.random() + radaresEnRutaActual.length,
+                        text: `<b>RADAR RUTA: ${radar.name}</b>`,
+                        type: 'simple', time: '00:00',
+                        date: `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`,
+                        createdAt: now.toISOString(),
+                        managedByUser: false, isLocationEnabled: true,
+                        locationCoordinates: { latitude: radar.lat, longitude: radar.lon },
+                        radiusMeters: 350, excludeFromList: true,
+                        isFromRuta: true,
+                        distanceOnRoute: nearestPointOnRoute.properties.location
+                    };
+                    const mapObject = plotSingleReminderOnMap(radarData, navigationMapInstance);
+                    if (mapObject) {
+                        reminderMapObjects.push(mapObject);
+                        radaresEnRutaActual.push(radarData);
+                    }
+                }
+            });
+        } catch (error) {
+            showToast(`Error al procesar radares en ruta: ${error.message}`, "error");
+        }
+    }
+
+    actualizarContadorRadares(radaresEnRutaActual.length);
+    if (navigationCurrentRouteData?.routes?.[0]) {
+        updateNavigationProgressDisplay(navigationCurrentRouteData.routes[0], lastCarDistanceAlongRouteForNavLogic);
+    }
+    if (radaresRutaCheckbox) {
+        radaresRutaCheckbox.checked = activo;
+    }
+}
+
+// ===================================================================
+// NOMBRE: toggleTareasRuta (VERSIÓN OPTIMIZADA)
+// RESUMEN: Muestra tareas en la ruta. Optimizado para evitar recalculos innecesarios.
+// ===================================================================
+async function toggleTareasRuta(activo) {
+    const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
+    const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
+    localStorage.setItem(TAREAS_RUTA_CHECKED_KEY, String(activo));
+    
+    if (actualWaypoints.length < 2) {
+        if (activo) {
+            showToast("Ruta inválida o inexistente. No se pueden buscar tareas en ruta.", "warning");
+        }
+        eliminarTareasDeBarraProgreso();
+        actualizarContadorTareas(0);
+        return;
+    }
+    
+    eliminarTareasDeBarraProgreso();
+    tareasEnRutaActual = [];
+
+    if (activo && navigationMapInstance && navigationRouteLayer) {
+        try {
+            const routeLineString = turf.lineString(navigationRouteLayer.getLatLngs().map(latlng => [latlng.lng, latlng.lat]));
+            const allReminders = JSON.parse(localStorage.getItem('reminders') || '[]');
+            const locationReminders = allReminders.filter(r => r.isLocationEnabled && r.locationCoordinates);
+
+            locationReminders.forEach(reminder => {
+                const taskPoint = turf.point([reminder.locationCoordinates.longitude, reminder.locationCoordinates.latitude]);
+                const nearestPointOnRoute = turf.nearestPointOnLine(routeLineString, taskPoint, { units: 'meters' });
+                const radius = reminder.radiusMeters || DEFAULT_LOCATION_RADIUS;
+                
+                if (nearestPointOnRoute && nearestPointOnRoute.properties.dist !== undefined && nearestPointOnRoute.properties.dist <= radius) {
+                    const taskData = {
+                        ...reminder,
+                        distanceOnRoute: nearestPointOnRoute.properties.location
+                    };
+                    tareasEnRutaActual.push(taskData);
+                    
+                    const isRadarTask = reminder.text.toUpperCase().includes("RADAR:");
+                    if (isRadarTask) {
+                        const existingMapObject = reminderMapObjects.find(obj => obj.reminderId === reminder.id);
+                        if (!existingMapObject) {
+                           const mapObject = plotSingleReminderOnMap({...reminder, isFromTarea: true}, navigationMapInstance);
+                           if (mapObject) reminderMapObjects.push(mapObject);
+                        }
+                    }
+                }
+            });
+        } catch (error) {
+             showToast("Error al procesar tareas en ruta: " + error.message, "error");
+        }
+    }
+
+    actualizarContadorTareas(tareasEnRutaActual.length);
+    if (navigationCurrentRouteData?.routes?.[0]) {
+        updateNavigationProgressDisplay(navigationCurrentRouteData.routes[0], lastCarDistanceAlongRouteForNavLogic);
+    }
+    if (tareasRutaCheckbox) {
+        tareasRutaCheckbox.checked = activo;
+    }
+}
+
+// ===================================================================
+// NOMBRE: importRadars (MODIFICADA)
+// RESUMEN: Importa radares y limpia la caché para forzar su reconstrucción.
+// ===================================================================
+async function importRadars() {
+    window.radarsCache = null;
+    window.radarsSpatialIndex = null;
+
+    const latFilterValue = document.getElementById('radar-filter-lat').value.trim();
+    const lonFilterValue = document.getElementById('radar-filter-lon').value.trim();
+    const keywordsFilterRaw = document.getElementById('radar-filter-keywords').value.trim().toUpperCase();
+    const keywordsFilter = keywordsFilterRaw ? keywordsFilterRaw.split(/\s+/).filter(k => k) : [];
+    const importExtra = document.getElementById('import-extra-radars-checkbox').checked;
+    const progressBar = document.getElementById('radar-import-progress-bar');
+    const statusMessage = document.getElementById('radar-import-status');
+    const progressContainer = document.getElementById('radar-import-progress-container');
+    progressContainer.style.display = 'block';
+    progressBar.value = 0;
+    statusMessage.textContent = 'Iniciando importación...';
+    statusMessage.style.color = '';
+    try {
+        let filesToProcess = await fetchKMLFilesList(KML_FILES_LIST_STANDARD);
+        if (importExtra) {
+            const extraFiles = await fetchKMLFilesList(KML_FILES_LIST_EXTRA);
+            filesToProcess = filesToProcess.concat(extraFiles.filter(f => !filesToProcess.includes(f)));
+        }
+        if (filesToProcess.length === 0) {
+            statusMessage.textContent = 'No se encontraron listas de archivos KML para procesar.';
+            progressBar.value = 100;
+            showToast('No hay archivos KML en las listas.', 'warning');
+            setTimeout(() => { progressContainer.style.display = 'none'; }, 3000);
+            return;
+        }
+        statusMessage.textContent = `Encontrados ${filesToProcess.length} archivos KML. Procesando...`;
+        let reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
+        let newRadarsCount = 0;
+        let totalFilesProcessed = 0;
+        for (const kmlFileName of filesToProcess) {
+            try {
+                statusMessage.textContent = `Procesando ${kmlFileName}... (${totalFilesProcessed + 1}/${filesToProcess.length})`;
+                const placemarks = await fetchAndParseKML(KML_BASE_PATH + kmlFileName);
+                placemarks.forEach(placemark => {
+                    const name = placemark.name.toUpperCase();
+                    const coords = placemark.coordinates;
+                    const matchesKeywords = keywordsFilter.length === 0 || keywordsFilter.some(kw => name.includes(kw));
+                    if (coords && matchesKeywords) {
+                        const [lonStr, latStr] = coords.split(',');
+                        const lon = parseFloat(lonStr);
+                        const lat = parseFloat(latStr);
+                        if (isNaN(lat) || isNaN(lon)) return;
+                        const matchesLat = parseCoordinateFilter(latFilterValue, lat);
+                        const matchesLon = parseCoordinateFilter(lonFilterValue, lon);
+                        if (matchesLat && matchesLon) {
+                            const existingRadar = reminders.find(r =>
+                                r.isLocationEnabled &&
+                                r.locationCoordinates &&
+                                Math.abs(r.locationCoordinates.latitude - lat) < COORD_EPSILON &&
+                                Math.abs(r.locationCoordinates.longitude - lon) < COORD_EPSILON &&
+                                (r.text.toUpperCase().includes("RADAR:") || r.excludeFromList)
+                            );
+                            if (!existingRadar) {
+                                const now = new Date();
+                                const newRadar = {
+                                    id: Date.now() + Math.random() + newRadarsCount,
+                                    text: `<b>RADAR: ${placemark.name}</b>`,
+                                    type: 'simple',
+                                    time: '00:01',
+                                    date: `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`,
+                                    createdAt: now.toISOString(),
+                                    managedByUser: false,
+                                    isLocationEnabled: true,
+                                    locationCoordinates: { latitude: lat, longitude: lon },
+                                    radiusMeters: 400,
+                                    excludeFromList: true
+                                };
+                                reminders.push(newRadar);
+                                newRadarsCount++;
+                            }
+                        }
+                    }
+                });
+            } catch (fileError) {
+                statusMessage.textContent = `Error en ${kmlFileName}: ${fileError.message}. Continuando...`;
+                statusMessage.style.color = 'orange';
+                await new Promise(resolve => setTimeout(resolve, 1500));
+            }
+            totalFilesProcessed++;
+            progressBar.value = (totalFilesProcessed / filesToProcess.length) * 100;
+        }
+        localStorage.setItem('reminders', JSON.stringify(reminders));
+        statusMessage.textContent = `Importación completa. ${newRadarsCount} nuevos radares/POIs añadidos.`;
+        statusMessage.style.color = '#28a745';
+        showToast(`${newRadarsCount} nuevos radares/POIs añadidos.`, 'success');
+        updateReminderCount();
+        updateButtonStyles();
+        checkReminders();
+    } catch (error) {
+        statusMessage.textContent = `Error general: ${error.message}`;
+        statusMessage.style.color = 'red';
+        showToast('Error durante la importación.', 'error');
+    } finally {
+         setTimeout(() => {
+            progressContainer.style.display = 'none';
+            statusMessage.style.color = '';
+        }, 5000);
+    }
+}
+
+// ===================================================================
+// NOMBRE: deleteFilteredRadars (MODIFICADA)
+// RESUMEN: Borra radares y limpia la caché para forzar su reconstrucción.
 // ===================================================================
 async function deleteFilteredRadars() {
+    window.radarsCache = null;
+    window.radarsSpatialIndex = null;
+    
     const latFilterValue = document.getElementById('radar-filter-lat').value.trim();
     const lonFilterValue = document.getElementById('radar-filter-lon').value.trim();
     const keywordsFilterRaw = document.getElementById('radar-filter-keywords').value.trim().toUpperCase();
@@ -21665,86 +21856,6 @@ async function deleteFilteredRadars() {
     }
 }
 
-
-
-// ===================================================================
-// NOMBRE: toggleRadaresRuta
-// RESUMEN: Activa/desactiva la visualización de radares en la ruta actual.
-// ===================================================================
-async function toggleRadaresRuta(activo) {
-    const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
-    const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
-    localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(activo));
-    if (actualWaypoints.length < 2) {
-        if (activo) {
-            showToast("Ruta inválida o inexistente. No se pueden buscar radares.", "warning");
-        }
-        eliminarRadaresDeRuta();
-        actualizarContadorRadares(0);
-        return;
-    }
-    eliminarRadaresDeRuta();
-    radaresEnRutaActual = [];
-    if (activo && navigationMapInstance && navigationRouteLayer) {
-        try {
-            const routeLineString = turf.lineString(navigationRouteLayer.getLatLngs().map(latlng => [latlng.lng, latlng.lat]));
-            let filesToProcess = await fetchKMLFilesList(KML_FILES_LIST_STANDARD);
-            const extraFiles = await fetchKMLFilesList(KML_FILES_LIST_EXTRA);
-            filesToProcess = filesToProcess.concat(extraFiles.filter(f => !filesToProcess.includes(f)));
-            for (const kmlFileName of filesToProcess) {
-                const placemarks = await fetchAndParseKML(KML_BASE_PATH + kmlFileName);
-                placemarks.forEach(placemark => {
-                    const coords = placemark.coordinates;
-                    if (coords) {
-                        const [lonStr, latStr] = coords.split(',');
-                        const lon = parseFloat(lonStr);
-                        const lat = parseFloat(latStr);
-                        if (isNaN(lat) || isNaN(lon)) return;
-                        const radarPoint = turf.point([lon, lat]);
-                        const nearestPointOnRoute = turf.nearestPointOnLine(routeLineString, radarPoint, { units: 'meters' });
-                        if (nearestPointOnRoute && nearestPointOnRoute.properties.dist !== undefined && nearestPointOnRoute.properties.dist <= RUTA_RADAR_PROXIMITY_THRESHOLD) {
-                            const existingMapObject = reminderMapObjects.find(obj =>
-                                obj.isFromRuta &&
-                                Math.abs(obj.marker.getLatLng().lat - lat) < COORD_EPSILON &&
-                                Math.abs(obj.marker.getLatLng().lng - lon) < COORD_EPSILON
-                            );
-                            if (!existingMapObject) {
-                                const now = new Date();
-                                const radarData = {
-                                    id: Date.now() + Math.random() + radaresEnRutaActual.length,
-                                    text: `<b>RADAR RUTA: ${placemark.name}</b>`,
-                                    type: 'simple', time: '00:00',
-                                    date: `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`,
-                                    createdAt: now.toISOString(),
-                                    managedByUser: false, isLocationEnabled: true,
-                                    locationCoordinates: { latitude: lat, longitude: lon },
-                                    radiusMeters: 350, excludeFromList: true,
-                                    isFromRuta: true,
-                                    distanceOnRoute: nearestPointOnRoute.properties.location
-                                };
-                                const mapObject = plotSingleReminderOnMap(radarData, navigationMapInstance);
-                                if (mapObject) {
-                                    reminderMapObjects.push(mapObject);
-                                    radaresEnRutaActual.push(radarData);
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-            if (radaresEnRutaActual.length === 0 && activo) {
-            }
-        } catch (error) {
-        }
-    }
-    actualizarContadorRadares(radaresEnRutaActual.length);
-    if (navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0]) {
-        updateNavigationProgressDisplay(navigationCurrentRouteData.routes[0], lastCarDistanceAlongRouteForNavLogic);
-    }
-    if (radaresRutaCheckbox) {
-        radaresRutaCheckbox.checked = activo;
-    }
-}
 
 
 
