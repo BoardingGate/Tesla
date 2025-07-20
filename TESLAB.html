@@ -1,4 +1,4 @@
-R22
+R23
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -7243,13 +7243,9 @@ async function updateDynamicRadars() {
     getCurrentLocation(
         (coords) => {
             let reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
-            const DYNAMIC_RADAR_KEY = 'boardinggate_dynamic_radars_ids';
             
-            const previousDynamicRadarIds = JSON.parse(localStorage.getItem(DYNAMIC_RADAR_KEY) || '[]');
-            if (previousDynamicRadarIds.length > 0) {
-                const dynamicIdsSet = new Set(previousDynamicRadarIds);
-                reminders = reminders.filter(r => !dynamicIdsSet.has(r.id));
-            }
+            // Limpia únicamente los radares marcados como dinámicos del ciclo anterior
+            reminders = reminders.filter(r => !r.isDynamicRadar);
             
             const DYNAMIC_RADAR_SEARCH_RADIUS_KM = 65;
             const R = 6371;
@@ -7279,30 +7275,26 @@ async function updateDynamicRadars() {
             }
 
             let newRadarsCount = 0;
-            let newDynamicRadarIds = [];
             candidateRadars.forEach(radar => {
                 const distance = calculateDistance(coords.latitude, coords.longitude, radar.lat, radar.lon);
                 if (distance <= (DYNAMIC_RADAR_SEARCH_RADIUS_KM * 1000)) {
                     const now = new Date();
-                    const newRadarId = Date.now() + Math.random() + newRadarsCount;
                     const newRadar = {
-                        id: newRadarId,
+                        id: Date.now() + Math.random() + newRadarsCount,
                         text: `<b>RADAR: ${radar.name}</b>`,
                         type: 'simple', time: '00:01',
                         date: `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`,
                         createdAt: now.toISOString(), managedByUser: false,
                         isLocationEnabled: true, locationCoordinates: { latitude: radar.lat, longitude: radar.lon },
-                        radiusMeters: 400, excludeFromList: true
+                        radiusMeters: 400, excludeFromList: true,
+                        isDynamicRadar: true // Marcador clave para identificar estos radares
                     };
                     reminders.push(newRadar);
-                    newDynamicRadarIds.push(newRadarId);
                     newRadarsCount++;
                 }
             });
             
             localStorage.setItem('reminders', JSON.stringify(reminders));
-            localStorage.setItem(DYNAMIC_RADAR_KEY, JSON.stringify(newDynamicRadarIds));
-            dynamicRadarReminders = newDynamicRadarIds;
             
             const existingToast = document.getElementById("radar-update");
             if(existingToast) existingToast.remove();
@@ -7320,7 +7312,7 @@ async function updateDynamicRadars() {
             showToast("No se pudo obtener ubicación para actualizar radares.", "warning");
         }
     );
-}    
+}
 
 // ===================================================================
 // NOMBRE: checkForExcessiveRadars
@@ -7328,9 +7320,10 @@ async function updateDynamicRadars() {
 // ===================================================================
 function checkForExcessiveRadars() {
     const reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
-    const radarReminders = reminders.filter(r => r && (r.text.toUpperCase().includes('RADAR:') || r.excludeFromList === true));
+    // Ahora solo cuenta los radares que NO son dinámicos
+    const manualRadarReminders = reminders.filter(r => r && (r.text.toUpperCase().includes('RADAR:') || r.excludeFromList === true) && !r.isDynamicRadar);
 
-    if (radarReminders.length > 200) {
+    if (manualRadarReminders.length > 200) {
         const modalId = 'excessive-radars-modal';
         const existingModal = document.getElementById(modalId);
         if (existingModal) return;
@@ -7340,7 +7333,7 @@ function checkForExcessiveRadars() {
         modal.className = 'choice-modal';
         modal.innerHTML = `
             <h2>Optimización de Radares</h2>
-            <p style="margin-bottom: 1rem;">Hemos detectado que tienes <strong>${radarReminders.length} radares</strong> importados manualmente. Un nuevo sistema carga automáticamente los radares cercanos (80 km) para mejorar el rendimiento.</p>
+            <p style="margin-bottom: 1rem;">Hemos detectado que tienes <strong>${manualRadarReminders.length} radares</strong> importados manualmente. Un nuevo sistema carga automáticamente los radares cercanos (80 km) para mejorar el rendimiento.</p>
             <p style="margin-bottom: 1.5rem; font-weight: bold;">¿Deseas eliminar los radares importados y activar el nuevo sistema dinámico?</p>
             <div class="modal-top-buttons">
                 <button id="confirm-radar-cleanup" class="choice-edit" style="background-color: #28a745; color: white;">Sí, limpiar y optimizar</button>
@@ -7358,19 +7351,20 @@ function checkForExcessiveRadars() {
         };
         
         confirmBtn.addEventListener('click', async () => {
-            showToast("Limpiando radares antiguos...", "info", 0, false, "radar-cleanup-toast");
-            const nonRadarReminders = reminders.filter(r => !(r && (r.text.toUpperCase().includes('RADAR:') || r.excludeFromList === true)));
-            localStorage.setItem('reminders', JSON.stringify(nonRadarReminders));
+            showToast("Limpiando radares manuales antiguos...", "info", 0, false, "radar-cleanup-toast");
+            const remindersToKeep = reminders.filter(r => !((r.text.toUpperCase().includes('RADAR:') || r.excludeFromList === true) && !r.isDynamicRadar));
+            localStorage.setItem('reminders', JSON.stringify(remindersToKeep));
             
             showToast("Guardando copia de seguridad en la nube...", "info", 0, false, "radar-cleanup-toast");
             await validateAndSaveUserToFirebase(); 
             
             const existingToast = document.getElementById("radar-cleanup-toast");
             if (existingToast) existingToast.remove();
-            showToast("¡Optimización completada! Cargando radares cercanos...", "success");
+            showToast("¡Optimización completada!", "success");
             
             closeHandler();
-            updateDynamicRadars();
+            updateReminderCount();
+            updateButtonStyles();
         });
 
         cancelBtn.addEventListener('click', () => {
@@ -7380,7 +7374,7 @@ function checkForExcessiveRadars() {
         
         addModalAutoCloseTimer(modal, confirmBtn, modalId, 60000);
     }
-}
+}    
     
 // ===================================================================
 // NOMBRE: toggleMapControls
@@ -18051,12 +18045,27 @@ function toggleEnlargedGraph() {
     
 }
 
-
- // ===================================================================
+// ===================================================================
 // NOMBRE: initializeApp (MODIFICADA)
 // RESUMEN: Añade la lógica para obtener y mostrar el contador de usuarios y inicializar el chat.
 // ===================================================================
 async function initializeApp() {
+    // --- LÓGICA DE LIMPIEZA INICIAL MEJORADA ---
+    try {
+        let reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
+        const originalCount = reminders.length;
+        // Elimina solo los recordatorios marcados explícitamente como dinámicos
+        reminders = reminders.filter(r => !r.isDynamicRadar);
+        
+        if (reminders.length < originalCount) {
+            localStorage.setItem('reminders', JSON.stringify(reminders));
+            console.log(`Limpieza inicial: Se eliminaron ${originalCount - reminders.length} radares dinámicos de la sesión anterior.`);
+        }
+    } catch (e) {
+        console.error("Error durante la limpieza inicial de radares:", e);
+    }
+    dynamicRadarReminders = []; // Resetea la variable en memoria
+
     loadCustomData();
     loadSavedSettings();
     const { isMobile, primaryId } = parseUserId(localStorage.getItem('userData_userId'));
@@ -18068,8 +18077,6 @@ async function initializeApp() {
     }
     lastMobileSyncTimestamp = parseInt(localStorage.getItem('lastCacheUpdateTimestamp') || '0');
     
-    dynamicRadarReminders = JSON.parse(localStorage.getItem('boardinggate_dynamic_radars_ids') || '[]');
-
     checkForExcessiveRadars();
     updateDynamicRadars();
     
@@ -18310,8 +18317,7 @@ async function initializeApp() {
             openAlertModal();
         });
     }
-}   
-
+}
     
 // ===================================================================
 // NOMBRE: LCONTROL
