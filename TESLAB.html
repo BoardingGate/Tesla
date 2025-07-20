@@ -8500,6 +8500,206 @@ function openNavigationMap() {
         updateNavigationGraphVisibilityAndMode();
     }, 0);
 }
+
+// ===================================================================
+// NOMBRE: checkReminders
+// RESUMEN: Comprueba periódicamente los recordatorios y las alertas de tráfico.
+// ===================================================================
+function checkReminders() {
+    if (Date.now() - lastDynamicRadarCheck > 30 * 60 * 1000) {
+        updateDynamicRadars();
+        return; 
+    }
+
+    if (Date.now() - lastAlertCheckTimestamp >= ALERT_CHECK_INTERVAL) {
+        lastAlertCheckTimestamp = Date.now();
+        processTrafficAlerts();
+    }
+    
+    if (isRecalculatingRoute && recalculationAttempts > 0) {
+        return;
+    }
+    let currentReminders = []; try { currentReminders = JSON.parse(localStorage.getItem('reminders') || '[]'); } catch (e) { localStorage.setItem('reminders_backup_error', localStorage.getItem('reminders') || '[]'); localStorage.removeItem('reminders'); showToast("Error al cargar recordatorios. Backup intentado.", "error", 5000); return; }
+    const now = new Date(); let overdueReminders = []; const validRemindersForStorage = []; let storageNeedsUpdate = false; const processedIds = new Set(); let newOverdueFound = false;
+    new Promise((resolve) => {
+        if (isSimulatingGpsLocation && simulatedGpsLocation) {
+            resolve(simulatedGpsLocation);
+        } else if (navigationCurrentLocation) {
+            resolve(navigationCurrentLocation);
+        } else if ('geolocation' in navigator) {
+             getCurrentLocation( (coordsParam) => resolve(coordsParam), (errorMsg) => { resolve(null); } );
+        } else {
+            resolve(null);
+        }
+    }).then(async coords => {
+        let allRemindersToCheck = [...currentReminders];
+        const radaresRutaActivos = document.getElementById('radares-ruta-checkbox')?.checked;
+        if (isNavigating && radaresRutaActivos && reminderMapObjects && reminderMapObjects.length > 0) {
+            reminderMapObjects.forEach(mapObj => {
+                if (mapObj.isFromRuta) {
+                    const tempReminderFromMap = {
+                        id: mapObj.reminderId, text: mapObj.marker.options.title || "RADAR RUTA", type: 'simple',
+                        time: '00:00', date: new Date().toISOString().split('T')[0], createdAt: new Date().toISOString(),
+                        managedByUser: false, isLocationEnabled: true,
+                        locationCoordinates: { latitude: mapObj.marker.getLatLng().lat, longitude: mapObj.marker.getLatLng().lng },
+                        radiusMeters: mapObj.circle ? mapObj.circle.getRadius() : 600,
+                        excludeFromList: true, isFromRuta: true
+                    };
+                    allRemindersToCheck.push(tempReminderFromMap);
+                }
+            });
+        }
+        
+        let isInsideAnyRadarZone = false;
+
+        allRemindersToCheck.forEach(reminder => {
+            if (!reminder || typeof reminder.id !== 'number' || typeof reminder.managedByUser === 'undefined' || !reminder.type || !reminder.time || !reminder.date || !reminder.createdAt) {
+                if (!reminder.isFromRuta) storageNeedsUpdate = true;
+                return;
+            }
+            if (processedIds.has(reminder.id)) {
+                if (!reminder.isFromRuta) storageNeedsUpdate = true;
+                return;
+            }
+            processedIds.add(reminder.id);
+            if (reminder.isFromRuta && snoozedRouteRadars.has(reminder.id)) {
+                const snoozeEndTime = snoozedRouteRadars.get(reminder.id);
+                if (Date.now() < snoozeEndTime) { return; } else { snoozedRouteRadars.delete(reminder.id); }
+            }
+            const isManagedByUser = reminder.managedByUser === true; let keepInStorage = true; let isOverdue = false; let locationConditionMet = false;
+            if (!isManagedByUser) {
+                let reminderLocalDueTime = null; try { const [year, month, day] = reminder.date.split('-').map(Number); const [hour, minute] = reminder.time.split(':').map(Number); reminderLocalDueTime = new Date(year, month - 1, day, hour, minute);
+                    if (isNaN(reminderLocalDueTime.getTime())) { throw new Error("Invalid date/time components"); }
+                    if (reminderLocalDueTime <= now) {
+                        isOverdue = true;
+                        if (reminder.isLocationEnabled && reminder.locationCoordinates) {
+                            if (coords) {
+                                const distance = calculateDistance( coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude );
+                                locationConditionMet = distance <= (reminder.radiusMeters || DEFAULT_LOCATION_RADIUS);
+                            } else { locationConditionMet = false; }
+                        }
+                    }
+                } catch (error) {
+                    if (!reminder.isFromRuta) storageNeedsUpdate = true;
+                    keepInStorage = false; isOverdue = false; locationConditionMet = false;
+                }
+            }
+            if (isOverdue && locationConditionMet) {
+                overdueReminders.push(reminder);
+                if (!isUnifiedWindowVisibleByLogic || !document.querySelector(`#unified-reminder-window .reminder-slide[data-id="${reminder.id}"]`)) {
+                    newOverdueFound = true;
+                }
+            }
+            
+            const isRadarType = reminder.text.toUpperCase().includes("RADAR");
+            if(isRadarType && reminder.isLocationEnabled && reminder.locationCoordinates && coords) {
+                const distance = calculateDistance(coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude);
+                if (distance <= (reminder.radiusMeters || DEFAULT_LOCATION_RADIUS)) {
+                    isInsideAnyRadarZone = true;
+                }
+            }
+
+            if (keepInStorage && !reminder.isFromRuta && !dynamicRadarReminders.includes(reminder.id)) { validRemindersForStorage.push(reminder); }
+        });
+        
+        const dynamicRemindersToKeep = allRemindersToCheck.filter(r => dynamicRadarReminders.includes(r.id));
+        const finalRemindersForStorage = [...validRemindersForStorage, ...dynamicRemindersToKeep];
+
+        if (storageNeedsUpdate || dynamicRadarReminders.length > 0) { 
+            try { 
+                localStorage.setItem('reminders', JSON.stringify(finalRemindersForStorage));
+            } catch (e) { 
+                showToast("Error al actualizar recordatorios tras limpieza.", "error", 5000); 
+            }
+        }
+        
+        let shouldDisplayWindow = false;
+        if (overdueReminders.length > 0) {
+            if (!isUnifiedWindowVisibleByLogic || newOverdueFound) {
+                shouldDisplayWindow = true;
+                currentNotificationSlideIndex = 0;
+                if (newOverdueFound) showYellowBorder();
+            } else {
+                const currentDisplayedIds = Array.from(document.querySelectorAll('#unified-reminder-window .reminder-slide')).map(el => parseInt(el.dataset.id));
+                const newOverdueIds = overdueReminders.map(r => r.id);
+                if (currentDisplayedIds.length !== newOverdueIds.length || !currentDisplayedIds.every(id => newOverdueIds.includes(id))) {
+                    shouldDisplayWindow = true;
+                }
+            }
+        }
+        if (shouldDisplayWindow) {
+             displayUnifiedReminderWindow(overdueReminders);
+        } else if (overdueReminders.length === 0 && isUnifiedWindowVisibleByLogic) {
+             hideUnifiedReminderWindow();
+             currentNotificationSlideIndex = 0;
+        }
+        if (isNavigating && navigationCurrentLocation && !isRecalculatingRoute && !isDeviationModalActive && !isAddReminderAtLocationModeActive) {
+            const currentCoords = navigationCurrentLocation;
+            if (navigationMapInstance && navigationRouteLayer && navigationRouteLayer.getLatLngs().length > 0 && typeof L.GeometryUtil !== 'undefined' && L.GeometryUtil.closestLayerSnap) {
+                const closestPointInfo = L.GeometryUtil.closestLayerSnap(navigationMapInstance, [navigationRouteLayer], L.latLng(currentCoords.latitude, currentCoords.longitude), DEVIATION_THRESHOLD_METERS * 2 , false);
+                if (closestPointInfo) {
+                    const distanceToRoute = closestPointInfo.distance;
+                    if (distanceToRoute > DEVIATION_THRESHOLD_METERS) {
+                        if (deviationStartTime === 0) {
+                            deviationStartTime = Date.now();
+                        } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
+                            showDeviationModal();
+                            deviationStartTime = 0;
+                        }
+                    } else { deviationStartTime = 0; }
+                } else {
+                    if (deviationStartTime === 0) {
+                         deviationStartTime = Date.now();
+                    } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
+                         showDeviationModal();
+                         deviationStartTime = 0;
+                    }
+                }
+            }
+        } else {
+            deviationStartTime = 0;
+        }
+        updateReminderCount(); updateButtonStyles();
+        let newInterval = isNavigating ? 1000 : 3000;
+        if (isNavigating) {
+            const distToNextManeuver = distanceToNextManeuverOSRM || Infinity;
+             if (distToNextManeuver < 500 && distToNextManeuver > 0) {
+                newInterval = 1000;
+            } else if (distToNextManeuver < 1000 && distToNextManeuver > 0) {
+                newInterval = 1500;
+            } else {
+                newInterval = 3000;
+            }
+        } else if (isInsideAnyRadarZone) {
+             newInterval = 1000;
+        }
+        const unifiedWindowCurrentlyVisible = document.getElementById('unified-reminder-window')?.classList.contains('visible');
+        if (unifiedWindowCurrentlyVisible && (isNavigationMapActive)) {
+            newInterval = Math.min(newInterval, 5000);
+        }
+        if (newInterval !== currentCheckIntervalDuration) {
+            currentCheckIntervalDuration = newInterval;
+            if (reminderCheckIntervalId) { clearInterval(reminderCheckIntervalId); }
+            reminderCheckIntervalId = setInterval(checkReminders, currentCheckIntervalDuration);
+        }
+        const swiperContainer = document.getElementById('reminder-swiper-container');
+        const windowElement = document.getElementById('unified-reminder-window');
+        if (swiperContainer && overdueReminders.length > 0 && windowElement.classList.contains('visible') && newInterval !== 1000 && newInterval !== 5000) {
+            const totalSlides = overdueReminders.length; let nextSlideIndex = currentNotificationSlideIndex;
+            if (totalSlides > 1) { nextSlideIndex = (currentNotificationSlideIndex + 1) % totalSlides; } else { nextSlideIndex = 0; }
+            if (totalSlides === 1 || nextSlideIndex !== currentNotificationSlideIndex) { currentNotificationSlideIndex = nextSlideIndex; const targetScrollLeft = currentNotificationSlideIndex * swiperContainer.offsetWidth; swiperContainer.scrollTo({ left: targetScrollLeft, behavior: 'smooth' }); setTimeout(updateReminderIndexDisplay, 400); }
+        }
+        const { isMobile, primaryId } = parseUserId(localStorage.getItem('userData_userId'));
+        if (isMobile) {
+            const localTimestamp = parseInt(localStorage.getItem('lastCacheUpdateTimestamp') || '0');
+            const backupPassword = localStorage.getItem('userData_backupPassword');
+            if (backupPassword && localTimestamp > lastMobileSyncTimestamp) {
+                autoSaveFromMobile(primaryId, backupPassword);
+            }
+        }
+    });
+}
+
     
 // ===================================================================
 // NOMBRE: assignMapButtonListeners (MODIFICADA)
@@ -12784,265 +12984,7 @@ function hideIntersectionPreviewMap() {
         intersectionPreviewTimer = null;
     }
 }
-
-// ===================================================================
-// NOMBRE: initializeApp (MODIFICADA)
-// RESUMEN: Añade la lógica para obtener y mostrar el contador de usuarios y inicializar el chat.
-// ===================================================================
-async function initializeApp() {
-    loadCustomData();
-    loadSavedSettings();
-    const { isMobile, primaryId } = parseUserId(localStorage.getItem('userData_userId'));
-    if (isMobile) {
-        document.body.classList.add('mobile-view');
-        await restoreCacheForMobile();
-    } else {
-        await syncDataOnLoad();
-    }
-    lastMobileSyncTimestamp = parseInt(localStorage.getItem('lastCacheUpdateTimestamp') || '0');
-    
-    checkForExcessiveRadars();
-    updateDynamicRadars();
-    
-    const termsAccepted = localStorage.getItem('termsAccepted_v1') === 'true';
-    const shouldDirectToNav = JSON.parse(localStorage.getItem(DIRECT_TO_NAVIGATION_KEY)) || false;
-    const tempPreventDirectNav = sessionStorage.getItem(TEMP_PREVENT_DIRECT_NAV_KEY);
-    
-    if (shouldDirectToNav && !tempPreventDirectNav && termsAccepted) {
-        sessionStorage.setItem('isInDirectToMapMode', 'true');
-        directToNavOnLoad = true;
-        const mainContent = document.querySelector('main'); if (mainContent) mainContent.style.display = 'none';
-        const footerContent = document.querySelector('footer'); if (footerContent) footerContent.style.display = 'none';
-        const noticesIconContainer = document.querySelector('.notices-icon-container'); if (noticesIconContainer) noticesIconContainer.style.display = 'none';
-        const sideControls = document.querySelectorAll('.toggle-image, .toggle-sign, .scroll-toggle-button'); sideControls.forEach(el => el.style.display = 'none');
-        document.querySelectorAll('#config-button, #personal-button, #radar-button, #home-button, #reload-button, #keyword-assignment-button, #password-toggle-button, #versions-button, #info-button').forEach(el => el.style.display = 'none');
-        document.getElementById('grid-filter-container').style.display = 'none';
-        createOtherButtons();
-        renderToggleButtons();
-        openNavigationMap();
-    } else {
-        sessionStorage.removeItem('isInDirectToMapMode');
-        directToNavOnLoad = false;
-        const mainContent = document.querySelector('main'); if (mainContent) mainContent.style.display = 'block';
-        const footerContent = document.querySelector('footer'); if (footerContent) footerContent.style.display = 'block';
-        const noticesIconContainer = document.querySelector('.notices-icon-container'); if (noticesIconContainer) noticesIconContainer.style.display = 'flex';
-        const sideControls = document.querySelectorAll('.toggle-image, .toggle-sign, .scroll-toggle-button'); sideControls.forEach(el => el.style.display = 'flex');
-        document.querySelectorAll('#config-button, #personal-button, #radar-button, #home-button, #reload-button, #keyword-assignment-button, #password-toggle-button, #versions-button, #info-button').forEach(el => el.style.display = 'block');
-        document.getElementById('grid-filter-container').style.display = 'flex';
-        renderGrid();
-        createOtherButtons();
-        renderToggleButtons();
-        updateButtonStyles();
-        filterGridItems();
-    }
-
-    initializeConfigModalListeners();
-    try { await updateVersion(); } catch (e) { }
-    try { await loadNotices(); startNoticeRotation(); } catch (e) { }
-    if (reminderCheckIntervalId) { clearInterval(reminderCheckIntervalId); }
-    checkReminders();
-    currentCheckIntervalDuration = 3000;
-    reminderCheckIntervalId = setInterval(checkReminders, currentCheckIntervalDuration);
-    
-    if (!termsAccepted) {
-        showConfigModal();
-    }
-
-    const noticeToggleIcon = document.getElementById('notice-toggle-icon');
-    if (noticeToggleIcon) noticeToggleIcon.addEventListener('click', toggleNotices);
-    const countEl = document.getElementById('reminder-count-globe');
-    if (countEl) {
-         const openTable = (e) => {
-             if (isEditMode || isAssignmentMode || isKeywordAssignmentMode) return;
-             e.preventDefault(); e.stopPropagation();
-             showAllReminders();
-         };
-         countEl.addEventListener('click', openTable);
-         countEl.style.cursor = 'pointer';
-    }
-    const filterInput = document.getElementById('grid-filter-input');
-    const clearButton = document.getElementById('clear-filter-button');
-    if (filterInput) {
-        const savedFilter = localStorage.getItem('gridFilterValue');
-        if (savedFilter !== null) filterInput.value = savedFilter;
-        filterInput.addEventListener('input', () => {
-             localStorage.setItem('gridFilterValue', filterInput.value);
-             filterGridItems();
-             if(isKeywordAssignmentMode) applyInitialKeywordHighlights();
-        });
-    }
-    if (clearButton) {
-        clearButton.addEventListener('click', () => {
-             if (filterInput) filterInput.value = '';
-             localStorage.removeItem('gridFilterValue');
-             filterGridItems();
-             if(isKeywordAssignmentMode) applyInitialKeywordHighlights();
-        });
-    }
-    adjustButtonPositions();
-    window.addEventListener('resize', adjustButtonPositions);
-    
-
-    const openChatArea = document.getElementById('open-chat-area');
-    if (openChatArea) {
-        openChatArea.addEventListener('click', openChatModal);
-    }
-    updateTotalMessageCount(); 
-
-    
-    const userCountGlobe = document.getElementById('user-count-globe');
-    if (userCountGlobe) {
-        userCountGlobe.addEventListener('click', () => {
-            showToast('Usuarios activos', 'info');
-        });
-        if (window.db && window.getDocs && window.collection) {
-            const usersCollectionRef = window.collection(window.db, "user_data");
-            window.getDocs(usersCollectionRef).then(snapshot => {
-                userCountGlobe.textContent = snapshot.size;
-            }).catch(error => {
-                userCountGlobe.textContent = 'X';
-            });
-        }
-    }
-
-    await checkVersionsIconOpacity();
-
-    document.body.addEventListener('click', function(event) {
-        const target = event.target;
-        const targetId = target.id || (target.closest('[id]') ? target.closest('[id]').id : null);
-        if (targetId === 'config-close-modal') {
-            const termsAcceptedForClose = localStorage.getItem('termsAccepted_v1') === 'true';
-            if (!termsAcceptedForClose) {
-                showToast('Debes aceptar las normas de uso para continuar.', 'warning');
-                return;
-            }
-            const modal = document.getElementById('config-modal');
-            if (modal && !modal.classList.contains('hidden')) {
-                clearModalAutoCloseTimer(modal, target, 'config-modal');
-                modal.classList.add('hidden');
-                 const mapWasOpenBeforeConfig = sessionStorage.getItem('boardinggate_map_should_reopen_after_config') === 'true';
-                 const mapContextToReopen = sessionStorage.getItem('mapContextToReopenAfterConfig');
-                 sessionStorage.removeItem('boardinggate_map_should_reopen_after_config');
-                 sessionStorage.removeItem('mapContextToReopenAfterConfig');
-                 if (mapWasOpenBeforeConfig && !document.getElementById('unified-reminder-window')?.classList.contains('visible') && !document.getElementById('reminders-location-map-modal')) {
-                    if (mapContextToReopen === 'navigation') {
-                        setTimeout(() => openNavigationMap(), 50);
-                    }
-                }
-            }
-        }
-        if (target.matches('.config-tab-button')) {
-            const modal = document.getElementById('config-modal');
-            if(modal && modal.classList.contains('hidden') === false) {
-                const tabTarget = target.dataset.tabTarget;
-                modal.querySelectorAll('.config-tab-button').forEach(btn => btn.classList.remove('active'));
-                modal.querySelectorAll('.config-tab-content').forEach(content => content.classList.remove('active'));
-                target.classList.add('active');
-                if (modal.querySelector(tabTarget)) {
-                    modal.querySelector(tabTarget).classList.add('active');
-                }
-            }
-        }
-        if (targetId === 'close-reminders-top' || targetId === 'close-reminders-bottom') {
-            const modalTable = document.querySelector('.reminder-table-modal');
-            if (modalTable) {
-                if (modalTable.autoCloseInterval) clearInterval(modalTable.autoCloseInterval);
-                modalTable.remove();
-                const mapShouldReopen = sessionStorage.getItem('boardinggate_map_was_open_before_table') === 'true';
-                const mapContext = sessionStorage.getItem('mapContext');
-                sessionStorage.removeItem('boardinggate_map_was_open_before_table');
-                sessionStorage.removeItem('mapContext');
-                if (fromReminderModal) {
-                    fromReminderModal = false;
-                    if (mapShouldReopen) {
-                        sessionStorage.setItem('boardinggate_map_should_reopen_after_form', 'true');
-                        sessionStorage.setItem('mapContext', mapContext);
-                    }
-                    showReminderModal();
-                } else if (mapShouldReopen) {
-                     if (mapContext === 'navigation') openNavigationMap();
-                }
-            }
-        }
-        if (targetId === 'view-all-locations-map') {
-            const modalTable = document.querySelector('.reminder-table-modal');
-             if (modalTable && modalTable.autoCloseInterval) clearInterval(modalTable.autoCloseInterval);
-             if (modalTable) modalTable.remove();
-            setTimeout(() => {
-                openLocationsPreviewMap();
-            }, 50);
-        }
-         if (targetId === 'close-locations-preview') {
-            const previewModal = document.getElementById('locations-preview-modal');
-            if (previewModal) {
-                if (locationsPreviewMap) {
-                    try { locationsPreviewMap.remove(); } catch (e) {}
-                    locationsPreviewMap = null;
-                }
-                if (mapLayersControlLocationsPreview) {
-                    try {mapLayersControlLocationsPreview.remove();} catch(e){}
-                    mapLayersControlLocationsPreview = null;
-                }
-                clearModalAutoCloseTimer(previewModal, target, 'locations-preview-modal');
-                previewModal.classList.add('hidden');
-            }
-        }
-        if (targetId === 'close-address-suggestions-modal') {
-            hideAddressSuggestionsModal();
-        }
-    });
-    const bookmarkGrid = document.getElementById('bookmark-grid');
-    if (bookmarkGrid) {
-        bookmarkGrid.addEventListener('click', function(event) {
-            const link = event.target.closest('a.bookmark-item');
-            if (link && link.href && link.href.startsWith("map-action:")) {
-                event.preventDefault();
-                const action = link.href.split(":")[1];
-                if (action === "openRemindersMapWithNoRadars") {
-                    closeOtherModals();
-                    setTimeout(() => {
-                        const existingPreviewModal = document.getElementById('locations-preview-modal');
-                        if (existingPreviewModal && !existingPreviewModal.classList.contains('hidden')) {
-                            showToast("El mapa de ubicaciones (sin radar) ya está abierto", "info");
-                        } else {
-                           openLocationsPreviewMap();
-                        }
-                    }, 50);
-                } else if (action === "openRemindersMap") {
-                    closeOtherModals();
-                    setTimeout(() => {
-                        const mapModalElement = document.getElementById('reminders-location-map-modal');
-                        if (mapModalElement && !mapModalElement.classList.contains('hidden')) {
-                            showToast("El mapa de navegación/ubicaciones ya está abierto", "info");
-                            if (navigationMapInstance) {
-                                requestAnimationFrame(() => {
-                                    requestAnimationFrame(() => {
-                                        if (navigationMapInstance) {
-                                            try {
-                                                 navigationMapInstance.invalidateSize({debounceMoveend: true});
-                                             } catch (e) {  }
-                                        }
-                                    });
-                                });
-                            }
-                        } else {
-                           openNavigationMap();
-                        }
-                    }, 50);
-                }
-            }
-        });
-    }
-
-    const accidentAlertButton = document.getElementById('accident-alert-button');
-    if (accidentAlertButton) {
-        accidentAlertButton.addEventListener('click', () => {
-            if (isEditMode || isAssignmentMode || isKeywordAssignmentMode) return;
-            openAlertModal();
-        });
-    }
-}    
-   
+  
     
 // ===================================================================
 // NOMBRE: showDeviationModal
