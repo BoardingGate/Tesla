@@ -1,4 +1,4 @@
-V2
+V3
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -10152,6 +10152,382 @@ function showPhotoModal(imageUrl) {
     });
 }
 
+
+// ===================================================================
+// NOMBRE: startFreeDrive
+// RESUMEN: Inicia el modo de conducción libre, preparando las estadísticas y la UI.
+// ===================================================================
+function startFreeDrive(initialCoords) {
+    if (isFreeDriveActive || isNavigating) return;
+
+    isFreeDriveActive = true;
+    isFreeDrivePaused = false;
+    freeDriveStats = {
+        startTime: new Date(),
+        totalDistance: 0,
+        lastPosition: { ...initialCoords },
+    };
+
+    navigationStartTimeForStats = new Date();
+    totalDistanceTravelledForStats = 0;
+    maxSpeedDuringTrip = 0;
+    maxSpeedCoordinates = null;
+    maxAltitudeDuringTrip = -Infinity;
+    minAltitudeDuringTrip = Infinity;
+    window.averageSpeedKmh = 0;
+    lastPositionForStats = { ...initialCoords };
+    
+    showToast("Grabación de viaje en modo libre iniciada.", "success");
+
+    navigationFollowUser = true;
+    shouldCenterOnUser = true;
+    const locateMeButton = document.getElementById('locate-me-on-reminders-map');
+    const locateMeImg = locateMeButton ? locateMeButton.querySelector('img') : null;
+    if (locateMeButton && locateMeImg) {
+        locateMeImg.src = "PNG/DEJARSEGUIR.PNG";
+        locateMeButton.title = "Dejar de centrar el mapa en mi posición";
+    }
+    toggleMapHeaderRowsVisibility(false);
+    showMapInfoOverlay("Modo FREE DRIVE sin destino conocido");
+
+    updateStartNavigationButtonState();
+    updateNavigationButtonColor();
+    
+    currentGraphMode = localStorage.getItem(GRAPH_STATE_KEY) || 'Desviación ETA'; 
+    initializeNavigationGraph();
+}
+
+// ===================================================================
+// NOMBRE: stopFreeDrive
+// RESUMEN: Detiene el modo de conducción libre y muestra el modal de estadísticas.
+// ===================================================================
+function stopFreeDrive() {
+    if (!isFreeDriveActive) return;
+
+    const statsToSend = { ...freeDriveStats };
+    showArrivalStatsModal(statsToSend);
+
+    isFreeDriveActive = false;
+    isFreeDrivePaused = false;
+    freeDriveStats = null;
+    tripStartLocationForStats = null;
+
+    updateStartNavigationButtonState();
+    updateNavigationButtonColor();
+    clearNavigationGraph();
+    showMapInfoOverlay("Modo FREE DRIVE fin de viaje");
+}
+
+// ===================================================================
+// NOMBRE: updateNavigationProgressDisplay (MODIFICADA - GESTIONA MODO LIBRE)
+// RESUMEN: Muestra la barra de progreso para una ruta o una tarjeta de información para el modo libre.
+// ===================================================================
+async function updateNavigationProgressDisplay(route, carDistanceAlongTheRoute = 0) {
+    const progressBarContainer = document.getElementById('navigation-bottom-progress-bar');
+    if (!progressBarContainer) return;
+
+    if (isFreeDriveActive) {
+        progressBarContainer.style.display = 'flex';
+        const topInfoBar = document.getElementById('navigation-top-info-bar');
+        const overallProgressContainer = document.getElementById('route-overall-progress-container');
+        const etaInfoContainer = document.getElementById('navigation-eta-info');
+        const routeProgressTextEl = document.getElementById('route-progress-text');
+        
+        if(topInfoBar) topInfoBar.style.display = 'none';
+        if(overallProgressContainer) overallProgressContainer.style.display = 'none';
+        if(etaInfoContainer) etaInfoContainer.style.display = 'none';
+
+        if(routeProgressTextEl) {
+             let kmRealizadosTexto = `${(totalDistanceTravelledForStats / 1000).toFixed(1)} km`;
+             const startTime = freeDriveStats ? freeDriveStats.startTime : new Date();
+             const startTimeFormatted = `${startTime.getHours().toString().padStart(2, '0')}:${startTime.getMinutes().toString().padStart(2, '0')}`;
+             const durationMs = Date.now() - startTime.getTime();
+             const totalTravelMinutes = Math.floor(durationMs / (1000 * 60));
+             const travelHours = Math.floor(totalTravelMinutes / 60);
+             const travelMinutes = totalTravelMinutes % 60;
+             const travelTimeFormatted = `${String(travelHours).padStart(2, '0')}:${String(travelMinutes).padStart(2, '0')}`;
+            
+             let currentStreet = 'Buscando calle...';
+             if (navigationCurrentLocation) {
+                 currentStreet = await getAddressForWaypoint(navigationCurrentLocation.latitude, navigationCurrentLocation.longitude, true);
+             }
+
+             routeProgressTextEl.innerHTML = `
+                <div style="font-size: 1.1em; line-height: 1.3;">
+                    <div style="font-weight: bold; color: white;">${currentStreet}</div>
+                    <div style="font-size: 0.9em; color: #f0f0f0;">
+                        ${kmRealizadosTexto} | Inicio: ${startTimeFormatted} | Viaje: ${travelTimeFormatted}
+                    </div>
+                </div>
+             `;
+             routeProgressTextEl.style.top = '10px';
+        }
+        
+        return;
+    }
+
+    if(document.getElementById('route-progress-text')) {
+        document.getElementById('route-progress-text').style.top = '50%';
+    }
+
+    const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
+    if (!route || typeof route.distance !== 'number' || typeof route.duration !== 'number' || actualWaypoints.length < 2) {
+        return;
+    }
+
+    const overallProgressFill = document.getElementById('route-overall-progress');
+    const routeProgressTextEl = document.getElementById('route-progress-text');
+    const routeProgressIconEl = document.getElementById('route-progress-icon');
+    const nextStageDistEl = document.getElementById('next-stage-distance');
+    const nextStageTimeEl = document.getElementById('next-stage-time');
+    const nextStageEtaEl = document.getElementById('next-stage-eta');
+    const nextStageDeviationEl = document.getElementById('next-stage-eta-deviation');
+    const finalDestDistEl = document.getElementById('final-destination-distance');
+    const finalDestTimeEl = document.getElementById('final-destination-time');
+    const finalDestEtaEl = document.getElementById('final-destination-eta');
+    const finalDestDeviationEl = document.getElementById('final-destination-eta-deviation');
+    const nextStageInfoDiv = document.getElementById('next-stage-info');
+    const finalDestInfoDiv = document.getElementById('final-destination-info');
+    const etaInfoContainer = document.getElementById('navigation-eta-info');
+    const nextStageLabelEl = document.getElementById('next-stage-label');
+
+    const totalJourneyDistanceForBar = (accumulatedDistanceBeforeCurrentSegment || 0) + route.distance;
+    const currentJourneyDistanceForBar = (accumulatedDistanceBeforeCurrentSegment || 0) + carDistanceAlongTheRoute;
+    const progressPercent = totalJourneyDistanceForBar > 0 ? (currentJourneyDistanceForBar / totalJourneyDistanceForBar) * 100 : 0;
+    
+    overallProgressFill.style.width = `${Math.min(100, progressPercent)}%`;
+
+    if (routeProgressIconEl) {
+        if (progressPercent > 0 && progressPercent < 100) {
+            routeProgressIconEl.style.display = 'block';
+        } else {
+            routeProgressIconEl.style.display = 'none';
+        }
+    }
+
+    if (routeProgressTextEl) {
+        let kmRecorridosTexto = "-- km";
+        let timeInfoString = ""; 
+        if (navigationCurrentRouteData) { 
+            if (isNavigating && navigationStartTimeForStats) {
+                kmRecorridosTexto = `${(totalDistanceTravelledForStats / 1000).toFixed(1)} km`;
+                const startTimeFormatted = `${navigationStartTimeForStats.getHours().toString().padStart(2, '0')}:${navigationStartTimeForStats.getMinutes().toString().padStart(2, '0')}`;
+                const nowForTravelTime = new Date();
+                const durationMs = nowForTravelTime - navigationStartTimeForStats;
+                const totalTravelMinutes = Math.floor(durationMs / (1000 * 60));
+                const travelHours = Math.floor(totalTravelMinutes / 60);
+                const travelMinutes = totalTravelMinutes % 60;
+                const travelTimeFormatted = `${String(travelHours).padStart(2, '0')}:${String(travelMinutes).padStart(2, '0')}`;
+                timeInfoString = ` (${startTimeFormatted} • ${travelTimeFormatted})`;
+            } else { 
+                kmRecorridosTexto = "0.0 km";
+                timeInfoString = ` (Stop)`;
+            }
+        } else { 
+            kmRecorridosTexto = "-- km";
+            timeInfoString = " (--:-- • --:--)";
+        }
+        routeProgressTextEl.innerHTML = `${kmRecorridosTexto}${timeInfoString}`;
+    }
+
+    const remainingDistanceTotal = Math.max(0, route.distance - carDistanceAlongTheRoute);
+    const remainingDurationTotal = route.distance > 0 ? route.duration * (remainingDistanceTotal / route.distance) : 0;
+
+    finalDestDistEl.textContent = `${(remainingDistanceTotal / 1000).toFixed(1)} km`;
+    const finalDestTotalMinutes = Math.round(remainingDurationTotal / 60);
+    const finalDestHours = Math.floor(finalDestTotalMinutes / 60);
+    const finalDestMinutes = finalDestTotalMinutes % 60;
+    finalDestTimeEl.textContent = `${String(finalDestHours).padStart(2, '0')}:${String(finalDestMinutes).padStart(2, '0')}`;
+    const currentFinalEta = new Date(Date.now() + remainingDurationTotal * 1000);
+    finalDestEtaEl.textContent = currentFinalEta.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    
+    if (tripInitialOverallEtaTime && isNavigating && navigationStartTimeForStats) {
+        const finalDeviationMs = currentFinalEta.getTime() - tripInitialOverallEtaTime.getTime();
+        finalDestDeviationEl.innerHTML = formatDeviation(finalDeviationMs);
+    } else {
+        finalDestDeviationEl.innerHTML = "";
+    }
+    
+    const hasUnvisitedIntermediateStages = actualWaypoints.some(wp => !wp.visited && wp.type === 'intermediate');
+
+    if (hasUnvisitedIntermediateStages) {
+        etaInfoContainer.classList.remove('single-destination');
+        finalDestInfoDiv.classList.remove('single-destination-layout');
+        nextStageInfoDiv.style.display = 'block';
+
+        const totalRealStages = actualWaypoints.length - 1;
+        const currentRealStageIndex = actualWaypoints.findIndex(wp => !wp.visited && wp.type !== 'S') -1;
+        const nextStageWaypointObject = actualWaypoints.find(wp => !wp.visited && wp.type !== 'S');
+        
+        if (nextStageLabelEl && nextStageWaypointObject) {
+            let stageDescription = nextStageWaypointObject.address || `Etapa ${nextStageWaypointObject.label}`;
+            if (stageDescription.length > 20) {
+                stageDescription = stageDescription.substring(0, 20) + '...';
+            }
+            nextStageLabelEl.textContent = `Etapa ${currentRealStageIndex + 1} de ${totalRealStages}: ${stageDescription}`;
+        }
+        
+        let cumulativeDistanceToStartOfCurrentLegOSRM = 0;
+        if (route.legs) {
+            for (let i = 0; i < currentLegIndexNav; i++) {
+                if (route.legs[i] && typeof route.legs[i].distance === 'number') {
+                    cumulativeDistanceToStartOfCurrentLegOSRM += route.legs[i].distance;
+                }
+            }
+        }
+
+        const legForDisplay = route.legs[currentLegIndexNav];
+        if (legForDisplay) {
+            const distanceIntoCurrentLegDisplay = Math.max(0, carDistanceAlongTheRoute - cumulativeDistanceToStartOfCurrentLegOSRM);
+            const remainingDistanceThisLegDisplay = Math.max(0, (legForDisplay.distance || 0) - distanceIntoCurrentLegDisplay);
+            const remainingDurationThisLegDisplay = (legForDisplay.distance > 0 && typeof legForDisplay.duration === 'number') ? legForDisplay.duration * (remainingDistanceThisLegDisplay / legForDisplay.distance) : 0;
+            
+            nextStageDistEl.textContent = `${(remainingDistanceThisLegDisplay / 1000).toFixed(1)} km`;
+            const nextStageTotalMinutes = Math.round(remainingDurationThisLegDisplay / 60);
+            const nextStageHours = Math.floor(nextStageTotalMinutes / 60);
+            const nextStageMinutes = nextStageTotalMinutes % 60;
+            nextStageTimeEl.textContent = `${String(nextStageHours).padStart(2, '0')}:${String(nextStageMinutes).padStart(2, '0')}`;
+            
+            const currentNextStageEta = new Date(Date.now() + remainingDurationThisLegDisplay * 1000);
+            nextStageEtaEl.textContent = currentNextStageEta.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+            if (currentStageInitialExpectedEtaTime && isNavigating && navigationStartTimeForStats) {
+               const deviationStageMs = currentNextStageEta.getTime() - currentStageInitialExpectedEtaTime.getTime();
+               nextStageDeviationEl.innerHTML = formatDeviation(accumulatedDeviationMs + deviationStageMs);
+            } else {
+               nextStageDeviationEl.innerHTML = "";
+            }
+        }
+    } else {
+        etaInfoContainer.classList.add('single-destination');
+        finalDestInfoDiv.classList.add('single-destination-layout');
+        nextStageInfoDiv.style.display = 'none';
+        if(nextStageDeviationEl) nextStageDeviationEl.innerHTML = "";
+    }
+
+    overallProgressContainer.querySelectorAll('.waypoint-dot-on-progress-bar, .radar-marker-on-progress-bar, .task-marker-on-progress-bar').forEach(dot => dot.remove());
+
+    if (actualWaypoints.length > 2 && totalJourneyDistanceForBar > 0 && typeof turf !== 'undefined' && navigationRouteLayer) {
+        const routeLineString = turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat]));
+        const startOfRoute = turf.point(routeLineString.geometry.coordinates[0]);
+
+        for (let i = 1; i < actualWaypoints.length - 1; i++) {
+            const waypoint = actualWaypoints[i];
+            const waypointPoint = turf.point([waypoint.lng, waypoint.lat]);
+            
+            const nearestPointOnLine = turf.nearestPointOnLine(routeLineString, waypointPoint, { units: 'meters' });
+            
+            const lineSliceToWaypoint = turf.lineSlice(startOfRoute, nearestPointOnLine, routeLineString);
+            const distanceToWaypoint = turf.length(lineSliceToWaypoint, { units: 'meters' });
+            
+            const totalDistanceWithAccumulated = (accumulatedDistanceBeforeCurrentSegment || 0) + distanceToWaypoint;
+            const percent = (totalDistanceWithAccumulated / totalJourneyDistanceForBar) * 100;
+            
+            if (percent < 100 && percent > 0) { 
+                const dot = document.createElement('div');
+                dot.className = 'waypoint-dot-on-progress-bar';
+                dot.style.left = `calc(${percent}% - 7px)`;
+                dot.title = `Etapa ${waypoint.label}`;
+                overallProgressContainer.appendChild(dot);
+            }
+        }
+    }
+
+    const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+    if (radaresRutaCheckbox && radaresRutaCheckbox.checked && radaresEnRutaActual.length > 0 && totalJourneyDistanceForBar > 0) {
+        radaresEnRutaActual.forEach(radar => {
+            if (radar.distanceOnRoute !== undefined) {
+                const totalDistanceToRadar = (accumulatedDistanceBeforeCurrentSegment || 0) + radar.distanceOnRoute;
+                if(totalDistanceToRadar <= totalJourneyDistanceForBar) {
+                    const percent = (totalDistanceToRadar / totalJourneyDistanceForBar) * 100;
+                     if (percent >= 0 && percent <= 100) {
+                        const radarMarker = document.createElement('div');
+                        radarMarker.className = 'radar-marker-on-progress-bar';
+                        radarMarker.style.left = `${percent}%`;
+                        radarMarker.title = radar.text.replace(/<b>|<\/b>/gi, '');
+                        overallProgressContainer.appendChild(radarMarker);
+                    }
+                }
+            }
+        });
+    }
+
+    const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
+    if (tareasRutaCheckbox && tareasRutaCheckbox.checked && tareasEnRutaActual.length > 0 && totalJourneyDistanceForBar > 0) {
+        tareasEnRutaActual.forEach(tarea => {
+            if (tarea.distanceOnRoute !== undefined) {
+                const totalDistanceToTask = (accumulatedDistanceBeforeCurrentSegment || 0) + tarea.distanceOnRoute;
+                if(totalDistanceToTask <= totalJourneyDistanceForBar) {
+                    const percent = (totalDistanceToTask / totalJourneyDistanceForBar) * 100;
+                    if (percent >= 0 && percent <= 100) {
+                        const taskMarker = document.createElement('div');
+                        taskMarker.className = 'task-marker-on-progress-bar';
+                        taskMarker.style.left = `${percent}%`;
+                        taskMarker.title = tarea.text.replace(/<b>|<\/b>/gi, '');
+                        overallProgressContainer.appendChild(taskMarker);
+                    }
+                }
+            }
+        });
+    }
+
+    if (isNavigating && !isArrivalSequenceStarted && remainingDistanceTotal < WAYPOINT_VISITED_THRESHOLD_METERS) {
+        isArrivalSequenceStarted = true;
+        setTimeout(() => {
+            if (!document.getElementById('arrival-stats-modal') || document.getElementById('arrival-stats-modal').classList.contains('hidden')) {
+                showArrivalStatsModal();
+            }
+        }, 14000);
+        let countdown = 14;
+        const toastId = `arrival-toast-${Date.now()}`;
+        showToast(`FIN DEL VIAJE (${countdown})`, 'success', 10000, false, toastId);
+        const countdownInterval = setInterval(() => {
+            countdown--;
+            const arrivalToast = document.getElementById(toastId);
+            if (arrivalToast) {
+                const span = arrivalToast.querySelector('span');
+                if (span) span.innerHTML = `FIN DEL VIAJE (${countdown})`;
+            }
+            if (countdown <= 0) {
+                clearInterval(countdownInterval);
+            }
+        }, 1000);
+    } else if (isNavigating) {
+        const destinationWp = navigationWaypoints[navigationWaypoints.length - 1];
+        if (destinationWp && destinationWp.address) {
+            const mapOverlay = document.getElementById('map-info-overlay');
+            if (mapOverlay && !mapOverlay.textContent.startsWith("HA LLEGADO AL ")) {
+                 showDestinationName();
+            }
+        }
+    }
+}
+
+// ===================================================================
+// NOMBRE: getAddressForWaypoint (MODIFICADA)
+// RESUMEN: Obtiene la dirección o solo la calle de un punto de ruta.
+// ===================================================================
+async function getAddressForWaypoint(lat, lng, streetOnly = false) {
+    if (typeof lat !== 'number' || typeof lng !== 'number' || isNaN(lat) || isNaN(lng)) {
+        return "Ubicación Desconocida";
+    }
+    try {
+        const response = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&addressdetails=1&accept-language=es`);
+        if (response.ok) {
+            const data = await response.json();
+            if (streetOnly) {
+                return data.address?.road || "Calle desconocida";
+            }
+            return data.display_name || `(${lat.toFixed(3)}, ${lng.toFixed(3)})`;
+        } else {
+            return streetOnly ? "Calle desconocida" : `Etapa (${lat.toFixed(3)}, ${lng.toFixed(3)})`;
+        }
+    } catch (err) {
+        return streetOnly ? "Calle desconocida" : `Etapa (${lat.toFixed(3)}, ${lng.toFixed(3)})`;
+    }
+}
+
+
     
 // ===================================================================
 // NOMBRE: openAlertModal
@@ -12398,59 +12774,7 @@ function generateBackup() {
     }
 }
 
-// ===================================================================
-// NOMBRE: startFreeDrive
-// RESUMEN: Inicia el modo de conducción libre, preparando las estadísticas y la UI.
-// ===================================================================
-function startFreeDrive(initialCoords) {
-    if (isFreeDriveActive || isNavigating) return;
 
-    isFreeDriveActive = true;
-    isFreeDrivePaused = false;
-    freeDriveStats = {
-        startTime: new Date(),
-        totalDistance: 0,
-        lastPosition: { ...initialCoords },
-    };
-
-    // Resetear estadísticas globales para el nuevo viaje
-    navigationStartTimeForStats = null; 
-    totalDistanceTravelledForStats = 0;
-    maxSpeedDuringTrip = 0;
-    maxSpeedCoordinates = null;
-    maxAltitudeDuringTrip = -Infinity;
-    minAltitudeDuringTrip = Infinity;
-    window.averageSpeedKmh = 0;
-    lastPositionForStats = null;
-    
-    showToast("Grabación de viaje en modo libre iniciada.", "success");
-
-    updateStartNavigationButtonState();
-    updateNavigationButtonColor();
-    
-    currentGraphMode = 'Desviación ETA'; 
-    initializeNavigationGraph();
-}
-
-// ===================================================================
-// NOMBRE: stopFreeDrive
-// RESUMEN: Detiene el modo de conducción libre y muestra el modal de estadísticas.
-// ===================================================================
-function stopFreeDrive() {
-    if (!isFreeDriveActive) return;
-
-    const statsToSend = { ...freeDriveStats };
-    showArrivalStatsModal(statsToSend);
-
-    isFreeDriveActive = false;
-    isFreeDrivePaused = false;
-    freeDriveStats = null;
-    tripStartLocationForStats = null;
-
-    updateStartNavigationButtonState();
-    updateNavigationButtonColor();
-    clearNavigationGraph();
-}
 
 // ===================================================================
 // NOMBRE: handleFreeDriveCancellation
@@ -20593,31 +20917,7 @@ function displayAddressSuggestionsModal(suggestions) {
             if (reorderButton) reorderButton.style.display = 'none';
         }
     }
-    
-    
-    
-    // ===================================================================
-    // NOMBRE: getAddressForWaypoint
-    // RESUMEN: Obtiene la dirección de un punto de ruta usando geocodificación inversa.
-    // ===================================================================
-    async function getAddressForWaypoint(lat, lng) {
-        if (typeof lat !== 'number' || typeof lng !== 'number' || isNaN(lat) || isNaN(lng)) {
-            return "Ubicación Desconocida";
-        }
-        try {
-            const response = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&addressdetails=0&accept-language=es`);
-            if (response.ok) {
-                const data = await response.json();
-                return data.display_name || `(${lat.toFixed(3)}, ${lng.toFixed(3)})`;
-            } else {
-                return `Etapa (${lat.toFixed(3)}, ${lng.toFixed(3)})`;
-            }
-        } catch (err) {
-            return `Etapa (${lat.toFixed(3)}, ${lng.toFixed(3)})`;
-        }
-    }
-    
-    
+      
     
 // ===================================================================
 // NOMBRE: updateWaypointTypesAndLabels (VERSIÓN CORREGIDA Y DEFINITIVA 2)
@@ -21631,243 +21931,6 @@ async function findChargingPointsOnRoute(powerFilters, searchConfig) {
     }
 }
     
-function updateNavigationProgressDisplay(route, carDistanceAlongTheRoute = 0) {
-    const progressBarContainer = document.getElementById('navigation-bottom-progress-bar');
-    if (!progressBarContainer) return;
-
-    const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
-    if (!route || typeof route.distance !== 'number' || typeof route.duration !== 'number' || actualWaypoints.length < 2) {
-        return;
-    }
-
-    const overallProgressFill = document.getElementById('route-overall-progress');
-    const overallProgressContainer = document.getElementById('route-overall-progress-container');
-    const routeProgressTextEl = document.getElementById('route-progress-text');
-    const routeProgressIconEl = document.getElementById('route-progress-icon');
-    const nextStageDistEl = document.getElementById('next-stage-distance');
-    const nextStageTimeEl = document.getElementById('next-stage-time');
-    const nextStageEtaEl = document.getElementById('next-stage-eta');
-    const nextStageDeviationEl = document.getElementById('next-stage-eta-deviation');
-    const finalDestDistEl = document.getElementById('final-destination-distance');
-    const finalDestTimeEl = document.getElementById('final-destination-time');
-    const finalDestEtaEl = document.getElementById('final-destination-eta');
-    const finalDestDeviationEl = document.getElementById('final-destination-eta-deviation');
-    const nextStageInfoDiv = document.getElementById('next-stage-info');
-    const finalDestInfoDiv = document.getElementById('final-destination-info');
-    const etaInfoContainer = document.getElementById('navigation-eta-info');
-    const nextStageLabelEl = document.getElementById('next-stage-label');
-
-    const totalJourneyDistanceForBar = (accumulatedDistanceBeforeCurrentSegment || 0) + route.distance;
-    const currentJourneyDistanceForBar = (accumulatedDistanceBeforeCurrentSegment || 0) + carDistanceAlongTheRoute;
-    const progressPercent = totalJourneyDistanceForBar > 0 ? (currentJourneyDistanceForBar / totalJourneyDistanceForBar) * 100 : 0;
-    
-    overallProgressFill.style.width = `${Math.min(100, progressPercent)}%`;
-
-    if (routeProgressIconEl) {
-        if (progressPercent > 0 && progressPercent < 100) {
-            routeProgressIconEl.style.display = 'block';
-        } else {
-            routeProgressIconEl.style.display = 'none';
-        }
-    }
-
-    if (routeProgressTextEl) {
-        let kmRecorridosTexto = "-- km";
-        let timeInfoString = ""; 
-        if (navigationCurrentRouteData) { 
-            if (isNavigating && navigationStartTimeForStats) {
-                kmRecorridosTexto = `${(totalDistanceTravelledForStats / 1000).toFixed(1)} km`;
-                const startTimeFormatted = `${navigationStartTimeForStats.getHours().toString().padStart(2, '0')}:${navigationStartTimeForStats.getMinutes().toString().padStart(2, '0')}`;
-                const nowForTravelTime = new Date();
-                const durationMs = nowForTravelTime - navigationStartTimeForStats;
-                const totalTravelMinutes = Math.floor(durationMs / (1000 * 60));
-                const travelHours = Math.floor(totalTravelMinutes / 60);
-                const travelMinutes = totalTravelMinutes % 60;
-                const travelTimeFormatted = `${String(travelHours).padStart(2, '0')}:${String(travelMinutes).padStart(2, '0')}`;
-                timeInfoString = ` (${startTimeFormatted} • ${travelTimeFormatted})`;
-            } else { 
-                kmRecorridosTexto = "0.0 km";
-                timeInfoString = ` (Stop)`;
-            }
-        } else { 
-            kmRecorridosTexto = "-- km";
-            timeInfoString = " (--:-- • --:--)";
-        }
-        routeProgressTextEl.innerHTML = `${kmRecorridosTexto}${timeInfoString}`;
-    }
-
-    const remainingDistanceTotal = Math.max(0, route.distance - carDistanceAlongTheRoute);
-    const remainingDurationTotal = route.distance > 0 ? route.duration * (remainingDistanceTotal / route.distance) : 0;
-
-    finalDestDistEl.textContent = `${(remainingDistanceTotal / 1000).toFixed(1)} km`;
-    const finalDestTotalMinutes = Math.round(remainingDurationTotal / 60);
-    const finalDestHours = Math.floor(finalDestTotalMinutes / 60);
-    const finalDestMinutes = finalDestTotalMinutes % 60;
-    finalDestTimeEl.textContent = `${String(finalDestHours).padStart(2, '0')}:${String(finalDestMinutes).padStart(2, '0')}`;
-    const currentFinalEta = new Date(Date.now() + remainingDurationTotal * 1000);
-    finalDestEtaEl.textContent = currentFinalEta.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    
-    if (tripInitialOverallEtaTime && isNavigating && navigationStartTimeForStats) {
-        const finalDeviationMs = currentFinalEta.getTime() - tripInitialOverallEtaTime.getTime();
-        finalDestDeviationEl.innerHTML = formatDeviation(finalDeviationMs);
-    } else {
-        finalDestDeviationEl.innerHTML = "";
-    }
-    
-    const hasUnvisitedIntermediateStages = actualWaypoints.some(wp => !wp.visited && wp.type === 'intermediate');
-
-    if (hasUnvisitedIntermediateStages) {
-        etaInfoContainer.classList.remove('single-destination');
-        finalDestInfoDiv.classList.remove('single-destination-layout');
-        nextStageInfoDiv.style.display = 'block';
-
-        const totalRealStages = actualWaypoints.length - 1;
-        const currentRealStageIndex = actualWaypoints.findIndex(wp => !wp.visited && wp.type !== 'S') -1;
-        const nextStageWaypointObject = actualWaypoints.find(wp => !wp.visited && wp.type !== 'S');
-        
-        if (nextStageLabelEl && nextStageWaypointObject) {
-            let stageDescription = nextStageWaypointObject.address || `Etapa ${nextStageWaypointObject.label}`;
-            if (stageDescription.length > 20) {
-                stageDescription = stageDescription.substring(0, 20) + '...';
-            }
-            nextStageLabelEl.textContent = `Etapa ${currentRealStageIndex + 1} de ${totalRealStages}: ${stageDescription}`;
-        }
-        
-        let cumulativeDistanceToStartOfCurrentLegOSRM = 0;
-        if (route.legs) {
-            for (let i = 0; i < currentLegIndexNav; i++) {
-                if (route.legs[i] && typeof route.legs[i].distance === 'number') {
-                    cumulativeDistanceToStartOfCurrentLegOSRM += route.legs[i].distance;
-                }
-            }
-        }
-
-        const legForDisplay = route.legs[currentLegIndexNav];
-        if (legForDisplay) {
-            const distanceIntoCurrentLegDisplay = Math.max(0, carDistanceAlongTheRoute - cumulativeDistanceToStartOfCurrentLegOSRM);
-            const remainingDistanceThisLegDisplay = Math.max(0, (legForDisplay.distance || 0) - distanceIntoCurrentLegDisplay);
-            const remainingDurationThisLegDisplay = (legForDisplay.distance > 0 && typeof legForDisplay.duration === 'number') ? legForDisplay.duration * (remainingDistanceThisLegDisplay / legForDisplay.distance) : 0;
-            
-            nextStageDistEl.textContent = `${(remainingDistanceThisLegDisplay / 1000).toFixed(1)} km`;
-            const nextStageTotalMinutes = Math.round(remainingDurationThisLegDisplay / 60);
-            const nextStageHours = Math.floor(nextStageTotalMinutes / 60);
-            const nextStageMinutes = nextStageTotalMinutes % 60;
-            nextStageTimeEl.textContent = `${String(nextStageHours).padStart(2, '0')}:${String(nextStageMinutes).padStart(2, '0')}`;
-            
-            const currentNextStageEta = new Date(Date.now() + remainingDurationThisLegDisplay * 1000);
-            nextStageEtaEl.textContent = currentNextStageEta.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-
-            if (currentStageInitialExpectedEtaTime && isNavigating && navigationStartTimeForStats) {
-               const deviationStageMs = currentNextStageEta.getTime() - currentStageInitialExpectedEtaTime.getTime();
-               nextStageDeviationEl.innerHTML = formatDeviation(accumulatedDeviationMs + deviationStageMs);
-            } else {
-               nextStageDeviationEl.innerHTML = "";
-            }
-        }
-    } else {
-        etaInfoContainer.classList.add('single-destination');
-        finalDestInfoDiv.classList.add('single-destination-layout');
-        nextStageInfoDiv.style.display = 'none';
-        if(nextStageDeviationEl) nextStageDeviationEl.innerHTML = "";
-    }
-
-    overallProgressContainer.querySelectorAll('.waypoint-dot-on-progress-bar, .radar-marker-on-progress-bar, .task-marker-on-progress-bar').forEach(dot => dot.remove());
-
-    if (actualWaypoints.length > 2 && totalJourneyDistanceForBar > 0 && typeof turf !== 'undefined' && navigationRouteLayer) {
-        const routeLineString = turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat]));
-        const startOfRoute = turf.point(routeLineString.geometry.coordinates[0]);
-
-        for (let i = 1; i < actualWaypoints.length - 1; i++) {
-            const waypoint = actualWaypoints[i];
-            const waypointPoint = turf.point([waypoint.lng, waypoint.lat]);
-            
-            const nearestPointOnLine = turf.nearestPointOnLine(routeLineString, waypointPoint, { units: 'meters' });
-            
-            const lineSliceToWaypoint = turf.lineSlice(startOfRoute, nearestPointOnLine, routeLineString);
-            const distanceToWaypoint = turf.length(lineSliceToWaypoint, { units: 'meters' });
-            
-            const totalDistanceWithAccumulated = (accumulatedDistanceBeforeCurrentSegment || 0) + distanceToWaypoint;
-            const percent = (totalDistanceWithAccumulated / totalJourneyDistanceForBar) * 100;
-            
-            if (percent < 100 && percent > 0) { 
-                const dot = document.createElement('div');
-                dot.className = 'waypoint-dot-on-progress-bar';
-                dot.style.left = `calc(${percent}% - 7px)`;
-                dot.title = `Etapa ${waypoint.label}`;
-                overallProgressContainer.appendChild(dot);
-            }
-        }
-    }
-
-    const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
-    if (radaresRutaCheckbox && radaresRutaCheckbox.checked && radaresEnRutaActual.length > 0 && totalJourneyDistanceForBar > 0) {
-        radaresEnRutaActual.forEach(radar => {
-            if (radar.distanceOnRoute !== undefined) {
-                const totalDistanceToRadar = (accumulatedDistanceBeforeCurrentSegment || 0) + radar.distanceOnRoute;
-                if(totalDistanceToRadar <= totalJourneyDistanceForBar) {
-                    const percent = (totalDistanceToRadar / totalJourneyDistanceForBar) * 100;
-                     if (percent >= 0 && percent <= 100) {
-                        const radarMarker = document.createElement('div');
-                        radarMarker.className = 'radar-marker-on-progress-bar';
-                        radarMarker.style.left = `${percent}%`;
-                        radarMarker.title = radar.text.replace(/<b>|<\/b>/gi, '');
-                        overallProgressContainer.appendChild(radarMarker);
-                    }
-                }
-            }
-        });
-    }
-
-    const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
-    if (tareasRutaCheckbox && tareasRutaCheckbox.checked && tareasEnRutaActual.length > 0 && totalJourneyDistanceForBar > 0) {
-        tareasEnRutaActual.forEach(tarea => {
-            if (tarea.distanceOnRoute !== undefined) {
-                const totalDistanceToTask = (accumulatedDistanceBeforeCurrentSegment || 0) + tarea.distanceOnRoute;
-                if(totalDistanceToTask <= totalJourneyDistanceForBar) {
-                    const percent = (totalDistanceToTask / totalJourneyDistanceForBar) * 100;
-                    if (percent >= 0 && percent <= 100) {
-                        const taskMarker = document.createElement('div');
-                        taskMarker.className = 'task-marker-on-progress-bar';
-                        taskMarker.style.left = `${percent}%`;
-                        taskMarker.title = tarea.text.replace(/<b>|<\/b>/gi, '');
-                        overallProgressContainer.appendChild(taskMarker);
-                    }
-                }
-            }
-        });
-    }
-
-    if (isNavigating && !isArrivalSequenceStarted && remainingDistanceTotal < WAYPOINT_VISITED_THRESHOLD_METERS) {
-        isArrivalSequenceStarted = true;
-        setTimeout(() => {
-            if (!document.getElementById('arrival-stats-modal') || document.getElementById('arrival-stats-modal').classList.contains('hidden')) {
-                showArrivalStatsModal();
-            }
-        }, 14000);
-        let countdown = 14;
-        const toastId = `arrival-toast-${Date.now()}`;
-        showToast(`FIN DEL VIAJE (${countdown})`, 'success', 10000, false, toastId);
-        const countdownInterval = setInterval(() => {
-            countdown--;
-            const arrivalToast = document.getElementById(toastId);
-            if (arrivalToast) {
-                const span = arrivalToast.querySelector('span');
-                if (span) span.innerHTML = `FIN DEL VIAJE (${countdown})`;
-            }
-            if (countdown <= 0) {
-                clearInterval(countdownInterval);
-            }
-        }, 1000);
-    } else if (isNavigating) {
-        const destinationWp = navigationWaypoints[navigationWaypoints.length - 1];
-        if (destinationWp && destinationWp.address) {
-            const mapOverlay = document.getElementById('map-info-overlay');
-            if (mapOverlay && !mapOverlay.textContent.startsWith("HA LLEGADO AL ")) {
-                 showDestinationName();
-            }
-        }
-    }
-}
     
     
     
