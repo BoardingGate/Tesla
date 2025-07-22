@@ -1,4 +1,4 @@
-V7
+V9
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -7406,7 +7406,20 @@ async function initializeApp() {
 }
 
 // ===================================================================
-// NOMBRE: updateDynamicRadars
+// NOMBRE: getCurrentLocationAsync (NUEVA FUNCIÓN)
+// RESUMEN: Envuelve getCurrentLocation en una Promise para poder usar async/await.
+// ===================================================================
+function getCurrentLocationAsync() {
+    return new Promise((resolve, reject) => {
+        getCurrentLocation(
+            (coords) => resolve(coords),
+            (errorMsg) => reject(new Error(errorMsg))
+        );
+    });
+}
+
+// ===================================================================
+// NOMBRE: updateDynamicRadars (VERSIÓN FINAL CORREGIDA)
 // RESUMEN: Limpia radares dinámicos antiguos, busca nuevos en un radio configurable y los añade como recordatorios temporales.
 // ===================================================================
 async function updateDynamicRadars(isInitialLoadCheck = false) {
@@ -7424,108 +7437,106 @@ async function updateDynamicRadars(isInitialLoadCheck = false) {
         }
     }
     
-    getCurrentLocation(
-        (coords) => {
-         
-            if (isInitialLoadCheck) {
-                const lastCoordsStr = localStorage.getItem('boardinggate_last_initial_radar_update_coords');
-                
-                if (lastCoordsStr) {
-                    try {
-                        const lastCoords = JSON.parse(lastCoordsStr);
-                        const distance = calculateDistance(coords.latitude, coords.longitude, lastCoords.lat, lastCoords.lng);
+    try {
+        const coords = await getCurrentLocationAsync();
+        showToast(`Ubicación GPS obtenida: ${coords.latitude.toFixed(4)}, ${coords.longitude.toFixed(4)}`, 'debug', 4000);
+
+        if (isInitialLoadCheck) {
+            const lastCoordsStr = localStorage.getItem('boardinggate_last_initial_radar_update_coords');
+            
+            if (lastCoordsStr) {
+                try {
+                    const lastCoords = JSON.parse(lastCoordsStr);
+                    const distance = calculateDistance(coords.latitude, coords.longitude, lastCoords.lat, lastCoords.lng);
+                    
+                    showToast(`Distancia desde la última actualización: ${distance.toFixed(0)} metros.`, 'debug', 5000);
+
+                    if (distance <= 10000) { 
+                        console.log(`Actualización inicial de radares omitida: distancia (${distance.toFixed(0)}m) < 10km.`);
+                        showToast("Radares cercanos ya actualizados para esta zona (distancia < 10 km).", "success", 4000);
                         
-                        showToast(`Distancia desde la última actualización: ${distance.toFixed(0)} metros.`, 'debug', 5000);
-
-                        if (distance <= 10000) { 
-                            console.log(`Actualización inicial de radares omitida: distancia (${distance.toFixed(0)}m) < 10km.`);
-                            
-                            showToast("Radares cercanos ya actualizados para esta zona (distancia < 10 km).", "success", 4000);
-                            
-                            localStorage.setItem('boardinggate_last_initial_radar_update_coords', JSON.stringify({ lat: coords.latitude, lng: coords.longitude }));
-                            return; }
-                    } catch(e) {
-                        console.error("Error al parsear las últimas coordenadas de radares.", e);
-                        showToast("Error al leer la última ubicación guardada.", "error");
+                        localStorage.setItem('boardinggate_last_initial_radar_update_coords', JSON.stringify({ lat: coords.latitude, lng: coords.longitude }));
+                        return; 
                     }
+                } catch (e) {
+                    showToast("Error al leer la última ubicación guardada.", "error");
                 }
-            }
-
-            let reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
-            reminders = reminders.filter(r => !r.isDynamicRadar);
-            
-            const DYNAMIC_RADAR_SEARCH_RADIUS_KM = 65;
-            const R = 6371;
-            const rad = DYNAMIC_RADAR_SEARCH_RADIUS_KM / R;
-            const latRad = coords.latitude * Math.PI / 180;
-            const GRID_SIZE = 0.1;
-
-            const latMin = coords.latitude - (rad * 180 / Math.PI);
-            const latMax = coords.latitude + (rad * 180 / Math.PI);
-            const deltaLon = Math.asin(Math.sin(rad) / Math.cos(latRad));
-            const lonMin = coords.longitude - (deltaLon * 180 / Math.PI);
-            const lonMax = coords.longitude + (deltaLon * 180 / Math.PI);
-            
-            const latIndexMin = Math.floor(latMin / GRID_SIZE);
-            const latIndexMax = Math.floor(latMax / GRID_SIZE);
-            const lonIndexMin = Math.floor(lonMin / GRID_SIZE);
-            const lonIndexMax = Math.floor(lonMax / GRID_SIZE);
-            
-            const candidateRadars = new Set();
-            for (let i = latIndexMin; i <= latIndexMax; i++) {
-                for (let j = lonIndexMin; j <= lonIndexMax; j++) {
-                    const cellId = `cell_${i}_${j}`;
-                    if (window.radarsSpatialIndex[cellId]) {
-                        window.radarsSpatialIndex[cellId].forEach(radar => candidateRadars.add(radar));
-                    }
-                }
-            }
-
-            let newRadarsCount = 0;
-            candidateRadars.forEach(radar => {
-                const distance = calculateDistance(coords.latitude, coords.longitude, radar.lat, radar.lon);
-                if (distance <= (DYNAMIC_RADAR_SEARCH_RADIUS_KM * 1000)) {
-                    const now = new Date();
-                    const newRadar = {
-                        id: Date.now() + Math.random() + newRadarsCount,
-                        text: `<b>RADAR: ${radar.name}</b>`,
-                        type: 'simple', time: '00:01',
-                        date: `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`,
-                        createdAt: now.toISOString(), managedByUser: false,
-                        isLocationEnabled: true, locationCoordinates: { latitude: radar.lat, longitude: radar.lon },
-                        radiusMeters: 400, excludeFromList: true,
-                        isDynamicRadar: true 
-                    };
-                    reminders.push(newRadar);
-                    newRadarsCount++;
-                }
-            });
-            
-            localStorage.setItem('reminders', JSON.stringify(reminders));
-            
-            localStorage.setItem('boardinggate_last_initial_radar_update_coords', JSON.stringify({ lat: coords.latitude, lng: coords.longitude }));
-
-            const existingToast = document.getElementById("radar-update");
-            if(existingToast) existingToast.remove();
-            showToast(`${newRadarsCount} radares cargados en tu zona.`, "success");
-            
-            if (isNavigationMapActive && navigationMapInstance) {
-                plotRemindersOnNavigationMap();
-            }
-            updateReminderCount();
-            updateButtonStyles();
-        },
-        (errorMsg) => {
-            showToast(`Error al obtener ubicación para actualizar radares: ${errorMsg}`, "error");
-            
-            if (isInitialLoadCheck) {
-                console.log("No se pudo obtener la ubicación en la carga inicial. Se omite la actualización de radares.");
-                return;
             }
         }
-    );
-}
 
+        let reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
+        reminders = reminders.filter(r => !r.isDynamicRadar);
+        
+        const DYNAMIC_RADAR_SEARCH_RADIUS_KM = 65;
+        const R = 6371;
+        const rad = DYNAMIC_RADAR_SEARCH_RADIUS_KM / R;
+        const latRad = coords.latitude * Math.PI / 180;
+        const GRID_SIZE = 0.1;
+
+        const latMin = coords.latitude - (rad * 180 / Math.PI);
+        const latMax = coords.latitude + (rad * 180 / Math.PI);
+        const deltaLon = Math.asin(Math.sin(rad) / Math.cos(latRad));
+        const lonMin = coords.longitude - (deltaLon * 180 / Math.PI);
+        const lonMax = coords.longitude + (deltaLon * 180 / Math.PI);
+        
+        const latIndexMin = Math.floor(latMin / GRID_SIZE);
+        const latIndexMax = Math.floor(latMax / GRID_SIZE);
+        const lonIndexMin = Math.floor(lonMin / GRID_SIZE);
+        const lonIndexMax = Math.floor(lonMax / GRID_SIZE);
+        
+        const candidateRadars = new Set();
+        for (let i = latIndexMin; i <= latIndexMax; i++) {
+            for (let j = lonIndexMin; j <= lonIndexMax; j++) {
+                const cellId = `cell_${i}_${j}`;
+                if (window.radarsSpatialIndex[cellId]) {
+                    window.radarsSpatialIndex[cellId].forEach(radar => candidateRadars.add(radar));
+                }
+            }
+        }
+
+        let newRadarsCount = 0;
+        candidateRadars.forEach(radar => {
+            const distance = calculateDistance(coords.latitude, coords.longitude, radar.lat, radar.lon);
+            if (distance <= (DYNAMIC_RADAR_SEARCH_RADIUS_KM * 1000)) {
+                const now = new Date();
+                const newRadar = {
+                    id: Date.now() + Math.random() + newRadarsCount,
+                    text: `<b>RADAR: ${radar.name}</b>`,
+                    type: 'simple', time: '00:01',
+                    date: `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`,
+                    createdAt: now.toISOString(), managedByUser: false,
+                    isLocationEnabled: true, locationCoordinates: { latitude: radar.lat, longitude: radar.lon },
+                    radiusMeters: 400, excludeFromList: true,
+                    isDynamicRadar: true 
+                };
+                reminders.push(newRadar);
+                newRadarsCount++;
+            }
+        });
+        
+        localStorage.setItem('reminders', JSON.stringify(reminders));
+        
+        localStorage.setItem('boardinggate_last_initial_radar_update_coords', JSON.stringify({ lat: coords.latitude, lng: coords.longitude }));
+
+        const existingToast = document.getElementById("radar-update");
+        if(existingToast) existingToast.remove();
+        showToast(`${newRadarsCount} radares cargados en tu zona.`, "success");
+        
+        if (isNavigationMapActive && navigationMapInstance) {
+            plotRemindersOnNavigationMap();
+        }
+        updateReminderCount();
+        updateButtonStyles();
+
+    } catch (error) {
+        showToast(`Error al obtener ubicación para actualizar radares: ${error.message}`, "error");
+        
+        if (isInitialLoadCheck) {
+            console.log("No se pudo obtener la ubicación en la carga inicial. Se omite la actualización de radares.");
+        }
+    }
+}
+    
 // ===================================================================
 // NOMBRE: checkForExcessiveRadars
 // RESUMEN: Comprueba si el usuario tiene demasiados radares importados y ofrece limpiarlos y hacer backup.
