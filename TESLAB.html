@@ -1,4 +1,4 @@
-MB06
+MB07
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -5800,13 +5800,12 @@ function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = fa
     const DISTANCE_BEFORE_MANEUVER_METERS = 110;
     const DISTANCE_AFTER_MANEUVER_METERS = 90;
     const CAR_POSITION_BEFORE_MANEUVER_METERS = 25;
-    if (!previewWindow.querySelector('#intersection-rotator')) {
-        previewWindow.innerHTML = `
-            <div id="intersection-rotator" style="width: 100%; height: 100%; transition: transform 0.3s ease-out;">
-                <div id="intersection-preview-map-container"></div>
-            </div>
-        `;
-    }
+
+    previewWindow.innerHTML = `
+        <div id="intersection-rotator" style="width: 100%; height: 100%; transition: transform 0.3s ease-out;">
+            <div id="intersection-preview-map-container"></div>
+        </div>
+    `;
     const rotatorDiv = previewWindow.querySelector('#intersection-rotator');
     const mapContainerEl = previewWindow.querySelector('#intersection-preview-map-container');
     const isProgressBarVisible = progressBarEl && progressBarEl.offsetParent !== null;
@@ -5814,12 +5813,14 @@ function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = fa
     if (isProgressBarVisible) {
         const progressBarRect = progressBarEl.getBoundingClientRect();
         previewWindow.style.width = `${progressBarRect.width}px`;
+        previewWindow.style.height = `${progressBarRect.height * 1.5}px`;
         previewWindow.style.top = `${progressBarRect.bottom + 5}px`;
         previewWindow.style.left = `${progressBarRect.left}px`;
         previewWindow.style.transform = 'none';
     } else if (isSimulationContextOrClick) {
         previewWindow.style.width = '90%';
         previewWindow.style.maxWidth = '500px';
+        previewWindow.style.height = '50vh';
         previewWindow.style.left = '50%';
         previewWindow.style.top = '50%';
         previewWindow.style.transform = 'translate(-50%, -50%)';
@@ -5834,117 +5835,79 @@ function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = fa
 
     try {
         if (intersectionPreviewMap) {
-            try {
-                intersectionPreviewMap.remove();
-            } catch(e) {}
+            try { intersectionPreviewMap.remove(); } catch(e) {}
             intersectionPreviewMap = null;
         }
 
-        intersectionPreviewMap = L.map(mapContainerEl, {
-            zoomControl: false, dragging: false, touchZoom: false, scrollWheelZoom: false,
-            doubleClickZoom: false, boxZoom: false, keyboard: false, attributionControl: false
+        intersectionPreviewMap = new mapboxgl.Map({
+            container: mapContainerEl,
+            style: navigationMapInstance.getStyle().id,
+            interactive: false,
+            attributionControl: false
         });
 
-        if (rotatorDiv) {
-            rotatorDiv.style.transition = 'none';
-            rotatorDiv.style.transform = 'rotate(0deg)';
-        }
+        intersectionPreviewMap.on('load', () => {
+            const maneuverPointCoords = step.maneuver.location;
+            const fullRouteLineString = turf.lineString(route.geometry.coordinates);
+            const maneuverPointOnRoute = turf.nearestPointOnLine(fullRouteLineString, maneuverPointCoords, { units: 'kilometers' });
+            const maneuverDistanceKm = maneuverPointOnRoute.properties.location;
 
-        const currentMapLayerName = localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "Satélite + Calles";
-        let tileLayerInstance;
-        if (currentMapLayerName.toLowerCase().includes("satélite puro")) {
-            tileLayerInstance = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { attribution: 'Tiles © Esri' });
-        } else if (currentMapLayerName.toLowerCase().includes("satélite + calles")) {
-            const labelsPaneName = 'intersection_labels_pane_unique';
-            tileLayerInstance = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { attribution: 'Tiles © Esri' });
-            if (!intersectionPreviewMap.getPane(labelsPaneName)) {
-                intersectionPreviewMap.createPane(labelsPaneName);
-                intersectionPreviewMap.getPane(labelsPaneName).style.zIndex = 650;
-                intersectionPreviewMap.getPane(labelsPaneName).style.pointerEvents = 'none';
+            const startSliceDistanceKm = Math.max(0, maneuverDistanceKm - (DISTANCE_BEFORE_MANEUVER_METERS / 1000));
+            const endSliceDistanceKm = Math.min(turf.length(fullRouteLineString), maneuverDistanceKm + (DISTANCE_AFTER_MANEUVER_METERS / 1000));
+
+            const startSlicePoint = turf.along(fullRouteLineString, startSliceDistanceKm);
+            const endSlicePoint = turf.along(fullRouteLineString, endSliceDistanceKm);
+            const routeSlice = turf.lineSlice(startSlicePoint, endSlicePoint, fullRouteLineString);
+            
+            const routeSourceId = 'intersection-route';
+            intersectionPreviewMap.addSource(routeSourceId, { type: 'geojson', data: routeSlice.geometry });
+            intersectionPreviewMap.addLayer({
+                id: routeSourceId,
+                type: 'line',
+                source: routeSourceId,
+                layout: { 'line-join': 'round', 'line-cap': 'round' },
+                paint: { 'line-color': 'orange', 'line-width': 10, 'line-opacity': 1 }
+            });
+
+            new mapboxgl.Marker({color: 'blue'}).setLngLat(maneuverPointCoords).addTo(intersectionPreviewMap);
+
+            const distanceForCarOnSegment = Math.max(0, DISTANCE_BEFORE_MANEUVER_METERS - CAR_POSITION_BEFORE_MANEUVER_METERS);
+            const carPositionPointTurf = turf.along(routeSlice, distanceForCarOnSegment, { units: 'meters' });
+            const carPositionLngLat = carPositionPointTurf.geometry.coordinates;
+            
+            intersectionPreviewCarMarker = new mapboxgl.Marker({ element: vehicleIconMiniMapElement.cloneNode(true) }).setLngLat(carPositionLngLat).addTo(intersectionPreviewMap);
+
+            const maneuver = step.maneuver;
+            const iconFilename = getManeuverIconFilename(maneuver);
+            const iconUrl = `https://boardinggate.github.io/Tesla/${iconFilename}`;
+            const carMarkerEl = intersectionPreviewCarMarker.getElement();
+            if (carMarkerEl) {
+                const overlayMini = carMarkerEl.querySelector('.vehicle-maneuver-overlay-minimap');
+                if (overlayMini) {
+                    overlayMini.style.backgroundImage = `url('${iconUrl}')`;
+                    overlayMini.style.display = 'block';
+                }
             }
-            L.tileLayer('https://{s}.basemaps.cartocdn.com/light_only_labels/{z}/{x}/{y}{r}.png', { attribution: '© OSM © CARTO', pane: labelsPaneName }).addTo(intersectionPreviewMap);
-        } else {
-            tileLayerInstance = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap' });
-        }
-        tileLayerInstance.addTo(intersectionPreviewMap);
 
-        const maneuverPoint = L.latLng(step.maneuver.location[1], step.maneuver.location[0]);
-        const fullRouteLineString = turf.lineString(route.geometry.coordinates);
-        const maneuverPointOnRoute = turf.nearestPointOnLine(fullRouteLineString, step.maneuver.location, { units: 'kilometers' });
-        const maneuverDistanceKm = maneuverPointOnRoute.properties.location;
-        const startSliceDistanceKm = Math.max(0, maneuverDistanceKm - (DISTANCE_BEFORE_MANEUVER_METERS / 1000));
-        const endSliceDistanceKm = Math.min(turf.length(fullRouteLineString), maneuverDistanceKm + (DISTANCE_AFTER_MANEUVER_METERS / 1000));
-        const startSlicePoint = turf.along(fullRouteLineString, startSliceDistanceKm);
-        const endSlicePoint = turf.along(fullRouteLineString, endSliceDistanceKm);
-        const routeSlice = turf.lineSlice(startSlicePoint, endSlicePoint, fullRouteLineString);
-        const routeSegmentCoords = routeSlice.geometry.coordinates.map(c => [c[1], c[0]]);
+            const bounds = new mapboxgl.LngLatBounds();
+            routeSlice.geometry.coordinates.forEach(coord => bounds.extend(coord));
+            
+            intersectionPreviewMap.fitBounds(bounds, { padding: 40, duration: 0 });
 
-        intersectionPreviewRouteLayer = L.polyline(routeSegmentCoords, { color: 'orange', weight: 10, opacity: 1 }).addTo(intersectionPreviewMap);
-        intersectionPreviewManeuverMarker = L.circleMarker(maneuverPoint, { radius: 5, color: 'white', weight: 1, fillColor: 'blue', fillOpacity: 1, zIndexOffset: 1000 }).addTo(intersectionPreviewMap);
-        
-        const lineStringToPlaceCar = turf.lineString(routeSegmentCoords.map(c => [c[1], c[0]]));
-        const distanceForCarOnSegment = Math.max(0, DISTANCE_BEFORE_MANEUVER_METERS - CAR_POSITION_BEFORE_MANEUVER_METERS);
-        const carPositionPointTurf = turf.along(lineStringToPlaceCar, distanceForCarOnSegment, { units: 'meters' });
-        const carPositionLatLng = L.latLng(carPositionPointTurf.geometry.coordinates[1], carPositionPointTurf.geometry.coordinates[0]);
-        intersectionPreviewCarMarker = L.marker(carPositionLatLng, { icon: vehicleIconMiniMap, zIndexOffset: 1001 }).addTo(intersectionPreviewMap);
-        
-        const maneuver = step.maneuver;
-        const iconFilename = getManeuverIconFilename(maneuver);
-        const iconUrl = `https://boardinggate.github.io/Tesla/${iconFilename}`;
-        if (intersectionPreviewCarMarker && intersectionPreviewCarMarker.getElement()) {
-            const overlayMini = intersectionPreviewCarMarker.getElement().querySelector('.vehicle-maneuver-overlay-minimap');
-            if (overlayMini) {
-                overlayMini.style.backgroundImage = `url('${iconUrl}')`;
-                overlayMini.style.display = 'block';
-            }
-        }
-        
-        const bounds = L.latLngBounds(routeSegmentCoords).pad(0.5);
+            setTimeout(() => {
+                let segmentBearing = 0;
+                const lookAheadPointTurf = turf.along(routeSlice, distanceForCarOnSegment + 5, { units: 'meters' });
+                if (lookAheadPointTurf) {
+                    segmentBearing = turf.bearing(carPositionPointTurf, lookAheadPointTurf);
+                } else {
+                    segmentBearing = (navigationCurrentLocation && typeof navigationCurrentLocation.heading === 'number') ? navigationCurrentLocation.heading : currentMapBearing;
+                }
 
-        requestAnimationFrame(() => {
-            if (intersectionPreviewMap && document.body.contains(mapContainerEl)) {
-                intersectionPreviewMap.invalidateSize();
-                
-                const mapMaxZoom = intersectionPreviewMap.getMaxZoom() || 22;
-                
-                const zoomThatFitsBounds = intersectionPreviewMap.getBoundsZoom(bounds);
-                
-                const targetZoom = Math.min(mapMaxZoom, zoomThatFitsBounds + 2);
-                
-                intersectionPreviewMap.setView(bounds.getCenter(), targetZoom, { animate: false });
-                
-                requestAnimationFrame(() => {
-                    let segmentBearing = 0;
-                    const lookAheadPointTurf = turf.along(lineStringToPlaceCar, distanceForCarOnSegment + 5, { units: 'meters' });
-                    if (lookAheadPointTurf) {
-                        segmentBearing = turf.bearing(carPositionPointTurf, lookAheadPointTurf);
-                        if (segmentBearing < 0) segmentBearing += 360;
-                    } else {
-                        segmentBearing = (navigationCurrentLocation && typeof navigationCurrentLocation.heading === 'number') ? navigationCurrentLocation.heading : currentMapBearing;
-                    }
-
-                    let mapRotation = 0;
-                    if (segmentBearing > 45 && segmentBearing <= 135) {
-                        mapRotation = -90;
-                    } else if (segmentBearing > 135 && segmentBearing <= 225) {
-                        mapRotation = 180;
-                    } else if (segmentBearing > 225 && segmentBearing <= 315) {
-                        mapRotation = 90;
-                    }
-
-                    if (rotatorDiv) {
-                        rotatorDiv.style.transition = 'transform 0.3s ease-out';
-                        rotatorDiv.style.transform = `rotate(${mapRotation}deg)`;
-                    }
-                    const finalIconRotation = segmentBearing - 90;
-                    if (intersectionPreviewCarMarker && intersectionPreviewCarMarker.getElement()) {
-                        const carWrapperMini = intersectionPreviewCarMarker.getElement().querySelector('.vehicle-icon-minimap');
-                        if (carWrapperMini) {
-                            carWrapperMini.style.transform = `rotate(${finalIconRotation}deg)`;
-                        }
-                    }
-                });
-            }
+                if (carMarkerEl) {
+                    const carWrapperMini = carMarkerEl.querySelector('.vehicle-icon-minimap');
+                    if(carWrapperMini) carWrapperMini.style.transform = `rotate(${segmentBearing - 90}deg)`;
+                }
+            }, 50);
         });
 
         if (timerDurationMs && timerDurationMs > 0) {
@@ -5955,7 +5918,6 @@ function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = fa
         hideIntersectionPreviewMap();
     }
 }
-
 
 // ===================================================================
 // NOMBRE: getCurrentLocationAsync (NUEVA FUNCIÓN)
@@ -6939,8 +6901,9 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
         if (existingRecalcToast) existingRecalcToast.remove();
         activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
         showToast("No hay suficientes etapas restantes para calcular una nueva ruta.", "warning");
-        if (navigationRouteLayer && navigationMapInstance) { try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {} navigationRouteLayer = null; }
-        if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
+        if (navigationMapInstance && navigationMapInstance.getLayer('route')) { navigationMapInstance.removeLayer('route'); navigationMapInstance.removeSource('route'); }
+        navigationRouteLayer = null;
+        if (completedRouteSegmentsLayer) { completedRouteSegmentsLayer.features = []; if(navigationMapInstance.getSource('completed-segments')) navigationMapInstance.getSource('completed-segments').setData(completedRouteSegmentsLayer); }
         navigationCurrentRouteData = null;
         hideMapInfoOverlay();
         isRecalculatingRoute = false;
@@ -6957,8 +6920,9 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
         if (existingRecalcToast) existingRecalcToast.remove();
         activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
         showToast("No hay suficientes waypoints válidos para calcular la ruta.", "warning");
-        if (navigationRouteLayer && navigationMapInstance) { try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch (e) {} navigationRouteLayer = null; }
-        if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
+        if (navigationMapInstance && navigationMapInstance.getLayer('route')) { navigationMapInstance.removeLayer('route'); navigationMapInstance.removeSource('route'); }
+        navigationRouteLayer = null;
+        if (completedRouteSegmentsLayer) { completedRouteSegmentsLayer.features = []; if(navigationMapInstance.getSource('completed-segments')) navigationMapInstance.getSource('completed-segments').setData(completedRouteSegmentsLayer); }
         navigationCurrentRouteData = null;
         hideMapInfoOverlay();
         isRecalculatingRoute = false;
@@ -6977,7 +6941,10 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
 
         if (data.routes && data.routes.length > 0) {
             navigationCurrentRouteData = data;
-            if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
+            if (completedRouteSegmentsLayer && navigationMapInstance.getSource('completed-segments')) {
+                completedRouteSegmentsLayer.features = [];
+                navigationMapInstance.getSource('completed-segments').setData(completedRouteSegmentsLayer);
+            }
             drawRouteOnMap(data.routes[0]);
             currentLegIndexNav = 0;
             currentStepIndexNav = 0;
@@ -6992,10 +6959,10 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
 
                  const currentCarPosForRecalc = navigationCurrentLocation;
                  let carDistanceAlongRouteForInternalUse = 0;
-                 if (currentCarPosForRecalc && navigationMapInstance && navigationRouteLayer && typeof turf !== 'undefined' && navigationRouteLayer.getLatLngs().length > 0) {
+                 if (currentCarPosForRecalc && navigationMapInstance && navigationRouteLayer && typeof turf !== 'undefined') {
                     try {
                         const carPointTurf = turf.point([currentCarPosForRecalc.longitude, currentCarPosForRecalc.latitude]);
-                        const routeLineStringTurf = turf.lineString(navigationRouteLayer.getLatLngs().map(ll => [ll.lng, ll.lat]));
+                        const routeLineStringTurf = turf.lineString(newRouteData.geometry.coordinates);
                         const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
                         const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
                         carDistanceAlongRouteForInternalUse = turf.length(lineSliceToNearestTurf, { units: 'meters' });
@@ -7043,8 +7010,9 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
         activeToasts = activeToasts.filter(t => t.id !== recalculateToastId);
         let errorMessageForToast = `Error al calcular ruta: ${error.message}`;
         showToast(errorMessageForToast, "error");
-        if (navigationRouteLayer && navigationMapInstance) { try { navigationMapInstance.removeLayer(navigationRouteLayer); } catch(e) {} navigationRouteLayer = null; }
-        if (completedRouteSegmentsLayer && navigationMapInstance ) completedRouteSegmentsLayer.clearLayers();
+        if (navigationMapInstance && navigationMapInstance.getLayer('route')) { navigationMapInstance.removeLayer('route'); navigationMapInstance.removeSource('route'); }
+        navigationRouteLayer = null;
+        if (completedRouteSegmentsLayer) { completedRouteSegmentsLayer.features = []; if(navigationMapInstance.getSource('completed-segments')) navigationMapInstance.getSource('completed-segments').setData(completedRouteSegmentsLayer); }
         navigationCurrentRouteData = null;
         lastValidCarDistanceForDisplay = 0;
         hideMapInfoOverlay();
@@ -7062,6 +7030,7 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
     }
 }
 
+    
 // ===================================================================
 // NOMBRE: openNavigationMap
 // RESUMEN: Abre y prepara el mapa de navegación principal, deshabilita controles hasta obtener la geolocalización y gestiona los callbacks de éxito/error.
