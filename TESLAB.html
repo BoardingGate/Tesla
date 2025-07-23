@@ -1,4 +1,4 @@
-MB03-46OK
+MB03-47
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -6461,6 +6461,146 @@ async function toggleNavigationState(isRecalculationStop = false) {
     actualizarContadorTareas(tareasEnRutaActual.length);
 }
 
+// =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+// NOMBRE: findChargingPointsOnRoute (CORREGIDA - ROBUSTA CONTRA ERUDA)
+// RESUMEN: Busca PDRs de OCM y gestiona el estado de la búsqueda.
+// ===================================================================
+async function findChargingPointsOnRoute(powerFilters, searchConfig) {
+    const pdrButton = document.getElementById('pdrs-ruta-button');
+    if (pdrButton) pdrButton.classList.remove('pdr-search-highlight');
+
+    clearChargingPoints();
+    lastPdrSearchResults = [];
+    
+    showToast("Buscando puntos de recarga (OCM)...", "info", 0, false, "pdrs-search");
+
+    const PDR_SEARCH_IN_VIEW_KEY = 'boardinggate_pdrSearchInView';
+    const hasRoute = searchConfig.type === 'route';
+    const searchInCurrentViewChecked = localStorage.getItem(PDR_SEARCH_IN_VIEW_KEY) === 'true';
+    
+    let apiUrl;
+
+    if (searchInCurrentViewChecked) {
+        const bounds = navigationMapInstance.getBounds();
+        apiUrl = `https://api.openchargemap.io/v3/poi/?output=json&key=${OCM_API_KEY}&boundingbox=(${bounds.getSouthWest().lat},${bounds.getSouthWest().lng}),(${bounds.getNorthEast().lat},${bounds.getNorthEast().lng})&maxresults=1500&compact=false&verbose=true`;
+        showToast("Buscando en la vista actual del mapa...", "info", 2000);
+    } else if (hasRoute) {
+        const routeSource = navigationMapInstance.getSource('route');
+        if (!routeSource || !routeSource._data || !routeSource._data.geometry || !routeSource._data.geometry.coordinates || routeSource._data.geometry.coordinates.length < 2) {
+            showToast("No hay ruta válida para buscar PDRs sobre ella.", "error");
+            const existingToast = document.getElementById("pdrs-search");
+            if (existingToast) existingToast.remove();
+            return;
+        }
+        const routeBounds = new mapboxgl.LngLatBounds();
+        routeSource._data.geometry.coordinates.forEach(coord => routeBounds.extend(coord));
+        apiUrl = `https://api.openchargemap.io/v3/poi/?output=json&key=${OCM_API_KEY}&boundingbox=(${routeBounds.getSouthWest().lat},${routeBounds.getSouthWest().lng}),(${routeBounds.getNorthEast().lat},${routeBounds.getNorthEast().lng})&maxresults=1500&compact=false&verbose=true`;
+    } else if (searchConfig.type === 'radius') {
+        apiUrl = `https://api.openchargemap.io/v3/poi/?output=json&key=${OCM_API_KEY}&latitude=${searchConfig.center.lat}&longitude=${searchConfig.center.lng}&distance=${searchConfig.radiusKm}&distanceunit=km&maxresults=1000&compact=false&verbose=true`;
+    } else {
+        showToast("Tipo de búsqueda no válido.", "error");
+        pdrSearchState = 'initial';
+        return;
+    }
+    
+    try {
+        const response = await fetch(apiUrl);
+        if (!response.ok) throw new Error(`Error de red de OCM: ${response.statusText}`);
+        const data = await response.json();
+        if (!data || !Array.isArray(data)) throw new Error("Respuesta de OCM no válida.");
+
+        window.lastOcmApiResponse = data;
+
+        const operatorFilterText = (document.getElementById('operator-filter-input')?.value || localStorage.getItem('boardinggate_operator_filter') || '').toLowerCase().trim();
+        const operatorFilterWords = operatorFilterText ? operatorFilterText.split(/\s+/).filter(w => w) : [];
+        
+        const routeLineForDistanceCheck = (searchConfig.type === 'route' && navigationMapInstance.getSource('route') && navigationMapInstance.getSource('route')._data) ? turf.lineString(navigationMapInstance.getSource('route')._data.geometry.coordinates) : null;
+        
+        let filteredPoints = [];
+
+        data.forEach(point => {
+            const formattedPoint = formatOCMPoint(point);
+            if (!formattedPoint) return;
+            const power = parseFloat(formattedPoint.power);
+            if (isNaN(power) || power < powerFilters.min || power > powerFilters.max) return;
+
+            if (operatorFilterWords.length > 0) {
+                const pointOperator = (formattedPoint.operator || '').toLowerCase();
+                const pointAddress = (formattedPoint.address || '').toLowerCase();
+                const operatorMatch = operatorFilterWords.some(word => 
+                    pointOperator.includes(word) || pointAddress.includes(word)
+                );
+                if (!operatorMatch) return;
+            }
+            
+            if (!searchInCurrentViewChecked && hasRoute && routeLineForDistanceCheck) {
+                const pointTurf = turf.point([formattedPoint.lon, formattedPoint.lat]);
+                const distanceKm = turf.pointToLineDistance(pointTurf, routeLineForDistanceCheck, { units: 'kilometers' });
+                if (distanceKm <= searchConfig.distanceFilters.max) {
+                    filteredPoints.push(formattedPoint);
+                }
+            } else { 
+                filteredPoints.push(formattedPoint);
+            }
+        });
+        
+        lastPdrSearchResults = [...filteredPoints];
+        currentChargingPointsOnRoute = [...filteredPoints];
+
+        const cheapestBySegment = {
+            '#5e5e5e': { price: Infinity, point: null },
+            '#007863': { price: Infinity, point: null },
+            'rgb(30, 144, 255)': { price: Infinity, point: null },
+            '#de2e03': { price: Infinity, point: null }
+        };
+
+        const parsePrice = (priceString) => {
+            if (priceString && typeof priceString === 'string') {
+                const priceMatch = priceString.match(/(\d[\d,.]*)/);
+                if (priceMatch && priceMatch[1]) {
+                    const priceNum = parseFloat(priceMatch[1].replace(',', '.'));
+                    if (!isNaN(priceNum) && priceNum > 0 && priceNum < 10) {
+                        return priceNum;
+                    }
+                }
+            }
+            return Infinity;
+        };
+
+        currentChargingPointsOnRoute.forEach(point => {
+            point.isCheapest = false;
+            const power = parseFloat(point.power);
+            const segmentColor = getChargingPointColorByPower(power);
+            const price = parsePrice(point.price);
+            
+            if (cheapestBySegment[segmentColor] && price < cheapestBySegment[segmentColor].price) {
+                cheapestBySegment[segmentColor].price = price;
+                cheapestBySegment[segmentColor].point = point;
+            }
+        });
+
+        for (const color in cheapestBySegment) {
+            const cheapest = cheapestBySegment[color];
+            if (cheapest.point) {
+                cheapest.point.isCheapest = true;
+            }
+        }
+
+        const existingToast = document.getElementById("pdrs-search");
+        if (existingToast) existingToast.remove();
+        showToast(`${currentChargingPointsOnRoute.length} PDRs encontrados.`, "success");
+        displayChargingPointsOnMap();
+
+        pdrSearchState = 'results_shown';
+
+    } catch (error) {
+        const existingToast = document.getElementById("pdrs-search");
+        if (existingToast) existingToast.remove();
+        showToast(`Error al buscar PDRs: ${error.message}`, "error");
+        pdrSearchState = 'initial';
+    }
+}
+    
 // ===================================================================
 // NOMBRE: reAddCustomMapLayersAndSources (NUEVA FUNCIÓN UTILITARIA)
 // RESUMEN: Vuelve a añadir las fuentes y capas personalizadas después de un cambio de estilo de mapa.
@@ -7904,8 +8044,8 @@ function showLoadRouteModal() {
 
 
 // ===================================================================
-// NOMBRE: updateInitialUserPosition (VERSIÓN CON ROTACIÓN FINAL)
-// RESUMEN: Actualiza la posición del usuario y rota el icono correctamente en todos los modos de vista.
+// NOMBRE: updateInitialUserPosition (VERSIÓN FINAL DE ROTACIÓN)
+// RESUMEN: Actualiza la posición del usuario y rota el icono correctamente en todos los modos.
 // ===================================================================
 function updateInitialUserPosition(coords, mapInstanceToUse) {
     if (!mapInstanceToUse || !coords || typeof coords.latitude !== 'number' || typeof coords.longitude !== 'number') {
@@ -7943,15 +8083,10 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
 
     const currentHeading = (effectiveHeading !== null) ? effectiveHeading : (currentMapBearing || 0);
     
-    // --- LÓGICA DE ROTACIÓN CORREGIDA ---
-    let iconRotation = 0;
-    if (mapViewMode === 'static') {
-        // Si el mapa está fijo al norte, el icono debe reflejar el rumbo completo del coche.
-        iconRotation = currentHeading - 90;
-    } else {
-        // Si el mapa ya está rotando (Rumbo o 3D), el icono solo necesita la compensación estática.
-        iconRotation = -90;
-    }
+    // --- LÓGICA DE ROTACIÓN CORREGIDA Y SIMPLIFICADA ---
+    // La propiedad 'rotationAlignment: map' se encarga de la rotación del mapa.
+    // Nosotros solo aplicamos la rotación del vehículo y la compensación del icono.
+    const iconRotation = currentHeading - 90;
     initialUserLocationMarker.setRotation(iconRotation);
     // --- FIN DE LA CORRECCIÓN ---
     
@@ -8116,7 +8251,6 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
             viewOptions.pitch = 60;
         }
 
-        // Si solo se va a cambiar el centro/rumbo pero no el zoom, evitamos `easeTo` y usamos `panTo` para ser más suaves.
         if (viewOptions.zoom === undefined && (mapViewMode === 'heading' || mapViewMode === 'perspective')) {
             navigationMapInstance.easeTo({
                 center: viewOptions.center,
@@ -8131,7 +8265,6 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
         }
     }
 }
-
 
 // ===================================================================
 // NOMBRE: handleProgressiveManeuverZoom (MODIFICADA)
@@ -19414,9 +19547,10 @@ function reactivateRealGpsAfterSimulation() {
     }
 }
 
+
 // ===================================================================
-// NOMBRE: showIntersectionPreviewMap (VERSIÓN CON SATÉLITE Y ZOOM FIJO)
-// RESUMEN: Muestra un minimapa detallado de la intersección en modo satélite.
+// NOMBRE: showIntersectionPreviewMap (VERSIÓN CON SATÉLITE Y ZOOM DETALLADO)
+// RESUMEN: Muestra un minimapa de la intersección en modo satélite con zoom ajustado.
 // ===================================================================
 function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = false, timerDurationMs = null) {
     const previewWindow = document.getElementById('intersection-preview-map-window');
@@ -19425,11 +19559,10 @@ function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = fa
         hideIntersectionPreviewMap();
         return;
     }
-    const DISTANCE_BEFORE_MANEUVER_METERS = 110;
-    const DISTANCE_AFTER_MANEUVER_METERS = 90;
-    const CAR_POSITION_BEFORE_MANEUVER_METERS = 25;
+    const DISTANCE_BEFORE_MANEUVER_METERS = 150;
+    const DISTANCE_AFTER_MANEUVER_METERS = 100;
+    const CAR_POSITION_BEFORE_MANEUVER_METERS = 40;
 
-    // Usamos el contenedor de Mapbox directamente, sin rotadores intermedios
     previewWindow.innerHTML = `<div id="intersection-preview-map-container" style="width:100%; height:100%;"></div>`;
     const mapContainerEl = previewWindow.querySelector('#intersection-preview-map-container');
 
@@ -19464,15 +19597,11 @@ function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = fa
             intersectionPreviewMap = null;
         }
 
-        // Forzamos el estilo satélite con calles para el minimapa
         intersectionPreviewMap = new mapboxgl.Map({
             container: mapContainerEl,
-            style: 'mapbox://styles/mapbox/satellite-streets-v12',
+            style: 'mapbox://styles/mapbox/satellite-streets-v12', // Forzar siempre satélite
             interactive: false,
             attributionControl: false,
-            zoom: 18, // Zoom fijo muy alto
-            pitch: 0,
-            bearing: 0,
             accessToken: MAPBOX_ACCESS_TOKEN
         });
 
@@ -19496,42 +19625,24 @@ function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = fa
                 type: 'line',
                 source: routeSourceId,
                 layout: { 'line-join': 'round', 'line-cap': 'round' },
-                paint: { 'line-color': 'yellow', 'line-width': 10, 'line-opacity': 1 }
+                paint: { 'line-color': 'yellow', 'line-width': 8, 'line-opacity': 0.9 }
             });
-
-            // Creamos un contenedor para el vehículo y el icono de maniobra
-            const vehicleContainer = document.createElement('div');
-            vehicleContainer.style.position = 'relative';
-            vehicleContainer.style.width = '48px';
-            vehicleContainer.style.height = '48px';
-            
-            const vehicleImg = document.createElement('img');
-            vehicleImg.src = "PNG/AVANCE.PNG";
-            vehicleImg.style.width = '100%';
-            vehicleImg.style.height = '100%';
-            vehicleImg.style.position = 'absolute';
-            
-            const maneuver = step.maneuver;
-            const iconFilename = getManeuverIconFilename(maneuver);
-            const maneuverIcon = document.createElement('img');
-            maneuverIcon.src = `https://boardinggate.github.io/Tesla/${iconFilename}`;
-            maneuverIcon.style.position = 'absolute';
-            maneuverIcon.style.top = '-30px';
-            maneuverIcon.style.left = '50%';
-            maneuverIcon.style.transform = 'translateX(-50%)';
-            maneuverIcon.style.width = '40px';
-            maneuverIcon.style.height = '40px';
-            maneuverIcon.style.backgroundColor = 'rgba(255,255,255,0.8)';
-            maneuverIcon.style.borderRadius = '5px';
-            maneuverIcon.style.padding = '2px';
-            
-            vehicleContainer.appendChild(vehicleImg);
-            vehicleContainer.appendChild(maneuverIcon);
 
             const distanceForCarOnSegment = Math.max(0, DISTANCE_BEFORE_MANEUVER_METERS - CAR_POSITION_BEFORE_MANEUVER_METERS);
             const carPositionPointTurf = turf.along(routeSlice, distanceForCarOnSegment, { units: 'meters' });
             const carPositionLngLat = carPositionPointTurf.geometry.coordinates;
             
+            const vehicleContainer = document.createElement('div');
+            vehicleContainer.style.cssText = 'width: 40px; height: 40px; position: relative;';
+            const vehicleImg = document.createElement('img');
+            vehicleImg.src = "PNG/AVANCE.PNG";
+            vehicleImg.style.cssText = 'width: 100%; height: 100%; position: absolute;';
+            const maneuverIcon = document.createElement('img');
+            maneuverIcon.src = `https://boardinggate.github.io/Tesla/${getManeuverIconFilename(step.maneuver)}`;
+            maneuverIcon.style.cssText = 'position: absolute; top: -28px; left: 50%; transform: translateX(-50%); width: 36px; height: 36px; background: rgba(255,255,255,0.8); border-radius: 5px; padding: 2px;';
+            vehicleContainer.appendChild(vehicleImg);
+            vehicleContainer.appendChild(maneuverIcon);
+
             intersectionPreviewCarMarker = new mapboxgl.Marker({ element: vehicleContainer, anchor: 'center' }).setLngLat(carPositionLngLat).addTo(intersectionPreviewMap);
 
             let segmentBearing = 0;
@@ -19542,11 +19653,11 @@ function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = fa
             
             const finalRotation = segmentBearing - 90;
             vehicleImg.style.transform = `rotate(${finalRotation}deg)`;
-            
-            // Centramos el mapa en la posición del coche para una vista perfecta
-            intersectionPreviewMap.setCenter(carPositionLngLat);
 
-            setTimeout(() => { if (intersectionPreviewMap) intersectionPreviewMap.resize(); }, 50);
+            const bounds = new mapboxgl.LngLatBounds();
+            routeSlice.geometry.coordinates.forEach(coord => bounds.extend(coord));
+            
+            intersectionPreviewMap.fitBounds(bounds, { padding: 20, duration: 0 });
         });
 
         if (timerDurationMs && timerDurationMs > 0) {
@@ -24253,8 +24364,8 @@ function handleStageTouchStart(e) {
 }
 
 // ===================================================================
-// NOMBRE: plotSingleReminderOnMap (VERSIÓN CON ICONOS ESCALABLES)
-// RESUMEN: Dibuja un recordatorio en el mapa con tamaño dinámico según el zoom.
+// NOMBRE: plotSingleReminderOnMap (VERSIÓN CON EVENT STOP)
+// RESUMEN: Dibuja un recordatorio y detiene la propagación del clic.
 // ===================================================================
 function plotSingleReminderOnMap(reminder, mapInstance) {
     if (!mapInstance || !reminder.isLocationEnabled || !reminder.locationCoordinates) return null;
@@ -24273,7 +24384,6 @@ function plotSingleReminderOnMap(reminder, mapInstance) {
         if (isRadarType) {
             markerElement = createRadarSpeedIcon(speedLimit, currentZoomLevel, isFromPersonalTask);
         } else {
-            // --- INICIO DE LA LÓGICA DE ESCALADO PARA RECORDATORIOS ---
             const SCALE_THRESHOLD_ZOOM = 13; 
             const MIN_SCALE = 0.5; 
             const MIN_ZOOM_FOR_SCALING = 7; 
@@ -24298,7 +24408,6 @@ function plotSingleReminderOnMap(reminder, mapInstance) {
             markerElement.style.width = `${finalWidth}px`;
             markerElement.style.height = `${finalHeight}px`;
             markerElement.style.cursor = 'pointer';
-            // --- FIN DE LA LÓGICA DE ESCALADO ---
         }
         
         const marker = new mapboxgl.Marker({element: markerElement, anchor: 'bottom'})
@@ -24332,14 +24441,16 @@ function plotSingleReminderOnMap(reminder, mapInstance) {
         const popup = new mapboxgl.Popup({ offset: 25 }).setHTML(popupContent);
         marker.setPopup(popup);
 
-        marker.getElement().addEventListener('click', () => {
+        marker.getElement().addEventListener('click', (e) => {
+            e.stopPropagation(); // <-- CORRECCIÓN CRÍTICA
             popup.on('open', () => {
                 const modifyButton = popup.getElement().querySelector('.modify-reminder-from-map');
                 if (modifyButton) {
                     const newModifyButton = modifyButton.cloneNode(true);
                     modifyButton.parentNode.replaceChild(newModifyButton, modifyButton);
-                    newModifyButton.addEventListener('click', (e) => {
-                        const id = parseInt(e.target.dataset.reminderId);
+                    newModifyButton.addEventListener('click', (ev) => {
+                        ev.stopPropagation(); // <-- Doble seguridad
+                        const id = parseInt(ev.target.dataset.reminderId);
                         let remToMod = null;
                         if (!isNaN(id)) {
                             const rems = JSON.parse(localStorage.getItem('reminders') || '[]');
@@ -24382,7 +24493,6 @@ function plotSingleReminderOnMap(reminder, mapInstance) {
     
     return mapObject;
 }
-
 
 // ===================================================================
 // NOMBRE: renderWaypointMarkers (CORREGIDA - A PRUEBA DE TIMING)
