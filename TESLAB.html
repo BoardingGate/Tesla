@@ -1,4 +1,4 @@
-MB03-60
+MB03-61
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -5497,8 +5497,7 @@ class CompassAndStatsControl {
     };
  
  
- 
-    let mapViewMode = 'static'; 
+    let isAnimatingZoom = false;  let mapViewMode = 'static'; 
     let isSimulatingFreeDrive = false; 
     let isFreeDriveActive = false;
     let isFreeDrivePaused = false;
@@ -6207,11 +6206,23 @@ function redrawAllMapIcons() {
     if (!navigationMapInstance || !navigationMapInstance.isStyleLoaded()) {
         return;
     }
-
     // 1. Redibujar Puntos de Carga (PDRs)
     displayChargingPointsOnMap();
-
     // 2. Redibujar Recordatorios y Radares
+    redrawReminderMapObjects();
+    // 3. Redibujar Waypoints de la Ruta
+    renderWaypointMarkers();
+}
+
+// ===================================================================
+// NOMBRE: redrawReminderMapObjects (CORREGIDA Y RESTAURADA)
+// RESUMEN: Limpia y redibuja todos los recordatorios/radares en el mapa.
+// ===================================================================
+function redrawReminderMapObjects() {
+    if (!navigationMapInstance || !navigationMapInstance.isStyleLoaded()) {
+        return;
+    }
+
     const remindersToRedraw = reminderMapObjects.map(obj => {
         const rems = JSON.parse(localStorage.getItem('reminders') || '[]');
         let reminderData = rems.find(r => r.id === obj.reminderId);
@@ -6228,7 +6239,7 @@ function redrawAllMapIcons() {
             if (navigationMapInstance.getSource(obj.circleId)) navigationMapInstance.removeSource(obj.circleId);
         }
     });
-    reminderMapObjects = []; 
+    reminderMapObjects = [];
 
     remindersToRedraw.forEach(reminder => {
         const newMapObject = plotSingleReminderOnMap(reminder, navigationMapInstance);
@@ -6236,10 +6247,212 @@ function redrawAllMapIcons() {
             reminderMapObjects.push(newMapObject);
         }
     });
-    
-    // 3. Redibujar Waypoints de la Ruta
-    renderWaypointMarkers();
 }
+
+// ===================================================================
+// NOMBRE: renderWaypointMarkers (VERSIÓN CON LIMPIEZA EXPLÍCITA)
+// RESUMEN: Limpia y redibuja los marcadores de la ruta.
+// ===================================================================
+function renderWaypointMarkers() {
+    if (!navigationMapInstance) return;
+
+    navigationWaypoints.forEach(wp => {
+        if (wp && wp.marker) {
+            wp.marker.remove();
+            wp.marker = null;
+        }
+    });
+
+    const render = () => {
+        const currentZoomLevel = navigationMapInstance.getZoom();
+        const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
+        
+        actualWaypoints.forEach(async (wp) => {
+            if (!wp) return;
+            const waypointIconElement = createWaypointMarkerIcon(wp.label, wp.type, wp.visited, currentZoomLevel);
+            wp.marker = new mapboxgl.Marker({
+                element: waypointIconElement,
+                draggable: !isNavigating,
+                anchor: 'center'
+            }).setLngLat([wp.lng, wp.lat]).addTo(navigationMapInstance);
+            
+            const markerElement = wp.marker.getElement();
+            if (markerElement) {
+                const deleteButton = markerElement.querySelector('.waypoint-delete-button');
+                if (deleteButton) {
+                    deleteButton.addEventListener('click', function(ev) {
+                        ev.stopPropagation();
+                        handleDeleteWaypointClick(wp.id);
+                    });
+                }
+            }
+            
+            let pressTimer = null;
+            let isLongPressTriggered = false;
+            const handlePressStart = (e) => {
+                isLongPressTriggered = false;
+                pressTimer = setTimeout(() => {
+                    isLongPressTriggered = true;
+                    if (wp.marker.getPopup()?.isOpen()) wp.marker.getPopup().remove();
+                    if (wp.type !== 'S' && wp.type !== 'S_Recalc') fetchAndDisplayAlternativeRoutes(wp.id);
+                }, 600); 
+            };
+            const handlePressEnd = () => clearTimeout(pressTimer);
+            
+            markerElement.addEventListener('mousedown', handlePressStart);
+            markerElement.addEventListener('mouseup', handlePressEnd);
+            markerElement.addEventListener('touchstart', handlePressStart, { passive: false });
+            markerElement.addEventListener('touchend', handlePressEnd);
+            wp.marker.on('dragstart', () => clearTimeout(pressTimer));
+            
+            markerElement.addEventListener('click', async (e) => {
+                e.stopPropagation();
+                if (isLongPressTriggered) return;
+                const popup = new mapboxgl.Popup({ maxWidth: "250px", offset: 35, closeButton: true });
+                wp.marker.setPopup(popup).togglePopup();
+                popup.setHTML(`<strong>Punto ${wp.label}</strong><br>Cargando...`);
+                
+                let address = wp.address || await getAddressForWaypoint(wp.lat, wp.lng);
+                wp.address = address;
+
+                let distanceToWaypoint = 0, timeToWaypoint = 0, etaToWaypoint = "--:--";
+                const currentActualWaypointsForPopup = navigationWaypoints.filter(w => w && !w.isInternal && !w.isRecalculatedStart);
+                const actualWaypointIndexInRoute = currentActualWaypointsForPopup.findIndex(awp => awp.id === wp.id);
+                if (navigationCurrentRouteData?.routes?.[0]) {
+                    const route = navigationCurrentRouteData.routes[0];
+                    if (actualWaypointIndexInRoute > 0) {
+                        for (let i = 0; i < actualWaypointIndexInRoute && i < route.legs.length; i++) {
+                            distanceToWaypoint += (route.legs[i].distance || 0);
+                            timeToWaypoint += (route.legs[i].duration || 0);
+                        }
+                    }
+                    if (timeToWaypoint > 0) etaToWaypoint = new Date(Date.now() + timeToWaypoint * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                }
+                const distanciaTexto = `${(distanceToWaypoint / 1000).toFixed(1)} km`;
+                const waypointTotalMinutes = Math.round(timeToWaypoint / 60);
+                const tiempoTexto = `${String(Math.floor(waypointTotalMinutes / 60)).padStart(2, '0')}:${String(waypointTotalMinutes % 60).padStart(2, '0')}`;
+                
+                const alternativesButtonHtml = (wp.type !== 'S' && wp.type !== 'S_Recalc') ? `<button data-waypoint-id="${wp.id}" class="show-alternatives-btn" style="margin-top: 8px; margin-right: 5px; padding: 4px 8px; font-size: 0.8rem; background-color: #ff9800; color: white; border: none; border-radius: 3px; cursor: pointer;">OTRAS RUTAS</button>` : '';
+                const deleteButtonHtml = (wp.type !== 'S_Recalc') ? `<button data-waypoint-id="${wp.id}" class="delete-waypoint-from-popup" style="margin-top: 8px; padding: 4px 8px; font-size: 0.8rem; background-color: #EF4444; color: white; border: none; border-radius: 3px; cursor: pointer;">BORRAR PUNTO</button>` : '';
+
+                popup.setHTML(`<div style="font-family: sans-serif; font-size: 0.9rem; max-width: 230px;"><strong style="font-size: 1rem; color: #333; display: block; margin-bottom: 3px;">Punto ${wp.label}: ${address}</strong><hr style="margin: 3px 0;"><p style="margin: 2px 0;"><strong>Distancia:</strong> ${distanciaTexto}</p><p style="margin: 2px 0;"><strong>Tiempo:</strong> ${tiempoTexto}</p><p style="margin: 2px 0;"><strong>Llegada (ETA):</strong> ${etaToWaypoint}</p><button data-waypoint-id="${wp.id}" class="share-waypoint-from-popup" style="margin-top: 8px; margin-right: 5px; padding: 4px 8px; font-size: 0.8rem; background-color: #007bff; color: white; border: none; border-radius: 3px; cursor: pointer;">Compartir</button>${alternativesButtonHtml}${deleteButtonHtml}</div>`);
+                
+                popup.on('open', () => {
+                    const popupEl = popup.getElement();
+                    popupEl.querySelector('.share-waypoint-from-popup')?.addEventListener('click', (ev) => { ev.stopPropagation(); handleSendToTeslaClick(wp.lat, wp.lng, wp.address); });
+                    popupEl.querySelector('.show-alternatives-btn')?.addEventListener('click', (ev) => { ev.stopPropagation(); fetchAndDisplayAlternativeRoutes(wp.id); wp.marker.getPopup()?.remove(); });
+                    popupEl.querySelector('.delete-waypoint-from-popup')?.addEventListener('click', (ev) => { ev.stopPropagation(); wp.marker.getPopup()?.remove(); handleDeleteWaypointClick(wp.id); });
+                });
+            });
+
+            wp.marker.on('dragend', (event) => {
+                if (isNavigating) return;
+                const newLngLat = event.target.getLngLat();
+                wp.lat = newLngLat.lat;
+                wp.lng = newLngLat.lng;
+                wp.address = '';
+                recalculateAndDrawRoute();
+            });
+        });
+    };
+
+    if (navigationMapInstance.isStyleLoaded()) {
+        render();
+    } else {
+        navigationMapInstance.once('style.load', render);
+    }
+}
+
+// ===================================================================
+// NOMBRE: updateInitialUserPosition (VERSIÓN CON BLOQUEO ANTI-CONFLICTO)
+// RESUMEN: Actualiza la posición del usuario pero no mueve el mapa si hay un recálculo en curso.
+// ===================================================================
+function updateInitialUserPosition(coords, mapInstanceToUse) {
+    if (!mapInstanceToUse || !coords || typeof coords.latitude !== 'number' || typeof coords.longitude !== 'number') {
+        return;
+    }
+    const lngLat = [coords.longitude, coords.latitude];
+    initialUserLocationMarkerLat = coords.latitude; 
+    initialUserLocationMarkerLng = coords.longitude;
+
+    if (!initialUserLocationMarker) {
+        const vehicleIconElement = document.createElement('div');
+        vehicleIconElement.style.width = '48px';
+        vehicleIconElement.style.height = '48px';
+        vehicleIconElement.innerHTML = `<img src="PNG/AVANCE.PNG" alt="Coche" style="width:100%; height:100%; object-fit:contain;">`;
+
+        initialUserLocationMarker = new mapboxgl.Marker({ element: vehicleIconElement, rotationAlignment: 'map', anchor: 'center' })
+            .setLngLat(lngLat)
+            .addTo(mapInstanceToUse);
+    } else {
+        initialUserLocationMarker.setLngLat(lngLat);
+    }
+    
+    let effectiveHeading = null;
+    if (coords.heading !== null && typeof coords.heading === 'number' && coords.heading >= 0) {
+        effectiveHeading = coords.heading;
+    } else if (window.lastPositionForSpeedCalc && typeof turf !== 'undefined') {
+        const lastPoint = turf.point([window.lastPositionForSpeedCalc.longitude, window.lastPositionForSpeedCalc.latitude]);
+        const currentPoint = turf.point([coords.longitude, coords.latitude]);
+        const distanceMoved = turf.distance(lastPoint, currentPoint, { units: 'meters' });
+        if (distanceMoved > 1) {
+            const bearing = turf.bearing(lastPoint, currentPoint);
+            effectiveHeading = (bearing < 0) ? bearing + 360 : bearing;
+        }
+    }
+
+    const currentHeading = (effectiveHeading !== null) ? effectiveHeading : (currentMapBearing || 0);
+    const iconRotation = currentHeading - 90;
+    initialUserLocationMarker.setRotation(iconRotation);
+    
+    if (compassAndModeControl) {
+        compassAndModeControl.updateOrientation(currentHeading); 
+        compassAndModeControl.updateAltitude(coords.altitude);
+        if (window.lastPositionForSpeedCalc && typeof coords.speed === 'number' && coords.speed !== null) { 
+            const distM = calculateDistance(window.lastPositionForSpeedCalc.latitude, window.lastPositionForSpeedCalc.longitude, coords.latitude, coords.longitude); 
+            const timeS = (Date.now() - window.lastPositionForSpeedCalc.time) / 1000; 
+            if (timeS > 0 && distM >= 0) { 
+                let speedMs = coords.speed; 
+                if (typeof speedMs !== 'number' || speedMs === null || speedMs < 0) { speedMs = distM / timeS; } 
+                window.currentSpeedKmh = speedMs * 3.6; 
+            } else { window.currentSpeedKmh = 0; } 
+        } else { 
+            if (typeof coords.speed === 'number' && coords.speed !== null && coords.speed >= 0) { window.currentSpeedKmh = coords.speed * 3.6; } else { window.currentSpeedKmh = 0; } 
+        }
+        window.lastPositionForSpeedCalc = { latitude: coords.latitude, longitude: coords.longitude, time: Date.now() };
+        
+        const isTripActive = isNavigating || isFreeDriveActive;
+        if (isTripActive) { 
+            if (window.currentSpeedKmh > maxSpeedDuringTrip) { 
+                maxSpeedDuringTrip = window.currentSpeedKmh; 
+                if (coords) { maxSpeedCoordinates = { lat: coords.latitude, lng: coords.longitude }; } 
+            }
+            if (coords.altitude !== null && !isNaN(coords.altitude)) { 
+                maxAltitudeDuringTrip = Math.max(maxAltitudeDuringTrip, coords.altitude); 
+                minAltitudeDuringTrip = Math.min(minAltitudeDuringTrip, coords.altitude); 
+            } 
+        }
+        
+        compassAndModeControl.updateCurrentSpeed(window.currentSpeedKmh);
+        compassAndModeControl.updateAverageSpeed(window.averageSpeedKmh);
+        compassAndModeControl.updateMaxSpeed(maxSpeedDuringTrip);
+    }
+    
+    const shouldFollow = (shouldCenterOnUser || navigationFollowUser) && !isAwaitingInitialZoomEnd;
+    
+    if (shouldFollow && !isRecalculatingRoute && navigationMapInstance && !mapInstanceToUse.isMoving()) {
+        const targetZoom = handleProgressiveManeuverZoom(navigationCurrentRouteData?.routes?.[0]?.legs?.[currentLegIndexNav]?.steps?.[currentStepIndexNav], distanceToNextManeuverOSRM);
+        const viewOptions = {
+            center: [coords.longitude, coords.latitude],
+            duration: 1000,
+            essential: true
+        };
+        if (targetZoom !== null) viewOptions.zoom = targetZoom;
+        if (mapViewMode === 'heading' || mapViewMode === 'perspective') viewOptions.bearing = currentHeading;
+        if (mapViewMode === 'perspective') viewOptions.pitch = 60;
+        navigationMapInstance.easeTo(viewOptions);
+    }
+}    
     
 // ===================================================================
 // NOMBRE: handleAddRadarHereClick
@@ -8022,228 +8235,6 @@ function showLoadRouteModal() {
 }
 
 
-// ===================================================================
-// NOMBRE: updateInitialUserPosition (VERSIÓN FINAL DE ROTACIÓN)
-// RESUMEN: Actualiza la posición del usuario y rota el icono correctamente en todos los modos.
-// ===================================================================
-function updateInitialUserPosition(coords, mapInstanceToUse) {
-    if (!mapInstanceToUse || !coords || typeof coords.latitude !== 'number' || typeof coords.longitude !== 'number') {
-        return;
-    }
-    const lngLat = [coords.longitude, coords.latitude];
-    initialUserLocationMarkerLat = coords.latitude; 
-    initialUserLocationMarkerLng = coords.longitude;
-
-    if (!initialUserLocationMarker) {
-        const vehicleIconElement = document.createElement('div');
-        vehicleIconElement.style.width = '48px';
-        vehicleIconElement.style.height = '48px';
-        vehicleIconElement.innerHTML = `<img src="PNG/AVANCE.PNG" alt="Coche" style="width:100%; height:100%; object-fit:contain;">`;
-
-        initialUserLocationMarker = new mapboxgl.Marker({ element: vehicleIconElement, rotationAlignment: 'map', anchor: 'center' })
-            .setLngLat(lngLat)
-            .addTo(mapInstanceToUse);
-    } else {
-        initialUserLocationMarker.setLngLat(lngLat);
-    }
-    
-    let effectiveHeading = null;
-    if (coords.heading !== null && typeof coords.heading === 'number' && coords.heading >= 0) {
-        effectiveHeading = coords.heading;
-    } else if (window.lastPositionForSpeedCalc && typeof turf !== 'undefined') {
-        const lastPoint = turf.point([window.lastPositionForSpeedCalc.longitude, window.lastPositionForSpeedCalc.latitude]);
-        const currentPoint = turf.point([coords.longitude, coords.latitude]);
-        const distanceMoved = turf.distance(lastPoint, currentPoint, { units: 'meters' });
-        if (distanceMoved > 1) {
-            const bearing = turf.bearing(lastPoint, currentPoint);
-            effectiveHeading = (bearing < 0) ? bearing + 360 : bearing;
-        }
-    }
-
-    const currentHeading = (effectiveHeading !== null) ? effectiveHeading : (currentMapBearing || 0);
-    
-    // --- LÓGICA DE ROTACIÓN CORREGIDA Y SIMPLIFICADA ---
-    // La propiedad 'rotationAlignment: map' se encarga de la rotación del mapa.
-    // Nosotros solo aplicamos la rotación del vehículo y la compensación del icono.
-    const iconRotation = currentHeading - 90;
-    initialUserLocationMarker.setRotation(iconRotation);
-    // --- FIN DE LA CORRECCIÓN ---
-    
-    if (compassAndModeControl) {
-        compassAndModeControl.updateOrientation(currentHeading); 
-        compassAndModeControl.updateAltitude(coords.altitude);
-        if (window.lastPositionForSpeedCalc && typeof coords.speed === 'number' && coords.speed !== null) { 
-            const distM = calculateDistance(window.lastPositionForSpeedCalc.latitude, window.lastPositionForSpeedCalc.longitude, coords.latitude, coords.longitude); 
-            const timeS = (Date.now() - window.lastPositionForSpeedCalc.time) / 1000; 
-            if (timeS > 0 && distM >= 0) { 
-                let speedMs = coords.speed; 
-                if (typeof speedMs !== 'number' || speedMs === null || speedMs < 0) { speedMs = distM / timeS; } 
-                window.currentSpeedKmh = speedMs * 3.6; 
-            } else { window.currentSpeedKmh = 0; } 
-        } else { 
-            if (typeof coords.speed === 'number' && coords.speed !== null && coords.speed >= 0) { window.currentSpeedKmh = coords.speed * 3.6; } else { window.currentSpeedKmh = 0; } 
-        }
-        window.lastPositionForSpeedCalc = { latitude: coords.latitude, longitude: coords.longitude, time: Date.now() };
-        
-        const isTripActive = isNavigating || isFreeDriveActive;
-        const tripStatsObject = isNavigating ? null : freeDriveStats;
-        let tripStartTime = isNavigating ? navigationStartTimeForStats : (tripStatsObject ? tripStatsObject.startTime : null);
-        let currentTotalDistance = isNavigating ? totalDistanceTravelledForStats : (tripStatsObject ? tripStatsObject.totalDistance : 0);
-
-        if (isTripActive) { 
-            if (window.currentSpeedKmh > maxSpeedDuringTrip) { 
-                maxSpeedDuringTrip = window.currentSpeedKmh; 
-                if (coords) { maxSpeedCoordinates = { lat: coords.latitude, lng: coords.longitude }; } 
-            }
-            const currentSpeed = window.currentSpeedKmh; 
-            for (const milestone of SPEED_MILESTONES) { 
-                if (currentSpeed >= milestone && lastSpeedMilestone < milestone) { 
-                    const milestoneIconEl = document.createElement('div');
-                    milestoneIconEl.innerHTML = `<div style="background-color: #706972; color: white; border-radius: 50%; width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 10px; border: 2px solid white; box-shadow: 0 0 4px black;">${milestone}</div>`;
-                    const marker = new mapboxgl.Marker({ element: milestoneIconEl, anchor: 'center' }).setLngLat([coords.longitude, coords.latitude]).addTo(mapInstanceToUse);
-                    speedMilestoneMarkerObjects.push(marker); 
-                    lastSpeedMilestone = milestone; 
-                    break; 
-                } 
-            } 
-            if (currentSpeed < lastSpeedMilestone) { 
-                let newMilestone = 0; 
-                for (let i = SPEED_MILESTONES.length - 1; i >= 0; i--) { 
-                    if (currentSpeed >= SPEED_MILESTONES[i]) { newMilestone = SPEED_MILESTONES[i]; break; } 
-                } 
-                lastSpeedMilestone = newMilestone; 
-            } 
-            if (coords.altitude !== null && !isNaN(coords.altitude)) { 
-                maxAltitudeDuringTrip = Math.max(maxAltitudeDuringTrip, coords.altitude); 
-                minAltitudeDuringTrip = Math.min(minAltitudeDuringTrip, coords.altitude); 
-            } 
-        }
-        
-        if (isTripActive && tripStartTime) {
-            let lastPosition = isNavigating ? lastPositionForStats : (tripStatsObject ? tripStatsObject.lastPosition : null);
-            if (lastPosition && coords) {
-                const distanceIncrement = calculateDistance(lastPosition.latitude, lastPosition.longitude, coords.latitude, coords.longitude);
-                if (distanceIncrement > 0 && distanceIncrement < 5000) {
-                    if(isNavigating) totalDistanceTravelledForStats += distanceIncrement;
-                    if(isFreeDriveActive) freeDriveStats.totalDistance += distanceIncrement;
-                    currentTotalDistance += distanceIncrement;
-                }
-            }
-            if(isNavigating) lastPositionForStats = { ...coords };
-            if(isFreeDriveActive) freeDriveStats.lastPosition = { ...coords };
-
-            if (currentTotalDistance > 300) {
-                const timeElapsedS = (Date.now() - tripStartTime.getTime()) / 1000;
-                if (timeElapsedS > 0) {
-                    const avgSpeedMs = currentTotalDistance / timeElapsedS;
-                    window.averageSpeedKmh = avgSpeedMs * 3.6;
-                } else {
-                    window.averageSpeedKmh = 0;
-                }
-            } else {
-                 window.averageSpeedKmh = 0;
-            }
-        } else if (isSimulatingGpsLocation && automatedSimulationIntervalId && navigationStartTimeForStats && typeof simulatedDistanceAlongRoute === 'number') {
-            const timeElapsedS = (Date.now() - navigationStartTimeForStats.getTime()) / 1000;
-            if (timeElapsedS > 0 && simulatedDistanceAlongRoute > 50) { 
-                const avgSpeedMs = simulatedDistanceAlongRoute / timeElapsedS;
-                window.averageSpeedKmh = avgSpeedMs * 3.6;
-            } else {
-                window.averageSpeedKmh = 0;
-            }
-        } else {
-            window.averageSpeedKmh = 0;
-        }
-
-        compassAndModeControl.updateCurrentSpeed(window.currentSpeedKmh);
-        compassAndModeControl.updateAverageSpeed(window.averageSpeedKmh);
-        compassAndModeControl.updateMaxSpeed(maxSpeedDuringTrip);
-    }
-    
-    if (isNavigating && !isRecalculatingRoute) {
-        const route = navigationCurrentRouteData?.routes?.[0];
-        if (route && route.geometry && typeof turf !== 'undefined') {
-            const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal);
-            const routeLineString = turf.lineString(route.geometry.coordinates); 
-            
-            for (let i = 0; i < actualWaypoints.length; i++) {
-                const waypoint = actualWaypoints[i];
-                if (waypoint && !waypoint.visited) {
-                    const waypointPoint = turf.point([waypoint.lng, waypoint.lat]);
-                    const nearestPointOnLine = turf.nearestPointOnLine(routeLineString, waypointPoint, { units: 'meters' });
-                    const startOfRoute = turf.point(routeLineString.geometry.coordinates[0]);
-                    const lineSliceToNearest = turf.lineSlice(startOfRoute, nearestPointOnLine, routeLineString);
-                    const distanceToWaypoint = turf.length(lineSliceToNearest, { units: 'meters' });
-                    
-                    if (lastCarDistanceAlongRouteForNavLogic >= distanceToWaypoint - WAYPOINT_VISITED_THRESHOLD_METERS) {
-                        waypoint.visited = true;
-                        renderWaypointMarkers();
-                    }
-                    break;
-                }
-            }
-        }
-
-        if (!navigationStartTimeForStats && tripStartLocationForStats) {
-            const distanceFromTripStart = calculateDistance(
-                coords.latitude, coords.longitude,
-                tripStartLocationForStats.latitude, tripStartLocationForStats.longitude
-            );
-            if (distanceFromTripStart > 50) {
-                navigationStartTimeForStats = new Date();
-                totalDistanceTravelledForStats = 0;
-                lastPositionForStats = { ...coords };
-                
-                if (route && route.legs && route.legs.length > 0) {
-                    const leg = route.legs[currentLegIndexNav];
-                    if (leg) {
-                        const distanceIntoCurrentLeg = Math.max(0, lastCarDistanceAlongRouteForNavLogic - calculateDistanceToEndOfStep(route, currentLegIndexNav - 1, -1));
-                        const remainingDistanceThisLeg = Math.max(0, leg.distance - distanceIntoCurrentLeg);
-                        const remainingDurationThisLeg = leg.distance > 0 ? leg.duration * (remainingDistanceThisLeg / leg.distance) : 0;
-                        currentStageInitialExpectedEtaTime = new Date(Date.now() + remainingDurationThisLeg * 1000);
-                    }
-                }
-            }
-        }
-    }
-    
-    const shouldFollow = (shouldCenterOnUser || navigationFollowUser) && !isAwaitingInitialZoomEnd;
-    
-    if (shouldFollow && !isRecalculatingRoute && navigationMapInstance && compassAndModeControl && !mapInstanceToUse.isMoving()) {
-        const targetZoom = handleProgressiveManeuverZoom(navigationCurrentRouteData?.routes?.[0]?.legs?.[currentLegIndexNav]?.steps?.[currentStepIndexNav], distanceToNextManeuverOSRM);
-        
-        const viewOptions = {
-            center: [coords.longitude, coords.latitude],
-            duration: 1000,
-            essential: true
-        };
-
-        if (targetZoom !== null) {
-            viewOptions.zoom = targetZoom;
-        }
-
-        if(mapViewMode === 'heading' || mapViewMode === 'perspective') {
-            viewOptions.bearing = currentHeading;
-        }
-        
-        if (mapViewMode === 'perspective') {
-            viewOptions.pitch = 60;
-        }
-
-        if (viewOptions.zoom === undefined && (mapViewMode === 'heading' || mapViewMode === 'perspective')) {
-            navigationMapInstance.easeTo({
-                center: viewOptions.center,
-                bearing: viewOptions.bearing,
-                pitch: viewOptions.pitch,
-                duration: 500
-            });
-        } else if (viewOptions.zoom !== undefined) {
-             navigationMapInstance.easeTo(viewOptions);
-        } else {
-             navigationMapInstance.panTo(viewOptions.center);
-        }
-    }
-}
 
 // ===================================================================
 // NOMBRE: handleProgressiveManeuverZoom (MODIFICADA)
@@ -24307,177 +24298,6 @@ function plotSingleReminderOnMap(reminder, mapInstance) {
     return mapObject;
 }
 
- // ===================================================================
-// NOMBRE: renderWaypointMarkers (VERSIÓN CON LIMPIEZA EXPLÍCITA)
-// RESUMEN: Limpia y redibuja los marcadores de la ruta.
-// ===================================================================
-function renderWaypointMarkers() {
-    if (!navigationMapInstance) return;
-
-    // 1. Limpieza explícita de marcadores antiguos
-    navigationWaypoints.forEach(wp => {
-        if (wp && wp.marker) {
-            wp.marker.remove();
-            wp.marker = null;
-        }
-    });
-
-    const render = () => {
-        const currentZoomLevel = navigationMapInstance.getZoom();
-        const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
-        
-        actualWaypoints.forEach(async (wp) => {
-            if (!wp) return;
-
-            const waypointIconElement = createWaypointMarkerIcon(wp.label, wp.type, wp.visited, currentZoomLevel);
-
-            wp.marker = new mapboxgl.Marker({
-                element: waypointIconElement,
-                draggable: !isNavigating,
-                anchor: 'center'
-            }).setLngLat([wp.lng, wp.lat]).addTo(navigationMapInstance);
-            
-            const markerElement = wp.marker.getElement();
-            if (markerElement) {
-                const deleteButton = markerElement.querySelector('.waypoint-delete-button');
-                if (deleteButton) {
-                    deleteButton.addEventListener('click', function(ev) {
-                        ev.stopPropagation();
-                        handleDeleteWaypointClick(wp.id);
-                    });
-                }
-            }
-            
-            let pressTimer = null;
-            let isLongPressTriggered = false;
-
-            const handlePressStart = (e) => {
-                isLongPressTriggered = false;
-                pressTimer = setTimeout(() => {
-                    isLongPressTriggered = true;
-                    if (wp.marker.getPopup()?.isOpen()) {
-                        wp.marker.getPopup().remove();
-                    }
-                    if (wp.type !== 'S' && wp.type !== 'S_Recalc') {
-                        fetchAndDisplayAlternativeRoutes(wp.id);
-                    }
-                }, 600); 
-            };
-
-            const handlePressEnd = () => {
-                clearTimeout(pressTimer);
-            };
-            
-            markerElement.addEventListener('mousedown', handlePressStart);
-            markerElement.addEventListener('mouseup', handlePressEnd);
-            markerElement.addEventListener('touchstart', handlePressStart, { passive: false });
-            markerElement.addEventListener('touchend', handlePressEnd);
-            
-            wp.marker.on('dragstart', () => clearTimeout(pressTimer));
-            
-            markerElement.addEventListener('click', async (e) => {
-                e.stopPropagation();
-                if (isLongPressTriggered) return;
-
-                const popup = new mapboxgl.Popup({ maxWidth: "250px", offset: 35, closeButton: true });
-                wp.marker.setPopup(popup).togglePopup();
-
-                popup.setHTML(`<strong>Punto ${wp.label}</strong><br>Cargando datos...`);
-                
-                let address = wp.address || "Calculando dirección...";
-                if (!wp.address) {
-                     if (typeof wp.lat === 'number' && typeof wp.lng === 'number') {
-                        wp.address = await getAddressForWaypoint(wp.lat, wp.lng);
-                     } else {
-                        wp.address = "Coordenadas no disponibles para dirección";
-                     }
-                     address = wp.address;
-                }
-                let distanceToWaypoint = 0;
-                let timeToWaypoint = 0;
-                let etaToWaypoint = "--:--";
-                const currentActualWaypointsForPopup = navigationWaypoints.filter(w => w && !w.isInternal && !w.isRecalculatedStart);
-                const actualWaypointIndexInRoute = currentActualWaypointsForPopup.findIndex(awp => awp.id === wp.id);
-                if (navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0]) {
-                    const route = navigationCurrentRouteData.routes[0];
-                    let cumulativeDistanceToThisWp = 0;
-                    let cumulativeDurationToThisWp = 0;
-                    if (actualWaypointIndexInRoute > 0) {
-                        for (let i = 0; i < actualWaypointIndexInRoute && i < route.legs.length; i++) {
-                            if (route.legs[i] && typeof route.legs[i].distance === 'number') {
-                               cumulativeDistanceToThisWp += (route.legs[i].distance || 0);
-                               cumulativeDurationToThisWp += (route.legs[i].duration || 0);
-                            }
-                        }
-                        distanceToWaypoint = cumulativeDistanceToThisWp;
-                        timeToWaypoint = cumulativeDurationToThisWp;
-                    }
-                     if (typeof timeToWaypoint === 'number' && !isNaN(timeToWaypoint)) {
-                        etaToWaypoint = new Date(Date.now() + timeToWaypoint * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-                    }
-                }
-                let distanciaTexto = "-- km";
-                if (typeof distanceToWaypoint === 'number' && !isNaN(distanceToWaypoint)) {
-                    distanciaTexto = `${(distanceToWaypoint / 1000).toFixed(1)} km`;
-                }
-                let tiempoTexto = "--:--";
-                if (typeof timeToWaypoint === 'number' && !isNaN(timeToWaypoint)) {
-                    const waypointTotalMinutes = Math.round(timeToWaypoint / 60);
-                    const waypointHours = Math.floor(waypointTotalMinutes / 60);
-                    const waypointMinutes = waypointTotalMinutes % 60;
-                    tiempoTexto = `${String(waypointHours).padStart(2, '0')}:${String(waypointMinutes).padStart(2, '0')}`;
-                }
-                const showDeleteButtonInPopup = wp.type !== 'S_Recalc';
-                const showAlternativesButton = wp.type !== 'S' && wp.type !== 'S_Recalc';
-                const alternativesButtonHtml = showAlternativesButton ? `<button data-waypoint-id="${wp.id}" class="show-alternatives-btn" style="margin-top: 8px; margin-right: 5px; padding: 4px 8px; font-size: 0.8rem; background-color: #ff9800; color: white; border: none; border-radius: 3px; cursor: pointer;">OTRAS RUTAS</button>` : '';
-                const finalPopupContent = `
-                    <div style="font-family: sans-serif; font-size: 0.9rem; max-width: 230px;">
-                        <strong style="font-size: 1rem; color: #333; display: block; margin-bottom: 3px;">Punto ${wp.label}: ${address || 'Dirección no disponible'}</strong>
-                        <hr style="margin: 3px 0;">
-                        <p style="margin: 2px 0;"><strong>Distancia:</strong> ${distanciaTexto}</p>
-                        <p style="margin: 2px 0;"><strong>Tiempo:</strong> ${tiempoTexto}</p>
-                        <p style="margin: 2px 0;"><strong>Llegada (ETA):</strong> ${etaToWaypoint || '--:--'}</p>
-                        <button data-waypoint-id="${wp.id}" class="share-waypoint-from-popup" style="margin-top: 8px; margin-right: 5px; padding: 4px 8px; font-size: 0.8rem; background-color: #007bff; color: white; border: none; border-radius: 3px; cursor: pointer;">Compartir</button>
-                        ${alternativesButtonHtml}
-                        ${showDeleteButtonInPopup ? `<button data-waypoint-id="${wp.id}" class="delete-waypoint-from-popup" style="margin-top: 8px; padding: 4px 8px; font-size: 0.8rem; background-color: #EF4444; color: white; border: none; border-radius: 3px; cursor: pointer;">BORRAR PUNTO</button>` : ''}
-                    </div>`;
-                
-                popup.setHTML(finalPopupContent);
-                
-                popup.on('open', () => {
-                    const shareButtonPopup = popup.getElement().querySelector('.share-waypoint-from-popup');
-                    if (shareButtonPopup) shareButtonPopup.addEventListener('click', (ev) => { ev.stopPropagation(); handleSendToTeslaClick(wp.lat, wp.lng, wp.address); });
-
-                    const alternativesButtonPopup = popup.getElement().querySelector('.show-alternatives-btn');
-                    if (alternativesButtonPopup) alternativesButtonPopup.addEventListener('click', (ev) => { ev.stopPropagation(); fetchAndDisplayAlternativeRoutes(wp.id); wp.marker.getPopup()?.remove(); });
-
-                    const deleteButtonPopup = popup.getElement().querySelector('.delete-waypoint-from-popup');
-                    if (deleteButtonPopup) deleteButtonPopup.addEventListener('click', (ev) => { ev.stopPropagation(); wp.marker.getPopup()?.remove(); handleDeleteWaypointClick(wp.id); });
-                });
-            });
-
-            wp.marker.on('dragend', function(event) {
-                if (isNavigating) return;
-                const newLngLat = event.target.getLngLat();
-                wp.lat = newLngLat.lat;
-                wp.lng = newLngLat.lng;
-                wp.address = '';
-                recalculateAndDrawRoute().then(() => {
-                    const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
-                    if (radaresRutaCheckbox && radaresRutaCheckbox.checked) toggleRadaresRuta(true);
-                    const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
-                    if (tareasRutaCheckbox && tareasRutaCheckbox.checked) toggleTareasRuta(true);
-                });
-            });
-        });
-    };
-
-    if (navigationMapInstance.isStyleLoaded()) {
-        render();
-    } else {
-        navigationMapInstance.once('style.load', render);
-    }
-}   
 
 // ===================================================================
 // NOMBRE: handleStageTouchMove
