@@ -1,4 +1,4 @@
-MB03-14
+MB03-15
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -7628,8 +7628,377 @@ function eliminarRadaresDeRuta() {
         updateNavigationProgressDisplay(navigationCurrentRouteData.routes[0], lastCarDistanceAlongRouteForNavLogic);
     }
 }
-    
 
+// ===================================================================
+// NOMBRE: handleZoomToggleButtonClick (MODIFICADA - PARA MAPBOX)
+// RESUMEN: Alterna el zoom del mapa entre la vista completa de la ruta y la vista del coche.
+// ===================================================================
+function handleZoomToggleButtonClick(zoomButton) {
+    if (!navigationMapInstance || !zoomButton) return;
+    const currentState = zoomButton.dataset.zoomState;
+    const img = zoomButton.querySelector('img');
+    if (!img) return;
+
+    if (currentState === 'waypoints' || currentState === 'no_route_zoom_out') {
+        if (navigationCurrentLocation) {
+            const targetZoom = (navigationMapInstance.getMaxZoom() || 19) - 2;
+            zoomButton.dataset.zoomState = 'car';
+            img.src = 'PNG/ZOOM-.PNG';
+            zoomButton.title = "Zoom para ver la ruta completa";
+            navigationMapInstance.flyTo({ 
+                center: [navigationCurrentLocation.longitude, navigationCurrentLocation.latitude], 
+                zoom: targetZoom,
+                duration: 1000 
+            });
+        } else {
+            showToast("Ubicación actual no disponible para hacer zoom.", "warning");
+        }
+    } else { // currentState is 'car'
+        const routeSource = navigationMapInstance.getSource('route');
+        if (routeSource && routeSource._data && routeSource._data.geometry && routeSource._data.geometry.coordinates.length > 1) {
+            const coordinates = routeSource._data.geometry.coordinates;
+            const bounds = new mapboxgl.LngLatBounds();
+            coordinates.forEach(coord => {
+                bounds.extend(coord);
+            });
+            if (!bounds.isEmpty()) {
+                navigationMapInstance.fitBounds(bounds, { padding: 80, animate: true, duration: 1000 });
+                zoomButton.dataset.zoomState = 'waypoints';
+            } else {
+                 navigationMapInstance.flyTo({ zoom: 10, duration: 1000 });
+                 zoomButton.dataset.zoomState = 'no_route_zoom_out';
+            }
+        } else {
+            navigationMapInstance.flyTo({ zoom: 10, duration: 1000 });
+            zoomButton.dataset.zoomState = 'no_route_zoom_out';
+        }
+        img.src = 'PNG/ZOOM+.PNG';
+        zoomButton.title = "Zoom a la ubicación del coche";
+    }
+}
+    
+ // ===================================================================
+// NOMBRE: handleLocateMeClick (MODIFICADA - PARA MAPBOX)
+// RESUMEN: Maneja el clic en el botón de "Estás Aquí" para centrar o dejar de seguir al usuario.
+// ===================================================================
+function handleLocateMeClick(locateMeButton) {
+    if (!navigationMapInstance || !locateMeButton) return;
+    
+    if (window.followMeReactivationTimer) {
+        clearTimeout(window.followMeReactivationTimer);
+        window.followMeReactivationTimer = null;
+        showToast('Seguimiento manual gestionado.', 'info');
+    }
+
+    const locateMeImg = locateMeButton.querySelector('img');
+
+    if (navigationFollowUser) {
+        shouldCenterOnUser = false;
+        navigationFollowUser = false;
+        if (locateMeImg) locateMeImg.src = "PNG/ESTASAQUI.PNG";
+        locateMeButton.title = "Mostrar mi posición actual y activar seguimiento";
+    } else {
+        shouldCenterOnUser = true;
+        navigationFollowUser = true;
+        if (locateMeImg) locateMeImg.src = "PNG/DEJARSEGUIR.PNG";
+        locateMeButton.title = "Dejar de centrar el mapa en mi posición";
+        
+        if (navigationCurrentLocation) {
+            const viewOptions = {
+                center: [navigationCurrentLocation.longitude, navigationCurrentLocation.latitude],
+                zoom: 17,
+                essential: true
+            };
+            if(compassAndModeControl) {
+                if(compassAndModeControl.mapViewMode === 'heading' || compassAndModeControl.mapViewMode === 'perspective') {
+                    viewOptions.bearing = navigationCurrentLocation.heading || 0;
+                }
+                if(compassAndModeControl.mapViewMode === 'perspective') {
+                    viewOptions.pitch = 60;
+                }
+            }
+            navigationMapInstance.flyTo(viewOptions);
+        } else {
+            getCurrentLocation(coords => {
+                if (navigationMapInstance) {
+                     navigationMapInstance.flyTo({ center: [coords.longitude, coords.latitude], zoom: 17 });
+                }
+                updateInitialUserPosition(coords, navigationMapInstance);
+            }, () => showToast("No se pudo obtener tu ubicación.", "warning"));
+        }
+    }
+    updateStartNavigationButtonState(); 
+}   
+    
+// ===================================================================
+// NOMBRE: showPDRsFilterModal (MODIFICADA - PARA MAPBOX)
+// RESUMEN: Muestra un modal de filtro que se adapta si hay o no una ruta cargada.
+// ===================================================================
+function showPDRsFilterModal() {
+    const mapContainer = document.getElementById('reminders-location-map-modal');
+    if (!mapContainer || !navigationMapInstance) {
+        showToast("El mapa de navegación debe estar abierto para usar los filtros.", "error");
+        return;
+    }
+
+    const hasRoute = navigationMapInstance.getSource('route') && 
+                     navigationMapInstance.getSource('route')._data &&
+                     navigationMapInstance.getSource('route')._data.geometry &&
+                     navigationMapInstance.getSource('route')._data.geometry.coordinates &&
+                     navigationMapInstance.getSource('route')._data.geometry.coordinates.length > 1;
+
+    const PDR_MIN_POWER_KEY = 'boardinggate_pdrFilterMinPower';
+    const PDR_MAX_POWER_KEY = 'boardinggate_pdrFilterMaxPower';
+    const PDR_DISTANCE_KEY = 'boardinggate_pdrFilterDistance';
+    const PDR_RADIUS_KEY = 'boardinggate_pdrFilterRadius';
+
+    const savedMinPower = parseInt(localStorage.getItem(PDR_MIN_POWER_KEY)) || 30;
+    const savedMaxPower = parseInt(localStorage.getItem(PDR_MAX_POWER_KEY)) || 600;
+    const savedDistance = parseInt(localStorage.getItem(PDR_DISTANCE_KEY)) || 20;
+    const savedRadius = parseInt(localStorage.getItem(PDR_RADIUS_KEY)) || 15;
+    let distanceControlHtml;
+    if (hasRoute) {
+        distanceControlHtml = `
+            <div id="distance-slider-container" class="filter-group">
+                <label id="distance-range-label">Distancia Máxima a la Ruta: ${savedDistance} km</label> 
+                <div class="slider-container single-slider-container">
+                    <div class="slider-track"></div>
+                    <div class="slider-range" id="distance-slider-range"></div>
+                    <div class="slider-thumb" id="distance-thumb"></div>
+                </div>
+            </div>`;
+    } else {
+        distanceControlHtml = `
+            <div id="radius-slider-container" class="filter-group">
+                <label id="radius-range-label">Radio de Búsqueda: ${savedRadius} km</label> 
+                <div class="slider-container single-slider-container">
+                    <div class="slider-track"></div>
+                    <div class="slider-range" id="radius-slider-range"></div>
+                    <div class="slider-thumb" id="radius-thumb"></div>
+                </div>
+            </div>`;
+    }
+
+    const existingModal = document.getElementById('pdrs-filter-modal-overlay');
+    if (existingModal) existingModal.remove();
+
+    const savedOperatorFilter = localStorage.getItem('boardinggate_operator_filter') || '';
+    const modalOverlay = document.createElement('div');
+    modalOverlay.id = 'pdrs-filter-modal-overlay';
+    modalOverlay.className = 'filter-modal-overlay';
+    
+    modalOverlay.innerHTML = `
+        <div class="filter-modal-content" style="background-color: #E6D6A8; color: #333;">
+            <h2 style="color: #111;">FILTRO PUNTOS DE CARGA</h2>
+            <div class="filter-group">
+                <label for="operator-filter-input" style="font-weight:bold;">Filtrar operadores:</label>
+                <div style="position: relative; width: 90%; margin: 5px auto 0 auto;">
+                    <input type="text" id="operator-filter-input" value="${savedOperatorFilter}" placeholder="Ej: Zunder Iberdrola" style="width: 100%; padding: 8px 30px 8px 8px; font-size: 1rem; border-radius: 4px; border: 1px solid #aaa; background-color: #f0f0e0;">
+                    <button id="clear-operator-filter" title="Limpiar filtro de operadores" style="position: absolute; right: 5px; top: 50%; transform: translateY(-50%); background: none; border: none; font-size: 1.5rem; color: #888; cursor: pointer; padding: 0 5px; display: none;">×</button>
+                </div>
+            </div>
+            <div class="filter-group">
+                <label id="power-range-label" style="font-weight:bold;">Potencia: ${savedMinPower} kW - ${savedMaxPower} kW</label> 
+                <div class="slider-container">
+                    <div class="slider-track"></div>
+                    <div class="slider-range" id="power-slider-range"></div>
+                    <div class="slider-thumb left" id="power-thumb-min"></div>
+                    <div class="slider-thumb right" id="power-thumb-max"></div>
+                </div>
+            </div>
+            
+            <div class="ocm-color-legend">
+                <div class="ocm-color-legend-item">
+                    <div class="ocm-color-legend-icon" style="border-color: black;"></div>
+                    <span>≤50kW</span>
+                </div>
+                <div class="ocm-color-legend-item">
+                    <div class="ocm-color-legend-icon" style="border-color: green;"></div>
+                    <span>≤100kW</span>
+                </div>
+                <div class="ocm-color-legend-item">
+                    <div class="ocm-color-legend-icon" style="border-color: rgb(30, 144, 255);"></div>
+                    <span>≤250kW</span>
+                </div>
+                <div class="ocm-color-legend-item">
+                    <div class="ocm-color-legend-icon" style="border-color: #de2e03;"></div>
+                    <span>>250kW</span>
+                </div>
+            </div>
+
+            ${distanceControlHtml}
+            
+            <div class="filter-group" style="text-align: left; margin-top: 20px;">
+                <label id="search-in-view-label" style="display: flex; align-items: center; cursor: pointer; font-size: 1.1rem; user-select: none; transition: opacity 0.3s;">
+                    <input type="checkbox" id="search-in-view-checkbox" style="width: 1.2rem; height: 1.2rem; margin-right: 10px; flex-shrink: 0;">
+                    Buscar en la zona del mapa que estés viendo ahora
+                </label>
+            </div>
+
+            <button id="accept-filters-btn" style="background-color: #2563EB;">Aceptar</button>
+
+            <div class="ocm-modal-info-footer">
+                <p><strong>(*) Cómo buscar:</strong> Si hay una ruta cargada, la búsqueda por defecto es sobre el trazado. Si no hay ruta, en un radio desde el centro. Para buscar siempre en la vista actual, marque la casilla superior.</p>
+                <p><strong>(*) Secuencia del botón:</strong> <strong>1ª Pulsación:</strong> Abre filtros. | <strong>2ª Pulsación:</strong> Muestra solo los más económicos. | <strong>3ª Pulsación:</strong> Limpia el mapa de PDRs.</p>
+                <p style="margin-top:10px; font-style:italic;">Datos proporcionados por <a href="https://openchargemap.org" target="_blank" style="color:#0056b3; text-decoration:underline;">Open Charge Map</a>.</p>
+            </div>
+        </div>
+    `;
+
+    mapContainer.appendChild(modalOverlay);
+    
+    const PDR_SEARCH_IN_VIEW_KEY = 'boardinggate_pdrSearchInView';
+    const searchInViewCheckbox = document.getElementById('search-in-view-checkbox');
+    const distanceSliderContainer = document.getElementById('distance-slider-container') || document.getElementById('radius-slider-container');
+    
+    const updateControlsState = () => {
+        if (searchInViewCheckbox.checked) {
+            distanceSliderContainer.style.opacity = '0.5';
+            distanceSliderContainer.style.pointerEvents = 'none';
+        } else {
+            distanceSliderContainer.style.opacity = '1';
+            distanceSliderContainer.style.pointerEvents = 'auto';
+        }
+    };
+    
+    const savedSearchInView = localStorage.getItem(PDR_SEARCH_IN_VIEW_KEY) === 'true';
+    searchInViewCheckbox.checked = savedSearchInView;
+    searchInViewCheckbox.addEventListener('change', () => {
+        localStorage.setItem(PDR_SEARCH_IN_VIEW_KEY, searchInViewCheckbox.checked);
+        updateControlsState();
+    });
+    
+    updateControlsState();
+
+    const operatorInput = document.getElementById('operator-filter-input');
+    const clearOperatorButton = document.getElementById('clear-operator-filter');
+    
+    const toggleClearButtonVisibility = () => {
+        clearOperatorButton.style.display = operatorInput.value.trim() ? 'block' : 'none';
+    };
+
+    operatorInput.addEventListener('input', toggleClearButtonVisibility);
+    clearOperatorButton.addEventListener('click', () => {
+        operatorInput.value = '';
+        toggleClearButtonVisibility();
+        operatorInput.focus();
+    });
+    toggleClearButtonVisibility();
+
+    const setupSlider = (idPrefix, minVal, maxVal, defaultMin, defaultMax, unit, isRange = true) => {
+        const thumbMax = document.getElementById(`${idPrefix}-thumb` + (isRange ? '-max' : ''));
+        if (!thumbMax) return () => ({ min: 0, max: 0 });
+        const container = thumbMax.parentElement;
+        const range = document.getElementById(`${idPrefix}-slider-range`);
+        const label = document.getElementById(`${idPrefix}-range-label`);
+        const thumbMin = isRange ? document.getElementById(`${idPrefix}-thumb-min`) : null;
+        let currentMin = defaultMin; 
+        let currentMax = defaultMax;
+
+        const updateVisuals = () => {
+            const minPercent = isRange ? ((currentMin - minVal) / (maxVal - minVal)) * 100 : 0;
+            const maxPercent = ((currentMax - minVal) / (maxVal - minVal)) * 100;
+            
+            if (isRange && thumbMin) thumbMin.style.left = `${minPercent}%`;
+            thumbMax.style.left = `${maxPercent}%`;
+            range.style.left = `${minPercent}%`;
+            range.style.width = `${maxPercent - minPercent}%`;
+            
+            if(isRange){
+                label.textContent = `Potencia: ${Math.round(currentMin)} ${unit} - ${Math.round(currentMax)} ${unit}`;
+            } else {
+                label.textContent = `${hasRoute ? 'Distancia Máxima a la Ruta' : 'Radio de Búsqueda'}: ${Math.round(currentMax)} ${unit}`;
+            }
+        };
+
+        const onDrag = (e, thumb) => {
+            const rect = container.getBoundingClientRect();
+            const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+            let percent = ((clientX - rect.left) / rect.width) * 100;
+            percent = Math.max(0, Math.min(100, percent));
+            
+            let value = minVal + (percent / 100) * (maxVal - minVal);
+            
+            if (isRange && thumb === thumbMin) {
+                currentMin = Math.min(value, currentMax);
+            } else {
+                currentMax = isRange ? Math.max(value, currentMin) : value;
+            }
+            updateVisuals();
+        };
+
+        const thumbsToSetup = isRange ? [thumbMin, thumbMax] : [thumbMax];
+        thumbsToSetup.forEach(thumb => {
+            const startDrag = (e) => {
+                const moveHandler = (moveEvent) => onDrag(moveEvent, thumb);
+                const endDrag = () => {
+                    document.removeEventListener('mousemove', moveHandler);
+                    document.removeEventListener('mouseup', endDrag);
+                    document.removeEventListener('touchmove', moveHandler);
+                    document.removeEventListener('touchend', endDrag);
+                };
+                document.addEventListener('mousemove', moveHandler);
+                document.addEventListener('mouseup', endDrag);
+                document.addEventListener('touchmove', moveHandler);
+                document.addEventListener('touchend', endDrag);
+            };
+            thumb.addEventListener('mousedown', startDrag);
+            thumb.addEventListener('touchstart', startDrag);
+        });
+        
+        updateVisuals();
+        return () => ({ min: isRange ? currentMin : minVal, max: currentMax });
+    };
+
+    const getPowerValues = setupSlider('power', 7, 2000, savedMinPower, savedMaxPower, 'kW', true);
+    const getDistanceValues = hasRoute ? setupSlider('distance', 0, 50, 0, savedDistance, 'km', false) : () => ({});
+    const getRadiusValues = !hasRoute ? setupSlider('radius', 1, 100, 1, savedRadius, 'km', false) : () => ({});
+
+    const acceptButton = document.getElementById('accept-filters-btn');
+    acceptButton.addEventListener('click', () => {
+        const operatorFilterValue = document.getElementById('operator-filter-input').value;
+        localStorage.setItem('boardinggate_operator_filter', operatorFilterValue);
+
+        const powerFilters = getPowerValues();
+        localStorage.setItem(PDR_MIN_POWER_KEY, Math.round(powerFilters.min));
+        localStorage.setItem(PDR_MAX_POWER_KEY, Math.round(powerFilters.max));
+
+        let searchConfig;
+        if (hasRoute) {
+            const distanceFilters = getDistanceValues();
+            localStorage.setItem(PDR_DISTANCE_KEY, Math.round(distanceFilters.max));
+            searchConfig = { type: 'route', distanceFilters };
+        } else {
+            const radiusFilters = getRadiusValues();
+            localStorage.setItem(PDR_RADIUS_KEY, Math.round(radiusFilters.max));
+            searchConfig = { type: 'radius', radiusKm: radiusFilters.max, center: navigationMapInstance.getCenter() };
+        }
+        
+        if (navigationFollowUser) {
+            const locateMeButton = document.getElementById('locate-me-on-reminders-map');
+            if (locateMeButton) {
+                handleLocateMeClick(locateMeButton);
+                showToast('Seguimiento pausado por 1 minuto para explorar el mapa.', 'info', 4000);
+                if (window.followMeReactivationTimer) {
+                    clearTimeout(window.followMeReactivationTimer);
+                }
+                window.followMeReactivationTimer = setTimeout(() => {
+                    if (!navigationFollowUser) {
+                        handleLocateMeClick(locateMeButton);
+                        showToast('Seguimiento automático reactivado.', 'info');
+                    }
+                    window.followMeReactivationTimer = null;
+                }, 60000);
+            }
+        }
+
+        modalOverlay.remove();
+        findChargingPointsOnRoute(powerFilters, searchConfig);
+    });
+
+    addModalAutoCloseTimer(modalOverlay, acceptButton, 'pdrs-filter-modal', 20000);
+}
+    
 // ===================================================================
 // NOMBRE: showAllReminders (MODIFICADA - PARA MAPBOX)
 // RESUMEN: Muestra una tabla con todos los recordatorios.
