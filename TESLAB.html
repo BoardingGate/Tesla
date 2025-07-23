@@ -1,4 +1,4 @@
-MB03-17
+MB03-18
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -7343,7 +7343,201 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     }
 }    
 
+// ===================================================================
+// NOMBRE: toggleNavigationState (MODIFICADA - GESTIONA MODO LIBRE)
+// RESUMEN: Inicia/detiene la navegación normal o el modo libre, y maneja el estado de pausa.
+// ===================================================================
+async function toggleNavigationState(isRecalculationStop = false) {
+    const startNavButton = document.getElementById('start-navigation-button');
+    const startNavImg = startNavButton ? startNavButton.querySelector('img') : null;
+    const mapContainer = document.getElementById('reminders-location-map-div');
+    let initialZoomTimeout = null;
 
+    if (isNavigating) {
+        if (isFreeDrivePaused) {
+            handleFreeDriveCancellation();
+        }
+        
+        if (initialZoomTimeout) clearTimeout(initialZoomTimeout);
+        isAwaitingInitialZoomEnd = false;
+        zoomLevelBeforeInitialOverview = null;
+        lastDisplayedManeuverIcon = null; 
+        
+        clearAlternativeRoutesDisplay();
+        alternativeRoutesCache.clear();
+        selectedStageRoutes.clear();
+
+        isNavigating = false;
+        navigationFollowUser = false;
+        if(startNavImg) startNavImg.src = "PNG/INICIARNAVEGACION.PNG";
+        if(startNavButton) startNavButton.classList.remove('navigating');
+        if (mapContainer) mapContainer.classList.remove('navigating');
+        setNavigationMapClickHandler();
+        navigationWaypoints.forEach(wp => { if (wp && wp.marker) wp.marker.setDraggable(true); });
+        showToast("Navegación finalizada", "info", 3000);
+        if (!isRecalculationStop && !isArrivalSequenceStarted) {
+            if (!document.getElementById('arrival-stats-modal') || document.getElementById('arrival-stats-modal').classList.contains('hidden')) {
+                showArrivalStatsModal();
+            }
+        }
+        mapHeaderButtonsVisible = true; 
+        toggleMapHeaderRowsVisibility(true); 
+
+        if (maxSpeedMarkerObjects && maxSpeedMarkerObjects.length > 0) {
+            maxSpeedMarkerObjects.forEach(marker => marker.remove());
+            maxSpeedMarkerObjects = [];
+        }
+        if (speedMilestoneMarkerObjects && speedMilestoneMarkerObjects.length > 0) {
+            speedMilestoneMarkerObjects.forEach(marker => marker.remove());
+            speedMilestoneMarkerObjects = [];
+        }
+       
+    } else if (isFreeDriveActive) {
+        stopFreeDrive();
+    } else {
+        if (!navigationCurrentRouteData || !navigationCurrentRouteData.routes || navigationCurrentRouteData.routes.length === 0 || navigationWaypoints.filter(wp => !wp.isInternal && !wp.isRecalculatedStart).length < 2) {
+            showToast("No hay ruta calculada para iniciar la navegación", "warning");
+            return;
+        }
+        if (isFreeDriveActive) {
+            isFreeDrivePaused = true;
+            isFreeDriveActive = false;
+            showToast("Modo Conducción Libre en pausa mientras planificas una ruta.", "info");
+        }
+        
+        const waypointsForRecents = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
+        const lastWpForName = waypointsForRecents[waypointsForRecents.length - 1];
+        const isMultiStageForName = waypointsForRecents.length > 2;
+        const suggestedName = await getSuggestedRouteName(lastWpForName.lat, lastWpForName.lng, isMultiStageForName, waypointsForRecents.length);
+        
+        const routeForRecents = {
+            name: currentRouteNameForSaving || suggestedName,
+            waypoints: waypointsForRecents
+        };
+        addRouteToRecents(routeForRecents);
+
+        clearNavigationGraph();
+        if(startNavImg) startNavImg.src = "PNG/TERMINARNAVEGACION.PNG";
+        navigationWaypoints.forEach(wp => {
+            if(wp) {
+                if (wp.type === 'S' || wp.type === 'S_Recalc') {
+                    wp.visited = true; 
+                } else {
+                    wp.visited = false; 
+                }
+                if (wp.marker) wp.marker.setDraggable(false);
+            }
+        });
+        getCurrentLocation(
+            (initialCoords) => {
+                navigationCurrentLocation = initialCoords;
+                updateInitialUserPosition(initialCoords, navigationMapInstance);
+            },
+            (errorMsg) => {
+                showToast(`No se pudo obtener tu ubicación inicial: ${errorMsg}. El mapa se centrará cuando el GPS esté listo.`, "warning", 5000);
+            }
+        );
+        startGpsWatching();
+        const loadingToast = document.getElementById("gps-init-toast");
+        if (loadingToast) loadingToast.remove();
+        activeToasts = activeToasts.filter(t => t.id !== "gps-init-toast");
+        isNavigating = true;
+        
+        mapHeaderButtonsVisible = false;
+        toggleMapHeaderRowsVisibility(false);
+        if(startNavButton) startNavButton.classList.add('navigating');
+        if (mapContainer) mapContainer.classList.add('navigating');
+        setNavigationMapClickHandler();
+        
+        const routeData = navigationCurrentRouteData.routes[0];
+        if (routeData) {
+            tripInitialDurationSec = routeData.duration;
+            tripInitialDistanceMeters = routeData.distance;
+            tripInitialOverallEtaTime = new Date(Date.now() + routeData.duration * 1000);
+            
+            if (routeData.legs && routeData.legs.length > 0) {
+                currentStageInitialExpectedEtaTime = new Date(Date.now() + routeData.legs[0].duration * 1000);
+            }
+        }
+        
+        tripStartLocationForStats = { ...navigationCurrentLocation };
+        navigationStartTimeForStats = null;
+        totalDistanceTravelledForStats = 0;
+        maxDistanceReachedOnRoute = 0; 
+        maxSpeedDuringTrip = 0; 
+        maxSpeedCoordinates = null; 
+        maxAltitudeDuringTrip = -Infinity; 
+        minAltitudeDuringTrip = Infinity; 
+        lastPositionForStats = {...navigationCurrentLocation};
+        accumulatedDeviationMs = 0;
+        
+        if (maxSpeedMarkerObjects && maxSpeedMarkerObjects.length > 0) {
+            maxSpeedMarkerObjects.forEach(marker => marker.remove());
+            maxSpeedMarkerObjects = [];
+        }
+        if (speedMilestoneMarkerObjects && speedMilestoneMarkerObjects.length > 0) {
+            speedMilestoneMarkerObjects.forEach(marker => marker.remove());
+            speedMilestoneMarkerObjects = [];
+        }
+        lastSpeedMilestone = 0;
+        if (compassAndModeControl) {
+            compassAndModeControl.updateMaxSpeed(maxSpeedDuringTrip); 
+        }
+        
+        showToast("Navegación iniciada. Esperando movimiento...", "success");
+        currentGraphMode = localStorage.getItem(GRAPH_STATE_KEY) || 'Desviación ETA';
+        initializeNavigationGraph();
+        updateStartNavigationButtonState();
+        updateNavigationButtonColor();
+        
+        const radaresCheckbox = document.getElementById('radares-ruta-checkbox');
+        if (radaresCheckbox && radaresCheckbox.checked) {
+            toggleRadaresRuta(true);
+        }
+        const tareasCheckbox = document.getElementById('tareas-ruta-checkbox');
+        if (tareasCheckbox && tareasCheckbox.checked) {
+            toggleTareasRuta(true);
+        }
+
+        const firstDestination = navigationWaypoints.find(wp => wp && !wp.isInternal && wp.type !== 'S' && !wp.visited);
+        if (firstDestination) {
+            fetchAndDisplayAlternativeRoutes(firstDestination.id);
+        }
+
+        isAwaitingInitialZoomEnd = true;
+        
+        if (navigationMapInstance) {
+            zoomLevelBeforeInitialOverview = navigationMapInstance.getZoom();
+            const routeSource = navigationMapInstance.getSource('route');
+            if (routeSource && routeSource._data && 
+                routeSource._data.geometry && 
+                routeSource._data.geometry.coordinates && 
+                routeSource._data.geometry.coordinates.length > 0) {
+                 const routeBounds = new mapboxgl.LngLatBounds();
+                 routeSource._data.geometry.coordinates.forEach(coord => routeBounds.extend(coord));
+                 if (!routeBounds.isEmpty()) {
+                     navigationMapInstance.fitBounds(routeBounds, { padding: 40, animate: true, duration: 2500 });
+                 }
+            }
+        }
+        
+        initialZoomTimeout = setTimeout(() => {
+            isAwaitingInitialZoomEnd = false;
+            if (isNavigating) {
+                clearAlternativeRoutesDisplay();
+                shouldCenterOnUser = true; 
+                navigationFollowUser = true;
+                navigationTargetZoom = 16.5;
+            }
+        }, 15000);
+    }
+    updateStartNavigationButtonState();
+    updateNavigationButtonColor();
+    actualizarContadorRadares(radaresEnRutaActual.length);
+    actualizarContadorTareas(tareasEnRutaActual.length);
+}
+
+    
 // ===================================================================
 // NOMBRE: handleFreeDriveCancellation
 // RESUMEN: Gestiona la reanudación del modo libre cuando se cancela una planificación de ruta.
