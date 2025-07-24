@@ -1,4 +1,4 @@
-MB24-35
+MB24-36
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -6103,10 +6103,9 @@ function redrawAllHTMLMarkers() {
     displayChargingPointsOnMap();
 }
 
-
 // ===================================================================
-// NOMBRE: updateAllIconSizes (NUEVA FUNCIÓN OPTIMIZADA)
-// RESUMEN: Redimensiona todos los iconos HTML en el mapa basándose en el nivel de zoom actual.
+// NOMBRE: updateAllIconSizes (VERSIÓN FINAL CON RE-CREACIÓN SELECTIVA DE MARCADORES)
+// RESUMEN: Redimensiona todos los iconos, re-creando solo los de Etapas y PDRs para asegurar el anclaje.
 // ===================================================================
 function updateAllIconSizes() {
     if (!navigationMapInstance || !navigationMapInstance.isStyleLoaded()) {
@@ -6115,18 +6114,90 @@ function updateAllIconSizes() {
 
     const currentZoomLevel = navigationMapInstance.getZoom();
 
+    // 1. WAYPOINTS DE RUTA (NECESITAN RE-CREACIÓN)
     navigationWaypoints.forEach(wp => {
         if (wp && wp.marker) {
-            const newIconElement = createWaypointMarkerIcon(wp.label, wp.type, wp.visited, currentZoomLevel);
+            wp.marker.remove();
+            
+            const waypointIconElement = createWaypointMarkerIcon(wp.label, wp.type, wp.visited, currentZoomLevel);
+            
+            wp.marker = new mapboxgl.Marker({
+                element: waypointIconElement,
+                draggable: !isNavigating,
+                anchor: 'center'
+            }).setLngLat([wp.lng, wp.lat]).addTo(navigationMapInstance);
+            
             const markerElement = wp.marker.getElement();
-            if (markerElement) {
-                markerElement.innerHTML = newIconElement.innerHTML;
-                markerElement.style.cssText = newIconElement.style.cssText;
-                markerElement.className = newIconElement.className;
-            }
+            let pressTimer = null;
+            let isLongPressTriggered = false;
+            const handlePressStart = (e) => {
+                isLongPressTriggered = false;
+                pressTimer = setTimeout(() => {
+                    isLongPressTriggered = true;
+                    if (wp.marker.getPopup()?.isOpen()) wp.marker.getPopup().remove();
+                    if (wp.type !== 'S' && wp.type !== 'S_Recalc') fetchAndDisplayAlternativeRoutes(wp.id);
+                }, 600); 
+            };
+            const handlePressEnd = () => clearTimeout(pressTimer);
+            
+            markerElement.addEventListener('mousedown', handlePressStart);
+            markerElement.addEventListener('mouseup', handlePressEnd);
+            markerElement.addEventListener('touchstart', handlePressStart, { passive: false });
+            markerElement.addEventListener('touchend', handlePressEnd);
+            wp.marker.on('dragstart', () => clearTimeout(pressTimer));
+            
+            markerElement.addEventListener('click', async (e) => {
+                e.stopPropagation();
+                if (isLongPressTriggered) return;
+                const popup = new mapboxgl.Popup({ maxWidth: "250px", offset: 35, closeButton: true });
+                wp.marker.setPopup(popup).togglePopup();
+                popup.setHTML(`<strong>Punto ${wp.label}</strong><br>Cargando...`);
+                
+                let address = wp.address || await getAddressForWaypoint(wp.lat, wp.lng);
+                wp.address = address;
+
+                let distanceToWaypoint = 0, timeToWaypoint = 0, etaToWaypoint = "--:--";
+                const currentActualWaypointsForPopup = navigationWaypoints.filter(w => w && !w.isInternal && !w.isRecalculatedStart);
+                const actualWaypointIndexInRoute = currentActualWaypointsForPopup.findIndex(awp => awp.id === wp.id);
+                if (navigationCurrentRouteData?.routes?.[0]) {
+                    const route = navigationCurrentRouteData.routes[0];
+                    if (actualWaypointIndexInRoute > 0) {
+                        for (let i = 0; i < actualWaypointIndexInRoute && i < route.legs.length; i++) {
+                            distanceToWaypoint += (route.legs[i].distance || 0);
+                            timeToWaypoint += (route.legs[i].duration || 0);
+                        }
+                    }
+                    if (timeToWaypoint > 0) etaToWaypoint = new Date(Date.now() + timeToWaypoint * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                }
+                const distanciaTexto = `${(distanceToWaypoint / 1000).toFixed(1)} km`;
+                const waypointTotalMinutes = Math.round(timeToWaypoint / 60);
+                const tiempoTexto = `${String(Math.floor(waypointTotalMinutes / 60)).padStart(2, '0')}:${String(waypointTotalMinutes % 60).padStart(2, '0')}`;
+                
+                const alternativesButtonHtml = (wp.type !== 'S' && wp.type !== 'S_Recalc') ? `<button data-waypoint-id="${wp.id}" class="show-alternatives-btn" style="margin-top: 8px; margin-right: 5px; padding: 4px 8px; font-size: 0.8rem; background-color: #ff9800; color: white; border: none; border-radius: 3px; cursor: pointer;">OTRAS RUTAS</button>` : '';
+                const deleteButtonHtml = (wp.type !== 'S_Recalc') ? `<button data-waypoint-id="${wp.id}" class="delete-waypoint-from-popup" style="margin-top: 8px; padding: 4px 8px; font-size: 0.8rem; background-color: #EF4444; color: white; border: none; border-radius: 3px; cursor: pointer;">BORRAR PUNTO</button>` : '';
+
+                popup.setHTML(`<div style="font-family: sans-serif; font-size: 0.9rem; max-width: 230px;"><strong style="font-size: 1rem; color: #333; display: block; margin-bottom: 3px;">Punto ${wp.label}: ${address}</strong><hr style="margin: 3px 0;"><p style="margin: 2px 0;"><strong>Distancia:</strong> ${distanciaTexto}</p><p style="margin: 2px 0;"><strong>Tiempo:</strong> ${tiempoTexto}</p><p style="margin: 2px 0;"><strong>Llegada (ETA):</strong> ${etaToWaypoint}</p><button data-waypoint-id="${wp.id}" class="share-waypoint-from-popup" style="margin-top: 8px; margin-right: 5px; padding: 4px 8px; font-size: 0.8rem; background-color: #007bff; color: white; border: none; border-radius: 3px; cursor: pointer;">Compartir</button>${alternativesButtonHtml}${deleteButtonHtml}</div>`);
+                
+                popup.on('open', () => {
+                    const popupEl = popup.getElement();
+                    popupEl.querySelector('.share-waypoint-from-popup')?.addEventListener('click', (ev) => { ev.stopPropagation(); handleSendToTeslaClick(wp.lat, wp.lng, wp.address); });
+                    popupEl.querySelector('.show-alternatives-btn')?.addEventListener('click', (ev) => { ev.stopPropagation(); fetchAndDisplayAlternativeRoutes(wp.id); wp.marker.getPopup()?.remove(); });
+                    popupEl.querySelector('.delete-waypoint-from-popup')?.addEventListener('click', (ev) => { ev.stopPropagation(); wp.marker.getPopup()?.remove(); handleDeleteWaypointClick(wp.id); });
+                });
+            });
+
+            wp.marker.on('dragend', (event) => {
+                if (isNavigating) return;
+                const newLngLat = event.target.getLngLat();
+                wp.lat = newLngLat.lat;
+                wp.lng = newLngLat.lng;
+                wp.address = '';
+                recalculateAndDrawRoute();
+            });
         }
     });
 
+    // 2. RECORDATORIOS Y RADARES (NO NECESITAN RE-CREACIÓN, SOLO ACTUALIZACIÓN DE ESTILO)
     reminderMapObjects.forEach(obj => {
         if (obj.marker) {
             const reminderData = (JSON.parse(localStorage.getItem('reminders') || '[]')).find(r => r.id === obj.reminderId);
@@ -6154,36 +6225,56 @@ function updateAllIconSizes() {
         }
     });
 
+    // 3. PUNTOS DE RECARGA (PDRs) (NECESITAN RE-CREACIÓN)
     if (Array.isArray(chargingPointsLayer) && lastPdrSearchResults.length > 0) {
         const ZOOM_THRESHOLD = 14;
-        chargingPointsLayer.forEach((marker, index) => {
-            const point = lastPdrSearchResults[index];
+        chargingPointsLayer.forEach(marker => marker.remove());
+        chargingPointsLayer = [];
+
+        lastPdrSearchResults.forEach((point, index) => {
             if (point) {
-                const markerElement = marker.getElement();
-                let newContent;
+                let iconElement;
+                const pointPower = parseFloat(point.power);
+                const bgColor = getChargingPointColorByPower(pointPower);
+                const div = document.createElement('div');
+                div.style.cursor = 'pointer';
+
                 if (currentZoomLevel > ZOOM_THRESHOLD) {
                     const operatorText = point.operator.length > 15 ? point.operator.substring(0, 14) + '...' : point.operator;
                     const priceValue = point.price.replace(/€\/kWh/i, '').trim();
-                    markerElement.className = "charging-point-card";
-                    markerElement.style.backgroundColor = getChargingPointColorByPower(parseFloat(point.power));
-                    markerElement.style.boxShadow = point.isCheapest ? '0 0 15px 5px yellow, inset 0 0 5px 2px yellow' : '0 2px 6px rgba(0,0,0,0.6)';
-                    markerElement.style.borderColor = point.isCheapest ? 'yellow' : 'white';
-                    newContent = `<span class="power">${point.power} <span class="unit-text">kW</span></span><p class="operator">${operatorText}</p><span class="price"><strong>${priceValue} <span class="unit-text">€/kWh</span></strong></span><p class="availability">${point.availabilityText}</p>`;
+                    div.className = "charging-point-card";
+                    div.style.backgroundColor = bgColor;
+                    div.style.boxShadow = point.isCheapest ? '0 0 15px 5px yellow, inset 0 0 5px 2px yellow' : '0 2px 6px rgba(0,0,0,0.6)';
+                    div.style.borderColor = point.isCheapest ? 'yellow' : 'white';
+                    div.innerHTML = `<span class="power">${point.power} <span class="unit-text">kW</span></span><p class="operator">${operatorText}</p><span class="price"><strong>${priceValue} <span class="unit-text">€/kWh</span></strong></span><p class="availability">${point.availabilityText}</p>`;
+                    iconElement = div;
                 } else {
-                    markerElement.className = "charging-point-icon-simple";
-                    markerElement.style.backgroundColor = getChargingPointColorByPower(parseFloat(point.power));
-                    markerElement.style.boxShadow = point.isCheapest ? '0 0 10px 3px yellow' : '0 1px 4px rgba(0,0,0,0.5)';
-                    markerElement.style.borderColor = point.isCheapest ? 'yellow' : 'white';
-                    newContent = `<img src="PNG/pdrs.png" alt="Punto de Recarga">`;
+                    div.className = "charging-point-icon-simple";
+                    div.style.backgroundColor = bgColor;
+                    div.style.boxShadow = point.isCheapest ? '0 0 10px 3px yellow' : '0 1px 4px rgba(0,0,0,0.5)';
+                    div.style.borderColor = point.isCheapest ? 'yellow' : 'white';
+                    div.innerHTML = `<img src="PNG/pdrs.png" alt="Punto de Recarga">`;
+                    iconElement = div;
                 }
-                if(markerElement.innerHTML !== newContent) {
-                    markerElement.innerHTML = newContent;
-                }
+                
+                const newMarker = new mapboxgl.Marker({ element: iconElement, anchor: 'center' })
+                    .setLngLat([point.lon, point.lat])
+                    .addTo(navigationMapInstance);
+
+                newMarker.getElement().addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    const fullPointData = window.lastOcmApiResponse.find(p => p.ID === point.ocmId);
+                    if (fullPointData) {
+                        showChargingPointModal(fullPointData, index);
+                    }
+                });
+                chargingPointsLayer.push(newMarker);
             }
         });
     }
-}
-    
+}    
+
+
 // ===================================================================
 // NOMBRE: redrawReminderMapObjects (CORREGIDA Y RESTAURADA)
 // RESUMEN: Limpia y redibuja todos los recordatorios/radares en el mapa.
