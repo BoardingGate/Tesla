@@ -1,4 +1,4 @@
-MB24-37
+MB24-38
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -7267,7 +7267,7 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
         
         const isRelevantIntersectionManeuver = type !== 'continue' && type !== 'new name' && type !== 'depart' && type !== 'straight';
         if (isNavigating && distanceToNextManeuver < 800 && distanceToNextManeuver >= 100 && isRelevantIntersectionManeuver && (!intersectionPreviewWindow || intersectionPreviewWindow.classList.contains('hidden') || intersectionPreviewWindow.dataset.source !== 'click') && (currentLegIndex + '_' + currentStepIndex) !== lastAutoShownManeuverId) {
-            showIntersectionPreviewMap(nextStepToDisplay, route, false, 6000);
+            showIntersectionPreviewMap(nextStepToDisplay, route, false, 10000);
             lastAutoShownManeuverId = currentLegIndex + '_' + currentStepIndex;
         } else if (intersectionPreviewWindow && !intersectionPreviewWindow.classList.contains('hidden') && intersectionPreviewWindow.dataset.source !== 'click' && (distanceToNextManeuver >= 800 || distanceToNextManeuver < 100 || !isRelevantIntersectionManeuver)) {
             hideIntersectionPreviewMap();
@@ -7314,9 +7314,106 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
             turnIconContainer.style.backgroundColor = 'white';
         }
     }
-}    
+}
 
+// ===================================================================
+// NOMBRE: showIntersectionPreviewMap (VERSIÓN REDISEÑADA Y ROBUSTA)
+// RESUMEN: Muestra un minimapa de la intersección orientado a la marcha, con zoom automático y sin artefactos.
+// ===================================================================
+function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = false, timerDurationMs = null) {
+    const previewWindow = document.getElementById('intersection-preview-map-window');
+    if (!previewWindow || !step || !step.geometry || !route || !navigationMapInstance) {
+        hideIntersectionPreviewMap();
+        return;
+    }
 
+    const DISTANCE_BEFORE_MANEUVER_METERS = 100;
+    const DISTANCE_AFTER_MANEUVER_METERS = 75;
+    const CAR_POSITION_BEFORE_MANEUVER_METERS = 30;
+
+    previewWindow.innerHTML = `<div id="intersection-preview-map-container" style="filter: contrast(110%) brightness(110%);"></div>`;
+    const mapContainerEl = previewWindow.querySelector('#intersection-preview-map-container');
+    
+    previewWindow.style.visibility = 'hidden'; // Ocultar hasta que esté listo
+    previewWindow.classList.remove('hidden');
+    previewWindow.dataset.source = isSimulationContextOrClick ? 'click' : 'auto';
+    if (intersectionPreviewTimer) clearTimeout(intersectionPreviewTimer);
+
+    try {
+        if (intersectionPreviewMap) {
+            try { intersectionPreviewMap.remove(); } catch(e) {}
+            intersectionPreviewMap = null;
+        }
+
+        intersectionPreviewMap = new mapboxgl.Map({
+            container: mapContainerEl,
+            style: 'mapbox://styles/mapbox/satellite-streets-v12',
+            interactive: false,
+            attributionControl: false,
+            accessToken: MAPBOX_ACCESS_TOKEN
+        });
+
+        intersectionPreviewMap.on('load', () => {
+            const maneuverPointCoords = step.maneuver.location;
+            const fullRouteLineString = turf.lineString(route.geometry.coordinates);
+            const maneuverPointOnRoute = turf.nearestPointOnLine(fullRouteLineString, maneuverPointCoords, { units: 'kilometers' });
+            const maneuverDistanceKm = maneuverPointOnRoute.properties.location;
+
+            const startSliceDistanceKm = Math.max(0, maneuverDistanceKm - (DISTANCE_BEFORE_MANEUVER_METERS / 1000));
+            const endSliceDistanceKm = Math.min(turf.length(fullRouteLineString), maneuverDistanceKm + (DISTANCE_AFTER_MANEUVER_METERS / 1000));
+
+            const startSlicePoint = turf.along(fullRouteLineString, startSliceDistanceKm);
+            const endSlicePoint = turf.along(fullRouteLineString, endSliceDistanceKm);
+            const routeSlice = turf.lineSlice(startSlicePoint, endSlicePoint, fullRouteLineString);
+            
+            const routeSourceId = 'intersection-route';
+            intersectionPreviewMap.addSource(routeSourceId, { type: 'geojson', data: routeSlice.geometry });
+            intersectionPreviewMap.addLayer({
+                id: routeSourceId,
+                type: 'line',
+                source: routeSourceId,
+                layout: { 'line-join': 'round', 'line-cap': 'round' },
+                paint: { 'line-color': 'yellow', 'line-width': 8, 'line-opacity': 0.9 }
+            });
+
+            const distanceForCarOnSegment = Math.max(0, DISTANCE_BEFORE_MANEUVER_METERS - CAR_POSITION_BEFORE_MANEUVER_METERS);
+            const carPositionPointTurf = turf.along(routeSlice, distanceForCarOnSegment, { units: 'meters' });
+            const carPositionLngLat = carPositionPointTurf.geometry.coordinates;
+            
+            const vehicleImg = document.createElement('img');
+            vehicleImg.src = "PNG/AVANCE.PNG";
+            vehicleImg.style.cssText = 'width: 40px; height: 40px;';
+
+            intersectionPreviewCarMarker = new mapboxgl.Marker({ element: vehicleImg, anchor: 'center' }).setLngLat(carPositionLngLat).addTo(intersectionPreviewMap);
+
+            let segmentBearing = 0;
+            const lookAheadPointTurf = turf.along(routeSlice, distanceForCarOnSegment + 5, { units: 'meters' });
+            if (lookAheadPointTurf) {
+                segmentBearing = turf.bearing(carPositionPointTurf, lookAheadPointTurf);
+            }
+            
+            intersectionPreviewMap.setBearing(segmentBearing);
+            
+            const bounds = new mapboxgl.LngLatBounds();
+            routeSlice.geometry.coordinates.forEach(coord => bounds.extend(coord));
+            
+            if (!bounds.isEmpty()) {
+                intersectionPreviewMap.fitBounds(bounds, { padding: 40, duration: 0, maxZoom: 18 });
+            }
+            
+            // Hacer visible la tarjeta solo cuando todo está cargado y posicionado
+            previewWindow.style.visibility = 'visible';
+        });
+
+        if (timerDurationMs && timerDurationMs > 0) {
+            intersectionPreviewTimer = setTimeout(hideIntersectionPreviewMap, timerDurationMs);
+        }
+    } catch (error) {
+        console.error("Error al mostrar el mapa de intersección:", error);
+        hideIntersectionPreviewMap();
+    }
+}
+    
     
 // ===================================================================
 // NOMBRE: toggleNavigationState (MODIFICADA - GESTIONA MODO LIBRE)
@@ -10752,109 +10849,7 @@ function cancelAutoStartNav(toastId) {
 window.cancelAutoStartNav = cancelAutoStartNav;
 
 
-  // ===================================================================
-// NOMBRE: showIntersectionPreviewMap (VERSIÓN FINAL CON SATÉLITE Y FITBOUNDS)
-// RESUMEN: Muestra un minimapa de la intersección en modo satélite con zoom ajustado.
-// ===================================================================
-function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = false, timerDurationMs = null) {
-    const previewWindow = document.getElementById('intersection-preview-map-window');
-    if (!previewWindow || !step || !step.geometry || !route || !navigationMapInstance) {
-        hideIntersectionPreviewMap();
-        return;
-    }
-
-    const DISTANCE_BEFORE_MANEUVER_METERS = 100;
-    const DISTANCE_AFTER_MANEUVER_METERS = 75;
-    const CAR_POSITION_BEFORE_MANEUVER_METERS = 30;
-
-    previewWindow.innerHTML = `<div id="intersection-preview-map-container"></div>`;
-    const mapContainerEl = previewWindow.querySelector('#intersection-preview-map-container');
-    
-    previewWindow.classList.remove('hidden');
-    previewWindow.dataset.source = isSimulationContextOrClick ? 'click' : 'auto';
-    if (intersectionPreviewTimer) clearTimeout(intersectionPreviewTimer);
-
-    try {
-        if (intersectionPreviewMap) {
-            try { intersectionPreviewMap.remove(); } catch(e) {}
-            intersectionPreviewMap = null;
-        }
-
-        intersectionPreviewMap = new mapboxgl.Map({
-            container: mapContainerEl,
-            style: 'mapbox://styles/mapbox/satellite-streets-v12',
-            interactive: false,
-            attributionControl: false,
-            accessToken: MAPBOX_ACCESS_TOKEN
-        });
-
-        intersectionPreviewMap.on('load', () => {
-            requestAnimationFrame(() => intersectionPreviewMap.resize());
-
-            const maneuverPointCoords = step.maneuver.location;
-            const fullRouteLineString = turf.lineString(route.geometry.coordinates);
-            const maneuverPointOnRoute = turf.nearestPointOnLine(fullRouteLineString, maneuverPointCoords, { units: 'kilometers' });
-            const maneuverDistanceKm = maneuverPointOnRoute.properties.location;
-
-            const startSliceDistanceKm = Math.max(0, maneuverDistanceKm - (DISTANCE_BEFORE_MANEUVER_METERS / 1000));
-            const endSliceDistanceKm = Math.min(turf.length(fullRouteLineString), maneuverDistanceKm + (DISTANCE_AFTER_MANEUVER_METERS / 1000));
-
-            const startSlicePoint = turf.along(fullRouteLineString, startSliceDistanceKm);
-            const endSlicePoint = turf.along(fullRouteLineString, endSliceDistanceKm);
-            const routeSlice = turf.lineSlice(startSlicePoint, endSlicePoint, fullRouteLineString);
-            
-            const routeSourceId = 'intersection-route';
-            intersectionPreviewMap.addSource(routeSourceId, { type: 'geojson', data: routeSlice.geometry });
-            intersectionPreviewMap.addLayer({
-                id: routeSourceId,
-                type: 'line',
-                source: routeSourceId,
-                layout: { 'line-join': 'round', 'line-cap': 'round' },
-                paint: { 'line-color': 'yellow', 'line-width': 8, 'line-opacity': 0.9 }
-            });
-
-            const distanceForCarOnSegment = Math.max(0, DISTANCE_BEFORE_MANEUVER_METERS - CAR_POSITION_BEFORE_MANEUVER_METERS);
-            const carPositionPointTurf = turf.along(routeSlice, distanceForCarOnSegment, { units: 'meters' });
-            const carPositionLngLat = carPositionPointTurf.geometry.coordinates;
-            
-            const vehicleContainer = document.createElement('div');
-            vehicleContainer.style.cssText = 'width: 40px; height: 40px; position: relative;';
-            const vehicleImg = document.createElement('img');
-            vehicleImg.src = "PNG/AVANCE.PNG";
-            vehicleImg.style.cssText = 'width: 100%; height: 100%; position: absolute;';
-            const maneuverIcon = document.createElement('img');
-            maneuverIcon.src = `https://boardinggate.github.io/Tesla/${getManeuverIconFilename(step.maneuver)}`;
-            maneuverIcon.style.cssText = 'position: absolute; top: -28px; left: 50%; transform: translateX(-50%); width: 36px; height: 36px; background: rgba(255,255,255,0.8); border-radius: 5px; padding: 2px;';
-            vehicleContainer.appendChild(vehicleImg);
-            vehicleContainer.appendChild(maneuverIcon);
-
-            intersectionPreviewCarMarker = new mapboxgl.Marker({ element: vehicleContainer, anchor: 'center' }).setLngLat(carPositionLngLat).addTo(intersectionPreviewMap);
-
-            let segmentBearing = 0;
-            const lookAheadPointTurf = turf.along(routeSlice, distanceForCarOnSegment + 5, { units: 'meters' });
-            if (lookAheadPointTurf) {
-                segmentBearing = turf.bearing(carPositionPointTurf, lookAheadPointTurf);
-            }
-            
-            const finalRotation = segmentBearing - 90;
-            vehicleImg.style.transform = `rotate(${finalRotation}deg)`;
-            
-            const bounds = new mapboxgl.LngLatBounds();
-            routeSlice.geometry.coordinates.forEach(coord => bounds.extend(coord));
-            
-            if (!bounds.isEmpty()) {
-                intersectionPreviewMap.fitBounds(bounds, { padding: 40, duration: 0, maxZoom: 18 });
-            }
-        });
-
-        if (timerDurationMs && timerDurationMs > 0) {
-            intersectionPreviewTimer = setTimeout(hideIntersectionPreviewMap, timerDurationMs);
-        }
-    } catch (error) {
-        console.error("Error al mostrar el mapa de intersección:", error);
-        hideIntersectionPreviewMap();
-    }
-}  
+ 
     
 // ===================================================================
 // NOMBRE: showIframeModal
