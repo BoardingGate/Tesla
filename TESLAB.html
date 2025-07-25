@@ -1,4 +1,4 @@
-NMB24-49
+NMB24-50
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -5489,16 +5489,19 @@ class CompassAndStatsControl {
         return originalToFixed.call(this, digits);
     };
  
-    
+
     let lastGpsUpdateTime = 0;
     let markerAnimationState = {
-    animationFrameId: null,
-    currentLngLat: null,
-    targetLngLat: null,
-    currentRotation: 0,
-    targetRotation: 0,
-    lastTimestamp: null
-     };
+        animationFrameId: null,
+        currentLngLat: null,
+        targetLngLat: null,
+        currentIconRotation: 0,
+        targetIconRotation: 0,
+        currentMapBearing: 0,
+        targetMapBearing: 0,
+        lastTimestamp: null
+    };
+
     let isAnimatingZoom = false;  let mapViewMode = 'static'; 
     let isSimulatingFreeDrive = false; 
     let isFreeDriveActive = false;
@@ -19691,8 +19694,57 @@ function animateMarker(timestamp) {
 }
 
 // ===================================================================
-// NOMBRE: updateInitialUserPosition (VERSIÓN CON ANIMACIÓN SUAVE Y ROTACIÓN CORREGIDA FINAL)
-// RESUMEN: Actualiza la posición del usuario, iniciando animaciones fluidas para el icono y la cámara, y aplicando la rotación correcta al icono del coche.
+// NOMBRE: animateMarkerAndMap (NUEVA FUNCIÓN COMBINADA)
+// RESUMEN: Bucle de animación para mover/rotar el icono y rotar el mapa de forma fluida.
+// ===================================================================
+function animateMarkerAndMap(timestamp) {
+    if (!markerAnimationState.lastTimestamp) {
+        markerAnimationState.lastTimestamp = timestamp;
+        markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
+        return;
+    }
+
+    const deltaTime = timestamp - markerAnimationState.lastTimestamp;
+    markerAnimationState.lastTimestamp = timestamp;
+
+    const LERP_RATE = 0.005; 
+    const ROTATION_LERP_RATE = 0.006;
+    const lerpFactor = 1.0 - Math.exp(-deltaTime * LERP_RATE);
+    const rotationLerpFactor = 1.0 - Math.exp(-deltaTime * ROTATION_LERP_RATE);
+
+    // Interpolar posición del icono
+    if (markerAnimationState.currentLngLat && markerAnimationState.targetLngLat) {
+        markerAnimationState.currentLngLat.lng += (markerAnimationState.targetLngLat.lng - markerAnimationState.currentLngLat.lng) * lerpFactor;
+        markerAnimationState.currentLngLat.lat += (markerAnimationState.targetLngLat.lat - markerAnimationState.currentLngLat.lat) * lerpFactor;
+        if (initialUserLocationMarker) {
+            initialUserLocationMarker.setLngLat(markerAnimationState.currentLngLat);
+        }
+    }
+    
+    // Interpolar rotación del icono
+    let deltaIconRotation = markerAnimationState.targetIconRotation - markerAnimationState.currentIconRotation;
+    if (deltaIconRotation > 180) deltaIconRotation -= 360;
+    if (deltaIconRotation < -180) deltaIconRotation += 360;
+    markerAnimationState.currentIconRotation += deltaIconRotation * rotationLerpFactor;
+    if (initialUserLocationMarker) {
+        initialUserLocationMarker.setRotation(markerAnimationState.currentIconRotation);
+    }
+
+    // Interpolar rotación (bearing) del mapa
+    let deltaMapBearing = markerAnimationState.targetMapBearing - markerAnimationState.currentMapBearing;
+    if (deltaMapBearing > 180) deltaMapBearing -= 360;
+    if (deltaMapBearing < -180) deltaMapBearing += 360;
+    markerAnimationState.currentMapBearing += deltaMapBearing * rotationLerpFactor;
+    if (navigationMapInstance && (mapViewMode === 'heading' || mapViewMode === 'perspective')) {
+        navigationMapInstance.setBearing(markerAnimationState.currentMapBearing);
+    }
+    
+    markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
+}
+
+// ===================================================================
+// NOMBRE: updateInitialUserPosition (VERSIÓN CON ANIMACIÓN SUAVE PARA TODO)
+// RESUMEN: Actualiza los destinos de animación para el icono y el mapa, y anima la cámara.
 // ===================================================================
 function updateInitialUserPosition(coords, mapInstanceToUse) {
     if (!mapInstanceToUse || !coords || typeof coords.latitude !== 'number' || typeof coords.longitude !== 'number') {
@@ -19714,8 +19766,6 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
             .addTo(mapInstanceToUse);
         
         markerAnimationState.currentLngLat = lngLat;
-        markerAnimationState.targetLngLat = lngLat;
-        lastGpsUpdateTime = Date.now();
     }
     
     let effectiveHeading = null;
@@ -19731,14 +19781,23 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
         }
     }
 
-    const currentHeading = (effectiveHeading !== null) ? effectiveHeading : (currentMapBearing || 0);
-    // SOLUCIÓN: Corregir la rotación del icono restando 90 grados por su orientación intrínseca.
+    const currentHeading = (effectiveHeading !== null) ? effectiveHeading : (markerAnimationState.currentMapBearing || 0);
     const iconRotation = currentHeading - 90;
     
+    // Actualizar los OBJETIVOS de la animación
     markerAnimationState.targetLngLat = lngLat;
-    markerAnimationState.targetRotation = iconRotation;
+    markerAnimationState.targetIconRotation = iconRotation;
+    markerAnimationState.targetMapBearing = currentHeading;
+    
+    // Si es la primera vez, establecer los valores actuales instantáneamente
+    if (markerAnimationState.lastTimestamp === null) {
+        markerAnimationState.currentIconRotation = iconRotation;
+        markerAnimationState.currentMapBearing = currentHeading;
+    }
+    
+    // Iniciar el bucle de animación si no está corriendo
     if (!markerAnimationState.animationFrameId) {
-        markerAnimationState.animationFrameId = requestAnimationFrame(animateMarker);
+        markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
     }
 
     if (compassAndModeControl) {
@@ -19780,6 +19839,7 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
         lastGpsUpdateTime = now;
 
         const targetZoom = handleProgressiveManeuverZoom(navigationCurrentRouteData?.routes?.[0]?.legs?.[currentLegIndexNav]?.steps?.[currentStepIndexNav], distanceToNextManeuverOSRM);
+        
         const viewOptions = {
             center: lngLat,
             duration: animationDuration,
@@ -19792,14 +19852,12 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
         viewOptions.padding = { top: topPadding, bottom: 0, left: 0, right: 0 };
         
         if (targetZoom !== null) viewOptions.zoom = targetZoom;
-        if (mapViewMode === 'heading' || mapViewMode === 'perspective') viewOptions.bearing = currentHeading;
+        // La rotación (bearing) ya no se controla aquí, sino en el bucle de animación
         if (mapViewMode === 'perspective') viewOptions.pitch = 60;
         
         navigationMapInstance.easeTo(viewOptions);
     }
 }
-
-
     
 // ===================================================================
 // NOMBRE: setNavigationMapClickHandler
