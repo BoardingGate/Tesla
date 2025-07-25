@@ -5509,7 +5509,28 @@ class CompassAndStatsControl {
         }
         return originalToFixed.call(this, digits);
     };
- 
+
+    // ===================================================================
+// NOMBRE: Constantes Globales de Mapa
+// RESUMEN: Define los estilos y modos de vista del mapa para uso global.
+// ===================================================================
+    const MAP_STYLES = {
+        "HÍBRIDO": "mapbox://styles/mapbox/satellite-streets-v12",
+        "SATÉLITE": "mapbox://styles/mapbox/satellite-v9",
+        "CALLES": "mapbox://styles/mapbox/streets-v12"
+    };
+    const MAP_LEGACY_NAME_MAP = {
+        "Satélite + Calles": "HÍBRIDO",
+        "Satélite Puro": "SATÉLITE",
+        "Mapa Normal": "CALLES"
+    };
+    const MAP_VIEW_MODES = {
+        'NORTE': {pitch: 0, bearing: 0, mode: 'static'},
+        'AVANCE': {pitch: 0, bearing: null, mode: 'heading'},
+        '3D': {pitch: 60, bearing: null, mode: 'perspective'}
+    };
+    let isInitialRouteOverviewActive = false; // Flag para controlar el estado de previsualización
+
 
     let lastGpsUpdateTime = 0;
     let markerAnimationState = {
@@ -6405,10 +6426,9 @@ function handleAddRadarHereClick(button) {
     });
 }
 
-    
-// ===================================================================
-// NOMBRE: toggleNavigationState (MODIFICADA - GESTIONA MODO LIBRE)
-// RESUMEN: Inicia/detiene la navegación normal o el modo libre, y maneja el estado de pausa.
+ // ===================================================================
+// NOMBRE: toggleNavigationState (MODIFICADA - GESTIONA VISTA PREVIA INICIAL)
+// RESUMEN: Inicia/detiene la navegación, gestionando una vista previa inicial de 15s.
 // ===================================================================
 async function toggleNavigationState(isRecalculationStop = false) {
     const startNavButton = document.getElementById('start-navigation-button');
@@ -6421,7 +6441,9 @@ async function toggleNavigationState(isRecalculationStop = false) {
             handleFreeDriveCancellation();
         }
         
+        isInitialRouteOverviewActive = false; // Asegurarse de que el flag se limpie al parar
         if (initialZoomTimeout) clearTimeout(initialZoomTimeout);
+        
         isAwaitingInitialZoomEnd = false;
         zoomLevelBeforeInitialOverview = null;
         lastDisplayedManeuverIcon = null; 
@@ -6517,7 +6539,6 @@ async function toggleNavigationState(isRecalculationStop = false) {
             tripInitialDurationSec = routeData.duration;
             tripInitialDistanceMeters = routeData.distance;
             tripInitialOverallEtaTime = new Date(Date.now() + routeData.duration * 1000);
-            
             if (routeData.legs && routeData.legs.length > 0) {
                 currentStageInitialExpectedEtaTime = new Date(Date.now() + routeData.legs[0].duration * 1000);
             }
@@ -6534,19 +6555,6 @@ async function toggleNavigationState(isRecalculationStop = false) {
         lastPositionForStats = {...navigationCurrentLocation};
         accumulatedDeviationMs = 0;
         
-        if (maxSpeedMarkerObjects && maxSpeedMarkerObjects.length > 0) {
-            maxSpeedMarkerObjects.forEach(marker => marker.remove());
-            maxSpeedMarkerObjects = [];
-        }
-        if (speedMilestoneMarkerObjects && speedMilestoneMarkerObjects.length > 0) {
-            speedMilestoneMarkerObjects.forEach(marker => marker.remove());
-            speedMilestoneMarkerObjects = [];
-        }
-        lastSpeedMilestone = 0;
-        if (compassAndModeControl) {
-            compassAndModeControl.updateMaxSpeed(maxSpeedDuringTrip); 
-        }
-        
         showToast("Navegación iniciada. Esperando movimiento...", "success");
         currentGraphMode = localStorage.getItem(GRAPH_STATE_KEY) || 'Desviación ETA';
         initializeNavigationGraph();
@@ -6554,51 +6562,77 @@ async function toggleNavigationState(isRecalculationStop = false) {
         updateNavigationButtonColor();
         
         const radaresCheckbox = document.getElementById('radares-ruta-checkbox');
-        if (radaresCheckbox && radaresCheckbox.checked) {
-            toggleRadaresRuta(true);
-        }
+        if (radaresCheckbox && radaresCheckbox.checked) { toggleRadaresRuta(true); }
         const tareasCheckbox = document.getElementById('tareas-ruta-checkbox');
-        if (tareasCheckbox && tareasCheckbox.checked) {
-            toggleTareasRuta(true);
-        }
+        if (tareasCheckbox && tareasCheckbox.checked) { toggleTareasRuta(true); }
 
         const firstDestination = navigationWaypoints.find(wp => wp && !wp.isInternal && wp.type !== 'S' && !wp.visited);
-        if (firstDestination) {
-            fetchAndDisplayAlternativeRoutes(firstDestination.id);
-        }
+        if (firstDestination) { fetchAndDisplayAlternativeRoutes(firstDestination.id); }
 
         isAwaitingInitialZoomEnd = true;
         
         if (navigationMapInstance) {
-            zoomLevelBeforeInitialOverview = navigationMapInstance.getZoom();
-            const routeSource = navigationMapInstance.getSource('route');
-            if (routeSource && routeSource._data && 
-                routeSource._data.geometry && 
-                routeSource._data.geometry.coordinates && 
-                routeSource._data.geometry.coordinates.length > 0) {
-                 const routeBounds = new mapboxgl.LngLatBounds();
-                 routeSource._data.geometry.coordinates.forEach(coord => routeBounds.extend(coord));
-                 if (!routeBounds.isEmpty()) {
-                     navigationMapInstance.fitBounds(routeBounds, { padding: 40, animate: true, duration: 2500 });
-                 }
-            }
+            // *** INICIO DE LA LÓGICA DE VISTA PREVIA ***
+            isInitialRouteOverviewActive = true;
+            const originalLayerName = localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO";
+            const originalViewMode = localStorage.getItem(MAP_VIEW_MODE_KEY) || 'static';
+
+            navigationMapInstance.setStyle(MAP_STYLES.CALLES);
+            navigationMapInstance.easeTo({ pitch: 0, bearing: 0, duration: 1000 });
+
+            navigationMapInstance.once('style.load', () => {
+                reAddCustomMapLayersAndSources(navigationMapInstance);
+
+                zoomLevelBeforeInitialOverview = navigationMapInstance.getZoom();
+                const routeSource = navigationMapInstance.getSource('route');
+                if (routeSource && routeSource._data && routeSource._data.geometry && routeSource._data.geometry.coordinates.length > 0) {
+                     const routeBounds = new mapboxgl.LngLatBounds();
+                     routeSource._data.geometry.coordinates.forEach(coord => routeBounds.extend(coord));
+                     if (!routeBounds.isEmpty()) {
+                         navigationMapInstance.fitBounds(routeBounds, { padding: 40, animate: true, duration: 2500 });
+                     }
+                }
+
+                initialZoomTimeout = setTimeout(() => {
+                    if (!isNavigating) { // Si el usuario canceló, no hacer nada
+                        isInitialRouteOverviewActive = false;
+                        return;
+                    }
+
+                    isInitialRouteOverviewActive = false;
+                    isAwaitingInitialZoomEnd = false;
+                    clearAlternativeRoutesDisplay();
+                    shouldCenterOnUser = true; 
+                    navigationFollowUser = true;
+                    navigationTargetZoom = 17;
+
+                    // Restaurar estilo y vista originales
+                    const finalLayerName = MAP_LEGACY_NAME_MAP[originalLayerName] || originalLayerName;
+                    const originalStyleUrl = MAP_STYLES[finalLayerName] || MAP_STYLES["HÍBRIDO"];
+                    navigationMapInstance.setStyle(originalStyleUrl);
+
+                    navigationMapInstance.once('style.load', () => {
+                        reAddCustomMapLayersAndSources(navigationMapInstance);
+                        const modeDetails = MAP_VIEW_MODES[Object.keys(MAP_VIEW_MODES).find(key => MAP_VIEW_MODES[key].mode === originalViewMode)] || MAP_VIEW_MODES.NORTE;
+                        const restoreOptions = { pitch: modeDetails.pitch };
+                        if (modeDetails.mode === 'heading' || modeDetails.mode === 'perspective') {
+                            restoreOptions.bearing = (navigationCurrentLocation && navigationCurrentLocation.heading !== null) ? navigationCurrentLocation.heading : 0;
+                        } else {
+                            restoreOptions.bearing = modeDetails.bearing;
+                        }
+                        navigationMapInstance.easeTo(restoreOptions);
+                    });
+                }, 15000);
+            });
+            // *** FIN DE LA LÓGICA DE VISTA PREVIA ***
         }
-        
-        initialZoomTimeout = setTimeout(() => {
-            isAwaitingInitialZoomEnd = false;
-            if (isNavigating) {
-                clearAlternativeRoutesDisplay();
-                shouldCenterOnUser = true; 
-                navigationFollowUser = true;
-                navigationTargetZoom = 17;
-            }
-        }, 15000);
     }
     updateStartNavigationButtonState();
     updateNavigationButtonColor();
     actualizarContadorRadares(radaresEnRutaActual.length);
     actualizarContadorTareas(tareasEnRutaActual.length);
-}
+}   
+
 
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 // NOMBRE: findChargingPointsOnRoute (CORREGIDA - ROBUSTA CONTRA ERUDA)
@@ -7343,11 +7377,15 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     }
 }
 
+
+
 // ===================================================================
-// NOMBRE: showIntersectionPreviewMap (VERSIÓN FINAL CON CAPAS CORREGIDAS - LEAFLET)
-// RESUMEN: Muestra un minimapa detallado de la intersección, asegurando su correcta inicialización y la capa de mapa correcta.
+// NOMBRE: showIntersectionPreviewMap (VERSIÓN FINAL A PRUEBA DE FALLOS - LEAFLET)
+// RESUMEN: Muestra un minimapa detallado. Si falla al generar la vista, se oculta automáticamente.
 // ===================================================================
 function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = false, timerDurationMs = null) {
+    if (isInitialRouteOverviewActive) return;
+
     const previewWindow = document.getElementById('intersection-preview-map-window');
     const progressBarEl = document.getElementById('navigation-bottom-progress-bar');
     if (!previewWindow || !step || !step.geometry || !route || !navigationMapInstance) {
@@ -7411,7 +7449,6 @@ function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = fa
         const layerNameLower = currentMapLayerName.toLowerCase();
         let tileLayerInstance;
 
-        // *** INICIO DE LA CORRECCIÓN DE LÓGICA DE CAPAS ***
         if (layerNameLower.includes("satélite puro") || layerNameLower.includes("satélite")) {
             tileLayerInstance = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { attribution: 'Tiles © Esri' });
         } else if (layerNameLower.includes("híbrido") || layerNameLower.includes("satélite + calles")) {
@@ -7423,10 +7460,9 @@ function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = fa
                 intersectionPreviewMap.getPane(labelsPaneName).style.pointerEvents = 'none';
             }
             L.tileLayer('https://{s}.basemaps.cartocdn.com/light_only_labels/{z}/{x}/{y}{r}.png', { attribution: '© OSM © CARTO', pane: labelsPaneName }).addTo(intersectionPreviewMap);
-        } else { // 'CALLES' o cualquier otro valor
+        } else { 
             tileLayerInstance = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap' });
         }
-        // *** FIN DE LA CORRECCIÓN DE LÓGICA DE CAPAS ***
         
         tileLayerInstance.addTo(intersectionPreviewMap);
 
@@ -7440,6 +7476,13 @@ function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = fa
         const endSlicePoint = turf.along(fullRouteLineString, endSliceDistanceKm);
         const routeSlice = turf.lineSlice(startSlicePoint, endSlicePoint, fullRouteLineString);
         const routeSegmentCoords = routeSlice.geometry.coordinates.map(c => [c[1], c[0]]);
+
+        // *** INICIO DE LA CORRECCIÓN DE COMPORTAMIENTO ***
+        // Si el segmento de ruta no es válido (por ejemplo, es un solo punto), abortamos.
+        if (!routeSegmentCoords || routeSegmentCoords.length < 2) {
+            throw new Error("El segmento de ruta para la vista previa de la intersección es inválido.");
+        }
+        // *** FIN DE LA CORRECCIÓN DE COMPORTAMIENTO ***
 
         intersectionPreviewRouteLayer = L.polyline(routeSegmentCoords, { color: 'orange', weight: 10, opacity: 1 }).addTo(intersectionPreviewMap);
         intersectionPreviewManeuverMarker = L.circleMarker(maneuverPoint, { radius: 5, color: 'white', weight: 1, fillColor: 'blue', fillOpacity: 1, zIndexOffset: 1000 }).addTo(intersectionPreviewMap);
@@ -7517,7 +7560,6 @@ function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = fa
 }
     
             
-//A BORRAR SI LA OTRA VA
 // ===================================================================
 // NOMBRE: BACKUPshowIntersectionPreviewMap (VERSIÓN FINAL CON REDIMENSIONAMIENTO FORZADO Y CORRECCIÓN DE ROTACIÓN)
 // RESUMEN: Muestra un minimapa de intersección orientado, con zoom y encuadre correctos, eliminando artefactos.
