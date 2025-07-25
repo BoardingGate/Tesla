@@ -1,4 +1,4 @@
-NMB24-61
+NMB24-62
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -7386,7 +7386,7 @@ async function toggleNavigationState(isRecalculationStop = false) {
             handleFreeDriveCancellation();
         }
         
-        isInitialRouteOverviewActive = false; // --> MODIFICADO: Asegurarse de que el flag se limpie al parar
+        isInitialRouteOverviewActive = false;
         if (initialZoomTimeout) clearTimeout(initialZoomTimeout);
         
         isAwaitingInitialZoomEnd = false;
@@ -7499,6 +7499,7 @@ async function toggleNavigationState(isRecalculationStop = false) {
         minAltitudeDuringTrip = Infinity; 
         lastPositionForStats = {...navigationCurrentLocation};
         accumulatedDeviationMs = 0;
+        accumulatedDistanceBeforeCurrentSegment = 0; // <-- RESETEO IMPORTANTE al iniciar una nueva navegación
         
         showToast("Navegación iniciada. Esperando movimiento...", "success");
         currentGraphMode = localStorage.getItem(GRAPH_STATE_KEY) || 'Desviación ETA';
@@ -7517,8 +7518,8 @@ async function toggleNavigationState(isRecalculationStop = false) {
         isAwaitingInitialZoomEnd = true;
         
         if (navigationMapInstance) {
-            isInitialRouteOverviewActive = true; // --> AÑADIDO
-            setMapImmersiveMode(true); // --> AÑADIDO: Activar modo inmersivo
+            isInitialRouteOverviewActive = true;
+            setMapImmersiveMode(true);
 
             const originalLayerName = localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO";
             const originalViewMode = localStorage.getItem(MAP_VIEW_MODE_KEY) || 'static';
@@ -7542,7 +7543,7 @@ async function toggleNavigationState(isRecalculationStop = false) {
                 initialZoomTimeout = setTimeout(() => {
                     if (!isNavigating) {
                         isInitialRouteOverviewActive = false;
-                        setMapImmersiveMode(false); // --> AÑADIDO: Asegurar desactivación si se cancela
+                        setMapImmersiveMode(false);
                         return;
                     }
 
@@ -7551,9 +7552,9 @@ async function toggleNavigationState(isRecalculationStop = false) {
                     clearAlternativeRoutesDisplay();
                     shouldCenterOnUser = true; 
                     navigationFollowUser = true;
-                    navigationTargetZoom = 18.5; // --> MODIFICADO: Zoom más cercano
+                    navigationTargetZoom = 18.5;
 
-                    setMapImmersiveMode(false); // --> AÑADIDO: Desactivar modo inmersivo
+                    setMapImmersiveMode(false);
 
                     const finalLayerName = MAP_LEGACY_NAME_MAP[originalLayerName] || originalLayerName;
                     const originalStyleUrl = MAP_STYLES[finalLayerName] || MAP_STYLES["HÍBRIDO"];
@@ -20615,8 +20616,8 @@ function showNavigationMapHelpModal() {
 
 
 // ===================================================================
-// NOMBRE: recalculateAndDrawRoute (VERSIÓN CORREGIDA Y ROBUSTA)
-// RESUMEN: Obtiene y dibuja la ruta, asegurando que los datos son válidos y previniendo errores.
+// NOMBRE: recalculateAndDrawRoute (VERSIÓN CON CÁLCULO DE DISTANCIA TOTAL CORREGIDO)
+// RESUMEN: Recalcula la ruta y ajusta la distancia total del viaje para reflejar el desvío.
 // ===================================================================
 async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
     if (isRecalculatingRoute) {
@@ -20625,12 +20626,20 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
     isRecalculatingRoute = true;
     
     const recalculateToastId = "recalculating-route-toast";
-    showToast("Calculando ruta...", "info", 0, false, recalculateToastId);
+    showToast("Recalculando ruta...", "info", 0, false, recalculateToastId);
 
     try {
+        if (preserveAccumulatedStats && isNavigating && navigationCurrentRouteData?.routes?.[0]) {
+            const previousLegIndex = currentLegIndexNav -1;
+            if (previousLegIndex >= 0 && navigationCurrentRouteData.routes[0].legs[previousLegIndex]) {
+                 const completedLeg = navigationCurrentRouteData.routes[0].legs[previousLegIndex];
+                 accumulatedDistanceBeforeCurrentSegment += completedLeg.distance || 0;
+            }
+        }
+
         let waypointsForAPI = [];
         if (isNavigating && navigationCurrentLocation) {
-            waypointsForAPI.push({ lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude });
+            waypointsForAPI.push({ lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude, isRecalculatedStart: true });
             const unvisitedWaypoints = navigationWaypoints.filter(wp => !wp.visited);
             waypointsForAPI.push(...unvisitedWaypoints);
         } else {
@@ -20652,13 +20661,17 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
             navigationCurrentRouteData = data;
             drawRouteOnMap(data.routes[0]);
             
-            // Actualizar UI y estado interno con los nuevos datos de la ruta
+            // --> LÍNEA CLAVE: Actualizamos la distancia total del viaje.
+            if (isNavigating && preserveAccumulatedStats) {
+                const newRemainingDistance = data.routes[0].distance;
+                tripInitialDistanceMeters = totalDistanceTravelledForStats + newRemainingDistance;
+            }
+            
             if (!preserveAccumulatedStats) {
-                // Resetear estadísticas si no se preservan
+                accumulatedDistanceBeforeCurrentSegment = 0;
                 totalDistanceTravelledForStats = 0;
                 maxDistanceReachedOnRoute = 0;
                 navigationStartTimeForStats = isNavigating ? new Date() : null;
-                // etc.
             }
             
             const newRouteData = data.routes[0];
@@ -20677,7 +20690,7 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
             
             const existingToast = document.getElementById(recalculateToastId);
             if(existingToast) existingToast.remove();
-            showToast("Ruta calculada correctamente.", "success");
+            showToast("Ruta recalculada correctamente.", "success");
 
         } else {
             throw new Error("La API no devolvió ninguna ruta.");
@@ -20687,7 +20700,6 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
         if(existingToast) existingToast.remove();
         showToast(`Error al calcular ruta: ${error.message}`, "error");
         
-        // Limpiar estado en caso de error
         drawRouteOnMap(null);
         navigationCurrentRouteData = null;
         hideNavigationUI();
@@ -20699,6 +20711,7 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
     }
 }
 
+    
     
     // ===================================================================
     // NOMBRE: formatPhotonFeatureName
