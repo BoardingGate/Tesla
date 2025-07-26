@@ -1,4 +1,4 @@
-F18
+F19
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -4940,7 +4940,14 @@ p.ocm-price-info {
     display: none; /* Oculto por defecto, JavaScript lo mostrará */
     transition: opacity 0.3s ease-in-out;
 }
-
+/* === INICIO: CSS PARA OCULTAR MODAL DEL MAPA SIN ROMPER EVENTOS === */
+#reminders-location-map-modal.map-modal-hidden {
+    display: flex; /* Mantenemos el display para el layout interno */
+    visibility: hidden;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.3s ease, visibility 0s linear 0.3s;
+}
 
 </style>
 
@@ -18321,8 +18328,8 @@ function initializeNavigationGraph() {
 }
 
 // ===================================================================
-// NOMBRE: closeNavigationMap (VERSIÓN FINAL CON MODAL PERSISTENTE)
-// RESUMEN: Cierra la vista del mapa simplemente ocultando el modal que ya existe en el HTML. Preserva la instancia del mapa y todos los eventos.
+// NOMBRE: closeNavigationMap (VERSIÓN FINAL CON MODAL PERSISTENTE Y VISIBILITY)
+// RESUMEN: Cierra la vista del mapa ocultando el modal con 'visibility' para preservar los eventos.
 // ===================================================================
 function closeNavigationMap(force = false) {
     if (manualZoomTimeout) { clearTimeout(manualZoomTimeout); manualZoomTimeout = null; }
@@ -18348,10 +18355,10 @@ function closeNavigationMap(force = false) {
     if (gpsRetryTimeoutId) { clearTimeout(gpsRetryTimeoutId); gpsRetryTimeoutId = null; }
     gpsRetryAttempt = 0;
     
-    // --- LÓGICA DE CIERRE SIMPLIFICADA ---
+    // --- LÓGICA DE CIERRE SIMPLIFICADA Y CORREGIDA ---
     const mapModalElement = document.getElementById('reminders-location-map-modal');
     if (mapModalElement) {
-        mapModalElement.classList.add('hidden'); // ¡Simplemente ocultamos el modal!
+        mapModalElement.classList.add('map-modal-hidden'); // ¡Simplemente ocultamos el modal con la nueva clase!
     }
     
     // El resto de la limpieza de estados es correcta
@@ -20067,8 +20074,8 @@ function getRouteStyleProperties() {
 }
 
 // ===================================================================
-// NOMBRE: openNavigationMap (VERSIÓN FINAL CON MODAL PERSISTENTE Y REASIGNACIÓN SEGURA DE LISTENERS)
-// RESUMEN: Activa el modal del mapa. Llama siempre a assignMapButtonListeners para garantizar que los eventos están activos, mientras que la propia función de listeners previene duplicados.
+// NOMBRE: openNavigationMap (VERSIÓN FINAL CON MODAL PERSISTENTE Y VISIBILITY)
+// RESUMEN: Activa el modal del mapa usando 'visibility' y 'opacity' para no romper la capa de eventos de Mapbox.
 // ===================================================================
 function openNavigationMap() {
     isGeolocated = false;
@@ -20096,20 +20103,16 @@ function openNavigationMap() {
         return;
     }
     
-    // Mostramos el modal
-    mapModal.classList.remove('hidden');
+    // ¡CAMBIO CLAVE! Usamos nuestra nueva clase para mostrarlo.
+    mapModal.classList.remove('map-modal-hidden');
 
     if (navigationMapInstance) {
-        // --- REABRIENDO EL MAPA ---
         showToast("Reabriendo sesión de mapa existente.", "info", 2000);
         handleLoadOrDeleteRouteClick(null);
-
         setTimeout(() => {
             if (navigationMapInstance) navigationMapInstance.resize();
         }, 100);
-        
     } else {
-        // --- ABRIENDO POR PRIMERA VEZ ---
         try {
             const mapActualContainer = document.getElementById('mapbox-map-actual-container');
             const savedLayerName = localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO";
@@ -20128,8 +20131,80 @@ function openNavigationMap() {
             compassAndModeControl = new CompassAndStatsControl();
             navigationMapInstance.addControl(compassAndModeControl, 'bottom-left');
             
+            assignMapButtonListeners();
+            
             navigationMapInstance.on('style.load', () => { loadAndAddMapImages(navigationMapInstance).then(() => reAddCustomMapLayersAndSources(navigationMapInstance)); });
-            navigationMapInstance.on('load', async function() { /* ... tu lógica de 'load' original ... */ });
+            
+            navigationMapInstance.on('load', async function() {
+                // ... Tu lógica de 'load' se mantiene intacta ...
+                try {
+                    await loadAndAddMapImages(navigationMapInstance);
+                    reAddCustomMapLayersAndSources(navigationMapInstance);
+                    const zoomContainer = document.getElementById('zoom-control-container');
+                    if (zoomContainer) zoomContainer.style.display = 'flex';
+                    mapPreviousZoomLevelForPDRs = navigationMapInstance.getZoom();
+                    navigationMapInstance.on('zoomend', updateAllIconSizes);
+                    setupAdvancedZoomControls();
+                    toggleMapHeaderRowsVisibility(mapHeaderButtonsVisible);
+                    navigationMapInstance.on('click', (e) => {
+                        const interactiveLayers = ['reminders-circles-layer', 'reminders-icons-layer', 'pdr-simple-circle-layer', 'pdr-cards-layer-bg', 'pdr-simple-text-layer', 'reminders-radar-text-layer', 'pdr-cards-layer-bg-halo', 'traffic-alerts-layer'];
+                        const features = navigationMapInstance.queryRenderedFeatures(e.point, { layers: interactiveLayers });
+                        if (features.length > 0) {
+                            const topFeature = features[0];
+                            const layerId = topFeature.layer.id;
+                            if (layerId.startsWith('reminders-')) {
+                                if (topFeature.properties.reminderId) {
+                                    showReminderActionModal(topFeature.properties.reminderId);
+                                    return; 
+                                }
+                            } else if (layerId.startsWith('pdr-')) {
+                                const pdrFeature = features.find(f => f.layer.id.startsWith('pdr-') && f.properties.ocmId);
+                                if (pdrFeature) {
+                                    const fullPointData = window.lastOcmApiResponse.find(p => p.ID === pdrFeature.properties.ocmId);
+                                    if (fullPointData) {
+                                        showChargingPointModal(fullPointData, pdrFeature.properties.index);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                        if (navigationMapClickHandler) {
+                            navigationMapClickHandler(e);
+                        }
+                    });
+                    const interactiveLayersForHover = ['reminders-circles-layer', 'reminders-icons-layer', 'pdr-simple-circle-layer', 'pdr-cards-layer-bg', 'traffic-alerts-layer'];
+                    navigationMapInstance.on('mouseenter', interactiveLayersForHover, () => {
+                        navigationMapInstance.getCanvas().style.cursor = 'pointer';
+                    });
+                    navigationMapInstance.on('mouseleave', interactiveLayersForHover, () => {
+                        navigationMapInstance.getCanvas().style.cursor = '';
+                    });
+                    setNavigationMapClickHandler();
+                    getCurrentLocation(
+                        (currentPos) => {
+                            const loadingToastGPS = document.getElementById("gps-init-toast");
+                            if (loadingToastGPS) loadingToastGPS.remove();
+                            showToast("Vehículo localizado. Controles del mapa activados.", "success");
+                            toggleMapControls(true);
+                            navigationCurrentLocation = currentPos;
+                            updateInitialUserPosition(currentPos, navigationMapInstance);
+                            if (navigationWaypoints.length === 0) {
+                                navigationMapInstance.flyTo({ center: [currentPos.longitude, currentPos.latitude], zoom: 15 });
+                            }
+                            startGpsWatching(); 
+                        },
+                        (errorMsg) => {
+                            const loadingToastGPS = document.getElementById("gps-init-toast");
+                            if (loadingToastGPS) loadingToastGPS.remove();
+                            showToast(`No se pudo obtener tu ubicación. Planificación manual activada.`, "warning");
+                            toggleMapControls(true);
+                            startGpsWatching(); 
+                        }
+                    );
+                } catch (error) {
+                    showToast("Error crítico al cargar recursos del mapa.", "error");
+                }
+            });
         } catch (error) {
              const errorContainer = document.getElementById('mapbox-map-actual-container'); 
              if (errorContainer) errorContainer.innerHTML = `<p style="color:red; text-align:center; padding:20px;">Error al cargar el mapa: ${error.message}</p>`;
@@ -20137,12 +20212,7 @@ function openNavigationMap() {
         }
     }
 
-    // ¡CAMBIO CLAVE! Se llama SIEMPRE para asegurar que los listeners están activos.
-    // La propia función se encargará de no duplicarlos.
-    assignMapButtonListeners();
-
-    // Lógica que se ejecuta siempre, tanto al crear como al reabrir
-    // ... (El resto de la función es idéntico a la versión anterior, no necesita cambios)
+    // Lógica común que se ejecuta siempre...
     const radaresCheckbox = document.getElementById('radares-ruta-checkbox');
     if (radaresCheckbox) radaresCheckbox.checked = localStorage.getItem(RADARES_RUTA_CHECKED_KEY) === 'true';
     const tareasCheckbox = document.getElementById('tareas-ruta-checkbox');
@@ -23919,6 +23989,11 @@ document.addEventListener('DOMContentLoaded', async () => {
          promptForPin();
      } else {
          await initializeApp();
+     }
+
+    const initialMapModal = document.getElementById('reminders-location-map-modal');
+     if (initialMapModal) {
+         initialMapModal.classList.add('map-modal-hidden');
      }
 
     // Listener de eventos para el cierre de modales y acciones genéricas
