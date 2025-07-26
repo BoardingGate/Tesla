@@ -1,4 +1,4 @@
-F33
+F34
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -7190,13 +7190,15 @@ function startAutomatedRouteSimulation(speedKmph, continueFromCurrentState = fal
 }
 
 // ===================================================================
-// NOMBRE: handleLoadOrDeleteRouteClick (VERSIÓN FINAL SIMPLIFICADA)
+// NOMBRE: handleLoadOrDeleteRouteClick (VERSIÓN FINAL)
 // RESUMEN: Limpia la ruta actual del mapa y sus estados asociados. Su única misión es la limpieza visual y de datos de la ruta.
 // ===================================================================
 function handleLoadOrDeleteRouteClick(button) {
     lastAutoShownManeuverId = null;
     lastDisplayedManeuverIcon = null; 
     
+    // Si estamos navegando, toggleNavigationState se encargará de poner isNavigating=false
+    // y de llamar a setNavigationMapClickHandler por su cuenta.
     if (isNavigating) {
         toggleNavigationState();
     }
@@ -7231,8 +7233,6 @@ function handleLoadOrDeleteRouteClick(button) {
     actualizarContadorRadares(0);
     actualizarContadorTareas(0);
     
-    // La restauración del click handler ahora se gestiona en setupMapForPlanning() y openNavigationMap()
-    
     if (button) {
         showToast("Ruta actual borrada del mapa", "info");
     }
@@ -7240,10 +7240,10 @@ function handleLoadOrDeleteRouteClick(button) {
     updateStartNavigationButtonState();
     updateNavigationButtonColor();
 }
-
+    
 // ===================================================================
-// NOMBRE: openNavigationMap (VERSIÓN FINAL CON SETUP DE PLANIFICACIÓN)
-// RESUMEN: Activa el modal del mapa. Llama a setupMapForPlanning() para garantizar que el mapa esté siempre listo para planificar, tanto en la primera apertura como en las siguientes.
+// NOMBRE: openNavigationMap (VERSIÓN FINAL CON RESTAURACIÓN DE ESTADO EXPLÍCITA)
+// RESUMEN: Activa el modal del mapa. Al reabrir, limpia la ruta anterior y, crucialmente, llama a setNavigationMapClickHandler() para garantizar que la interactividad de planificación siempre se restaure.
 // ===================================================================
 function openNavigationMap() {
     isGeolocated = false;
@@ -7276,10 +7276,19 @@ function openNavigationMap() {
     if (navigationMapInstance) {
         // --- REABRIENDO EL MAPA ---
         showToast("Reabriendo sesión de mapa existente.", "info", 2000);
-        setupMapForPlanning(); // <-- Llama a nuestra nueva función de reseteo infalible
+        
+        // 1. Limpiamos la ruta visual y los estados de navegación/simulación.
+        handleLoadOrDeleteRouteClick(null);
+        
+        // 2. ¡LA CORRECCIÓN MÁS IMPORTANTE! Forzamos la re-evaluación del manejador de clics.
+        // Como acabamos de limpiar y 'isNavigating' es false, esto asignará el comportamiento de añadir puntos.
+        setNavigationMapClickHandler();
+
+        // 3. Ajustamos el tamaño del mapa.
         setTimeout(() => {
             if (navigationMapInstance) navigationMapInstance.resize();
         }, 100);
+        
     } else {
         // --- ABRIENDO POR PRIMERA VEZ ---
         try {
@@ -7347,9 +7356,7 @@ function openNavigationMap() {
                     navigationMapInstance.on('mouseleave', interactiveLayersForHover, () => {
                         navigationMapInstance.getCanvas().style.cursor = '';
                     });
-                    
-                    setupMapForPlanning(); // <-- Pone el mapa en estado inicial de planificación
-                    
+                    setNavigationMapClickHandler(); // Se establece por primera vez
                     getCurrentLocation(
                         (currentPos) => {
                             const loadingToastGPS = document.getElementById("gps-init-toast");
@@ -7382,7 +7389,7 @@ function openNavigationMap() {
         }
     }
 
-    // Lógica común
+    // Lógica común que se ejecuta siempre
     const radaresCheckbox = document.getElementById('radares-ruta-checkbox');
     if (radaresCheckbox) radaresCheckbox.checked = localStorage.getItem(RADARES_RUTA_CHECKED_KEY) === 'true';
     const tareasCheckbox = document.getElementById('tareas-ruta-checkbox');
@@ -7395,6 +7402,8 @@ function openNavigationMap() {
     const autoBtn = document.getElementById('zoom-auto-button');
     if (autoBtn) autoBtn.classList.toggle('active', isAutoZoomActive);
     toggleMapHeaderRowsVisibility(mapHeaderButtonsVisible);
+    updateStartNavigationButtonState();
+    updateNavigationButtonColor();
     toggleMapLocationSearchVisibility(!isNavigating);
 }
     
@@ -7972,8 +7981,8 @@ function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = fa
 }    
 
 // ===================================================================
-// NOMBRE: toggleNavigationState (VERSIÓN FINAL CON SETUP DE PLANIFICACIÓN)
-// RESUMEN: Inicia/detiene la navegación. Al detener, llama a setupMapForPlanning para garantizar una transición limpia y completa al modo de planificación.
+// NOMBRE: toggleNavigationState (VERSIÓN FINAL CON RESTAURACIÓN DE INTERACTIVIDAD GARANTIZADA)
+// RESUMEN: Inicia/detiene la navegación. Al detener, llama explícitamente a setNavigationMapClickHandler() DESPUÉS de actualizar el estado, garantizando que el mapa vuelva al modo de planificación.
 // ===================================================================
 async function toggleNavigationState(isRecalculationStop = false) {
     const startNavButton = document.getElementById('start-navigation-button');
@@ -7989,8 +7998,18 @@ async function toggleNavigationState(isRecalculationStop = false) {
             }
         }
         
-        // ¡CAMBIO CLAVE! Llamamos a la función de reseteo, que se encargará de todo.
-        setupMapForPlanning();
+        isNavigating = false; // ¡IMPORTANTE! Cambiar el estado ANTES de cualquier otra cosa.
+        navigationFollowUser = false;
+        
+        if(startNavImg) startNavImg.src = "PNG/INICIARNAVEGACION.PNG";
+        if(startNavButton) startNavButton.classList.remove('navigating');
+        if (mapContainer) mapContainer.classList.remove('navigating');
+        
+        // ¡¡¡LÍNEA CRÍTICA!!!
+        // Con isNavigating = false, esta llamada restaurará el modo de añadir puntos.
+        setNavigationMapClickHandler();
+        
+        navigationWaypoints.forEach(wp => { if (wp && wp.marker) wp.marker.setDraggable(true); });
         
         mapHeaderButtonsVisible = true; 
         toggleMapHeaderRowsVisibility(true); 
@@ -7999,40 +8018,103 @@ async function toggleNavigationState(isRecalculationStop = false) {
         stopFreeDrive();
     } else {
         // --- INICIANDO LA NAVEGACIÓN ---
-        if (!navigationCurrentRouteData || !navigationCurrentRouteData.routes || !navigationCurrentRouteData.routes.length === 0 || navigationWaypoints.filter(wp => !wp.isInternal && !wp.isRecalculatedStart).length < 2) {
+        if (!navigationCurrentRouteData || !navigationCurrentRouteData.routes || navigationCurrentRouteData.routes.length === 0 || navigationWaypoints.filter(wp => !wp.isInternal && !wp.isRecalculatedStart).length < 2) {
             showToast("No hay ruta calculada para iniciar la navegación", "warning");
             return;
         }
-        // ... (el resto de tu lógica para INICIAR navegación es correcta y se mantiene) ...
-        if (isFreeDriveActive) { isFreeDrivePaused = true; isFreeDriveActive = false; showToast("Modo Conducción Libre en pausa mientras planificas una ruta.", "info"); }
+        if (isFreeDriveActive) {
+            isFreeDrivePaused = true;
+            isFreeDriveActive = false;
+            showToast("Modo Conducción Libre en pausa mientras planificas una ruta.", "info");
+        }
+        
         clearSpeedMarkers();
         const waypointsForRecents = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
         const lastWpForName = waypointsForRecents[waypointsForRecents.length - 1];
         const isMultiStageForName = waypointsForRecents.length > 2;
         const suggestedName = await getSuggestedRouteName(lastWpForName.lat, lastWpForName.lng, isMultiStageForName, waypointsForRecents.length);
+        
         const routeForRecents = { name: currentRouteNameForSaving || suggestedName, waypoints: waypointsForRecents };
         addRouteToRecents(routeForRecents);
         clearNavigationGraph();
         if(startNavImg) startNavImg.src = "PNG/TERMINARNAVEGACION.PNG";
         navigationWaypoints.forEach(wp => { if(wp) { if (wp.type === 'S' || wp.type === 'S_Recalc') { wp.visited = true; } else { wp.visited = false; } if (wp.marker) wp.marker.setDraggable(false); } });
-        getCurrentLocation( (initialCoords) => { navigationCurrentLocation = initialCoords; updateInitialUserPosition(initialCoords, navigationMapInstance); }, (errorMsg) => { showToast(`No se pudo obtener tu ubicación inicial: ${errorMsg}. El mapa se centrará cuando el GPS esté listo.`, "warning", 5000); });
+        getCurrentLocation(
+            (initialCoords) => { navigationCurrentLocation = initialCoords; updateInitialUserPosition(initialCoords, navigationMapInstance); },
+            (errorMsg) => { showToast(`No se pudo obtener tu ubicación inicial: ${errorMsg}. El mapa se centrará cuando el GPS esté listo.`, "warning", 5000); }
+        );
         startGpsWatching();
         const loadingToast = document.getElementById("gps-init-toast"); if (loadingToast) loadingToast.remove(); activeToasts = activeToasts.filter(t => t.id !== "gps-init-toast");
-        isNavigating = true;
-        mapHeaderButtonsVisible = false; toggleMapHeaderRowsVisibility(false);
+        
+        isNavigating = true; // ¡IMPORTANTE! Cambiar el estado ANTES de llamar al handler.
+        
+        mapHeaderButtonsVisible = false;
+        toggleMapHeaderRowsVisibility(false);
         if(startNavButton) startNavButton.classList.add('navigating');
         if (mapContainer) mapContainer.classList.add('navigating');
+        
+        // Con isNavigating = true, esta llamada desactivará el modo de añadir puntos.
         setNavigationMapClickHandler();
+        
         const routeData = navigationCurrentRouteData.routes[0];
-        if (routeData) { tripInitialDurationSec = routeData.duration; tripInitialDistanceMeters = routeData.distance; tripInitialOverallEtaTime = new Date(Date.now() + routeData.duration * 1000); if (routeData.legs && routeData.legs.length > 0) { currentStageInitialExpectedEtaTime = new Date(Date.now() + routeData.legs[0].duration * 1000); } }
-        tripStartLocationForStats = navigationCurrentLocation ? { ...navigationCurrentLocation } : null; navigationStartTimeForStats = null; totalDistanceTravelledForStats = 0; maxDistanceReachedOnRoute = 0; maxSpeedDuringTrip = 0; maxSpeedCoordinates = null; maxAltitudeDuringTrip = -Infinity; minAltitudeDuringTrip = Infinity; lastPositionForStats = navigationCurrentLocation ? {...navigationCurrentLocation} : null; accumulatedDeviationMs = 0; accumulatedDistanceBeforeCurrentSegment = 0;
+        if (routeData) {
+            tripInitialDurationSec = routeData.duration;
+            tripInitialDistanceMeters = routeData.distance;
+            tripInitialOverallEtaTime = new Date(Date.now() + routeData.duration * 1000);
+            if (routeData.legs && routeData.legs.length > 0) {
+                currentStageInitialExpectedEtaTime = new Date(Date.now() + routeData.legs[0].duration * 1000);
+            }
+        }
+        
+        tripStartLocationForStats = navigationCurrentLocation ? { ...navigationCurrentLocation } : null;
+        navigationStartTimeForStats = null;
+        totalDistanceTravelledForStats = 0;
+        maxDistanceReachedOnRoute = 0;
+        maxSpeedDuringTrip = 0;
+        maxSpeedCoordinates = null;
+        maxAltitudeDuringTrip = -Infinity;
+        minAltitudeDuringTrip = Infinity;
+        lastPositionForStats = navigationCurrentLocation ? {...navigationCurrentLocation} : null;
+        accumulatedDeviationMs = 0;
+        accumulatedDistanceBeforeCurrentSegment = 0;
+        
         showToast("Navegación iniciada. Esperando movimiento...", "success");
         currentGraphMode = localStorage.getItem(GRAPH_STATE_KEY) || 'Desviación ETA';
         initializeNavigationGraph();
+        
         const radaresCheckbox = document.getElementById('radares-ruta-checkbox'); if (radaresCheckbox && radaresCheckbox.checked) { toggleRadaresRuta(true); }
         const tareasCheckbox = document.getElementById('tareas-ruta-checkbox'); if (tareasCheckbox && tareasCheckbox.checked) { toggleTareasRuta(true); }
-        const firstDestination = navigationWaypoints.find(wp => wp && !wp.isInternal && wp.type !== 'S' && !wp.visited); if (firstDestination) { fetchAndDisplayAlternativeRoutes(firstDestination.id); }
-        if (navigationMapInstance) { /* ... tu lógica de flyTo ... */ }
+
+        const firstDestination = navigationWaypoints.find(wp => wp && !wp.isInternal && wp.type !== 'S' && !wp.visited);
+        if (firstDestination) { fetchAndDisplayAlternativeRoutes(firstDestination.id); }
+
+        if (navigationMapInstance) {
+            shouldCenterOnUser = true; 
+            navigationFollowUser = true;
+            
+            const startCoords = navigationCurrentLocation 
+                ? [navigationCurrentLocation.longitude, navigationCurrentLocation.latitude] 
+                : [navigationWaypoints[0].lng, navigationWaypoints[0].lat];
+
+            const savedViewMode = localStorage.getItem(MAP_VIEW_MODE_KEY) || 'static';
+            const modeDetails = MAP_VIEW_MODES[Object.keys(MAP_VIEW_MODES).find(key => MAP_VIEW_MODES[key].mode === savedViewMode)] || MAP_VIEW_MODES.NORTE;
+
+            const initialFlyToOptions = {
+                center: startCoords,
+                zoom: 17,
+                pitch: modeDetails.pitch,
+                essential: true,
+                duration: 1500
+            };
+
+            if ((modeDetails.mode === 'heading' || modeDetails.mode === 'perspective') && navigationCurrentLocation && navigationCurrentLocation.heading !== null) {
+                initialFlyToOptions.bearing = navigationCurrentLocation.heading;
+            } else {
+                initialFlyToOptions.bearing = modeDetails.bearing;
+            }
+
+            navigationMapInstance.flyTo(initialFlyToOptions);
+        }
     }
     updateStartNavigationButtonState();
     updateNavigationButtonColor();
@@ -20142,24 +20224,6 @@ function getRouteStyleProperties() {
 }
 
 
-// ===================================================================
-// NOMBRE: setupMapForPlanning (NUEVA FUNCIÓN DE AYUDA)
-// RESUMEN: Reinicia el estado del mapa al modo de planificación, limpiando la ruta anterior y asegurando que los clics añadan nuevos puntos de ruta.
-// ===================================================================
-function setupMapForPlanning() {
-    // 1. Llama a la función de limpieza para borrar la ruta visualmente
-    handleLoadOrDeleteRouteClick(null);
-    
-    // 2. Asegura que el estado de navegación esté desactivado
-    isNavigating = false;
-    
-    // 3. Actualiza los botones para que reflejen el estado de planificación
-    updateStartNavigationButtonState();
-    updateNavigationButtonColor();
-    
-    // 4. ¡LA LÍNEA CLAVE! Restaura explícitamente el manejador de clics para añadir puntos.
-    setNavigationMapClickHandler();
-}        
     
 // ===================================================================
 // NOMBRE: parseReminderText
