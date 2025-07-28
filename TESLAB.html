@@ -1,4 +1,4 @@
-F145
+F146
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -6097,6 +6097,39 @@ class CompassAndStatsControl {
 
 
 // ===================================================================
+// NOMBRE: loadAlertIcons (NUEVA FUNCIÓN)
+// RESUMEN: Precarga todas las imágenes de alerta de tráfico y las registra en Mapbox para su uso en capas GeoJSON.
+// ===================================================================
+async function loadAlertIcons(mapInstance) {
+    const alertIconsMap = {
+        1: 'AACCIDENTE.png', 2: 'AAVERIADO.png', 3: 'AGUARDIA.png',
+        4: 'AATASCO.png', 5: 'APELIGRO.png', 6: 'ARESVALAR.png',
+        7: 'AOBRAS.png', 8: 'ACERRADA.png'
+    };
+
+    const imageLoadPromises = Object.entries(alertIconsMap).map(([code, filename]) => {
+        return new Promise((resolve) => {
+            const imageId = `alert-icon-${code}`;
+            if (mapInstance.hasImage(imageId)) {
+                resolve();
+                return;
+            }
+            mapInstance.loadImage(`PNG/${filename}`, (error, image) => {
+                if (error) {
+                    console.error(`Error al cargar icono de alerta ${imageId}:`, error);
+                } else if (!mapInstance.hasImage(imageId)) {
+                    mapInstance.addImage(imageId, image);
+                }
+                resolve(); // Resolvemos incluso si hay un error para no bloquear el resto.
+            });
+        });
+    });
+
+    await Promise.all(imageLoadPromises);
+}
+    
+
+// ===================================================================
 // NOMBRE: createRadarSpeedIcon (VERSIÓN FINAL DE ESCALADO DIRECTO)
 // RESUMEN: Crea un icono de radar que se escala correctamente de pequeño a grande al hacer zoom.
 // ===================================================================
@@ -7364,7 +7397,129 @@ function startAutomatedRouteSimulation(speedKmph, continueFromCurrentState = fal
     }, SIMULATION_TICK_INTERVAL_MS);
 }
 
-        
+// ===================================================================
+// NOMBRE: displayAlertsOnMap (MODIFICADA - VUELVE A GEOJSON EFICIENTE)
+// RESUMEN: Actualiza la fuente de datos GeoJSON con las alertas de tráfico para un renderizado nativo y de alto rendimiento.
+// ===================================================================
+function displayAlertsOnMap() {
+    if (!navigationMapInstance || !navigationMapInstance.getSource('traffic-alerts-source')) {
+        // Si la fuente no existe, es probable que se esté cargando. Esperamos a que esté lista.
+        if(navigationMapInstance) {
+            navigationMapInstance.once('style.load', displayAlertsOnMap);
+        }
+        return;
+    }
+
+    const currentZoom = navigationMapInstance.getZoom();
+    const ZOOM_THRESHOLD = 16;
+    const iconSize = (currentZoom < ZOOM_THRESHOLD ? 27 : 55) / 50.0; // Tamaño relativo para Mapbox
+
+    const newFeatures = trafficAlertsCache
+        .filter(alert => alert.code !== 9) // No dibujar las alertas de anulación
+        .map(alert => ({
+            type: 'Feature',
+            geometry: {
+                type: 'Point',
+                coordinates: [alert.coordinates.lon, alert.coordinates.lat]
+            },
+            properties: {
+                icon: `alert-icon-${alert.code}`,
+                size: iconSize
+            }
+        }));
+
+    navigationMapInstance.getSource('traffic-alerts-source').setData({
+        type: 'FeatureCollection',
+        features: newFeatures
+    });
+}
+
+// ===================================================================
+// NOMBRE: reAddCustomMapLayersAndSources (VERSIÓN FINAL CON PRECARGA DE ICONOS DE ALERTA)
+// RESUMEN: Reconstruye todas las capas y fuentes, asegurando que los iconos de alerta se carguen antes de añadir la capa que los usa.
+// ===================================================================
+async function reAddCustomMapLayersAndSources(mapInstance) {
+    if (!mapInstance) return;
+
+    // 1. Precargamos TODAS las imágenes necesarias (genéricas Y de alertas)
+    await loadAndAddMapImages(mapInstance);
+    await loadAlertIcons(mapInstance);
+
+    // 2. Preparamos los datos que necesitamos ANTES de tocar el mapa.
+    const routeGeojsonData = (navigationCurrentRouteData?.routes?.[0]?.geometry)
+        ? { type: 'Feature', properties: {}, geometry: navigationCurrentRouteData.routes[0].geometry }
+        : { type: 'FeatureCollection', features: [] };
+    
+    // ... (el resto de la preparación de datos se mantiene igual)
+    const reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
+    const remindersWithLocation = reminders.filter(r => r.isLocationEnabled && r.locationCoordinates?.latitude && !r.isFromRuta);
+    const reminderFeatures = remindersWithLocation.map(r => ({
+        type: 'Feature',
+        geometry: { type: 'Point', coordinates: [r.locationCoordinates.longitude, r.locationCoordinates.latitude] },
+        properties: { reminderId: r.id, isRadar: r.text.toUpperCase().includes("RADAR:") || r.excludeFromList, speed: extractSpeedFromRadarText(r.text), isFromTarea: r.isFromTarea || false }
+    }));
+    const remindersGeojsonData = { type: 'FeatureCollection', features: reminderFeatures };
+    const pdrFeatures = lastPdrSearchResults.map((point, index) => ({
+        type: 'Feature',
+        geometry: { type: 'Point', coordinates: [point.lon, point.lat] },
+        properties: { ocmId: point.ocmId, index: index, bgColor: getChargingPointColorByPower(parseFloat(point.power)), isCheapest: point.isCheapest || false, power: point.power, operator: point.operator.substring(0, 14), price: point.price, availability: point.availabilityText }
+    }));
+    const pdrsGeojsonData = { type: 'FeatureCollection', features: pdrFeatures };
+
+    // 3. Limpiamos las capas y fuentes antiguas.
+    const sourcesAndLayersToRemove = [
+        'speed-markers-text', 'speed-markers-circle-bg', 'reminders-radar-text-layer', 'reminders-speed-text-layer', 'reminders-icons-layer', 'reminders-circles-layer',
+        'pdr-cards-layer-availability', 'pdr-cards-layer-price', 'pdr-cards-layer-operator', 'pdr-cards-layer-power', 'pdr-cards-layer-bg-halo', 'pdr-cards-layer-bg',
+        'pdr-simple-text-layer', 'pdr-simple-circle-layer', 'traffic-alerts-layer', 'completed-segments-layer', 'route',
+        'speed-markers-source', 'reminders-geojson-source', 'pdrs-geojson-source', 'traffic-alerts-source', 'completed-segments', 'route'
+    ];
+    sourcesAndLayersToRemove.forEach(id => {
+        try { if (mapInstance.getLayer(id)) mapInstance.removeLayer(id); if (mapInstance.getSource(id)) mapInstance.removeSource(id); } catch (e) {}
+    });
+
+    // 4. Añadimos las nuevas fuentes.
+    mapInstance.addSource('route', { type: 'geojson', data: routeGeojsonData });
+    mapInstance.addSource('completed-segments', { type: 'geojson', data: completedSegmentsGeoJSON });
+    mapInstance.addSource('speed-markers-source', { type: 'geojson', data: { type: 'FeatureCollection', features: speedMarkerFeatures } });
+    mapInstance.addSource('reminders-geojson-source', { type: 'geojson', data: remindersGeojsonData });
+    mapInstance.addSource('pdrs-geojson-source', { type: 'geojson', data: pdrsGeojsonData });
+    mapInstance.addSource('traffic-alerts-source', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } }); // Se crea vacía, `displayAlertsOnMap` la llenará
+
+    // 5. Añadimos todas las capas.
+    mapInstance.addLayer({ id: 'route', type: 'line', source: 'route', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: getRouteStyleProperties() });
+    mapInstance.addLayer({ id: 'completed-segments-layer', type: 'line', source: 'completed-segments', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': 'green', 'line-width': 6, 'line-opacity': 0.8 } });
+    
+    mapInstance.addLayer({ id: 'speed-markers-circle-bg', type: 'circle', source: 'speed-markers-source', paint: { 'circle-radius': 15, 'circle-color': ['case', ['==', ['get', 'type'], 'maxSpeed'], '#4B0082', '#36454F'], 'circle-stroke-width': 2, 'circle-stroke-color': 'white' } });
+    mapInstance.addLayer({ id: 'speed-markers-text', type: 'symbol', source: 'speed-markers-source', layout: { 'text-field': ['get', 'speedText'], 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': 11, 'text-allow-overlap': true }, paint: { 'text-color': 'white' } });
+
+    mapInstance.addLayer({ id: 'pdr-simple-circle-layer', type: 'circle', source: 'pdrs-geojson-source', filter: ['<=', ['zoom'], 14], paint: { 'circle-radius': 18, 'circle-color': ['get', 'bgColor'], 'circle-opacity': 1, 'circle-stroke-width': ['case', ['==', ['get', 'isCheapest'], true], 3.5, 2], 'circle-stroke-color': ['case', ['==', ['get', 'isCheapest'], true], '#FFD700', 'white'] } });
+    mapInstance.addLayer({ id: 'pdr-simple-text-layer', type: 'symbol', source: 'pdrs-geojson-source', filter: ['<=', ['zoom'], 14], layout: { 'text-field': ['concat', ['get', 'power'], 'kW'], 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': 9, 'text-allow-overlap': true }, paint: { 'text-color': 'white', 'text-opacity': 1, 'text-halo-color': '#000', 'text-halo-width': 1 } });
+    mapInstance.addLayer({ id: 'pdr-cards-layer-bg-halo', type: 'circle', source: 'pdrs-geojson-source', filter: ['all', ['>', ['zoom'], 14], ['==', ['get', 'isCheapest'], true]], paint: { 'circle-radius': 48, 'circle-color': '#FFD700', 'circle-opacity': 0.8, 'circle-blur': 1 } });
+    mapInstance.addLayer({ id: 'pdr-cards-layer-bg', type: 'circle', source: 'pdrs-geojson-source', filter: ['>', ['zoom'], 14], paint: { 'circle-radius': 45, 'circle-color': ['get', 'bgColor'], 'circle-opacity': 1, 'circle-stroke-width': 3, 'circle-stroke-color': 'white' } });
+    mapInstance.addLayer({ id: 'pdr-cards-layer-power', type: 'symbol', source: 'pdrs-geojson-source', filter: ['>', ['zoom'], 14], layout: { 'text-field': ['concat', ['get', 'power'], ' kW'], 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': 14, 'text-offset': [0, -1.2], 'text-allow-overlap': true }, paint: { 'text-color': '#ffd700', 'text-opacity': 1, 'text-halo-color': '#000', 'text-halo-width': 1 } });
+    mapInstance.addLayer({ id: 'pdr-cards-layer-operator', type: 'symbol', source: 'pdrs-geojson-source', filter: ['>', ['zoom'], 14], layout: { 'text-field': ['get', 'operator'], 'text-font': ['Open Sans Semibold', 'Arial Unicode MS Bold'], 'text-size': 11, 'text-offset': [0, -0.1], 'text-allow-overlap': true, 'text-max-width': 10 }, paint: { 'text-color': 'white', 'text-opacity': 1, 'text-halo-color': '#000', 'text-halo-width': 1 } });
+    mapInstance.addLayer({ id: 'pdr-cards-layer-price', type: 'symbol', source: 'pdrs-geojson-source', filter: ['>', ['zoom'], 14], layout: { 'text-field': ['get', 'price'], 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': 12, 'text-offset': [0, 1.0], 'text-allow-overlap': true }, paint: { 'text-color': '#90ee90', 'text-opacity': 1, 'text-halo-color': '#000', 'text-halo-width': 1 } });
+    mapInstance.addLayer({ id: 'pdr-cards-layer-availability', type: 'symbol', source: 'pdrs-geojson-source', filter: ['>', ['zoom'], 14], layout: { 'text-field': ['get', 'availability'], 'text-font': ['Open Sans Semibold', 'Arial Unicode MS Bold'], 'text-size': 10, 'text-offset': [0, 2.3], 'text-allow-overlap': true }, paint: { 'text-color': '#e0e0e0', 'text-opacity': 1, 'text-halo-color': '#000', 'text-halo-width': 1 } });
+
+    mapInstance.addLayer({ id: 'reminders-circles-layer', type: 'circle', source: 'reminders-geojson-source', filter: ['==', ['get', 'isRadar'], true], paint: { 'circle-color': 'red', 'circle-opacity': 1, 'circle-radius': ['interpolate', ['linear'], ['zoom'], 10, 11, 14, 19, 17, 27], 'circle-stroke-width': ['interpolate', ['linear'], ['zoom'], 10, 1.5, 17, 3], 'circle-stroke-color': ['case', ['==', ['get', 'isFromTarea'], true], '#00FF00', 'white'] } });
+    mapInstance.addLayer({ id: 'reminders-speed-text-layer', type: 'symbol', source: 'reminders-geojson-source', filter: ['all', ['==', ['get', 'isRadar'], true], ['has', 'speed']], layout: { 'text-field': ['get', 'speed'], 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': ['interpolate', ['linear'], ['zoom'], 10, 9, 14, 16, 17, 22], 'text-allow-overlap': true }, paint: { 'text-color': 'yellow', 'text-opacity': 1, 'text-halo-color': '#000', 'text-halo-width': 1 } });
+    mapInstance.addLayer({ id: 'reminders-radar-text-layer', type: 'symbol', source: 'reminders-geojson-source', filter: ['all', ['==', ['get', 'isRadar'], true], ['!', ['has', 'speed']]], layout: { 'text-field': 'Rdar', 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': ['interpolate', ['linear'], ['zoom'], 10, 8, 14, 14, 17, 20], 'text-allow-overlap': true }, paint: { 'text-color': 'yellow', 'text-opacity': 1, 'text-halo-color': '#000', 'text-halo-width': 1 } });
+    mapInstance.addLayer({ id: 'reminders-icons-layer', type: 'symbol', source: 'reminders-geojson-source', filter: ['==', ['get', 'isRadar'], false], layout: { 'icon-image': 'reminder-icon', 'icon-size': ['interpolate', ['linear'], ['zoom'], 10, 0.4, 14, 0.6, 17, 0.8], 'icon-allow-overlap': true, 'icon-anchor': 'bottom' } });
+    
+    // Añadimos de nuevo la capa de alertas
+    mapInstance.addLayer({
+        id: 'traffic-alerts-layer',
+        type: 'symbol',
+        source: 'traffic-alerts-source',
+        layout: {
+            'icon-image': ['get', 'icon'],
+            'icon-size': ['get', 'size'],
+            'icon-allow-overlap': true,
+            'icon-ignore-placement': true
+        }
+    });
+}
+    
 // ===================================================================
 // NOMBRE: handleGpsSimulationToggle (MODIFICADA - PARA MAPBOX)
 // RESUMEN: Activa/desactiva el modo de simulación GPS. Si hay una ruta cargada al activar, muestra el modal de selección de velocidad y tipo de simulación.
@@ -14159,81 +14314,6 @@ function createRadarAlertIcon(currentZoomLevel = null, isFromTarea = false) {
     return container; 
 }
     
-// ===================================================================
-// NOMBRE: displayAlertsOnMap (MODIFICADA - PARA MAPBOX)
-// RESUMEN: Dibuja los iconos de las alertas de tráfico en el mapa, con tamaño dinámico según el zoom.
-// ===================================================================
-function displayAlertsOnMap() {
-    if (!navigationMapInstance || !navigationMapInstance.isStyleLoaded()) {
-        return;
-    }
-    
-    if (trafficAlertsMarkers && trafficAlertsMarkers.length > 0) {
-        trafficAlertsMarkers.forEach(marker => marker.remove());
-    }
-    trafficAlertsMarkers = [];
-
-    const currentZoom = navigationMapInstance.getZoom();
-    const ZOOM_THRESHOLD = 16; 
-    const isSmall = currentZoom < ZOOM_THRESHOLD;
-    const largeIconTotalSize = 55; 
-    const smallIconTotalSize = 27; 
-    const iconSize = isSmall ? smallIconTotalSize : largeIconTotalSize;
-
-    const alertIconsMap = { 
-        1: 'AACCIDENTE.png', 2: 'AAVERIADO.png', 3: 'AGUARDIA.png',
-        4: 'AATASCO.png', 5: 'APELIGRO.png', 6: 'ARESVALAR.png',
-        7: 'AOBRAS.png', 8: 'ACERRADA.png', 9: 'AANULAR.png'
-    };
-
-    const newFeatures = [];
-
-    trafficAlertsCache.forEach(alert => {
-        const iconFilename = alertIconsMap[alert.code];
-        if (iconFilename) {
-            const imageUrl = `PNG/${iconFilename}`; 
-            const imageId = `alert-icon-${alert.code}`;
-
-            if (!navigationMapInstance.hasImage(imageId)) {
-                navigationMapInstance.loadImage(imageUrl, (error, image) => {
-                    if (error) {
-                        console.error('Error al cargar imagen para Mapbox:', error);
-                        return;
-                    }
-                    if (!navigationMapInstance.hasImage(imageId)) { 
-                        navigationMapInstance.addImage(imageId, image);
-                    }
-                    if (navigationMapInstance.getSource('traffic-alerts-source')) {
-                         navigationMapInstance.getSource('traffic-alerts-source').setData(navigationMapInstance.getSource('traffic-alerts-source')._data);
-                    }
-                });
-            }
-            
-            newFeatures.push({
-                type: 'Feature',
-                geometry: {
-                    type: 'Point',
-                    coordinates: [alert.coordinates.lon, alert.coordinates.lat]
-                },
-                properties: {
-                    icon: imageId, 
-                    size: iconSize / 50, 
-                    alertCode: alert.code 
-                }
-            });
-        }
-    });
-
-    if (navigationMapInstance.getSource('traffic-alerts-source')) {
-        navigationMapInstance.getSource('traffic-alerts-source').setData({
-            type: 'FeatureCollection',
-            features: newFeatures
-        });
-    } else {
-        console.error("traffic-alerts-source no está definida en el mapa.");
-    }
-
-}
     
 // ===================================================================
 // NOMBRE: checkAlertsProximity
@@ -16332,87 +16412,6 @@ async function loadAndAddMapImages(mapInstance) {
     await Promise.all(imageLoadPromises);
 }    
 
-
-// ===================================================================
-// NOMBRE: reAddCustomMapLayersAndSources (VERSIÓN FINAL CON RECONSTRUCCIÓN DE DATOS)
-// RESUMEN: Reconstruye todas las capas y fuentes, incluyendo los datos de la ruta, recordatorios, PDRs y alertas.
-// ===================================================================
-async function reAddCustomMapLayersAndSources(mapInstance) {
-    if (!mapInstance) return;
-
-    await loadAndAddMapImages(mapInstance);
-
-    // 1. Preparamos los datos que necesitamos ANTES de tocar el mapa.
-    const routeGeojsonData = (navigationCurrentRouteData?.routes?.[0]?.geometry)
-        ? { type: 'Feature', properties: {}, geometry: navigationCurrentRouteData.routes[0].geometry }
-        : { type: 'FeatureCollection', features: [] };
-
-    const reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
-    const remindersWithLocation = reminders.filter(r => r.isLocationEnabled && r.locationCoordinates?.latitude && !r.isFromRuta);
-    const reminderFeatures = remindersWithLocation.map(r => ({
-        type: 'Feature',
-        geometry: { type: 'Point', coordinates: [r.locationCoordinates.longitude, r.locationCoordinates.latitude] },
-        properties: { reminderId: r.id, isRadar: r.text.toUpperCase().includes("RADAR:") || r.excludeFromList, speed: extractSpeedFromRadarText(r.text), isFromTarea: r.isFromTarea || false }
-    }));
-    const remindersGeojsonData = { type: 'FeatureCollection', features: reminderFeatures };
-
-    const pdrFeatures = lastPdrSearchResults.map((point, index) => ({
-        type: 'Feature',
-        geometry: { type: 'Point', coordinates: [point.lon, point.lat] },
-        properties: { ocmId: point.ocmId, index: index, bgColor: getChargingPointColorByPower(parseFloat(point.power)), isCheapest: point.isCheapest || false, power: point.power, operator: point.operator.substring(0, 14), price: point.price, availability: point.availabilityText }
-    }));
-    const pdrsGeojsonData = { type: 'FeatureCollection', features: pdrFeatures };
-    
-    const alertFeatures = trafficAlertsCache.map(alert => ({
-        type: 'Feature',
-        geometry: { type: 'Point', coordinates: [alert.coordinates.lon, alert.coordinates.lat] },
-        properties: { icon: `alert-icon-${alert.code}`, size: (mapInstance.getZoom() < 16 ? 27 : 55) / 50, alertCode: alert.code }
-    }));
-    const alertsGeojsonData = { type: 'FeatureCollection', features: alertFeatures };
-
-
-    // 2. Limpiamos las capas y fuentes antiguas.
-    const sourcesAndLayersToRemove = [
-        'speed-markers-text', 'speed-markers-circle-bg', 'reminders-radar-text-layer', 'reminders-speed-text-layer', 'reminders-icons-layer', 'reminders-circles-layer',
-        'pdr-cards-layer-availability', 'pdr-cards-layer-price', 'pdr-cards-layer-operator', 'pdr-cards-layer-power', 'pdr-cards-layer-bg-halo', 'pdr-cards-layer-bg',
-        'pdr-simple-text-layer', 'pdr-simple-circle-layer', 'traffic-alerts-layer', 'completed-segments-layer', 'route',
-        'speed-markers-source', 'reminders-geojson-source', 'pdrs-geojson-source', 'traffic-alerts-source', 'completed-segments', 'route'
-    ];
-    sourcesAndLayersToRemove.forEach(id => {
-        try { if (mapInstance.getLayer(id)) mapInstance.removeLayer(id); if (mapInstance.getSource(id)) mapInstance.removeSource(id); } catch (e) {}
-    });
-
-    // 3. Añadimos las nuevas fuentes CON LOS DATOS YA PREPARADOS.
-    mapInstance.addSource('route', { type: 'geojson', data: routeGeojsonData });
-    mapInstance.addSource('completed-segments', { type: 'geojson', data: completedSegmentsGeoJSON }); // Usa la variable global
-    mapInstance.addSource('speed-markers-source', { type: 'geojson', data: { type: 'FeatureCollection', features: speedMarkerFeatures } }); // Usa la variable global
-    mapInstance.addSource('reminders-geojson-source', { type: 'geojson', data: remindersGeojsonData });
-    mapInstance.addSource('pdrs-geojson-source', { type: 'geojson', data: pdrsGeojsonData });
-    mapInstance.addSource('traffic-alerts-source', { type: 'geojson', data: alertsGeojsonData });
-
-    // 4. Añadimos todas las capas que dependen de esas fuentes.
-    mapInstance.addLayer({ id: 'route', type: 'line', source: 'route', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: getRouteStyleProperties() });
-    mapInstance.addLayer({ id: 'completed-segments-layer', type: 'line', source: 'completed-segments', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': 'green', 'line-width': 6, 'line-opacity': 0.8 } });
-    
-    mapInstance.addLayer({ id: 'speed-markers-circle-bg', type: 'circle', source: 'speed-markers-source', paint: { 'circle-radius': 15, 'circle-color': ['case', ['==', ['get', 'type'], 'maxSpeed'], '#4B0082', '#36454F'], 'circle-stroke-width': 2, 'circle-stroke-color': 'white' } });
-    mapInstance.addLayer({ id: 'speed-markers-text', type: 'symbol', source: 'speed-markers-source', layout: { 'text-field': ['get', 'speedText'], 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': 11, 'text-allow-overlap': true }, paint: { 'text-color': 'white' } });
-
-    mapInstance.addLayer({ id: 'pdr-simple-circle-layer', type: 'circle', source: 'pdrs-geojson-source', filter: ['<=', ['zoom'], 14], paint: { 'circle-radius': 18, 'circle-color': ['get', 'bgColor'], 'circle-opacity': 1, 'circle-stroke-width': ['case', ['==', ['get', 'isCheapest'], true], 3.5, 2], 'circle-stroke-color': ['case', ['==', ['get', 'isCheapest'], true], '#FFD700', 'white'] } });
-    mapInstance.addLayer({ id: 'pdr-simple-text-layer', type: 'symbol', source: 'pdrs-geojson-source', filter: ['<=', ['zoom'], 14], layout: { 'text-field': ['concat', ['get', 'power'], 'kW'], 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': 9, 'text-allow-overlap': true }, paint: { 'text-color': 'white', 'text-opacity': 1, 'text-halo-color': '#000', 'text-halo-width': 1 } });
-    mapInstance.addLayer({ id: 'pdr-cards-layer-bg-halo', type: 'circle', source: 'pdrs-geojson-source', filter: ['all', ['>', ['zoom'], 14], ['==', ['get', 'isCheapest'], true]], paint: { 'circle-radius': 48, 'circle-color': '#FFD700', 'circle-opacity': 0.8, 'circle-blur': 1 } });
-    mapInstance.addLayer({ id: 'pdr-cards-layer-bg', type: 'circle', source: 'pdrs-geojson-source', filter: ['>', ['zoom'], 14], paint: { 'circle-radius': 45, 'circle-color': ['get', 'bgColor'], 'circle-opacity': 1, 'circle-stroke-width': 3, 'circle-stroke-color': 'white' } });
-    mapInstance.addLayer({ id: 'pdr-cards-layer-power', type: 'symbol', source: 'pdrs-geojson-source', filter: ['>', ['zoom'], 14], layout: { 'text-field': ['concat', ['get', 'power'], ' kW'], 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': 14, 'text-offset': [0, -1.2], 'text-allow-overlap': true }, paint: { 'text-color': '#ffd700', 'text-opacity': 1, 'text-halo-color': '#000', 'text-halo-width': 1 } });
-    mapInstance.addLayer({ id: 'pdr-cards-layer-operator', type: 'symbol', source: 'pdrs-geojson-source', filter: ['>', ['zoom'], 14], layout: { 'text-field': ['get', 'operator'], 'text-font': ['Open Sans Semibold', 'Arial Unicode MS Bold'], 'text-size': 11, 'text-offset': [0, -0.1], 'text-allow-overlap': true, 'text-max-width': 10 }, paint: { 'text-color': 'white', 'text-opacity': 1, 'text-halo-color': '#000', 'text-halo-width': 1 } });
-    mapInstance.addLayer({ id: 'pdr-cards-layer-price', type: 'symbol', source: 'pdrs-geojson-source', filter: ['>', ['zoom'], 14], layout: { 'text-field': ['get', 'price'], 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': 12, 'text-offset': [0, 1.0], 'text-allow-overlap': true }, paint: { 'text-color': '#90ee90', 'text-opacity': 1, 'text-halo-color': '#000', 'text-halo-width': 1 } });
-    mapInstance.addLayer({ id: 'pdr-cards-layer-availability', type: 'symbol', source: 'pdrs-geojson-source', filter: ['>', ['zoom'], 14], layout: { 'text-field': ['get', 'availability'], 'text-font': ['Open Sans Semibold', 'Arial Unicode MS Bold'], 'text-size': 10, 'text-offset': [0, 2.3], 'text-allow-overlap': true }, paint: { 'text-color': '#e0e0e0', 'text-opacity': 1, 'text-halo-color': '#000', 'text-halo-width': 1 } });
-
-    mapInstance.addLayer({ id: 'reminders-circles-layer', type: 'circle', source: 'reminders-geojson-source', filter: ['==', ['get', 'isRadar'], true], paint: { 'circle-color': 'red', 'circle-opacity': 1, 'circle-radius': ['interpolate', ['linear'], ['zoom'], 10, 11, 14, 19, 17, 27], 'circle-stroke-width': ['interpolate', ['linear'], ['zoom'], 10, 1.5, 17, 3], 'circle-stroke-color': ['case', ['==', ['get', 'isFromTarea'], true], '#00FF00', 'white'] } });
-    mapInstance.addLayer({ id: 'reminders-speed-text-layer', type: 'symbol', source: 'reminders-geojson-source', filter: ['all', ['==', ['get', 'isRadar'], true], ['has', 'speed']], layout: { 'text-field': ['get', 'speed'], 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': ['interpolate', ['linear'], ['zoom'], 10, 9, 14, 16, 17, 22], 'text-allow-overlap': true }, paint: { 'text-color': 'yellow', 'text-opacity': 1, 'text-halo-color': '#000', 'text-halo-width': 1 } });
-    mapInstance.addLayer({ id: 'reminders-radar-text-layer', type: 'symbol', source: 'reminders-geojson-source', filter: ['all', ['==', ['get', 'isRadar'], true], ['!', ['has', 'speed']]], layout: { 'text-field': 'Rdar', 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': ['interpolate', ['linear'], ['zoom'], 10, 8, 14, 14, 17, 20], 'text-allow-overlap': true }, paint: { 'text-color': 'yellow', 'text-opacity': 1, 'text-halo-color': '#000', 'text-halo-width': 1 } });
-    mapInstance.addLayer({ id: 'reminders-icons-layer', type: 'symbol', source: 'reminders-geojson-source', filter: ['==', ['get', 'isRadar'], false], layout: { 'icon-image': 'reminder-icon', 'icon-size': ['interpolate', ['linear'], ['zoom'], 10, 0.4, 14, 0.6, 17, 0.8], 'icon-allow-overlap': true, 'icon-anchor': 'bottom' } });
-    
-    mapInstance.addLayer({ id: 'traffic-alerts-layer', type: 'symbol', source: 'traffic-alerts-source', layout: { 'icon-image': ['get', 'icon'], 'icon-size': ['get', 'size'], 'icon-allow-overlap': true } });
-}
 
     
 // ===================================================================
