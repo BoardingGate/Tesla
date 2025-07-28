@@ -1,4 +1,4 @@
-F183
+F184
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -5827,8 +5827,8 @@ class CompassAndStatsControl {
     }
 }
 // ===================================================================
-// NOMBRE: ZoomControl (NUEVA CLASE)
-// RESUMEN: Crea y gestiona un panel de control de zoom personalizado con botones +, -, Auto y Toggle.
+// NOMBRE: ZoomControl (NUEVA CLASE - LÓGICA DE ANULACIÓN MEJORADA)
+// RESUMEN: Crea y gestiona un panel de control de zoom personalizado. Ahora la acción manual no desactiva el modo AUTO, sino que lo anula temporalmente.
 // ===================================================================
 class ZoomControl {
     onAdd(map) {
@@ -5875,10 +5875,6 @@ class ZoomControl {
         });
         
         const handleManualZoomAction = (zoomFunction) => {
-            isAutoZoomActive = false;
-            autoBtn.classList.remove('active');
-            localStorage.setItem(AUTO_ZOOM_ACTIVE_KEY, 'false');
-
             isManualZoomActive = true;
             if (manualZoomTimeout) clearTimeout(manualZoomTimeout);
             
@@ -5908,22 +5904,32 @@ class ZoomControl {
             localStorage.setItem(AUTO_ZOOM_ACTIVE_KEY, isAutoZoomActive);
             showToast(`Zoom automático ${isAutoZoomActive ? 'ACTIVADO' : 'DESACTIVADO'}`, 'success');
             if (isAutoZoomActive) {
+                isManualZoomActive = false;
+                if (manualZoomTimeout) clearTimeout(manualZoomTimeout);
                 handleAutoZoom();
             }
         });
 
         toggleBtn.addEventListener('click', (e) => {
             e.stopPropagation();
-            // Llama a la función global, que ya no está en el HTML sino aquí
             const currentState = toggleBtn.dataset.zoomState || 'waypoints';
             const img = toggleBtn.querySelector('img');
+
+            const performZoom = (zoomLogic) => {
+                isManualZoomActive = true;
+                if (manualZoomTimeout) clearTimeout(manualZoomTimeout);
+                zoomLogic();
+                manualZoomTimeout = setTimeout(() => {
+                    isManualZoomActive = false;
+                }, 30000);
+            };
 
             if (currentState === 'waypoints' || currentState === 'no_route_zoom_out') {
                 if (navigationCurrentLocation) {
                     toggleBtn.dataset.zoomState = 'car';
                     if (img) img.src = 'PNG/ZOOM-.PNG';
                     toggleBtn.title = "Alejar para ver la ruta completa";
-                    map.flyTo({ center: [navigationCurrentLocation.longitude, navigationCurrentLocation.latitude], zoom: 19, duration: 1500 });
+                    performZoom(() => map.flyTo({ center: [navigationCurrentLocation.longitude, navigationCurrentLocation.latitude], zoom: 19, duration: 1500 }));
                 } else {
                     showToast("Ubicación actual no disponible para hacer zoom.", "warning");
                 }
@@ -5933,13 +5939,15 @@ class ZoomControl {
                 toggleBtn.title = "Acercar a la ubicación del coche";
                 const routeSource = map.getSource('route');
                 if (routeSource && routeSource._data && routeSource._data.geometry && routeSource._data.geometry.coordinates.length > 1) {
-                    const bounds = new mapboxgl.LngLatBounds();
-                    routeSource._data.geometry.coordinates.forEach(coord => bounds.extend(coord));
-                    if (!bounds.isEmpty()) {
-                        map.fitBounds(bounds, { padding: 80, animate: true, duration: 1500 });
-                    }
+                    performZoom(() => {
+                        const bounds = new mapboxgl.LngLatBounds();
+                        routeSource._data.geometry.coordinates.forEach(coord => bounds.extend(coord));
+                        if (!bounds.isEmpty()) {
+                            map.fitBounds(bounds, { padding: 80, animate: true, duration: 1500 });
+                        }
+                    });
                 } else {
-                    map.flyTo({ zoom: 10, duration: 1500 });
+                    performZoom(() => map.flyTo({ zoom: 10, duration: 1500 }));
                 }
             }
         });
@@ -5953,7 +5961,7 @@ class ZoomControl {
         }
         this._map = undefined;
     }
-}    
+}
 // ===================================================================
 // NOMBRE: CombinedMapControl (NUEVA CLASE)
 // RESUMEN: Envuelve los controles de Capas/Vista y Zoom en un único contenedor para que aparezcan juntos.
@@ -6501,13 +6509,12 @@ function showReminderActionModal(reminderId) {
 }   
 
 // ===================================================================
-// NOMBRE: handleAutoZoom (VERSIÓN CON PRIORIDAD DE MANIOBRA)
-// RESUMEN: Ajusta el zoom del mapa automáticamente según la velocidad, respetando el zoom de maniobra.
+// NOMBRE: handleAutoZoom (VERSIÓN CON ANULACIÓN TEMPORAL)
+// RESUMEN: Ajusta el zoom automáticamente, pero respeta la anulación manual temporal y la prioridad de maniobra.
 // ===================================================================
 function handleAutoZoom() {
     if (!isAutoZoomActive || isManualZoomActive || !isNavigating || !navigationMapInstance) return;
 
-    // --> AÑADIDO: No aplicar zoom automático si el zoom de maniobra está activo.
     if (isZoomedForManeuver) return;
 
     const speed = window.currentSpeedKmh || 0;
@@ -6520,14 +6527,12 @@ function handleAutoZoom() {
     else if (speed < 110) targetZoom = 17.1;
     else if (speed < 120) targetZoom = 16.6;
     else if (speed < 200) targetZoom = 16.3;
-    else return; // No hacer nada si la velocidad es muy alta
+    else return; 
 
-    // Aplicar solo si el cambio es significativo para evitar vibraciones
     if (Math.abs(navigationMapInstance.getZoom() - targetZoom) > 0.2) {
         navigationMapInstance.easeTo({ zoom: targetZoom, duration: 2000 });
     }
 }
-
 // ===================================================================
 // NOMBRE: handleDragStartReorder
 // RESUMEN: Inicia el arrastre de una etapa en la lista de reordenamiento.
@@ -9285,27 +9290,20 @@ function eliminarRadaresDeRuta() {
         updateNavigationProgressDisplay(navigationCurrentRouteData.routes[0], lastCarDistanceAlongRouteForNavLogic);
     }
 }
-
 // ===================================================================
-// NOMBRE: handleZoomToggleButtonClick (VERSIÓN CON ANULACIÓN FORZADA)
-// RESUMEN: Alterna el zoom y activa un temporizador para anular cualquier zoom automático.
+// NOMBRE: handleZoomToggleButtonClick (VERSIÓN CON ANULACIÓN TEMPORAL)
+// RESUMEN: Alterna el zoom y activa la anulación temporal del modo AUTO.
 // ===================================================================
 function handleZoomToggleButtonClick(button) {
     if (!navigationMapInstance || !button) return;
 
-    // --- INICIO DE LA LÓGICA DE ANULACIÓN ---
-    isAutoZoomActive = false;
-    const autoBtn = document.getElementById('zoom-auto-button');
-    if (autoBtn) autoBtn.classList.remove('active');
-    
-    isManualZoomActive = true; // Activar el bloqueo
+    isManualZoomActive = true;
     if (manualZoomTimeout) clearTimeout(manualZoomTimeout);
-    showToast("Zoom manual. El seguimiento automático de zoom se reanudará en 30s.", "info", 4000);
+    showToast("Anulación temporal de zoom automático (30s).", "info", 3000);
     manualZoomTimeout = setTimeout(() => {
         isManualZoomActive = false;
-        showToast("Seguimiento automático de zoom reactivado.", "info");
+        showToast("Anulación temporal de zoom finalizada.", "info");
     }, 30000);
-    // --- FIN DE LA LÓGICA DE ANULACIÓN ---
 
     const currentState = button.dataset.zoomState;
     const img = button.querySelector('img');
