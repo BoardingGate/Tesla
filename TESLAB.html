@@ -1,4 +1,4 @@
-F184
+F185la 184 oktodo
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -6042,6 +6042,7 @@ class CombinedMapControl {
         lastTimestamp: null
     };
 
+    const MAX_SESSIONS_KEY = 'boardinggate_max_map_sessions';
     let autoStartNavModalTimer = null;
     let persistentMapHost = null;
     let persistentMapModal = null;
@@ -8395,10 +8396,49 @@ function restoreOriginalGrid() {
 }
 
 // ===================================================================
-// NOMBRE: openNavigationMap (VERSIÓN FINAL CON CARGA DE ALERTAS)
-// RESUMEN: Carga el mapa, los controles, e inicia la carga de alertas de tráfico.
+// NOMBRE: openNavigationMap (VERSIÓN FINAL CON CONTROL DE ACCESO)
+// RESUMEN: Carga el mapa, los controles, e inicia la carga de alertas y el control de acceso por sesiones.
 // ===================================================================
-function openNavigationMap() {
+async function openNavigationMap() {
+    const { primaryId: userId } = parseUserId(localStorage.getItem('userData_userId'));
+    if (userId && userId.toLowerCase() !== 'boardinggate') {
+        const toastId = "map-access-check";
+        showToast("Verificando acceso al mapa...", "info", 0, false, toastId);
+        try {
+            const adminDocRef = window.doc(window.db, "user_data", "boardinggate");
+            const userDocRef = window.doc(window.db, "user_data", userId);
+            
+            const [adminSnap, userSnap] = await Promise.all([window.getDoc(adminDocRef), window.getDoc(userDocRef)]);
+            
+            let maxSessions = Infinity;
+            if (adminSnap.exists() && typeof adminSnap.data().max_monthly_sessions === 'number') {
+                maxSessions = adminSnap.data().max_monthly_sessions;
+            }
+            
+            let userMonthlyCount = 0;
+            if (userSnap.exists()) {
+                const userData = userSnap.data();
+                const now = new Date();
+                const currentMonthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+                if (userData.map_sessions_last_month === currentMonthStr) {
+                    userMonthlyCount = userData.map_sessions_month || 0;
+                }
+            }
+
+            const existingToast = document.getElementById(toastId);
+            if(existingToast) existingToast.remove();
+            
+            if (userMonthlyCount >= maxSessions) {
+                showToast("HA SUPERADO EL NÚMERO MÁXIMO DE SESIONES MENSUALES DE MAPA, consulte con el administrador", "error", 10000);
+                return; 
+            }
+        } catch (error) {
+            const existingToast = document.getElementById(toastId);
+            if(existingToast) existingToast.remove();
+            showToast("No se pudo verificar el límite de sesiones. Acceso permitido.", "warning");
+        }
+    }
+
     isGeolocated = false;
     // Ocultar la UI principal
     const mainContent = document.querySelector('main'); if (mainContent) mainContent.style.display = 'none';
@@ -8555,7 +8595,7 @@ function openNavigationMap() {
     updateNavigationButtonColor();
     toggleMapLocationSearchVisibility(!isNavigating);
 }
-
+    
 // ===================================================================
 // NOMBRE: fetchKMLFilesList
 // RESUMEN: Obtiene la lista de archivos KML a procesar desde una URL.
@@ -8571,8 +8611,6 @@ async function fetchKMLFilesList(listUrl) {
         return [];
     }
 }
-
-
 
 // ===================================================================
 // NOMBRE: fetchAndParseKML
@@ -8590,8 +8628,6 @@ async function fetchAndParseKML(kmlFileUrl) {
         throw error;
     }
 }
-
-
 
 // ===================================================================
 // NOMBRE: parseKML
@@ -10881,11 +10917,9 @@ async function reAddCustomMapLayersAndSources(mapInstance) {
     mapInstance.addLayer({ id: 'reminders-icons-layer', type: 'symbol', source: 'reminders-geojson-source', filter: ['==', ['get', 'isRadar'], false], layout: { 'icon-image': 'reminder-icon', 'icon-size': ['interpolate', ['linear'], ['zoom'], 10, 0.4, 14, 0.6, 17, 0.8], 'icon-allow-overlap': true, 'icon-anchor': 'bottom' } });
 }
 
-
-    
 // ===================================================================
-// NOMBRE: fetchAndRenderChatUsers (MODIFICADA)
-// RESUMEN: Muestra la lista de usuarios, incluyendo estadísticas de sesión para el admin.
+// NOMBRE: fetchAndRenderChatUsers (MODIFICADA - AÑADE CONTROL ADMIN)
+// RESUMEN: Muestra la lista de usuarios y, para el admin, un campo para gestionar el límite de sesiones de mapa.
 // ===================================================================
 async function fetchAndRenderChatUsers() {
     const usersListContainer = document.getElementById('chat-users-list');
@@ -10914,9 +10948,53 @@ async function fetchAndRenderChatUsers() {
             }
         }
         statsHeader.textContent = `Sesiones-> Mes: ${stats.totalMonth} | Total: ${stats.totalHistoric}`;
+        
+        let maxSessionsControl = document.getElementById('chat-max-sessions-control');
+        if (!maxSessionsControl) {
+            maxSessionsControl = document.createElement('div');
+            maxSessionsControl.id = 'chat-max-sessions-control';
+            maxSessionsControl.style.cssText = 'padding: 8px; background-color: #3a3a3c; border-bottom: 1px solid #444; display: flex; align-items: center; justify-content: center; gap: 10px;';
+            maxSessionsControl.innerHTML = `
+                <label for="chat-max-sessions-input" style="font-weight: bold; color: #ffd700;">MÁXIMO SESIONES:</label>
+                <input type="number" id="chat-max-sessions-input" style="width: 80px; text-align: center; background-color: #2c2c2e; border: 1px solid #555; color: #f0f0f0; border-radius: 4px;">
+            `;
+            statsHeader.insertAdjacentElement('afterend', maxSessionsControl);
+
+            const maxSessionsInput = document.getElementById('chat-max-sessions-input');
+            
+            const localMaxSessions = localStorage.getItem(MAX_SESSIONS_KEY);
+            if(localMaxSessions) {
+                maxSessionsInput.value = localMaxSessions;
+            } else {
+                const adminDocRef = window.doc(window.db, "user_data", "boardinggate");
+                window.getDoc(adminDocRef).then(docSnap => {
+                    if (docSnap.exists() && docSnap.data().max_monthly_sessions) {
+                        const maxSessions = docSnap.data().max_monthly_sessions;
+                        maxSessionsInput.value = maxSessions;
+                        localStorage.setItem(MAX_SESSIONS_KEY, maxSessions);
+                    }
+                });
+            }
+
+            maxSessionsInput.addEventListener('change', async () => {
+                const newValue = parseInt(maxSessionsInput.value, 10);
+                if (!isNaN(newValue) && newValue >= 0) {
+                    localStorage.setItem(MAX_SESSIONS_KEY, newValue);
+                    const adminDocRef = window.doc(window.db, "user_data", "boardinggate");
+                    try {
+                        await window.setDoc(adminDocRef, { max_monthly_sessions: newValue }, { merge: true });
+                        showToast(`Límite máximo de sesiones mensuales actualizado a ${newValue}.`, 'success');
+                    } catch (error) {
+                        showToast(`Error al guardar el límite en la nube.`, 'error');
+                    }
+                }
+            });
+        }
     } else {
         const statsHeader = document.getElementById('chat-admin-stats-header');
         if (statsHeader) statsHeader.remove();
+        const maxSessionsControl = document.getElementById('chat-max-sessions-control');
+        if (maxSessionsControl) maxSessionsControl.remove();
     }
     
     try {
