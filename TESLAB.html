@@ -1,4 +1,4 @@
-f188
+f189
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -9765,10 +9765,10 @@ function showAllReminders(options = {}) {
          modalTable.querySelector('#close-reminders-bottom').addEventListener('click', closeClean);
          setupReminderTableListeners(modalTable);
 }
-    
+
 // ===================================================================
-// NOMBRE: openLocationsPreviewMap (MODIFICADA - PARA MAPBOX Y CORREGIDA)
-// RESUMEN: Abre un mapa modal con vista satélite que muestra todos los recordatorios con ubicación. Se ha eliminado la lógica de redibujado en zoomend que causaba el error.
+// NOMBRE: openLocationsPreviewMap (VERSIÓN FINAL CON RENDERIZADO GEOJSON)
+// RESUMEN: Abre un mapa modal satélite y dibuja TODOS los marcadores de forma eficiente usando una única fuente GeoJSON, solucionando el bug de visualización.
 // ===================================================================
 function openLocationsPreviewMap() {
     closeOtherModals('locations-preview-modal');
@@ -9801,7 +9801,6 @@ function openLocationsPreviewMap() {
         locationsPreviewMapObjects = [];
         clearModalAutoCloseTimer(modal, closeButton, 'locations-preview-modal');
         modal.classList.add('hidden');
-        
         document.body.classList.remove('modal-open');
     };
 
@@ -9822,53 +9821,99 @@ function openLocationsPreviewMap() {
         attributionControl: true 
     });
 
-    const allReminders = JSON.parse(localStorage.getItem('reminders') || '[]').map(r => ({ ...r }));
-    const showExcluded = JSON.parse(localStorage.getItem(SHOW_EXCLUDED_REMINDERS_KEY)) || false;
-    let locationsToPlot = allReminders.filter(r => {
-        const hasLocation = r.isLocationEnabled && r.locationCoordinates?.latitude && r.locationCoordinates?.longitude;
-        if (!hasLocation) return false;
-        if (showExcluded) {
-            return true;
-        } else {
-            return !r.excludeFromList;
+    const plotAllLocations = async () => {
+        await loadAndAddMapImages(locationsPreviewMap);
+
+        const allReminders = JSON.parse(localStorage.getItem('reminders') || '[]').map(r => ({ ...r }));
+        const showExcluded = JSON.parse(localStorage.getItem(SHOW_EXCLUDED_REMINDERS_KEY)) || false;
+        let locationsToPlot = allReminders.filter(r => {
+            const hasLocation = r.isLocationEnabled && r.locationCoordinates?.latitude && r.locationCoordinates?.longitude;
+            if (!hasLocation) return false;
+            return showExcluded ? true : !r.excludeFromList;
+        });
+
+        if (titleElement) {
+            titleElement.textContent = `Ubicaciones con Recordatorios ${showExcluded ? '(incl. Radares)' : '(sin Radares)'}`;
         }
-    });
 
-    if (titleElement) {
-        titleElement.textContent = `Ubicaciones con Recordatorios ${showExcluded ? '(incl. Radares)' : '(sin Radares)'}`;
-    }
+        const geojsonFeatures = locationsToPlot.map(reminder => {
+            const isRadar = reminder.text.toUpperCase().includes("RADAR:") || reminder.excludeFromList;
+            const speed = isRadar ? extractSpeedFromRadarText(reminder.text) : null;
+            
+            const properties = {
+                reminderId: reminder.id,
+                isRadar: isRadar,
+                isFromTarea: reminder.isFromTarea || false,
+            };
+            if (speed !== null) {
+                properties.speed = String(speed);
+            }
 
-    locationsPreviewMapObjects.forEach(obj => {
-        if(obj.marker) obj.marker.remove();
-        if(obj.circleId && locationsPreviewMap.getLayer(obj.circleId)) locationsPreviewMap.removeLayer(obj.circleId);
-        if(obj.circleId && locationsPreviewMap.getSource(obj.circleId)) locationsPreviewMap.removeSource(obj.circleId);
-    });
-    locationsPreviewMapObjects = [];
+            return {
+                type: 'Feature',
+                geometry: {
+                    type: 'Point',
+                    coordinates: [reminder.locationCoordinates.longitude, reminder.locationCoordinates.latitude]
+                },
+                properties: properties
+            };
+        });
 
-    locationsPreviewMap.on('load', () => {
-        locationsToPlot.forEach(reminder => {
-            const mapObject = plotSingleReminderOnMap(reminder, locationsPreviewMap);
-            if (mapObject) {
-                locationsPreviewMapObjects.push(mapObject);
+        const geojsonData = {
+            type: 'FeatureCollection',
+            features: geojsonFeatures
+        };
+
+        const sourceId = 'locations-preview-source';
+        if (locationsPreviewMap.getSource(sourceId)) {
+            locationsPreviewMap.getSource(sourceId).setData(geojsonData);
+        } else {
+            locationsPreviewMap.addSource(sourceId, { type: 'geojson', data: geojsonData });
+        }
+
+        const layers = [
+            { id: 'preview-circles', type: 'circle', filter: ['==', 'isRadar', true], paint: {'circle-color': 'red', 'circle-radius': 15, 'circle-stroke-width': 2, 'circle-stroke-color': 'white'} },
+            { id: 'preview-speed-text', type: 'symbol', filter: ['all', ['==', 'isRadar', true], ['has', 'speed']], layout: {'text-field': '{speed}', 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': 12, 'text-allow-overlap': true}, paint: {'text-color': 'yellow'} },
+            { id: 'preview-radar-text', type: 'symbol', filter: ['all', ['==', 'isRadar', true], ['!', ['has', 'speed']]], layout: { 'text-field': 'Rdar', 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': 10, 'text-allow-overlap': true}, paint: { 'text-color': 'yellow'} },
+            { id: 'preview-reminder-icons', type: 'symbol', filter: ['==', 'isRadar', false], layout: {'icon-image': 'reminder-icon', 'icon-size': 0.7, 'icon-allow-overlap': true, 'icon-anchor': 'bottom'} }
+        ];
+
+        layers.forEach(layer => {
+            if (!locationsPreviewMap.getLayer(layer.id)) {
+                locationsPreviewMap.addLayer({ ...layer, source: sourceId });
             }
         });
 
-        if (locationsPreviewMapObjects.length > 0) {
+        if (geojsonFeatures.length > 0) {
             const bounds = new mapboxgl.LngLatBounds();
-            locationsPreviewMapObjects.forEach(obj => {
-                const lngLat = obj.marker.getLngLat();
-                bounds.extend([lngLat.lng, lngLat.lat]);
+            geojsonFeatures.forEach(feature => {
+                bounds.extend(feature.geometry.coordinates);
             });
             if (!bounds.isEmpty()) {
-                locationsPreviewMap.fitBounds(bounds, { padding: 40 });
+                locationsPreviewMap.fitBounds(bounds, { padding: 50, duration: 0 });
             }
         } else {
             showToast(`No hay recordatorios con ubicación para mostrar según el filtro actual.`, "info");
         }
-    });
-    
-    locationsPreviewMap.resize(); 
-}
+
+        const interactiveLayers = ['preview-circles', 'preview-reminder-icons'];
+        locationsPreviewMap.on('click', interactiveLayers, (e) => {
+            if (e.features && e.features.length > 0) {
+                const reminderId = e.features[0].properties.reminderId;
+                showReminderActionModal(reminderId);
+            }
+        });
+
+        locationsPreviewMap.on('mouseenter', interactiveLayers, () => { locationsPreviewMap.getCanvas().style.cursor = 'pointer'; });
+        locationsPreviewMap.on('mouseleave', interactiveLayers, () => { locationsPreviewMap.getCanvas().style.cursor = ''; });
+    };
+
+    if (locationsPreviewMap.isStyleLoaded()) {
+        plotAllLocations();
+    } else {
+        locationsPreviewMap.on('load', plotAllLocations);
+    }
+}    
 
 // ===================================================================
 // NOMBRE: showSavedLocationsModal (MODIFICADA - PARA MAPBOX)
@@ -24149,10 +24194,10 @@ function createWaypointMarkerIcon(label, type, visited, id, currentZoomLevel = n
     
     return el;
 }
-    
+
 // ===================================================================
-// NOMBRE: plotSingleReminderOnMap (VERSIÓN FINAL CON ESCALADO COMPLETO)
-// RESUMEN: Dibuja un recordatorio. Ahora también escala los iconos de recordatorios normales según el zoom.
+// NOMBRE: plotSingleReminderOnMap (VERSIÓN FINAL CON MODAL PERSONALIZADO)
+// RESUMEN: Dibuja un recordatorio y, al hacer clic, abre un modal de acciones personalizado.
 // ===================================================================
 function plotSingleReminderOnMap(reminder, mapInstance) {
     if (!mapInstance || !reminder.isLocationEnabled || !reminder.locationCoordinates) return null;
@@ -24173,17 +24218,10 @@ function plotSingleReminderOnMap(reminder, mapInstance) {
             markerElement = createRadarSpeedIcon(speedLimit, currentZoomLevel, isFromPersonalTask);
             anchorPoint = 'center';
         } else {
-            const ZOOM_PEQUENO = 11.5; const ZOOM_GRANDE = 17; const TAMANO_MINIMO_W = 18; const TAMANO_MINIMO_H = 28; const TAMANO_MAXIMO_W = 25; const TAMANO_MAXIMO_H = 41;
-            let finalWidth = TAMANO_MINIMO_W; let finalHeight = TAMANO_MINIMO_H;
-            if (currentZoomLevel !== null) {
-                if (currentZoomLevel <= ZOOM_PEQUENO) { finalWidth = TAMANO_MINIMO_W; finalHeight = TAMANO_MINIMO_H; }
-                else if (currentZoomLevel >= ZOOM_GRANDE) { finalWidth = TAMANO_MAXIMO_W; finalHeight = TAMANO_MAXIMO_H; }
-                else { const progress = (currentZoomLevel - ZOOM_PEQUENO) / (ZOOM_GRANDE - ZOOM_PEQUENO); finalWidth = TAMANO_MINIMO_W + (TAMANO_MAXIMO_W - TAMANO_MINIMO_W) * progress; finalHeight = TAMANO_MINIMO_H + (TAMANO_MAXIMO_H - TAMANO_MINIMO_H) * progress; }
-            }
             markerElement = document.createElement('img');
             markerElement.src = 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-green.png';
-            markerElement.style.width = `${Math.round(finalWidth)}px`;
-            markerElement.style.height = `${Math.round(finalHeight)}px`;
+            markerElement.style.width = '25px';
+            markerElement.style.height = '41px';
             markerElement.style.cursor = 'pointer';
             anchorPoint = 'bottom';
         }
@@ -24235,7 +24273,7 @@ function plotSingleReminderOnMap(reminder, mapInstance) {
         mapInstance.once('style.load', plot);
     }
     return mapObject;
-}
+}    
     
 // ===================================================================
 // NOMBRE: handleStageTouchMove
