@@ -4775,12 +4775,12 @@ p.ocm-price-info {
 #map-info-overlay {
     position: absolute;
     top: 4px;    right: 4px;    z-index: 1001; 
-    background-color: rgba(138, 136, 136, 0.1); 
+    background-color: rgba(0, 0, 0, 0.03); 
     color: #dbd9d9; font-weight: bold;
     padding: 4px 6px;  border-radius: 5px;
     box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-    max-width: 300px; 
-    font-size: 0.8em;  font-weight: 500;
+    max-width: 300px;
+    font-size: 0.9em;  font-weight: 500;
     text-align: center;  display: none; 
     transition: opacity 0.3s ease-in-out;
 }
@@ -6420,7 +6420,7 @@ function initializeLocationPickerMap(mapContainerId, slotIndex) {
 // RESUMEN: Carga los ajustes de saturación y contraste del mapa desde localStorage y los aplica como variables CSS.
 // ===================================================================
 function applyMapVisualSettings() {
-    const savedSaturation = localStorage.getItem('boardinggate_map_saturation') || '1.4';
+    const savedSaturation = localStorage.getItem('boardinggate_map_saturation') || '1.6';
     const savedContrast = localStorage.getItem('boardinggate_map_contrast') || '1.2';
     
     document.documentElement.style.setProperty('--map-saturation', savedSaturation);
@@ -6572,11 +6572,12 @@ function showReminderActionModal(reminderId) {
 }   
 
 // ===================================================================
-// NOMBRE: handleAutoZoom (VERSIÓN CON ANULACIÓN TEMPORAL)
-// RESUMEN: Ajusta el zoom automáticamente, pero respeta la anulación manual temporal y la prioridad de maniobra.
+// NOMBRE: handleAutoZoom (VERSIÓN CON ANULACIÓN TEMPORAL Y MODO LIBRE)
+// RESUMEN: Ajusta el zoom, pero respeta anulación manual y prioridad de maniobra. Ahora funciona en modo Navegación y Free Drive.
 // ===================================================================
 function handleAutoZoom() {
-    if (!isAutoZoomActive || isManualZoomActive || !isNavigating || !navigationMapInstance) return;
+    // <<< CORRECCIÓN: Se añade '|| isFreeDriveActive' para que la función se ejecute también en modo libre >>>
+    if (!isAutoZoomActive || isManualZoomActive || !(isNavigating || isFreeDriveActive) || !navigationMapInstance) return;
 
     if (isZoomedForManeuver) return;
 
@@ -6596,6 +6597,7 @@ function handleAutoZoom() {
         navigationMapInstance.easeTo({ zoom: targetZoom, duration: 2000 });
     }
 }
+    
 // ===================================================================
 // NOMBRE: handleDragStartReorder
 // RESUMEN: Inicia el arrastre de una etapa en la lista de reordenamiento.
@@ -6862,8 +6864,8 @@ function processSimulatedGpsPosition(forceExactPosition = false) {
 }    
 
 // ===================================================================
-// NOMBRE: startFreeDrive (MODIFICADA - LIMPIEZA INICIAL)
-// RESUMEN: Inicia el modo de conducción libre, limpiando marcadores de velocidad anteriores.
+// NOMBRE: startFreeDrive (MODIFICADA - LIMPIEZA INICIAL Y ZOOM AUTOMÁTICO)
+// RESUMEN: Inicia el modo libre, limpia marcadores y aplica el zoom correcto (automático o fijo).
 // ===================================================================
 function startFreeDrive(initialCoords) {
     if (isFreeDriveActive || isNavigating) return;
@@ -6888,6 +6890,21 @@ function startFreeDrive(initialCoords) {
     
     showToast("Grabación de viaje en modo libre iniciada.", "success");
 
+    if (navigationMapInstance) {
+        const flyToOptions = {
+            center: [initialCoords.longitude, initialCoords.latitude],
+            duration: 1500 
+        };
+
+        if (isAutoZoomActive) {
+            handleAutoZoom(); 
+        } else {
+            flyToOptions.zoom = 17.5;
+        }
+
+        navigationMapInstance.flyTo(flyToOptions);
+    }
+    
     navigationFollowUser = true;
     shouldCenterOnUser = true;
     const locateMeButton = document.getElementById('locate-me-on-reminders-map');
@@ -6904,6 +6921,8 @@ function startFreeDrive(initialCoords) {
     currentGraphMode = localStorage.getItem(GRAPH_STATE_KEY) || 'Desviación ETA'; 
     initializeNavigationGraph();
 }
+
+    
     
 // NOMBRE: redrawAllHTMLMarkers (VERSIÓN FINAL Y CORRECTA)
 // RESUMEN: Limpia y redibuja los marcadores de Etapas y Recordatorios/Radares.
@@ -8536,7 +8555,7 @@ async function openNavigationMap() {
                 container: mapActualContainer,
                 style: initialStyle, 
                 center: [-3.703790, 40.416775],
-                zoom: 1.5,
+                zoom: 3.1,
                 pitch: 0, 
                 bearing: 0,
                 attributionControl: false, 
@@ -15022,10 +15041,13 @@ function initializeConfigModalListeners() {
     function markCacheAsDirty() {
         localStorage.setItem('lastCacheUpdateTimestamp', Date.now().toString());
     }
-    
-  // ===================================================================
-// NOMBRE: startGpsWatching (VERSIÓN CON INICIO AUTOMÁTICO DE NAVEGACIÓN)
-// RESUMEN: Inicia el seguimiento GPS. Si hay una ruta planificada y el usuario se mueve >50m, activa la navegación automáticamente.
+
+// ===================================================================
+// NOMBRE: startGpsWatching (VERSIÓN CORREGIDA Y ROBUSTA)
+// RESUMEN: Inicia el seguimiento GPS. Ahora incluye una doble comprobación para el inicio automático:
+//          1. Comprueba si la ruta es relevante (si el coche está cerca del punto de partida).
+//          2. Si es relevante, comprueba si el coche ha comenzado a moverse para activar la navegación.
+//          3. AÑADIDO: Si NO hay ruta, comprueba si el coche se ha movido para activar el MODO FREE DRIVE.
 // ===================================================================
 function startGpsWatching() {
     if (gpsRetryTimeoutId) {
@@ -15067,19 +15089,50 @@ function startGpsWatching() {
             };
             navigationCurrentLocation = coordsForUpdate;
 
-            // --- INICIO DE LA NUEVA LÓGICA DE AUTO-NAVEGACIÓN ---
             const hasPlottedRoute = navigationCurrentRouteData && navigationWaypoints.length >= 2;
             if (!isNavigating && hasPlottedRoute) {
                 const startPoint = navigationWaypoints[0];
                 const distanceFromStart = calculateDistance(startPoint.lat, startPoint.lng, coordsForUpdate.latitude, coordsForUpdate.longitude);
-                
-                if (distanceFromStart > 50) { // Umbral de 50 metros
+
+                const START_TRIGGER_DISTANCE = 50;  // Distancia para iniciar la navegación.
+                const RELEVANCE_DISTANCE = 200; // Distancia máxima para considerar la ruta como "relevante".
+
+                // **COMPROBACIÓN CLAVE:**
+                // Solo se inicia si nos hemos alejado MÁS de 50m, pero estábamos a MENOS de 200m del inicio.
+                // Esto evita el inicio automático si la ruta es de un viaje anterior y estamos a kilómetros de distancia.
+                if (distanceFromStart > START_TRIGGER_DISTANCE && distanceFromStart < RELEVANCE_DISTANCE) {
                     showToast("Movimiento detectado. Iniciando navegación automáticamente...", "success");
                     toggleNavigationState(); // Activa la navegación
                     return; // Salimos para que el resto de la lógica se ejecute en el siguiente tick ya con isNavigating = true
                 }
             }
-            // --- FIN DE LA NUEVA LÓGICA DE AUTO-NAVEGACIÓN ---
+            
+            // <<< INICIO DE LA CORRECCIÓN: Lógica para iniciar Free Drive automáticamente >>>
+            const noRouteLoaded = !hasPlottedRoute;
+            // Comprobamos si NO estamos navegando, NO hay una ruta cargada, y el modo Free Drive AÚN NO está activo.
+            if (!isNavigating && !isFreeDriveActive && noRouteLoaded) {
+                
+                // Para evitar arranques accidentales por imprecisión del GPS, esperamos un movimiento mínimo.
+                if (lastPositionForStats) {
+                    const distanceMoved = calculateDistance(
+                        lastPositionForStats.latitude, lastPositionForStats.longitude,
+                        coordsForUpdate.latitude, coordsForUpdate.longitude
+                    );
+                    
+                    // Si nos hemos movido más de 20 metros, consideramos que el viaje ha comenzado.
+                    if (distanceMoved > 20) { 
+                        startFreeDrive(coordsForUpdate); // ¡Llamamos a la función para iniciar el modo!
+                        
+                        // Salimos de la ejecución actual. El siguiente tick del GPS ya operará con isFreeDriveActive = true.
+                        return; 
+                    }
+                }
+                
+                // Si es la primera vez que recibimos la posición, o no nos hemos movido lo suficiente,
+                // simplemente la guardamos para la siguiente comprobación.
+                lastPositionForStats = { ...coordsForUpdate };
+            }
+            // <<< FIN DE LA CORRECCIÓN >>>
 
             const isTripActive = isNavigating || isFreeDriveActive;
             if (isTripActive && lastPositionForStats) {
@@ -15104,7 +15157,6 @@ function startGpsWatching() {
             updateInitialUserPosition(coordsForUpdate, navigationMapInstance);
 
             if (isNavigating && navigationCurrentRouteData && navigationCurrentRouteData.routes[0] && coordsForUpdate) {
-                // ... (el resto de la función se mantiene igual)
                 const routeForDistCalc = navigationCurrentRouteData.routes[0];
                 let carDistTurf = 0;
                 if (navigationMapInstance.getSource('route') && navigationMapInstance.getSource('route')._data && typeof turf !== 'undefined') {
@@ -15168,7 +15220,9 @@ function startGpsWatching() {
         },
         { enableHighAccuracy: true, timeout: 15000, maximumAge: 2000, distanceFilter: 3 }
     );
-}     
+}
+
+
     
     // ===================================================================
     // NOMBRE: promptForBackupPassword
@@ -17102,7 +17156,7 @@ function applyZoom(state) {
         if (!document.getElementById('radar-button')) {
             radarButton = document.createElement('span');
             radarButton.id = 'radar-button';
-            radarButton.innerHTML = `<img src="PNG/RADAR.PNG" alt="Radar/Ubicaciones/Navegación">`;
+            radarButton.innerHTML = `<img src="PNG/AVANCE.PNG" alt="Radar/Ubicaciones/Navegación">`;
             document.body.appendChild(radarButton);
             radarButton.addEventListener('click', () => {
                 if (isEditMode || isAssignmentMode || isKeywordAssignmentMode) return;
