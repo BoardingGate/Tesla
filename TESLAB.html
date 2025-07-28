@@ -1,4 +1,4 @@
-B8
+B9
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -11651,82 +11651,6 @@ function adaptMapboxRouteToOSRMFormat(mapboxRoute) {
 }
 
     
-// ===================================================================
-// NOMBRE: fetchRouteData (MODIFICADA)
-// RESUMEN: Obtiene la ruta del servicio primario (OSRM o Mapbox) y usa el otro como respaldo.
-// ===================================================================
-async function fetchRouteData(coordsString) {
-    const MAPBOX_PRIMARY_KEY = 'boardinggate_useMapboxAsPrimary';
-    const useMapboxAsPrimary = localStorage.getItem(MAPBOX_PRIMARY_KEY) === 'true';
-
-    const osrmService = {
-        name: 'OSRM',
-        buildUrl: (coords) => `${OSRM_SERVICE_URL}/driving/${coords}?overview=full&geometries=geojson&steps=true&alternatives=false&annotations=true`,
-        processResponse: async (response) => {
-            if (!response.ok) {
-                let errorData = { message: `OSRM HTTP error ${response.status}` };
-                try { errorData = await response.json(); } catch (e) {}
-                throw new Error(errorData.code || errorData.message || response.statusText);
-            }
-            const data = await response.json();
-            if (data.code !== 'Ok' || !data.routes || data.routes.length === 0) {
-                throw new Error(data.message || "No se encontraron rutas en OSRM.");
-            }
-            return data;
-        }
-    };
-
-    const mapboxService = {
-        name: 'Mapbox',
-        buildUrl: (coords) => `https://api.mapbox.com/directions/v5/mapbox/driving/${coords}?alternatives=false&geometries=geojson&overview=full&steps=true&access_token=${MAPBOX_ACCESS_TOKEN}`,
-        processResponse: async (response) => {
-            if (!response.ok) {
-                let errorData = { message: `Mapbox HTTP error ${response.status}` };
-                try { errorData = await response.json(); } catch (e) {}
-                throw new Error(errorData.message || response.statusText);
-            }
-            const data = await response.json();
-            if (data.code !== 'Ok' || !data.routes || data.routes.length === 0) {
-                throw new Error(data.message || "No se encontraron rutas en Mapbox.");
-            }
-            const adaptedRoute = adaptMapboxRouteToOSRMFormat(data.routes[0]);
-            const adaptedWaypoints = data.waypoints.map(wp => ({
-                distance: wp.distance,
-                hint: wp.hint,
-                location: wp.location,
-                name: wp.name,
-            }));
-            return {
-                code: 'Ok',
-                routes: [adaptedRoute],
-                waypoints: adaptedWaypoints
-            };
-        }
-    };
-
-    const primaryService = useMapboxAsPrimary ? mapboxService : osrmService;
-    const fallbackService = useMapboxAsPrimary ? osrmService : mapboxService;
-
-    try {
-        const primaryUrl = primaryService.buildUrl(coordsString);
-        const primaryResponse = await fetch(primaryUrl);
-        return await primaryService.processResponse(primaryResponse);
-    } catch (primaryError) {
-        showToast(`Servicio principal (${primaryService.name}) falló. Intentando con respaldo (${fallbackService.name})...`, "warning", 4000);
-        
-        try {
-            const fallbackUrl = fallbackService.buildUrl(coordsString);
-            const fallbackResponse = await fetch(fallbackUrl);
-            const fallbackData = await fallbackService.processResponse(fallbackResponse);
-            
-            showToast(`Ruta calculada con el servicio auxiliar ${fallbackService.name}.`, "info", 3000);
-            return fallbackData;
-        } catch (fallbackError) {
-            showToast(`El servicio de respaldo (${fallbackService.name}) también falló: ${fallbackError.message}`, "error", 5000);
-            throw fallbackError;
-        }
-    }
-}
 
 // ===================================================================
 // NOMBRE: assignMapButtonListeners (VERSIÓN FINAL CON REASIGNACIÓN SEGURA)
@@ -21521,8 +21445,8 @@ function filterForCheapestPDRs() {
     }
     
 // ===================================================================
-// NOMBRE: recalculateAndDrawRoute (VERSIÓN CON CÁLCULO DE DISTANCIA TOTAL CORREGIDO)
-// RESUMEN: Recalcula la ruta y ajusta la distancia total del viaje para reflejar el desvío.
+// NOMBRE: recalculateAndDrawRoute (VERSIÓN MODIFICADA CON RUMBO)
+// RESUMEN: Recalcula la ruta y, si se está navegando, pasa el rumbo actual del vehículo para evitar cambios de sentido.
 // ===================================================================
 async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
     if (isRecalculatingRoute) {
@@ -21535,7 +21459,7 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
 
     try {
         if (preserveAccumulatedStats && isNavigating && navigationCurrentRouteData?.routes?.[0]) {
-            const previousLegIndex = currentLegIndexNav -1;
+            const previousLegIndex = currentLegIndexNav - 1;
             if (previousLegIndex >= 0 && navigationCurrentRouteData.routes[0].legs[previousLegIndex]) {
                  const completedLeg = navigationCurrentRouteData.routes[0].legs[previousLegIndex];
                  accumulatedDistanceBeforeCurrentSegment += completedLeg.distance || 0;
@@ -21543,6 +21467,11 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
         }
 
         let waypointsForAPI = [];
+        // ---> INICIO DE LA MODIFICACIÓN <---
+        // Obtenemos el rumbo actual SOLO si estamos navegando activamente.
+        const currentHeading = (isNavigating && navigationCurrentLocation) ? navigationCurrentLocation.heading : null;
+        // ---> FIN DE LA MODIFICACIÓN <---
+
         if (isNavigating && navigationCurrentLocation) {
             waypointsForAPI.push({ lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude, isRecalculatedStart: true });
             const unvisitedWaypoints = navigationWaypoints.filter(wp => !wp.visited);
@@ -21560,13 +21489,16 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
         }
 
         const coordsString = validWaypoints.map(wp => `${wp.lng},${wp.lat}`).join(';');
-        const data = await fetchRouteData(coordsString);
+        
+        // ---> INICIO DE LA MODIFICACIÓN <---
+        // Pasamos el rumbo actual a la función que llama a la API.
+        const data = await fetchRouteData(coordsString, currentHeading);
+        // ---> FIN DE LA MODIFICACIÓN <---
 
         if (data.routes && data.routes.length > 0) {
             navigationCurrentRouteData = data;
             drawRouteOnMap(data.routes[0]);
             
-            // --> LÍNEA CLAVE: Actualizamos la distancia total del viaje.
             if (isNavigating && preserveAccumulatedStats) {
                 const newRemainingDistance = data.routes[0].distance;
                 tripInitialDistanceMeters = totalDistanceTravelledForStats + newRemainingDistance;
@@ -21616,7 +21548,104 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
     }
 }
 
-    
+
+// ===================================================================
+// NOMBRE: fetchRouteData (MODIFICADA CON RUMBO)
+// RESUMEN: Obtiene la ruta, añadiendo el parámetro 'bearings' si se proporciona un rumbo de salida.
+// ===================================================================
+async function fetchRouteData(coordsString, startHeading = null) {
+    const MAPBOX_PRIMARY_KEY = 'boardinggate_useMapboxAsPrimary';
+    const useMapboxAsPrimary = localStorage.getItem(MAPBOX_PRIMARY_KEY) === 'true';
+
+    const osrmService = {
+        name: 'OSRM',
+        buildUrl: (coords) => {
+            let url = `${OSRM_SERVICE_URL}/driving/${coords}?overview=full&geometries=geojson&steps=true&alternatives=false&annotations=true`;
+            // ---> INICIO DE LA MODIFICACIÓN <---
+            // Si recibimos un rumbo, lo añadimos a la URL de la API.
+            if (startHeading !== null && !isNaN(startHeading)) {
+                // El formato es {rumbo},{tolerancia};. La tolerancia de 45º permite que la ruta
+                // comience en cualquier carretera dentro de un arco de 90º frente al coche.
+                // El punto y coma final asegura que la restricción solo se aplica al punto de partida.
+                url += `&bearings=${Math.round(startHeading)},45;`;
+            }
+            // ---> FIN DE LA MODIFICACIÓN <---
+            return url;
+        },
+        processResponse: async (response) => {
+            if (!response.ok) {
+                let errorData = { message: `OSRM HTTP error ${response.status}` };
+                try { errorData = await response.json(); } catch (e) {}
+                throw new Error(errorData.code || errorData.message || response.statusText);
+            }
+            const data = await response.json();
+            if (data.code !== 'Ok' || !data.routes || data.routes.length === 0) {
+                throw new Error(data.message || "No se encontraron rutas en OSRM.");
+            }
+            return data;
+        }
+    };
+
+    const mapboxService = {
+        name: 'Mapbox',
+        buildUrl: (coords) => {
+            let url = `https://api.mapbox.com/directions/v5/mapbox/driving/${coords}?alternatives=false&geometries=geojson&overview=full&steps=true&access_token=${MAPBOX_ACCESS_TOKEN}`;
+            // ---> INICIO DE LA MODIFICACIÓN <---
+            // Hacemos lo mismo para la API de Mapbox.
+            if (startHeading !== null && !isNaN(startHeading)) {
+                url += `&bearings=${Math.round(startHeading)},45;`;
+            }
+            // ---> FIN DE LA MODIFICACIÓN <---
+            return url;
+        },
+        processResponse: async (response) => {
+            if (!response.ok) {
+                let errorData = { message: `Mapbox HTTP error ${response.status}` };
+                try { errorData = await response.json(); } catch (e) {}
+                throw new Error(errorData.message || response.statusText);
+            }
+            const data = await response.json();
+            if (data.code !== 'Ok' || !data.routes || data.routes.length === 0) {
+                throw new Error(data.message || "No se encontraron rutas en Mapbox.");
+            }
+            const adaptedRoute = adaptMapboxRouteToOSRMFormat(data.routes[0]);
+            const adaptedWaypoints = data.waypoints.map(wp => ({
+                distance: wp.distance,
+                hint: wp.hint,
+                location: wp.location,
+                name: wp.name,
+            }));
+            return {
+                code: 'Ok',
+                routes: [adaptedRoute],
+                waypoints: adaptedWaypoints
+            };
+        }
+    };
+
+    const primaryService = useMapboxAsPrimary ? mapboxService : osrmService;
+    const fallbackService = useMapboxAsPrimary ? osrmService : mapboxService;
+
+    try {
+        const primaryUrl = primaryService.buildUrl(coordsString);
+        const primaryResponse = await fetch(primaryUrl);
+        return await primaryService.processResponse(primaryResponse);
+    } catch (primaryError) {
+        showToast(`Servicio principal (${primaryService.name}) falló. Intentando con respaldo (${fallbackService.name})...`, "warning", 4000);
+        
+        try {
+            const fallbackUrl = fallbackService.buildUrl(coordsString);
+            const fallbackResponse = await fetch(fallbackUrl);
+            const fallbackData = await fallbackService.processResponse(fallbackResponse);
+            
+            showToast(`Ruta calculada con el servicio auxiliar ${fallbackService.name}.`, "info", 3000);
+            return fallbackData;
+        } catch (fallbackError) {
+            showToast(`El servicio de respaldo (${fallbackService.name}) también falló: ${fallbackError.message}`, "error", 5000);
+            throw fallbackError;
+        }
+    }
+}
     
     // ===================================================================
     // NOMBRE: formatPhotonFeatureName
