@@ -1,4 +1,4 @@
- B62
+ B63
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -16048,9 +16048,10 @@ async function showPoiInfoModal(feature) {
 }
 
 // ===================================================================
-// NOMBRE: openNavigationMap (VERSIÓN DE DIAGNÓSTICO v8 - FLUJO DE 3 PASOS CORREGIDO)
-// RESUMEN: Reimplementa el flujo de 3 pasos con la llamada correcta a la Geocoding API
-//          para el Paso 2. Mantiene los logs exhaustivos para verificar cada etapa.
+// NOMBRE: openNavigationMap (VERSIÓN FINAL Y FUNCIONAL v9)
+// RESUMEN: Implementa el flujo de Geocodificación Inversa Pura con un filtro de
+//          tipos flexible ('poi,address,place,locality') para garantizar
+//          la máxima fiabilidad en la obtención de datos de POI en español.
 // ===================================================================
 async function openNavigationMap() {
     const { primaryId: userId } = parseUserId(localStorage.getItem('userData_userId'));
@@ -16160,70 +16161,52 @@ async function openNavigationMap() {
                     toggleMapHeaderRowsVisibility(mapHeaderButtonsVisible);
 
                     navigationMapInstance.on('click', async (e) => {
-                        console.log("--- INICIO DE DIAGNÓSTICO DE CLIC ---");
-                        
-                        if (isAddReminderAtLocationModeActive) { console.log("MODO ACTIVO: Añadir Recordatorio."); handleMapClickToAddReminder(e); return; }
-                        if (isSimulatingGpsLocation && !automatedSimulationIntervalId) { console.log("MODO ACTIVO: Simulación GPS."); handleSimulateGpsPositionClick(e); return; }
-                        if (isNavigating) { console.log("MODO ACTIVO: Navegación."); return; }
-
-                        console.log("Modo por defecto: Planificación de Ruta.");
+                        // Prioridad 1: Modos especiales
+                        if (isAddReminderAtLocationModeActive) { handleMapClickToAddReminder(e); return; }
+                        if (isSimulatingGpsLocation && !automatedSimulationIntervalId) { handleSimulateGpsPositionClick(e); return; }
+                        if (isNavigating) { return; }
 
                         const point = e.point;
                         const lngLat = e.lngLat;
-                        
+
+                        // Prioridad 2: Nuestras capas personalizadas (PDRs, Recordatorios)
                         const customInteractiveLayers = ['pdr-simple-circle-layer', 'pdr-cards-layer-bg', 'reminders-circles-layer', 'reminders-icons-layer'];
                         if (navigationMapInstance.queryRenderedFeatures(point, { layers: customInteractiveLayers }).length > 0) {
-                             console.log("CLIC DETECTADO EN CAPA PERSONALIZADA (PDR/Recordatorio). Finalizando.");
-                             return;
-                        }
-
-                        // PASO 1: Identificar si hemos pulsado sobre un POI visual.
-                        const mapboxPoiLayers = ['poi-label'];
-                        const features = navigationMapInstance.queryRenderedFeatures(point, { layers: mapboxPoiLayers });
-                        console.log("PASO 1: Features visuales encontrados bajo el cursor:", features);
-
-                        const validPoiFeature = features.find(f => f.layer.id === 'poi-label' && f.properties && f.properties.name);
-
-                        if (validPoiFeature) {
-                            const poiName = validPoiFeature.properties.name;
-                            console.log(`PASO 1 - ÉXITO: Se encontró un POI visual con nombre: "${poiName}"`);
-
-                            try {
-                                // PASO 2: Usar la Geocoding API para encontrar el POI por nombre.
-                                const searchUrl = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(poiName)}.json?language=es&proximity=${lngLat.lng},${lngLat.lat}&limit=1&access_token=${mapboxgl.accessToken}`;
-                                console.log("PASO 2: URL de la Geocoding API a consultar:", searchUrl);
-                                
-                                const searchResponse = await fetch(searchUrl);
-                                const searchData = await searchResponse.json();
-                                console.log("PASO 2 - RESPUESTA de la Geocoding API:", searchData);
-
-                                if (searchData.features && searchData.features.length > 0) {
-                                    const bestMatch = searchData.features[0];
-                                    console.log(`PASO 2 - ÉXITO: Se encontró una coincidencia con id: "${bestMatch.id}"`);
-                                    
-                                    const featureForModal = {
-                                        properties: { mapbox_id: bestMatch.id },
-                                        geometry: bestMatch.geometry 
-                                    };
-                                    console.log("ACCIÓN: Llamando a showPoiInfoModal con el id válido.");
-                                    showPoiInfoModal(featureForModal);
-                                } else {
-                                    console.log("PASO 2 - FALLO: La Geocoding API no devolvió 'features'.");
-                                    console.log("ACCIÓN DE FALLBACK: Mostrando información básica del POI visual.");
-                                    showPoiInfoModal(validPoiFeature);
-                                }
-                            } catch (error) {
-                                console.error("ERROR CATASTRÓFICO en el flujo de búsqueda/recuperación de POI:", error);
-                                console.log("ACCIÓN DE FALLBACK (por error): Mostrando información básica del POI visual.");
-                                showPoiInfoModal(validPoiFeature);
-                            }
-                        } else {
-                            console.log("PASO 1 - FALLO: No se encontró un POI visual válido bajo el cursor.");
-                            console.log("ACCIÓN POR DEFECTO: Añadiendo etapa de ruta.");
-                            addWaypoint(lngLat);
+                            // La lógica específica para estas capas ya está en sus propios listeners,
+                            // así que simplemente salimos para no añadir una etapa.
+                            return;
                         }
                         
-                        console.log("--- FIN DE DIAGNÓSTICO DE CLIC ---");
+                        // Prioridad 3: Búsqueda de POIs con Geocodificación Inversa Pura y Flexible
+                        try {
+                            // ¡CORRECCIÓN CLAVE! Usamos un filtro de tipos más amplio para mayor robustez.
+                            const geocodingUrl = `https://api.mapbox.com/geocoding/v5/mapbox.places/${lngLat.lng},${lngLat.lat}.json?types=poi,address,place,locality&limit=1&language=es&access_token=${mapboxgl.accessToken}`;
+                            
+                            const response = await fetch(geocodingUrl);
+                            if (!response.ok) throw new Error('La respuesta de la API de Geocodificación no fue exitosa.');
+                            const data = await response.json();
+                            
+                            if (data.features && data.features.length > 0) {
+                                const bestFeature = data.features[0];
+                                const featureCoords = bestFeature.geometry.coordinates;
+                                const clickCoords = [lngLat.lng, lngLat.lat];
+                                const distance = turf.distance(turf.point(featureCoords), turf.point(clickCoords), { units: 'meters' });
+                                
+                                // Si el resultado está a menos de 50 metros del clic, lo consideramos válido.
+                                if (distance < 50) {
+                                    showPoiInfoModal(bestFeature);
+                                    return;
+                                }
+                            }
+                            
+                            // Acción por defecto: Si no se encontró nada relevante cerca, añadimos un waypoint.
+                            addWaypoint(lngLat);
+
+                        } catch (error) {
+                            console.error("Error en el flujo de búsqueda/recuperación de POI:", error);
+                            showToast("No se pudo obtener información del punto. Añadiendo etapa.", "warning");
+                            addWaypoint(lngLat); // Fallback en caso de error de red
+                        }
                     });
                     
                     enablePoiInteractivity(navigationMapInstance);
@@ -16286,6 +16269,7 @@ async function openNavigationMap() {
     updateNavigationButtonColor();
     toggleMapLocationSearchVisibility(!isNavigating);
 }
+
  
 // ===================================================================
 // NOMBRE: updateRouteAndCarIconStyle (MODIFICADA)
