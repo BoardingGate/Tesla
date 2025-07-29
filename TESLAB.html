@@ -1,4 +1,4 @@
- B53
+ B54
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -15914,10 +15914,11 @@ async function showPoiInfoModal(feature) {
     }
 }
 
-// ===================================================================
-// NOMBRE: openNavigationMap (VERSIÓN DE DIAGNÓSTICO v6)
-// RESUMEN: Incluye logs de consola detallados para depurar el flujo de
-//          obtención de información de POIs y entender la respuesta de la API.
+ // ===================================================================
+// NOMBRE: openNavigationMap (VERSIÓN DEFINITIVA Y ROBUSTA v6)
+// RESUMEN: Utiliza un filtro de tipos más amplio ('poi,address,place,locality')
+//          en la llamada de Geocodificación Inversa para garantizar la obtención
+//          de resultados incluso cuando el clic no cae sobre un POI estricto.
 // ===================================================================
 async function openNavigationMap() {
     const { primaryId: userId } = parseUserId(localStorage.getItem('userData_userId'));
@@ -16026,85 +16027,66 @@ async function openNavigationMap() {
                     navigationMapInstance.on('zoomend', updateTrafficAlertIconSizes);
                     toggleMapHeaderRowsVisibility(mapHeaderButtonsVisible);
 
-                    // ====================================================================
-                    // === INICIO: LISTENER DE CLIC CON DIAGNÓSTICO DETALLADO ===
-                    // ====================================================================
                     navigationMapInstance.on('click', async (e) => {
-                        console.log("--- INICIO DE DIAGNÓSTICO DE CLIC ---");
-
                         // Prioridad 1: Modos especiales
-                        if (isAddReminderAtLocationModeActive) { console.log("MODO ACTIVO: Añadir Recordatorio. Finalizando."); handleMapClickToAddReminder(e); return; }
-                        if (isSimulatingGpsLocation && !automatedSimulationIntervalId) { console.log("MODO ACTIVO: Simulación GPS. Finalizando."); handleSimulateGpsPositionClick(e); return; }
-                        if (isNavigating) { console.log("MODO ACTIVO: Navegación. Finalizando."); return; }
+                        if (isAddReminderAtLocationModeActive) { handleMapClickToAddReminder(e); return; }
+                        if (isSimulatingGpsLocation && !automatedSimulationIntervalId) { handleSimulateGpsPositionClick(e); return; }
+                        if (isNavigating) { return; }
 
                         const point = e.point;
                         const lngLat = e.lngLat;
-                        console.log("Punto del clic (coordenadas de pantalla):", point);
-                        console.log("Coordenadas geográficas del clic:", lngLat);
 
-                        // Prioridad 2: Nuestras capas personalizadas
+                        // Prioridad 2: Nuestras capas personalizadas (PDRs, Recordatorios)
                         const customInteractiveLayers = ['pdr-simple-circle-layer', 'pdr-cards-layer-bg', 'reminders-circles-layer', 'reminders-icons-layer'];
                         const customFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: customInteractiveLayers });
                         if (customFeatures.length > 0) {
-                            console.log("CLIC DETECTADO EN CAPA PERSONALIZADA. Finalizando.");
-                            // ... (lógica existente para PDRs y recordatorios) ...
-                            return;
+                            const topFeature = customFeatures[0];
+                            if (topFeature.layer.id.startsWith('pdr-')) {
+                                const pdrFeature = customFeatures.find(f => f.layer.id.startsWith('pdr-') && f.properties.ocmId);
+                                if (pdrFeature) {
+                                    const fullPointData = window.lastOcmApiResponse.find(p => p.ID === pdrFeature.properties.ocmId);
+                                    if (fullPointData) showChargingPointModal(fullPointData, pdrFeature.properties.index);
+                                    return;
+                                }
+                            } else if (topFeature.layer.id.startsWith('reminders-')) {
+                                if (topFeature.properties.reminderId) {
+                                    showReminderActionModal(topFeature.properties.reminderId);
+                                    return;
+                                }
+                            }
                         }
                         
-                        // Prioridad 3: Búsqueda de POIs
+                        // Prioridad 3: Búsqueda de POIs con Geocodificación Inversa
                         try {
-                            // CONSTRUIMOS LA URL DE LA API PARA VERIFICARLA
-                            const geocodingUrl = `https://api.mapbox.com/geocoding/v5/mapbox.places/${lngLat.lng},${lngLat.lat}.json?types=poi&limit=1&language=es&access_token=${mapboxgl.accessToken}`;
-                            console.log("URL de la API a consultar:", geocodingUrl);
-
+                            // ¡CORRECCIÓN CLAVE! Ampliamos los tipos de búsqueda para mayor robustez.
+                            const geocodingUrl = `https://api.mapbox.com/geocoding/v5/mapbox.places/${lngLat.lng},${lngLat.lat}.json?types=poi,address,place,locality&limit=1&language=es&access_token=${mapboxgl.accessToken}`;
+                            
                             const response = await fetch(geocodingUrl);
-                            console.log("Respuesta de la API (status):", response.status, response.statusText);
-                            if (!response.ok) {
-                                const errorText = await response.text();
-                                console.error("Error en la respuesta de la API:", errorText);
-                                throw new Error('La respuesta de la API de Geocodificación no fue exitosa.');
-                            }
-                            
+                            if (!response.ok) throw new Error('La respuesta de la API de Geocodificación no fue exitosa.');
                             const data = await response.json();
-                            console.log("Datos recibidos de la API de Mapbox:", data);
                             
-                            const hasFeatures = data.features && data.features.length > 0;
-                            console.log("¿Se encontraron 'features' en la respuesta?:", hasFeatures);
-
-                            if (hasFeatures) {
-                                const poiFeature = data.features[0];
-                                console.log("Primer 'feature' encontrado:", poiFeature);
-                                
-                                const poiCoords = poiFeature.geometry.coordinates;
+                            if (data.features && data.features.length > 0) {
+                                const bestFeature = data.features[0];
+                                const featureCoords = bestFeature.geometry.coordinates;
                                 const clickCoords = [lngLat.lng, lngLat.lat];
-                                const distance = turf.distance(turf.point(poiCoords), turf.point(clickCoords), { units: 'meters' });
-                                console.log(`Distancia entre el clic y el POI encontrado: ${distance.toFixed(2)} metros.`);
+                                const distance = turf.distance(turf.point(featureCoords), turf.point(clickCoords), { units: 'meters' });
                                 
+                                // Si el resultado está a menos de 50 metros del clic, lo consideramos válido.
                                 if (distance < 50) {
-                                    console.log("ACCIÓN: Distancia aceptable. Mostrando modal de POI.");
-                                    showPoiInfoModal(poiFeature);
+                                    showPoiInfoModal(bestFeature);
                                     return;
-                                } else {
-                                    console.log("ACCIÓN: POI encontrado demasiado lejos. Se tratará como clic en mapa vacío.");
                                 }
-                            } else {
-                                console.log("ACCIÓN: No se encontraron POIs válidos en la respuesta de la API.");
                             }
                             
-                            console.log("ACCIÓN POR DEFECTO: Añadiendo etapa de ruta.");
+                            // Acción por defecto: Si no se encontró nada relevante cerca, añadimos un waypoint.
                             addWaypoint(lngLat);
 
                         } catch (error) {
-                            console.error("ERROR CATASTRÓFICO en el flujo de búsqueda/recuperación de POI:", error);
+                            console.error("Error en el flujo de búsqueda/recuperación de POI:", error);
                             showToast("No se pudo obtener información del punto. Añadiendo etapa.", "warning");
                             addWaypoint(lngLat);
-                        } finally {
-                             console.log("--- FIN DE DIAGNÓSTICO DE CLIC ---");
                         }
                     });
-                    // ===============================================
-                    // === FIN: LISTENER DE CLIC CON DIAGNÓSTICO ===
-                    // ===============================================
                     
                     enablePoiInteractivity(navigationMapInstance);
                     setNavigationMapClickHandler();
