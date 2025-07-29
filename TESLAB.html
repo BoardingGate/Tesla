@@ -1,4 +1,4 @@
- B30
+ B31
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -8451,10 +8451,10 @@ async function showPoiInfoModal(feature) {
         if (overlay.parentNode) overlay.remove();
     }
 }
-
 // ===================================================================
-// NOMBRE: openNavigationMap (VERSIÓN FINAL CON LÓGICA DE CLIC INTELIGENTE)
-// RESUMEN: Carga el mapa, los controles, e implementa la nueva lógica de clics priorizada.
+// NOMBRE: openNavigationMap (VERSIÓN FINAL CON MANEJO DE ERRORES ROBUSTO)
+// RESUMEN: Carga el mapa, los controles, e implementa la lógica de clics y un try...catch para evitar fallos críticos.
+// ===================================================================
 async function openNavigationMap() {
     const { primaryId: userId } = parseUserId(localStorage.getItem('userData_userId'));
     if (userId && userId.toLowerCase() !== 'boardinggate') {
@@ -8511,7 +8511,8 @@ async function openNavigationMap() {
     if (!mapModal) { console.error("Error crítico: El modal del mapa no se encuentra en el HTML."); isNavigationMapActive = false; return; }
     
     mapModal.classList.remove('map-modal-hidden');
-
+    const mapActualContainer = document.getElementById('mapbox-map-actual-container');
+    
     if (navigationMapInstance) {
         showToast("Reabriendo sesión de mapa existente.", "info", 2000);
         handleLoadOrDeleteRouteClick(null);
@@ -8520,7 +8521,6 @@ async function openNavigationMap() {
         
     } else {
         try {
-            const mapActualContainer = document.getElementById('mapbox-map-actual-container');
             const savedLayerName = localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO";
             const finalLayerName = MAP_LEGACY_NAME_MAP[savedLayerName] || savedLayerName;
             const initialStyle = MAP_STYLES[finalLayerName] || MAP_STYLES["HÍBRIDO"];
@@ -8529,9 +8529,7 @@ async function openNavigationMap() {
                 container: mapActualContainer,
                 style: initialStyle, 
                 center: [-3.703790, 40.416775],
-                zoom: 3.1,
-                pitch: 0, 
-                bearing: 0,
+                zoom: 3.1, pitch: 0, bearing: 0,
                 attributionControl: false, 
                 accessToken: mapboxgl.accessToken
             });
@@ -8545,7 +8543,12 @@ async function openNavigationMap() {
             compassAndModeControl = new CompassAndStatsControl();
             navigationMapInstance.addControl(compassAndModeControl, 'bottom-left');
             
-            navigationMapInstance.on('style.load', () => { loadAndAddMapImages(navigationMapInstance).then(() => reAddCustomMapLayersAndSources(navigationMapInstance)); });
+            navigationMapInstance.on('error', (e) => {
+                console.error("Error de Mapbox:", e);
+                if (e.error && e.error.message.includes("Token")) {
+                    showToast("Error de Token de Mapbox. Revisa los permisos (scopes) en tu cuenta.", "error", 10000);
+                }
+            });
             
             navigationMapInstance.on('load', async function() {
                 try {
@@ -8559,30 +8562,13 @@ async function openNavigationMap() {
                     navigationMapInstance.on('zoomend', updateTrafficAlertIconSizes);
                     toggleMapHeaderRowsVisibility(mapHeaderButtonsVisible);
 
-                    // === INICIO DE LA NUEVA LÓGICA DE CLIC PRIORIZADA ===
                     navigationMapInstance.on('click', (e) => {
-                        // Si está activo el modo "Añadir Recordatorio", tiene la máxima prioridad
-                        if (isAddReminderAtLocationModeActive) {
-                            handleMapClickToAddReminder(e);
-                            return;
-                        }
-                        
-                        // Si está activo el modo de simulación por clic, tiene la segunda prioridad
-                        if (isSimulatingGpsLocation && !automatedSimulationIntervalId) {
-                            handleSimulateGpsPositionClick(e);
-                            return;
-                        }
-
-                        // Durante la navegación activa, no hacemos nada con los clics en el mapa
+                        if (isAddReminderAtLocationModeActive) { handleMapClickToAddReminder(e); return; }
+                        if (isSimulatingGpsLocation && !automatedSimulationIntervalId) { handleSimulateGpsPositionClick(e); return; }
                         if (isNavigating) return;
-
-                        const point = e.point;
                         
-                        // 1. PRIORIDAD MÁXIMA: Nuestras capas personalizadas (PDRs, Recordatorios)
-                        const customInteractiveLayers = [
-                            'pdr-simple-circle-layer', 'pdr-cards-layer-bg', 'pdr-cards-layer-bg-halo',
-                            'reminders-circles-layer', 'reminders-icons-layer'
-                        ];
+                        const point = e.point;
+                        const customInteractiveLayers = ['pdr-simple-circle-layer', 'pdr-cards-layer-bg', 'pdr-cards-layer-bg-halo', 'reminders-circles-layer', 'reminders-icons-layer'];
                         const customFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: customInteractiveLayers });
 
                         if (customFeatures.length > 0) {
@@ -8602,20 +8588,17 @@ async function openNavigationMap() {
                             }
                         }
 
-                        // 2. SEGUNDA PRIORIDAD: Puntos de Interés de Mapbox
                         const poiFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: ['poi-label'] });
                         if (poiFeatures.length > 0) {
                             showPoiInfoModal(poiFeatures[0]);
                             return;
                         }
 
-                        // 3. ACCIÓN POR DEFECTO: Añadir etapa si se hace clic en un espacio vacío
                         addWaypoint(e.lngLat);
                     });
-                    // === FIN DE LA NUEVA LÓGICA DE CLIC ===
                     
-                    enablePoiInteractivity(navigationMapInstance); // Mantenemos esto para el cursor :hover
-                    setNavigationMapClickHandler(); // Esta función ahora se simplificará
+                    enablePoiInteractivity(navigationMapInstance);
+                    setNavigationMapClickHandler();
                     
                     getCurrentLocation(
                         (currentPos) => {
@@ -8638,13 +8621,14 @@ async function openNavigationMap() {
                             startGpsWatching(); 
                         }
                     );
-                } catch (error) {
-                    showToast("Error crítico al cargar recursos del mapa.", "error");
+                } catch (loadError) {
+                    console.error("Error durante el evento 'load' del mapa:", loadError);
+                    showToast("Error crítico al cargar los recursos del mapa.", "error", 10000);
                 }
             });
         } catch (error) {
-             const errorContainer = document.getElementById('mapbox-map-actual-container'); 
-             if (errorContainer) errorContainer.innerHTML = `<p style="color:red; text-align:center; padding:20px;">Error al cargar el mapa: ${error.message}</p>`;
+             console.error("Error CRÍTICO al inicializar el mapa:", error);
+             if (mapActualContainer) mapActualContainer.innerHTML = `<div style="color:red; text-align:center; padding:20px; background: rgba(0,0,0,0.7); height:100%; display:flex; align-items:center; justify-content:center; flex-direction:column;"><h2>Error al cargar el mapa</h2><p>${error.message}</p><p style="margin-top:10px; font-size:0.9rem;">Por favor, revisa tu token de Mapbox y sus permisos (scopes).</p></div>`;
              isNavigationMapActive = false;
         }
     }
@@ -10611,10 +10595,11 @@ function displayAlertsOnMap() {
 }
     
 // ===================================================================
-// NOMBRE: reAddCustomMapLayersAndSources (VERSIÓN CORREGIDA SIN CAPA DE ALERTAS)
-// RESUMEN: Ya no crea la fuente ni la capa para 'traffic-alerts-source', ya que se gestionan como marcadores HTML.
+// NOMBRE: reAddCustomMapLayersAndSources (VERSIÓN A PRUEBA DE FALLOS)
+// RESUMEN: Añade capas de forma segura, evitando errores si no existen previamente.
+// ===================================================================
 async function reAddCustomMapLayersAndSources(mapInstance) {
-    if (!mapInstance) return;
+    if (!mapInstance || !mapInstance.isStyleLoaded()) return;
 
     await loadAndAddMapImages(mapInstance);
 
@@ -10638,15 +10623,16 @@ async function reAddCustomMapLayersAndSources(mapInstance) {
     }));
     const pdrsGeojsonData = { type: 'FeatureCollection', features: pdrFeatures };
     
-    // --- CORRECCIÓN: Eliminadas las referencias a la capa de alertas de tráfico ---
     const sourcesAndLayersToRemove = [
         'speed-markers-text', 'speed-markers-circle-bg', 'reminders-radar-text-layer', 'reminders-speed-text-layer', 'reminders-icons-layer', 'reminders-circles-layer',
         'pdr-cards-layer-availability', 'pdr-cards-layer-price', 'pdr-cards-layer-operator', 'pdr-cards-layer-power', 'pdr-cards-layer-bg-halo', 'pdr-cards-layer-bg',
         'pdr-simple-text-layer', 'pdr-simple-circle-layer', 'completed-segments-layer', 'route',
         'speed-markers-source', 'reminders-geojson-source', 'pdrs-geojson-source', 'completed-segments', 'route'
     ];
+
     sourcesAndLayersToRemove.forEach(id => {
-        try { if (mapInstance.getLayer(id)) mapInstance.removeLayer(id); if (mapInstance.getSource(id)) mapInstance.removeSource(id); } catch (e) {}
+        try { if (mapInstance.getLayer(id)) mapInstance.removeLayer(id); } catch (e) { /* Ignorar error si la capa no existe */ }
+        try { if (mapInstance.getSource(id)) mapInstance.removeSource(id); } catch (e) { /* Ignorar error si la fuente no existe */ }
     });
 
     mapInstance.addSource('route', { type: 'geojson', data: routeGeojsonData });
@@ -10654,7 +10640,6 @@ async function reAddCustomMapLayersAndSources(mapInstance) {
     mapInstance.addSource('speed-markers-source', { type: 'geojson', data: { type: 'FeatureCollection', features: speedMarkerFeatures } });
     mapInstance.addSource('reminders-geojson-source', { type: 'geojson', data: remindersGeojsonData });
     mapInstance.addSource('pdrs-geojson-source', { type: 'geojson', data: pdrsGeojsonData });
-    // Ya no se añade la fuente 'traffic-alerts-source'
 
     mapInstance.addLayer({ id: 'route', type: 'line', source: 'route', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: getRouteStyleProperties() });
     mapInstance.addLayer({ id: 'completed-segments-layer', type: 'line', source: 'completed-segments', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': 'green', 'line-width': 6, 'line-opacity': 0.8 } });
@@ -10676,7 +10661,6 @@ async function reAddCustomMapLayersAndSources(mapInstance) {
     mapInstance.addLayer({ id: 'reminders-radar-text-layer', type: 'symbol', source: 'reminders-geojson-source', filter: ['all', ['==', ['get', 'isRadar'], true], ['!', ['has', 'speed']]], layout: { 'text-field': 'Rdar', 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': ['interpolate', ['linear'], ['zoom'], 10, 8, 14, 14, 17, 20], 'text-allow-overlap': true }, paint: { 'text-color': 'yellow', 'text-opacity': 1, 'text-halo-color': '#000', 'text-halo-width': 1 } });
     mapInstance.addLayer({ id: 'reminders-icons-layer', type: 'symbol', source: 'reminders-geojson-source', filter: ['==', ['get', 'isRadar'], false], layout: { 'icon-image': 'reminder-icon', 'icon-size': ['interpolate', ['linear'], ['zoom'], 10, 0.4, 14, 0.6, 17, 0.8], 'icon-allow-overlap': true, 'icon-anchor': 'bottom' } });
 }
-
 // ===================================================================
 // NOMBRE: fetchAndRenderChatUsers (MODIFICADA - AÑADE CONTROL ADMIN)
 // RESUMEN: Muestra la lista de usuarios y, para el admin, un campo para gestionar el límite de sesiones de mapa.
