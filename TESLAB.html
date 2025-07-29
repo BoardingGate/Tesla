@@ -1,4 +1,4 @@
- B57
+ B58
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -15915,9 +15915,9 @@ async function showPoiInfoModal(feature) {
 }
 
 // ===================================================================
-// NOMBRE: openNavigationMap (VERSIÓN DE DIAGNÓSTICO v8)
-// RESUMEN: Mantiene los logs y ahora pasa el objeto 'feature' COMPLETO
-//          al modal en caso de éxito en la búsqueda.
+// NOMBRE: openNavigationMap (VERSIÓN DE DIAGNÓSTICO v8 - FLUJO DE 3 PASOS CORREGIDO)
+// RESUMEN: Reimplementa el flujo de 3 pasos con la llamada correcta a la Search Box API.
+//          Mantiene los logs exhaustivos para verificar cada etapa.
 // ===================================================================
 async function openNavigationMap() {
     const { primaryId: userId } = parseUserId(localStorage.getItem('userData_userId'));
@@ -16055,22 +16055,28 @@ async function openNavigationMap() {
                             console.log(`PASO 1 - ÉXITO: Se encontró un POI visual con nombre: "${poiName}"`);
 
                             try {
-                                const searchUrl = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(poiName)}.json?language=es&proximity=${lngLat.lng},${lngLat.lat}&limit=1&access_token=${mapboxgl.accessToken}`;
-                                console.log("PASO 2: URL de la Geocoding API a consultar:", searchUrl);
+                                const session_token = crypto.randomUUID();
+                                // PASO 2: Buscar en la Search API para obtener un mapbox_id.
+                                const searchUrl = `https://api.mapbox.com/search/searchbox/v1/search/${session_token}?q=${encodeURIComponent(poiName)}&language=es&proximity=${lngLat.lng},${lngLat.lat}&access_token=${mapboxgl.accessToken}`;
+                                console.log("PASO 2: URL de la Search API a consultar:", searchUrl);
                                 
                                 const searchResponse = await fetch(searchUrl);
                                 const searchData = await searchResponse.json();
-                                console.log("PASO 2 - RESPUESTA de la Geocoding API:", searchData);
+                                console.log("PASO 2 - RESPUESTA de la Search API:", searchData);
 
-                                if (searchData.features && searchData.features.length > 0) {
-                                    const bestMatch = searchData.features[0];
-                                    console.log(`PASO 2 - ÉXITO: Se encontró una coincidencia con id: "${bestMatch.id}"`);
+                                if (searchData.suggestions && searchData.suggestions.length > 0) {
+                                    const bestMatch = searchData.suggestions[0];
+                                    console.log(`PASO 2 - ÉXITO: Se encontró una sugerencia con mapbox_id: "${bestMatch.mapbox_id}"`);
                                     
-                                    // ¡CAMBIO CLAVE! Pasamos el objeto 'feature' completo.
-                                    console.log("ACCIÓN: Llamando a showPoiInfoModal con el objeto 'feature' completo.");
-                                    showPoiInfoModal(bestMatch);
+                                    const featureForModal = {
+                                        properties: { mapbox_id: bestMatch.mapbox_id },
+                                        geometry: { type: 'Point', coordinates: [lngLat.lng, lngLat.lat] }
+                                    };
+                                    
+                                    console.log("ACCIÓN: Llamando a showPoiInfoModal con el mapbox_id válido.");
+                                    showPoiInfoModal(featureForModal);
                                 } else {
-                                    console.log("PASO 2 - FALLO: La Geocoding API no devolvió 'features'.");
+                                    console.log("PASO 2 - FALLO: La Search API no devolvió sugerencias.");
                                     console.log("ACCIÓN DE FALLBACK: Mostrando información básica del POI visual.");
                                     showPoiInfoModal(validPoiFeature);
                                 }
@@ -16148,7 +16154,6 @@ async function openNavigationMap() {
     updateNavigationButtonColor();
     toggleMapLocationSearchVisibility(!isNavigating);
 } 
- 
 // ===================================================================
 // NOMBRE: enablePoiInteractivity (VERSIÓN SIMPLIFICADA)
 // RESUMEN: Únicamente cambia el cursor a "puntero" al pasar sobre los POIs.
@@ -16243,12 +16248,12 @@ async function showSaveRoutePromptForSingleWaypoint(waypointObject) {
 
 // ===================================================================
 // NOMBRE: showPoiInfoModal (VERSIÓN DE DIAGNÓSTICO v8)
-// RESUMEN: Recibe el 'feature' de la Geocoding API. NO hace llamadas a la red.
-//          Muestra los datos que recibe e incluye logs para depurar el proceso.
+// RESUMEN: Recibe un 'feature' con un mapbox_id. Llama a la API de Retrieve
+//          para obtener los detalles completos y los muestra. Incluye logs detallados.
 // ===================================================================
 async function showPoiInfoModal(feature) {
     console.log("--- INICIO DE DIAGNÓSTICO DE showPoiInfoModal ---");
-    console.log("Objeto 'feature' recibido:", feature);
+    console.log("Objeto 'feature' inicial recibido:", feature);
 
     const existingModal = document.querySelector('.poi-modal-overlay');
     if (existingModal) existingModal.remove();
@@ -16259,38 +16264,65 @@ async function showPoiInfoModal(feature) {
     overlay.innerHTML = `
         <div class="poi-modal-content">
             <div class="poi-modal-body" style="text-align: center; padding: 3rem;">
-                <p>Procesando información...</p>
+                <p>Obteniendo información del lugar...</p>
             </div>
         </div>
     `;
     document.body.appendChild(overlay);
 
     try {
-        const properties = feature.properties || {}; // Aseguramos que 'properties' exista
+        const properties = feature.properties || {};
         const coordinates = feature.geometry.coordinates.slice();
+        const mapbox_id = properties.mapbox_id;
 
-        // LOG: Extraer y mostrar cada pieza de información
-        const name = feature.text || properties.name || 'Punto de Interés';
-        console.log("Nombre extraído:", name);
+        let name, address, category, phone, website, imageUrl, saveName;
+
+        if (mapbox_id) {
+            console.log("PASO 3: Se ha recibido un mapbox_id válido:", mapbox_id);
+            const session_token = crypto.randomUUID();
+            const retrieveUrl = `https://api.mapbox.com/search/searchbox/v1/retrieve/${mapbox_id}?session_token=${session_token}&language=es&access_token=${mapboxgl.accessToken}`;
+            console.log("PASO 3: URL de la Retrieve API a consultar:", retrieveUrl);
+            
+            const response = await fetch(retrieveUrl);
+            const data = await response.json();
+            console.log("PASO 3 - RESPUESTA de la Retrieve API:", data);
+
+            if (!response.ok || !data || !data.features || data.features.length === 0) {
+                console.error("PASO 3 - FALLO: La API de Retrieve no devolvió detalles válidos.");
+                throw new Error('No se pudieron obtener los detalles del POI desde la API.');
+            }
+            
+            const poiDetails = data.features[0].properties;
+            console.log("PASO 3 - ÉXITO: Detalles completos recibidos:", poiDetails);
+            
+            name = poiDetails.name || 'Punto de Interés';
+            address = poiDetails.full_address || poiDetails.address || 'Dirección no disponible';
+            category = translatePoiCategory(poiDetails.poi_category_ids ? poiDetails.poi_category : (poiDetails.category ? [poiDetails.category] : []));
+            phone = poiDetails.metadata?.phone;
+            website = poiDetails.metadata?.website;
+
+            if (poiDetails.photos && poiDetails.photos.length > 0 && poiDetails.photos[0].id) {
+                imageUrl = `https://api.mapbox.com/v1/search/images/${poiDetails.photos[0].id}?access_token=${mapboxgl.accessToken}`;
+            } else {
+                imageUrl = 'PNG/modalrutas.png';
+            }
+            
+            const cityContext = poiDetails.context?.place?.name || poiDetails.context?.region?.name || '';
+            saveName = cityContext ? `${name}, ${cityContext}` : name;
+
+        } else {
+            console.log("Fallback: No se recibió un mapbox_id. Mostrando información básica.");
+            name = properties.name || 'Lugar sin detalles';
+            address = `(${coordinates[1].toFixed(4)}, ${coordinates[0].toFixed(4)})`;
+            category = translatePoiCategory(properties.category ? [properties.category] : []);
+            phone = null;
+            website = null;
+            imageUrl = 'PNG/modalrutas.png';
+            saveName = name;
+        }
         
-        const address = properties.address ? `${properties.address}, ${feature.place_name.split(',').slice(1).join(',').trim()}` : feature.place_name || 'Dirección no disponible';
-        console.log("Dirección extraída:", address);
+        console.log("Datos finales a mostrar:", { name, address, category, phone, website, saveName });
 
-        const category = translatePoiCategory(properties.category ? properties.category.split(', ') : []);
-        console.log("Categoría extraída y procesada:", category);
-
-        const phone = properties.maki; // Intentamos con 'maki' que a veces contiene el tipo de POI
-        console.log("Teléfono/Metadata extraído:", phone);
-
-        const website = properties.metadata?.website || properties.website;
-        console.log("Sitio web extraído:", website);
-
-        const imageUrl = 'PNG/modalrutas.png';
-
-        const cityContext = feature.context?.place?.text || feature.context?.region?.text || '';
-        const saveName = cityContext ? `${name}, ${cityContext}` : name;
-        console.log("Nombre para guardar generado:", saveName);
-        
         const existingWaypoint = findExistingWaypointAtCoords(coordinates[1], coordinates[0]);
 
         let buttonsHtml = `
@@ -16376,7 +16408,8 @@ async function showPoiInfoModal(feature) {
     }
 }
  
- // ===================================================================
+ 
+// ===================================================================
 // NOMBRE: updateRouteAndCarIconStyle (MODIFICADA)
 // RESUMEN: Ajusta el estilo de la línea de ruta cuando ya existe, tras un cambio de capa de mapa.
 function updateRouteAndCarIconStyle() {
