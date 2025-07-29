@@ -1,4 +1,4 @@
- B48
+ B49
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -16040,6 +16040,7 @@ async function showSaveRoutePromptForSingleWaypoint(waypointObject) {
 // RESUMEN: Implementa el flujo correcto de 3 pasos:
 //          1. Identifica el POI visual. 2. Usa la Search API para obtener un mapbox_id real.
 //          3. Pasa ese ID al modal para que recupere todos los detalles en español.
+// ===================================================================
 async function openNavigationMap() {
     const { primaryId: userId } = parseUserId(localStorage.getItem('userData_userId'));
     if (userId && userId.toLowerCase() !== 'boardinggate') {
@@ -16189,6 +16190,7 @@ async function openNavigationMap() {
 
                             try {
                                 const session_token = crypto.randomUUID();
+                                // PASO 2: Buscar para obtener el mapbox_id correcto
                                 const searchUrl = `https://api.mapbox.com/search/searchbox/v1/search/${session_token}?q=${encodeURIComponent(poiName)}&language=es&proximity=${lngLat.lng},${lngLat.lat}&access_token=${mapboxgl.accessToken}`;
 
                                 const searchResponse = await fetch(searchUrl);
@@ -16197,9 +16199,10 @@ async function openNavigationMap() {
                                 if (searchData.suggestions && searchData.suggestions.length > 0) {
                                     const bestMatch = searchData.suggestions[0];
                                     const featureForModal = {
-                                        properties: { mapbox_id: bestMatch.mapbox_id },
+                                        properties: { mapbox_id: bestMatch.mapbox_id }, // Solo pasamos el ID
                                         geometry: { type: 'Point', coordinates: [lngLat.lng, lngLat.lat] }
                                     };
+                                    // PASO 3: El modal se encargará de recuperar todos los detalles
                                     showPoiInfoModal(featureForModal);
                                 } else {
                                     throw new Error("Search API no devolvió coincidencias.");
@@ -16280,6 +16283,157 @@ async function openNavigationMap() {
     toggleMapLocationSearchVisibility(!isNavigating);
 }
  
+// ===================================================================
+// NOMBRE: showPoiInfoModal (VERSIÓN DEFINITIVA v4 - RECUPERACIÓN DE DETALLES)
+// RESUMEN: Recibe un `mapbox_id` válido, llama a la API de Retrieve para
+//          obtener los detalles completos en español y los muestra en el modal.
+// ===================================================================
+async function showPoiInfoModal(feature) {
+    const existingModal = document.querySelector('.poi-modal-overlay');
+    if (existingModal) existingModal.remove();
+
+    const overlay = document.createElement('div');
+    overlay.className = 'poi-modal-overlay';
+    
+    overlay.innerHTML = `
+        <div class="poi-modal-content">
+            <div class="poi-modal-body" style="text-align: center; padding: 3rem;">
+                <p>Obteniendo información del lugar...</p>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(overlay);
+
+    try {
+        const properties = feature.properties;
+        const coordinates = feature.geometry.coordinates.slice();
+        const mapbox_id = properties.mapbox_id;
+
+        let name, address, category, phone, website, imageUrl, saveName;
+
+        // Si tenemos un mapbox_id, podemos obtener los detalles completos.
+        if (mapbox_id) {
+            const session_token = crypto.randomUUID();
+            // PASO 3: Usamos la API de Retrieve con el ID correcto y en español
+            const retrieveUrl = `https://api.mapbox.com/search/searchbox/v1/retrieve/${mapbox_id}?session_token=${session_token}&language=es&access_token=${mapboxgl.accessToken}`;
+            
+            const response = await fetch(retrieveUrl);
+            if (!response.ok) throw new Error('No se pudieron obtener los detalles del POI desde la API.');
+            const data = await response.json();
+            
+            if (!data || !data.features || data.features.length === 0) {
+                throw new Error('La respuesta de la API de detalles está vacía.');
+            }
+            
+            const poiDetails = data.features[0].properties;
+            name = poiDetails.name || 'Punto de Interés';
+            address = poiDetails.full_address || poiDetails.address || 'Dirección no disponible';
+            category = translatePoiCategory(poiDetails.poi_category_ids ? poiDetails.poi_category : (poiDetails.category ? [poiDetails.category] : []));
+            phone = poiDetails.metadata?.phone;
+            website = poiDetails.metadata?.website;
+
+            if (poiDetails.photos && poiDetails.photos.length > 0 && poiDetails.photos[0].id) {
+                imageUrl = `https://api.mapbox.com/v1/search/images/${poiDetails.photos[0].id}?access_token=${mapboxgl.accessToken}`;
+            } else {
+                imageUrl = 'PNG/modalrutas.png';
+            }
+            
+            const cityContext = poiDetails.context?.place?.name || poiDetails.context?.region?.name || '';
+            saveName = cityContext ? `${name}, ${cityContext}` : name;
+
+        } else {
+            // Fallback para POIs sin mapbox_id (información básica del mapa)
+            name = properties.name || 'Lugar sin detalles';
+            address = `(${coordinates[1].toFixed(4)}, ${coordinates[0].toFixed(4)})`;
+            category = translatePoiCategory(properties.category ? [properties.category] : []);
+            phone = null;
+            website = null;
+            imageUrl = 'PNG/modalrutas.png';
+            saveName = name;
+        }
+        
+        const existingWaypoint = findExistingWaypointAtCoords(coordinates[1], coordinates[0]);
+
+        let buttonsHtml = `
+            <button id="poi-add-btn" class="btn-modal-action-primary">Añadir a Ruta</button>
+            <button id="poi-save-btn" class="btn-modal-favorite">Guardar POI</button>
+            <button id="poi-share-btn" class="btn-modal-action-primary">Compartir</button>
+        `;
+        if (existingWaypoint) {
+            buttonsHtml += `<button id="poi-delete-btn" class="btn-modal-danger" data-waypoint-id="${existingWaypoint.id}">Eliminar Etapa</button>`;
+        } else {
+             buttonsHtml += `<button id="poi-close-btn" class="btn-modal-action-secondary">Cerrar <span class="button-countdown-timer"></span></button>`;
+        }
+        
+        const modalContent = `
+            <div class="poi-modal-header" style="background-image: url('${imageUrl}');">
+                <h3 class="poi-modal-title">${name}</h3>
+                <p class="poi-modal-address">${address}</p>
+            </div>
+            <div class="poi-modal-body">
+                <div class="poi-modal-info-section">
+                    <h4>Categoría</h4>
+                    <p>${category}</p>
+                </div>
+                ${phone ? `
+                <div class="poi-modal-info-section">
+                    <h4>Teléfono</h4>
+                    <a href="tel:${phone}">${phone}</a>
+                </div>` : ''}
+                ${website ? `
+                <div class="poi-modal-info-section">
+                    <h4>Sitio Web</h4>
+                    <a href="${website}" target="_blank" rel="noopener noreferrer">${website}</a>
+                </div>` : ''}
+            </div>
+            <div class="poi-modal-footer">
+                ${buttonsHtml}
+            </div>
+        `;
+
+        overlay.querySelector('.poi-modal-content').innerHTML = modalContent;
+
+        const closeHandler = () => {
+            clearModalAutoCloseTimer(overlay, overlay.querySelector('#poi-close-btn, #poi-delete-btn'), 'poi-modal');
+            if (overlay.parentNode) overlay.remove();
+        };
+
+        const closeBtn = overlay.querySelector('#poi-close-btn');
+        if (closeBtn) closeBtn.addEventListener('click', closeHandler);
+        
+        overlay.querySelector('#poi-add-btn').addEventListener('click', async () => {
+            const snapped = await snapCoordsToRoad(coordinates[1], coordinates[0]);
+            addWaypoint({ lat: snapped.lat, lng: snapped.lng }, address);
+            closeHandler();
+        });
+
+        overlay.querySelector('#poi-save-btn').addEventListener('click', () => {
+             const waypointForSave = { lat: coordinates[1], lng: coordinates[0], address: saveName, id: Date.now() };
+             showSaveRoutePromptForSingleWaypoint(waypointForSave);
+             closeHandler();
+        });
+
+        overlay.querySelector('#poi-share-btn').addEventListener('click', () => {
+            handleSendToTeslaClick(coordinates[1], coordinates[0], name);
+            closeHandler();
+        });
+
+        const deleteBtn = overlay.querySelector('#poi-delete-btn');
+        if (deleteBtn) {
+            deleteBtn.addEventListener('click', () => {
+                const waypointId = parseInt(deleteBtn.dataset.waypointId);
+                handleDeleteWaypointClick(waypointId);
+                closeHandler();
+            });
+        }
+        addModalAutoCloseTimer(overlay, overlay.querySelector('#poi-close-btn, #poi-delete-btn'), 'poi-modal', 20000);
+
+    } catch (error) {
+        showToast(error.message, 'error');
+        if (overlay.parentNode) overlay.remove();
+    }
+}
+
  
  // ===================================================================
 // NOMBRE: updateRouteAndCarIconStyle (MODIFICADA)
