@@ -1,4 +1,4 @@
- B38
+ B39
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -15988,9 +15988,10 @@ async function loadAndAddMapImages(mapInstance) {
 }
 
 // ===================================================================
-// NOMBRE: openNavigationMap (VERSIÓN CORREGIDA Y FUNCIONAL)
-// RESUMEN: Abre el mapa, gestiona sesiones y ahora implementa correctamente
-//          la detección de POIs mediante geocodificación inversa al hacer clic.
+// NOMBRE: openNavigationMap (VERSIÓN FINAL Y FUNCIONAL)
+// RESUMEN: Abre el mapa y gestiona el clic del usuario con una lógica híbrida y robusta.
+//          Primero comprueba si el clic fue sobre un POI visual del mapa y, si es así,
+//          usa la geocodificación inversa para obtener sus detalles completos. Si no, añade una etapa.
 // ===================================================================
 async function openNavigationMap() {
     const { primaryId: userId } = parseUserId(localStorage.getItem('userData_userId'));
@@ -16099,9 +16100,9 @@ async function openNavigationMap() {
                     navigationMapInstance.on('zoomend', updateTrafficAlertIconSizes);
                     toggleMapHeaderRowsVisibility(mapHeaderButtonsVisible);
 
-                    // ==========================================================
-                    // === INICIO: LISTENER DE CLIC CORREGIDO Y FUNCIONAL ===
-                    // ==========================================================
+                    // ====================================================================
+                    // === INICIO: LISTENER DE CLIC HÍBRIDO, ROBUSTO Y FUNCIONAL (v3) ===
+                    // ====================================================================
                     navigationMapInstance.on('click', async (e) => {
                         // Prioridad 1: Modos especiales
                         if (isAddReminderAtLocationModeActive) { handleMapClickToAddReminder(e); return; }
@@ -16111,8 +16112,8 @@ async function openNavigationMap() {
                         const point = e.point;
                         const lngLat = e.lngLat;
 
-                        // Prioridad 2: Nuestras capas personalizadas
-                        const customInteractiveLayers = ['pdr-simple-circle-layer', 'pdr-cards-layer-bg', 'pdr-cards-layer-bg-halo', 'reminders-circles-layer', 'reminders-icons-layer'];
+                        // Prioridad 2: Nuestras capas personalizadas (PDRs, Recordatorios)
+                        const customInteractiveLayers = ['pdr-simple-circle-layer', 'pdr-cards-layer-bg', 'reminders-circles-layer', 'reminders-icons-layer'];
                         const customFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: customInteractiveLayers });
                         if (customFeatures.length > 0) {
                             const topFeature = customFeatures[0];
@@ -16131,41 +16132,53 @@ async function openNavigationMap() {
                             }
                         }
 
-                        // Prioridad 3: Búsqueda de POIs de Mapbox mediante Geocodificación Inversa
-                        try {
-                            const geocodingUrl = `https://api.mapbox.com/geocoding/v5/mapbox.places/${lngLat.lng},${lngLat.lat}.json?types=poi&limit=1&access_token=${mapboxgl.accessToken}`;
-                            
-                            const response = await fetch(geocodingUrl);
-                            if (!response.ok) {
-                                throw new Error('La respuesta de la API de Geocodificación no fue exitosa.');
-                            }
-                            const data = await response.json();
+                        // Prioridad 3: Capas de POIs de Mapbox (Método Híbrido)
+                        const mapboxPoiLayers = ['poi-label'];
+                        const mapboxPoiFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: mapboxPoiLayers });
+                        
+                        // Si el usuario HIZO CLIC sobre un icono de POI del mapa base...
+                        if (mapboxPoiFeatures.length > 0) {
+                            const clickedPoi = mapboxPoiFeatures[0];
 
-                            if (data.features && data.features.length > 0) {
-                                const poiFeature = data.features[0];
-                                const compatibleFeature = {
-                                    properties: {
-                                        mapbox_id: poiFeature.id,
-                                        name: poiFeature.text,
-                                        ...poiFeature.properties
-                                    },
-                                    geometry: poiFeature.geometry
+                            // Ahora, enriquecemos la información con una llamada a la API
+                            try {
+                                const geocodingUrl = `https://api.mapbox.com/geocoding/v5/mapbox.places/${lngLat.lng},${lngLat.lat}.json?types=poi&limit=1&access_token=${mapboxgl.accessToken}`;
+                                const response = await fetch(geocodingUrl);
+                                const data = await response.json();
+
+                                if (data.features && data.features.length > 0) {
+                                    // Usamos la información rica de la API si está disponible
+                                    const apiPoi = data.features[0];
+                                    const compatibleFeature = {
+                                        properties: { mapbox_id: apiPoi.id, name: apiPoi.text, ...apiPoi.properties },
+                                        geometry: apiPoi.geometry
+                                    };
+                                    showPoiInfoModal(compatibleFeature);
+                                } else {
+                                    // Fallback: Si la API no devuelve nada, usamos la info básica del mapa
+                                    const fallbackFeature = {
+                                        properties: { mapbox_id: null, name: clickedPoi.properties.name, category: clickedPoi.properties.class },
+                                        geometry: { type: 'Point', coordinates: [lngLat.lng, lngLat.lat] }
+                                    };
+                                    showPoiInfoModal(fallbackFeature);
+                                }
+                            } catch (error) {
+                                // Fallback en caso de error de red
+                                console.error("Error enriqueciendo POI, usando datos básicos:", error);
+                                const fallbackFeature = {
+                                    properties: { mapbox_id: null, name: clickedPoi.properties.name, category: clickedPoi.properties.class },
+                                    geometry: { type: 'Point', coordinates: [lngLat.lng, lngLat.lat] }
                                 };
-                                showPoiInfoModal(compatibleFeature);
-                                return;
+                                showPoiInfoModal(fallbackFeature);
                             }
-
-                            // Acción por defecto: Si la API no devuelve ningún POI, añadimos un waypoint.
-                            addWaypoint(lngLat);
-
-                        } catch (error) {
-                            console.error("Error en la geocodificación inversa:", error);
-                            showToast("No se pudo obtener información del punto. Añadiendo como etapa genérica.", "warning");
-                            addWaypoint(lngLat);
+                            return; // Importante: no continuar a la acción por defecto
                         }
+
+                        // Acción por defecto: Si no se hizo clic en nada de lo anterior, añadir un waypoint
+                        addWaypoint(lngLat);
                     });
                     // ===============================================
-                    // === FIN: LISTENER DE CLIC CORREGIDO Y FUNCIONAL ===
+                    // === FIN: LISTENER DE CLIC HÍBRIDO Y FUNCIONAL ===
                     // ===============================================
                     
                     enablePoiInteractivity(navigationMapInstance);
