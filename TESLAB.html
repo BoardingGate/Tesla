@@ -1,4 +1,4 @@
-G21
+G22
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -7840,9 +7840,11 @@ function loadSavedSettings() {
 }
 
 // ===================================================================
-// NOMBRE: showReorderStagesModal (VERSIÓN FINAL, DEPURADA CON LOGS)
-// RESUMEN: Muestra el modal para reordenar. La lógica de confirmación ha sido
-//          completamente reescrita para descartar todos los puntos internos y recalcular
+// NOMBRE: showReorderStagesModal (VERSIÓN FINAL, CORREGIDA Y LIMPIA)
+// RESUMEN: Muestra el modal para reordenar. Se ha eliminado la línea de depuración
+//          que causaba el error "circular structure" y se mantiene la lógica de
+//          reconstrucción atómica de la ruta para garantizar la estabilidad.
+// ===================================================================
 function showReorderStagesModal() {
     if (isNavigating) {
         showToast("No se puede reordenar etapas mientras se navega.", "warning");
@@ -7857,23 +7859,22 @@ function showReorderStagesModal() {
     const modal = document.getElementById('reorder-stages-modal');
     const listElement = modal.querySelector('#sortable-stages-list');
     
-    // Log del estado inicial
-    console.log('[DEBUG] Abriendo modal de reordenamiento. Estado actual de navigationWaypoints:', JSON.parse(JSON.stringify(navigationWaypoints)));
-    
     listElement.innerHTML = '';
     
     actualWaypointsForReorder.forEach(async (wp) => {
         const li = document.createElement('li');
         li.dataset.id = wp.id;
-        // ... (el resto de la creación de los elementos li, que ya funciona bien)
+
         const dragHandle = document.createElement('span');
         dragHandle.className = 'drag-handle';
         dragHandle.innerHTML = '<img src="PNG/MOVER.PNG" alt="Mover etapa">';
         dragHandle.title = 'Arrastrar para reordenar';
         dragHandle.draggable = true;
+
         const badge = document.createElement('span');
         badge.className = 'stage-label-badge';
         badge.textContent = wp.label;
+
         const nameSpan = document.createElement('span');
         nameSpan.className = 'stage-name-text';
         nameSpan.textContent = wp.address || `Cargando... (${wp.lat.toFixed(3)}, ${wp.lng.toFixed(3)})`;
@@ -7881,15 +7882,31 @@ function showReorderStagesModal() {
              wp.address = await getAddressForWaypoint(wp.lat, wp.lng);
              nameSpan.textContent = wp.address;
         }
+
         const deleteButton = document.createElement('span');
         deleteButton.className = 'delete-stage-button';
         deleteButton.innerHTML = '×';
         deleteButton.title = 'Eliminar esta etapa';
+
         deleteButton.addEventListener('click', (e) => {
             e.stopPropagation();
             const listItem = e.target.closest('li');
-            if (listItem) listItem.remove();
+            if (listItem) {
+                listItem.remove();
+                
+                const remainingListItems = listElement.querySelectorAll('li');
+                const confirmBtn = modal.querySelector('#confirm-reorder-stages');
+                
+                if (confirmBtn) { confirmBtn.disabled = false; }
+                
+                if (remainingListItems.length < 2 && remainingListItems.length > 0) {
+                    showToast("Queda solo 1 etapa. Al aceptar, se eliminará la ruta.", "warning", 3000);
+                } else if (remainingListItems.length === 0) {
+                    showToast("No quedan etapas. La ruta se eliminará al confirmar.", "info", 3000);
+                }
+            }
         });
+
         li.appendChild(dragHandle);
         li.appendChild(badge);
         li.appendChild(nameSpan);
@@ -7911,19 +7928,22 @@ function showReorderStagesModal() {
         clearModalAutoCloseTimer(modal, newConfirmButton, 'reorder-stages-modal');
         modal.classList.add('hidden');
         listElement.removeEventListener('dragstart', handleDragStartReorder);
-        // ... (limpieza de listeners que ya funciona bien)
+        listElement.removeEventListener('dragend', handleDragEndReorder);
+        listElement.removeEventListener('dragover', handleDragOverReorder);
+        listElement.removeEventListener('touchstart', handleStageTouchStart);
+        listElement.removeEventListener('touchmove', handleStageTouchMove);
+        listElement.removeEventListener('touchend', handleStageTouchEnd);
+        listElement.removeEventListener('touchcancel', handleStageTouchEnd);
+        document.body.style.overflow = '';
     };
 
     newConfirmButton.addEventListener('click', async () => {
         const orderedLiElements = Array.from(listElement.children);
         const finalWaypointIds = orderedLiElements.map(li => parseInt(li.dataset.id));
-        
-        console.log('[DEBUG] Botón Aceptar pulsado. IDs finales desde el modal:', finalWaypointIds);
 
         clearAllWaypointMarkersFromMap();
 
         if (finalWaypointIds.length < 2) {
-            console.log('[DEBUG] Menos de 2 etapas. Limpiando ruta.');
             navigationWaypoints = [];
             handleLoadOrDeleteRouteClick(null);
             closeReorderModal();
@@ -7933,23 +7953,19 @@ function showReorderStagesModal() {
         try {
             // --- INICIO DE LA LÓGICA CORREGIDA Y DEFINITIVA ---
             
-            // 1. Creamos un mapa de consulta del array global para un acceso rápido.
-            const originalWaypointMap = new Map(navigationWaypoints.map(wp => [wp.id, wp]));
+            const waypointMap = new Map(navigationWaypoints.map(wp => [wp.id, wp]));
             
-            // 2. Construimos la nueva lista de waypoints desde cero,
-            //    tomando solo los objetos completos que el usuario ha dejado en el modal.
-            //    Esto descarta automáticamente todos los puntos internos y ocultos.
-            const newWaypointsList = [];
+            // Reconstruimos la lista solo con los waypoints que el usuario ha dejado, descartando los internos.
+            const userWaypointsInNewOrder = [];
             finalWaypointIds.forEach(id => {
-                if (originalWaypointMap.has(id)) {
-                    newWaypointsList.push(originalWaypointMap.get(id));
+                if (waypointMap.has(id)) {
+                    userWaypointsInNewOrder.push(waypointMap.get(id));
                 }
             });
-
-            // 3. Reemplazamos el array global con esta nueva lista limpia.
-            navigationWaypoints = newWaypointsList;
             
-            console.log('[DEBUG] navigationWaypoints reconstruido ANTES de recalcular:', JSON.parse(JSON.stringify(navigationWaypoints)));
+            // Si hay un punto de partida de recálculo, lo preservamos al principio
+            const recalcStartPoint = navigationWaypoints.find(wp => wp && wp.isRecalculatedStart);
+            navigationWaypoints = recalcStartPoint ? [recalcStartPoint, ...userWaypointsInNewOrder] : [...userWaypointsInNewOrder];
             // --- FIN DE LA LÓGICA CORREGIDA ---
             
             await updateWaypointTypesAndLabels();
@@ -7960,8 +7976,7 @@ function showReorderStagesModal() {
             showToast("Etapas reordenadas y ruta recalculada", "success");
 
         } catch (error) {
-            console.error("[DEBUG] Error capturado en el bloque `try` del modal:", error);
-            // La notificación de error ya la muestra la propia función de recálculo.
+            console.error("Fallo al recalcular la ruta después de reordenar:", error);
         } finally {
             closeReorderModal();
             updateStartNavigationButtonState();
