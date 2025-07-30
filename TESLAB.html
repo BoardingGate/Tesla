@@ -1,4 +1,4 @@
-B80
+G1
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -20,7 +20,7 @@ B80
     <script src='https://api.mapbox.com/mapbox-gl-js/v3.13.0/mapbox-gl.js'></script>
     
     <script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>                                                                 <script async src="https://maps.googleapis.com/maps/api/js?key=AIzaSyCEAWL1PjlOMBrGnXLOS79W3iDJMkmTQGw&v=beta&libraries=places&callback=initMap"></script> <script>   function initMap() {} </script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@3.9.1/dist/chart.min.js"></script>                                                                 <script loading="async" async src="https://maps.googleapis.com/maps/api/js?key=AIzaSyCEAWL1PjlOMBrGnXLOS79W3iDJMkmTQGw&v=beta&libraries=places&callback=initMap"></script> <script>   function initMap() {} </script>
  </head>
 <style>  
 
@@ -4911,15 +4911,15 @@ object-fit: contain;
     display: flex; justify-content: center; align-items: center;
     padding: 15px;
 }
-
 .poi-modal-content {
     background-color: #2c2c2e; color: #f0f0f0;
     border-radius: 14px; box-shadow: 0 10px 30px rgba(0,0,0,0.5);
     border: 1px solid #444;
-    width: 100%; max-width: 420px;
+    width: 100%; max-width: 750px; 
+    max-height: 95vh; 
     display: flex; flex-direction: column;
     overflow: hidden;
-}
+}    
 
 .poi-modal-header {
     height: 140px;
@@ -6328,6 +6328,61 @@ class CombinedMapControl {
             }
         }).join(', ');
 
+// ===================================================================
+// NOMBRE: checkAndIncrementPoiCount
+// RESUMEN: Verifica el límite global de POIs y actualiza el contador del usuario.
+async function checkAndIncrementPoiCount() {
+    const { primaryId: userId } = parseUserId(localStorage.getItem('userData_userId'));
+    if (!userId || !window.db) return false;
+
+    const GLOBAL_POI_LIMIT = 7000;
+
+    try {
+        const now = new Date();
+        const monthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+        
+        // 1. Obtener estadísticas globales para comprobar el límite total
+        const globalStats = await getGlobalPoiStats();
+        if (globalStats.totalMonth >= GLOBAL_POI_LIMIT) {
+            showToast("Servicio de POI temporalmente inactivo (límite mensual alcanzado).", "warning");
+            return false; // Bloquear si se ha alcanzado el límite global
+        }
+        
+        // 2. Si el límite global está bien, proceder a actualizar el contador del usuario
+        const userDocRef = window.doc(window.db, "user_data", userId);
+        
+        await db.runTransaction(async (transaction) => {
+            const userDoc = await transaction.get(userDocRef);
+            if (!userDoc.exists()) {
+                // Si el usuario no existe en la BD, se crea con el primer clic
+                transaction.set(userDocRef, {
+                    poi_clicks_last_month: monthStr,
+                    poi_clicks_month: 1
+                }, { merge: true });
+            } else {
+                const userData = userDoc.data();
+                let newMonthCount = 1;
+                if (userData.poi_clicks_last_month === monthStr) {
+                    newMonthCount = (userData.poi_clicks_month || 0) + 1;
+                }
+                
+                transaction.update(userDocRef, {
+                    poi_clicks_last_month: monthStr,
+                    poi_clicks_month: newMonthCount
+                });
+            }
+        });
+
+        return true; // Permitir la llamada a la API
+        
+    } catch (error) {
+        console.error("Error al verificar/incrementar el contador de POIs:", error);
+        showToast("Error al verificar límite de POIs. Inténtalo de nuevo.", "error");
+        return false; // Bloquear por seguridad en caso de error
+    }
+}
+
+    
 // ===================================================================
 // NOMBRE: createRadarSpeedIcon (VERSIÓN FINAL DE ESCALADO DIRECTO)
 // RESUMEN: Crea un icono de radar que se escala correctamente de pequeño a grande al hacer zoom.
@@ -10358,9 +10413,12 @@ async function reAddCustomMapLayersAndSources(mapInstance) {
     mapInstance.addLayer({ id: 'reminders-radar-text-layer', type: 'symbol', source: 'reminders-geojson-source', filter: ['all', ['==', ['get', 'isRadar'], true], ['!', ['has', 'speed']]], layout: { 'text-field': 'Rdar', 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': ['interpolate', ['linear'], ['zoom'], 10, 8, 14, 14, 17, 20], 'text-allow-overlap': true }, paint: { 'text-color': 'yellow', 'text-opacity': 1, 'text-halo-color': '#000', 'text-halo-width': 1 } });
     mapInstance.addLayer({ id: 'reminders-icons-layer', type: 'symbol', source: 'reminders-geojson-source', filter: ['==', ['get', 'isRadar'], false], layout: { 'icon-image': 'reminder-icon', 'icon-size': ['interpolate', ['linear'], ['zoom'], 10, 0.4, 14, 0.6, 17, 0.8], 'icon-allow-overlap': true, 'icon-anchor': 'bottom' } });
 }
+
 // ===================================================================
-// NOMBRE: fetchAndRenderChatUsers (MODIFICADA - AÑADE CONTROL ADMIN)
-// RESUMEN: Muestra la lista de usuarios y, para el admin, un campo para gestionar el límite de sesiones de mapa.
+// NOMBRE: fetchAndRenderChatUsers (CON ESTADÍSTICAS COMPLETAS PARA ADMIN)
+// RESUMEN: Muestra la lista de usuarios y, para el admin, estadísticas
+//          de sesiones de mapa y clics en POIs.
+// ===================================================================
 async function fetchAndRenderChatUsers() {
     const usersListContainer = document.getElementById('chat-users-list');
     const messageInput = document.getElementById('chat-message-input');
@@ -10376,7 +10434,12 @@ async function fetchAndRenderChatUsers() {
     const isAdmin = (localStorage.getItem('userData_userId') || '').toLowerCase() === 'boardinggate';
 
     if (isAdmin) {
-        const stats = await getGlobalMapSessionStats();
+        // Obtenemos ambas estadísticas globales en paralelo para mayor eficiencia
+        const [sessionStats, poiStats] = await Promise.all([
+            getGlobalMapSessionStats(),
+            getGlobalPoiStats()
+        ]);
+
         let statsHeader = document.getElementById('chat-admin-stats-header');
         if (!statsHeader) {
             statsHeader = document.createElement('div');
@@ -10387,7 +10450,8 @@ async function fetchAndRenderChatUsers() {
                 filterContainer.insertAdjacentElement('afterend', statsHeader);
             }
         }
-        statsHeader.textContent = `Sesiones-> Mes: ${stats.totalMonth} | Total: ${stats.totalHistoric}`;
+        // Mostramos ambas líneas de estadísticas
+        statsHeader.innerHTML = `Sesiones-> Mes: ${sessionStats.totalMonth} | Total: ${sessionStats.totalHistoric}<br>POI Clics (Mes): ${poiStats.totalMonth}`;
         
         let maxSessionsControl = document.getElementById('chat-max-sessions-control');
         if (!maxSessionsControl) {
@@ -10456,6 +10520,9 @@ async function fetchAndRenderChatUsers() {
         usersListContainer.innerHTML = ''; 
         let userCount = 0;
         
+        const now = new Date();
+        const currentMonthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+        
         usersData.forEach(userData => {
             const userId = userData.id;
 
@@ -10504,14 +10571,13 @@ async function fetchAndRenderChatUsers() {
             userDetails.textContent = `(${detailsParts.join(', ')})`;
 
             if (isAdmin) {
-                const now = new Date();
-                const currentMonthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
                 const userMonthSessions = (userData.map_sessions_last_month === currentMonthStr) ? (userData.map_sessions_month || 0) : 0;
                 const userTotalSessions = userData.map_sessions_total || 0;
+                const userPoiClicks = (userData.poi_clicks_last_month === currentMonthStr) ? (userData.poi_clicks_month || 0) : 0;
                 
                 const statsSpan = document.createElement('span');
                 statsSpan.className = 'chat-user-session-stats';
-                statsSpan.textContent = `(Mes: ${userMonthSessions} Total: ${userTotalSessions})`;
+                statsSpan.textContent = `(Sesiones Mes: ${userMonthSessions} | POI: ${userPoiClicks} | Sesiones Total: ${userTotalSessions})`;
                 userDetails.appendChild(statsSpan);
             }
             
@@ -10526,9 +10592,11 @@ async function fetchAndRenderChatUsers() {
         }
 
     } catch (error) {
+        console.error("Error al renderizar usuarios del chat:", error);
         usersListContainer.innerHTML = '<p class="chat-no-users">Error al cargar usuarios.</p>';
     }
 }
+    
 
 // ===================================================================
 // NOMBRE: openChatModal (MODIFICADA)
@@ -16233,12 +16301,45 @@ async function openNavigationMap() {
     toggleMapLocationSearchVisibility(!isNavigating);
 }   
 
+// ===================================================================
+// NOMBRE: getGlobalPoiStats
+// RESUMEN: Calcula las estadísticas globales de clics en POIs de todos los usuarios.
+// ===================================================================
+async function getGlobalPoiStats() {
+    if (!window.db) return { totalMonth: 0 };
+    
+    let totalMonth = 0;
+    
+    try {
+        const usersCollectionRef = window.collection(window.db, "user_data");
+        const querySnapshot = await window.getDocs(usersCollectionRef);
+        
+        const now = new Date();
+        const currentMonthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+        
+        querySnapshot.forEach(doc => {
+            const data = doc.data();
+            if (data.poi_clicks_last_month === currentMonthStr) {
+                totalMonth += (data.poi_clicks_month || 0);
+            }
+        });
 
+    } catch (error) {
+        console.error("Error al obtener estadísticas globales de POIs:", error);
+    }
+    
+    return { totalMonth };
+}
+    
 // ===================================================================
 // NOMBRE: showPoiInfoModal (VERSIÓN FINAL CON GOOGLE PLACES API v2)
 // RESUMEN: Muestra un modal enriquecido con datos de Google Places.
 // ===================================================================
 async function showPoiInfoModal(feature) {
+    const canProceed = await checkAndIncrementPoiCount();
+    if (!canProceed) {
+        return; }
+ 
     const existingModal = document.querySelector('.poi-modal-overlay');
     if (existingModal) existingModal.remove();
 
