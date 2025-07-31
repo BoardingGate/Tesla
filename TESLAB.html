@@ -1,4 +1,4 @@
-V20
+V21
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -20925,115 +20925,131 @@ function animateMarkerAndMap(timestamp) {
 }
 
 // ===================================================================
-// NOMBRE: showSimulationSpeedModal (MODIFICADA)
-// RESUMEN: Muestra un modal para que el usuario introduzca la velocidad de simulación y elija el modo (Navegación Normal o Free Drive).
-function showSimulationSpeedModal(defaultSpeed, callback) {
-    closeOtherModals('simulation-speed-modal');
-    let modal = document.getElementById('simulation-speed-modal');
-    if (modal) modal.remove();
-    modal = document.createElement('div');
-    modal.id = 'simulation-speed-modal';
+// NOMBRE: showSimulationModal (MODIFICADA - AÑADIDO TEXTO DE AYUDA)
+// RESUMEN: Muestra un modal con la lista de maniobras y un texto de ayuda para simular desvíos.
+async function showSimulationModal() {
+    const canSimulate = (navigationWaypoints.filter(wp => !wp.isInternal && !wp.isRecalculatedStart).length >= 2 && navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0]) ||
+                    (isNavigating && navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0]);
+    if (!canSimulate) {
+        showToast("Se necesitan al menos 2 puntos y una ruta calculada para mostrar las maniobras.", "warning");
+        return;
+    }
+    const route = navigationCurrentRouteData.routes[0];
+    if (!route || !route.legs || !route.legs.length === 0) {
+        showToast("Datos de ruta incompletos para mostrar maniobras.", "error");
+        return;
+    }
+    closeOtherModals('simulation-modal');
+    
+    let modal = document.getElementById('simulation-modal');
+    if (!modal) {
+        modal = document.createElement('div');
+        modal.id = 'simulation-modal';
+        document.body.appendChild(modal);
+    }
     modal.innerHTML = `
-        <h2>Velocidad y Modo de Simulación</h2>
-        <div class="filter-group" style="margin-bottom: 20px;">
-            <label id="speed-range-label">Velocidad: ${defaultSpeed} km/h</label>
-            <div class="slider-container single-slider-container" style="height: 25px;">
-                <div class="slider-track"></div>
-                <div class="slider-range" id="speed-slider-range"></div>
-                <div class="slider-thumb" id="speed-thumb" style="left: 0%;"></div>
-            </div>
+        <h2 style="font-size: 1.3rem; font-weight: bold; text-align: center; margin-bottom: 1rem; color: #333;">Maniobras de la Ruta</h2>
+        <div class="modal-top-buttons" style="justify-content: flex-start; margin-bottom: 1rem;">
+            <button id="close-simulation-modal" style="flex: 0 0 auto; width: auto; min-width: unset;">Salir <span class="button-countdown-timer"></span></button>
         </div>
-        <div class="modal-top-buttons" style="flex-direction: column; gap: 10px;">
-            <button id="confirm-navigation-simulation" style="background-color: #28a745; color: white;">Simular Navegación Normal <span class="button-countdown-timer"></span></button>
-            <button id="confirm-freedrive-simulation" style="background-color: #34D399; color: #111827; font-weight: bold;">Recorrer en Modo Free Drive</button>
-            <button id="cancel-simulation-speed" style="background-color: #6c757d; color: white;">Cancelar</button>
-        </div>
+        <div id="simulation-content-area"><p>Cargando maniobras...</p></div>
+        <!-- AÑADIDO: Párrafo de ayuda para simular desvíos -->
+        <p style="font-size: 0.85rem; color: #444; margin-top: 1rem; text-align: left; font-style: italic; border-top: 1px solid #ccc; padding-top: 10px;">
+            (*) Para simular DESVIOS, sin cargar ruta pulse el botón SIMILAR, LUEGO CARGUE la ruta y acto seguido PULSE EN EL MAPA a donde quiere MOVER EL COCHE y ESPERE la detección del desvio
+        </p>
     `;
-    document.body.appendChild(modal);
+    modal.classList.remove('hidden');
 
-    const speedSliderContainer = modal.querySelector('#speed-thumb').parentElement;
-    const speedThumb = modal.querySelector('#speed-thumb');
-    const speedRange = modal.querySelector('#speed-slider-range');
-    const speedLabel = modal.querySelector('#speed-range-label');
-    const minSpeed = 1;
-    const maxSpeed = 5000;
-    let currentSpeed = defaultSpeed || 90;
+    const closeButton = modal.querySelector('#close-simulation-modal');
+    const closeSimulationModalHandler = () => {
+        if (simulationModalTimer) clearTimeout(simulationModalTimer);
+        clearModalAutoCloseTimer(modal, closeButton, 'simulation-modal');
+        modal.classList.add('hidden');
+        hideIntersectionPreviewMap();
+    };
+    closeButton.addEventListener('click', closeSimulationModalHandler);
+    addModalAutoCloseTimer(modal, closeButton, 'simulation-modal', 50000);
 
-    const updateSpeedVisuals = () => {
-        const minLog = Math.log(minSpeed);
-        const maxLog = Math.log(maxSpeed);
-        const percent = (Math.log(currentSpeed) - minLog) / (maxLog - minLog);
+    const carDist = lastCarDistanceAlongRouteForNavLogic;
+    let simulationList = document.createElement('ul');
+    let stepsShown = 0;
+    let actualStageCounter = 1;
+    
+    const waypointsForRequest = navigationWaypoints.filter(wp => wp);
+    
+    for (let legIdx = 0; legIdx < route.legs.length; legIdx++) {
+        const leg = route.legs[legIdx];
+        if (!leg || !leg.steps) continue;
         
-        speedThumb.style.left = `${percent * 100}%`;
-        speedRange.style.width = `${percent * 100}%`;
-        speedLabel.textContent = `Velocidad: ${Math.round(currentSpeed)} km/h`;
-    };
-
-    const onSpeedDrag = (e) => {
-        const rect = speedSliderContainer.getBoundingClientRect();
-        const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-        let percent = (clientX - rect.left) / rect.width;
-        percent = Math.max(0, Math.min(1, percent));
+        const legDestinationWaypoint = waypointsForRequest[legIdx + 1];
+        if (legDestinationWaypoint && !legDestinationWaypoint.isInternal) {
+             const stageAddress = legDestinationWaypoint.address || `Etapa ${legDestinationWaypoint.label}`;
+             const stageDistance = leg.distance ? (leg.distance / 1000).toFixed(1) + " km" : "Dist. desc.";
+             const headerLi = document.createElement('li');
+             headerLi.style.cssText = "background-color: #e0e0e0; font-weight: bold; padding: 5px; margin-top:5px;";
+             headerLi.textContent = `ETAPA ${actualStageCounter}: ${stageAddress} (Total ${stageDistance})`;
+             simulationList.appendChild(headerLi);
+             actualStageCounter++;
+        }
         
-        const minLog = Math.log(minSpeed);
-        const maxLog = Math.log(maxSpeed);
-        currentSpeed = Math.exp(minLog + percent * (maxLog - minLog));
-        
-        updateSpeedVisuals();
-    };
+        for (let stepIdx = 0; stepIdx < leg.steps.length; stepIdx++) {
+            const step = leg.steps[stepIdx];
+            if (!step || !step.maneuver) continue;
 
-    const startSpeedDrag = (e) => {
-        const moveHandler = (moveEvent) => onSpeedDrag(moveEvent);
-        const endDrag = () => {
-            document.removeEventListener('mousemove', moveHandler);
-            document.removeEventListener('mouseup', endDrag);
-            document.removeEventListener('touchmove', moveHandler);
-            document.removeEventListener('touchend', endDrag);
-        };
-        document.addEventListener('mousemove', moveHandler);
-        document.addEventListener('mouseup', endDrag);
-        document.addEventListener('touchmove', moveHandler);
-        document.addEventListener('touchend', endDrag);
-    };
+            const isArrivalAtInternal = step.maneuver.type === 'arrive' && waypointsForRequest[legIdx + 1]?.isInternal;
+            const isDepartureFromInternal = step.maneuver.type === 'depart' && stepIdx === 0 && legIdx > 0 && waypointsForRequest[legIdx]?.isInternal;
+            if (isArrivalAtInternal || isDepartureFromInternal) continue;
+            
+            const distanceToEndOfThisStep = calculateDistanceToEndOfStep(route, legIdx, stepIdx);
+            if (distanceToEndOfThisStep < carDist) continue;
+            const distanceToThisStepManeuver = Math.max(0, distanceToEndOfThisStep - carDist);
+            
+            const maneuver = step.maneuver;
+            const type = maneuver.type || '';
+            
+            const maneuverText = getManeuverInstructionText(maneuver);
+            let streetNameText = step.name || '';
+            if (type === 'arrive' || type === 'depart' || type === 'end of road' || type === 'roundabout' || type === 'rotary') {
+                streetNameText = '';
+            } else if (streetNameText.toLowerCase() === 'continúa' && maneuverText.toLowerCase() !== 'continúa') {
+                streetNameText = '';
+            }
+            
+            let distanceFormatted = (distanceToThisStepManeuver >= 1000) ? `${(distanceToThisStepManeuver / 1000).toFixed(1)} km` : `${Math.round(distanceToThisStepManeuver)} m`;
+            
+            const li = document.createElement('li');
+            li.dataset.legIndex = legIdx;
+            li.dataset.stepIndex = stepIdx;
+            li.style.cursor = 'pointer';
+            
+            const iconContainer = document.createElement('span');
+            iconContainer.className = 'turn-icon-sim';
+            
+            const textContainer = document.createElement('span');
+            textContainer.innerHTML = `${maneuverText}${streetNameText ? ` <strong>${streetNameText}</strong>` : ''} (${distanceFormatted})`;
+            
+            li.appendChild(iconContainer);
+            li.appendChild(textContainer);
+            simulationList.appendChild(li);
+
+            const iconFilename = getManeuverIconFilename(maneuver);
+            const iconUrl = `https://boardinggate.github.io/Tesla/${iconFilename}`;
+            iconContainer.innerHTML = `<img src="${iconUrl}" alt="Maniobra" style="width:24px; height:24px; object-fit:contain;">`;
+            
+            stepsShown++;
+        }
+    }
     
-    speedThumb.addEventListener('mousedown', startSpeedDrag);
-    speedThumb.addEventListener('touchstart', startSpeedDrag);
-    updateSpeedVisuals();
-    
-    const confirmNavBtn = modal.querySelector('#confirm-navigation-simulation');
-    const confirmFreeDriveBtn = modal.querySelector('#confirm-freedrive-simulation');
-    const cancelBtn = modal.querySelector('#cancel-simulation-speed');
-    
-    const closeHandler = () => {
-        clearModalAutoCloseTimer(modal, confirmNavBtn, 'simulation-speed-modal');
-        if (modal.parentNode) modal.remove();
-    };
-
-    confirmNavBtn.addEventListener('click', () => {
-        isSimulatingFreeDrive = false; 
-        callback(Math.round(currentSpeed));
-        closeHandler();
-    });
-
-    confirmFreeDriveBtn.addEventListener('click', () => {
-        isSimulatingFreeDrive = true; 
-        callback(Math.round(currentSpeed));
-        closeHandler();
-    });
-
-    cancelBtn.addEventListener('click', () => {
-        showToast("Inicio de simulación cancelado", "info");
-        const simulateGpsButton = document.getElementById('toggle-simulate-gps-button');
-        if (simulateGpsButton) simulateGpsButton.classList.remove('active-simulate-gps-mode');
-        isSimulatingGpsLocation = false;
-        reactivateRealGpsAfterSimulation();
-        setNavigationMapClickHandler();
-        closeHandler();
-    });
-
-    addModalAutoCloseTimer(modal, confirmNavBtn, 'simulation-speed-modal', 30000);
-}
-    
+    const contentArea = modal.querySelector('#simulation-content-area');
+    if (stepsShown > 0) {
+        contentArea.innerHTML = '';
+        contentArea.appendChild(simulationList);
+        contentArea.removeEventListener('click', handleSimulationItemClick);
+        contentArea.addEventListener('click', handleSimulationItemClick);
+    } else {
+        contentArea.innerHTML = "<p>No hay más interacciones futuras en la ruta o estás muy cerca del final.</p>";
+    }
+}    
     
 // ===================================================================
 // NOMBRE: getRouteStyleProperties (VERSIÓN CORREGIDA)
