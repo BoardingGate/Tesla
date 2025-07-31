@@ -1,4 +1,4 @@
-S26
+S27
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -8644,6 +8644,191 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false) {
     updateStartNavigationButtonState();
     updateNavigationButtonColor();
 }
+
+// ===================================================================
+// NOMBRE: fetchAndRenderChatUsers (CON ESTADÍSTICAS COMPLETAS PARA ADMIN)
+// RESUMEN: Muestra la lista de usuarios y, para el admin, estadísticas
+//          de sesiones de mapa y clics en POIs.
+// ===================================================================
+async function fetchAndRenderChatUsers() {
+    const usersListContainer = document.getElementById('chat-users-list');
+    const messageInput = document.getElementById('chat-message-input');
+    const filterInput = document.getElementById('chat-user-filter-input');
+    
+    if (!usersListContainer || !window.db || !messageInput || !filterInput) return;
+
+    if (!filterInput.listenerAdded) {
+        filterInput.addEventListener('input', fetchAndRenderChatUsers);
+        filterInput.listenerAdded = true;
+    }
+
+    const isAdmin = (localStorage.getItem('userData_userId') || '').toLowerCase() === 'boardinggate';
+
+    if (isAdmin) {
+        // Obtenemos ambas estadísticas globales en paralelo para mayor eficiencia
+        const [sessionStats, poiStats] = await Promise.all([
+            getGlobalMapSessionStats(),
+            getGlobalPoiStats()
+        ]);
+
+        let statsHeader = document.getElementById('chat-admin-stats-header');
+        if (!statsHeader) {
+            statsHeader = document.createElement('div');
+            statsHeader.id = 'chat-admin-stats-header';
+            statsHeader.className = 'chat-admin-stats-header';
+            const filterContainer = document.getElementById('chat-users-filter-container');
+            if (filterContainer) {
+                filterContainer.insertAdjacentElement('afterend', statsHeader);
+            }
+        }
+        // Mostramos ambas líneas de estadísticas
+        statsHeader.innerHTML = `Sesiones-> Mes: ${sessionStats.totalMonth} | Total: ${sessionStats.totalHistoric}<br>POI Clics (Mes): ${poiStats.totalMonth}`;
+        
+        let maxSessionsControl = document.getElementById('chat-max-sessions-control');
+        if (!maxSessionsControl) {
+            maxSessionsControl = document.createElement('div');
+            maxSessionsControl.id = 'chat-max-sessions-control';
+            maxSessionsControl.style.cssText = 'padding: 8px; background-color: #3a3a3c; border-bottom: 1px solid #444; display: flex; align-items: center; justify-content: center; gap: 10px;';
+            maxSessionsControl.innerHTML = `
+                <label for="chat-max-sessions-input" style="font-weight: bold; color: #ffd700;">MÁXIMO SESIONES:</label>
+                <input type="number" id="chat-max-sessions-input" style="width: 80px; text-align: center; background-color: #2c2c2e; border: 1px solid #555; color: #f0f0f0; border-radius: 4px;">
+            `;
+            statsHeader.insertAdjacentElement('afterend', maxSessionsControl);
+
+            const maxSessionsInput = document.getElementById('chat-max-sessions-input');
+            
+            const localMaxSessions = localStorage.getItem(MAX_SESSIONS_KEY);
+            if(localMaxSessions) {
+                maxSessionsInput.value = localMaxSessions;
+            } else {
+                const adminDocRef = window.doc(window.db, "user_data", "boardinggate");
+                window.getDoc(adminDocRef).then(docSnap => {
+                    if (docSnap.exists() && docSnap.data().max_monthly_sessions) {
+                        const maxSessions = docSnap.data().max_monthly_sessions;
+                        maxSessionsInput.value = maxSessions;
+                        localStorage.setItem(MAX_SESSIONS_KEY, maxSessions);
+                    }
+                });
+            }
+
+            maxSessionsInput.addEventListener('change', async () => {
+                const newValue = parseInt(maxSessionsInput.value, 10);
+                if (!isNaN(newValue) && newValue >= 0) {
+                    localStorage.setItem(MAX_SESSIONS_KEY, newValue);
+                    const adminDocRef = window.doc(window.db, "user_data", "boardinggate");
+                    try {
+                        await window.setDoc(adminDocRef, { max_monthly_sessions: newValue }, { merge: true });
+                        showToast(`Límite máximo de sesiones mensuales actualizado a ${newValue}.`, 'success');
+                    } catch (error) {
+                        showToast(`Error al guardar el límite en la nube.`, 'error');
+                    }
+                }
+            });
+        }
+    } else {
+        const statsHeader = document.getElementById('chat-admin-stats-header');
+        if (statsHeader) statsHeader.remove();
+        const maxSessionsControl = document.getElementById('chat-max-sessions-control');
+        if (maxSessionsControl) maxSessionsControl.remove();
+    }
+    
+    try {
+        const usersRef = window.collection(window.db, "user_data");
+        const q = window.query(usersRef, window.where("rss", "==", true));
+        const querySnapshot = await window.getDocs(q);
+        
+        const filterText = filterInput.value.toLowerCase();
+        let usersData = [];
+
+        querySnapshot.forEach(doc => {
+            const userData = doc.data();
+            const userId = userData.usuario || doc.id;
+            usersData.push({ id: userId, ...userData });
+        });
+
+        usersData.sort((a, b) => a.id.localeCompare(b.id));
+
+        usersListContainer.innerHTML = ''; 
+        let userCount = 0;
+        
+        const now = new Date();
+        const currentMonthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+        
+        usersData.forEach(userData => {
+            const userId = userData.id;
+
+            const isBoardingGateAccount = userId.toLowerCase().includes('boardinggate');
+            const isMainAdminAccount = userId.toLowerCase() === 'boardinggate';
+            if (isBoardingGateAccount && !isMainAdminAccount) {
+                return; 
+            }
+
+            const userString = `${userId} ${userData.modelo || ''} ${userData.anio || ''} ${userData.provincia || ''}`.toLowerCase();
+            if (filterText && !userString.includes(filterText)) {
+                return;
+            }
+            
+            const userElement = document.createElement('div');
+            userElement.className = 'chat-user-item';
+            userElement.style.cursor = 'pointer';
+            userElement.title = `Enviar mensaje privado a ${userId}`;
+
+            userElement.addEventListener('click', () => {
+                const currentText = messageInput.value;
+                if (currentText.startsWith('@')) {
+                    const existingMentionEndIndex = currentText.indexOf(' ');
+                    if (existingMentionEndIndex !== -1) {
+                        messageInput.value = `@${userId} ` + currentText.substring(existingMentionEndIndex + 1);
+                    } else {
+                        messageInput.value = `@${userId} `;
+                    }
+                } else {
+                    messageInput.value = `@${userId} ` + currentText;
+                }
+                messageInput.focus();
+                messageInput.dispatchEvent(new Event('input'));
+            });
+
+            const userName = document.createElement('span');
+            userName.className = 'chat-user-name';
+            userName.textContent = userId;
+            
+            const userDetails = document.createElement('span');
+            userDetails.className = 'chat-user-details';
+            const detailsParts = [];
+            if (userData.modelo) detailsParts.push(userData.modelo);
+            if (userData.anio) detailsParts.push(userData.anio);
+            if (userData.provincia) detailsParts.push(userData.provincia);
+            userDetails.textContent = `(${detailsParts.join(', ')})`;
+
+            if (isAdmin) {
+                const userMonthSessions = (userData.map_sessions_last_month === currentMonthStr) ? (userData.map_sessions_month || 0) : 0;
+                const userTotalSessions = userData.map_sessions_total || 0;
+                const userPoiClicks = (userData.poi_clicks_last_month === currentMonthStr) ? (userData.poi_clicks_month || 0) : 0;
+                
+                const statsSpan = document.createElement('span');
+                statsSpan.className = 'chat-user-session-stats';
+                statsSpan.textContent = `(Sesiones Mes: ${userMonthSessions} | POI: ${userPoiClicks} | Sesiones Total: ${userTotalSessions})`;
+                userDetails.appendChild(statsSpan);
+            }
+            
+            userElement.appendChild(userName);
+            userElement.appendChild(userDetails);
+            usersListContainer.appendChild(userElement);
+            userCount++;
+        });
+
+        if (userCount === 0) {
+            usersListContainer.innerHTML = '<p class="chat-no-users">No hay usuarios que coincidan con el filtro.</p>';
+        }
+
+    } catch (error) {
+        console.error("Error al renderizar usuarios del chat:", error);
+        usersListContainer.innerHTML = '<p class="chat-no-users">Error al cargar usuarios.</p>';
+    }
+}
+    
+
     
 // ===================================================================
 // NOMBRE: handleFreeDriveCancellation
