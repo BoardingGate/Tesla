@@ -1,4 +1,4 @@
-V8
+V9
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -11858,13 +11858,26 @@ function showAutoStartNavigationModal() {
     }, 1000);
 }
 
+// ===================================================================
+// NOMBRE: toggleNavigationState (MODIFICADA - LIMPIA RADARES DINÁMICOS)
+// RESUMEN: Al iniciar/parar navegación, limpia los radares dinámicos.
+// ===================================================================
 async function toggleNavigationState(isRecalculationStop = false) {
+    // ... (código existente al principio de la función)
     const startNavButton = document.getElementById('start-navigation-button');
     const startNavImg = startNavButton ? startNavButton.querySelector('img') : null;
     const mapContainer = document.getElementById('reminders-location-map-div');
 
+    // ¡NUEVO! Limpiar radares dinámicos al cambiar de estado.
+    let reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
+    const dynamicRadarsExist = reminders.some(r => r.isDynamicRadar);
+    if (dynamicRadarsExist) {
+        reminders = reminders.filter(r => !r.isDynamicRadar);
+        localStorage.setItem('reminders', JSON.stringify(reminders));
+        plotRemindersOnNavigationMap(); // Actualiza el mapa para quitarlos
+    }
+    
     if (isNavigating) {
-        showToast("Navegación finalizada", "info", 3000);
         
         if (isSimulatingGpsLocation) {
             stopAutomatedRouteSimulation();
@@ -11891,7 +11904,7 @@ async function toggleNavigationState(isRecalculationStop = false) {
     } else if (isFreeDriveActive) {
         stopFreeDrive();
     } else {
-        if (!navigationCurrentRouteData || !navigationCurrentRouteData.routes || !navigationCurrentRouteData.routes.length === 0 || navigationWaypoints.filter(wp => !wp.isInternal && !wp.isRecalculatedStart).length < 2) {
+         if (!navigationCurrentRouteData || !navigationCurrentRouteData.routes || !navigationCurrentRouteData.routes.length === 0 || navigationWaypoints.filter(wp => !wp.isInternal && !wp.isRecalculatedStart).length < 2) {
             showToast("No hay ruta calculada para iniciar la navegación", "warning");
             return;
         }
@@ -12004,7 +12017,7 @@ async function toggleNavigationState(isRecalculationStop = false) {
     actualizarContadorRadares(radaresEnRutaActual.length);
     actualizarContadorTareas(tareasEnRutaActual.length);
 }
-    
+
     
 // ===================================================================
 // NOMBRE: clearAllWaypointMarkersFromMap (MODIFICADA - PARA MAPBOX)
@@ -21680,144 +21693,86 @@ function translateOcmTerm(term) {
   
 
 // ===================================================================
-// NOMBRE: checkReminders (VERSIÓN FINAL CON LÓGICA CENTRALIZADA)
-// RESUMEN: Comprueba periódicamente los recordatorios y actualiza radares dinámicos de forma robusta.
+// NOMBRE: checkReminders (VERSIÓN CON LÓGICA DIFERENCIADA NAVEGACIÓN/LIBRE)
+// RESUMEN: Si se navega, solo comprueba radares en ruta. Si no, comprueba
+//          los radares dinámicos cercanos.
+// ===================================================================
 function checkReminders() {
     const now = new Date();
-    const timeSinceLastCheck = now - lastDynamicRadarCheck;
-    const currentReminders = JSON.parse(localStorage.getItem('reminders') || '[]');
-    const hasExistingDynamicRadars = currentReminders.some(r => r.isDynamicRadar === true);
+    
+    if (!isNavigating) {
+        const timeSinceLastCheck = now - lastDynamicRadarCheck;
+        const currentReminders = JSON.parse(localStorage.getItem('reminders') || '[]');
+        const hasExistingDynamicRadars = currentReminders.some(r => r.isDynamicRadar === true);
 
-    const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
-    const isRadaresRutaActive = radaresRutaCheckbox ? radaresRutaCheckbox.checked : false;
-
-    if ((timeSinceLastCheck > 30 * 60 * 1000 || !hasExistingDynamicRadars) && !isRadaresRutaActive) {
-        updateDynamicRadars();
-    }
-
-    if (isRecalculatingRoute && recalculationAttempts > 0) {
-        return;
+        if (timeSinceLastCheck > 30 * 60 * 1000 || !hasExistingDynamicRadars) {
+            updateDynamicRadars(true);
+        }
     }
     
-    const overdueReminders = []; 
-    const validRemindersForStorage = []; 
-    let storageNeedsUpdate = false; 
-    const processedIds = new Set(); 
-    let newOverdueFound = false;
-
+    if (isRecalculatingRoute && recalculationAttempts > 0) return;
+    
+    const overdueReminders = [];
     new Promise((resolve) => {
-        if (isSimulatingGpsLocation && simulatedGpsLocation) {
-            resolve(simulatedGpsLocation);
-        } else if (navigationCurrentLocation) {
-            resolve(navigationCurrentLocation);
-        } else if ('geolocation' in navigator) {
-             getCurrentLocation( (coordsParam) => resolve(coordsParam), (errorMsg) => { resolve(null); } );
-        } else {
-            resolve(null);
-        }
+        if (isSimulatingGpsLocation && simulatedGpsLocation) resolve(simulatedGpsLocation);
+        else if (navigationCurrentLocation) resolve(navigationCurrentLocation);
+        else if ('geolocation' in navigator) getCurrentLocation(coords => resolve(coords), () => resolve(null));
+        else resolve(null);
     }).then(async coords => {
-        let allRemindersToCheck = [...currentReminders];
-        const radaresRutaActivos = document.getElementById('radares-ruta-checkbox')?.checked;
-        if (isNavigating && radaresRutaActivos && reminderMapObjects && reminderMapObjects.length > 0) {
-            reminderMapObjects.forEach(mapObj => {
-                if (mapObj.isFromRuta) {
-                    const tempReminderFromMap = {
-                        id: mapObj.reminderId, text: mapObj.marker.getElement().title || "RADAR RUTA", type: 'simple',
-                        time: '00:00', date: new Date().toISOString().split('T')[0], createdAt: new Date().toISOString(),
-                        managedByUser: false, isLocationEnabled: true,
-                        locationCoordinates: { latitude: mapObj.marker.getLngLat().lat, longitude: mapObj.marker.getLngLat().lng },
-                        radiusMeters: mapObj.circleRadius ? mapObj.circleRadius : 600,
-                        excludeFromList: true, isFromRuta: true
-                    };
-                    allRemindersToCheck.push(tempReminderFromMap);
-                }
-            });
-        }
+        let allRemindersToCheck = JSON.parse(localStorage.getItem('reminders') || '[]');
         
+        // ¡NUEVO! Si navegamos, filtramos la lista para quedarnos solo con lo relevante.
+        if (isNavigating) {
+            // Nos quedamos con los recordatorios personales/tareas y los radares que están marcados como "en ruta".
+            allRemindersToCheck = allRemindersToCheck.filter(r => !r.isDynamicRadar);
+            // Añadimos los radares en ruta que no están en la lista principal (los que vienen del checkbox)
+            allRemindersToCheck.push(...radaresEnRutaActual);
+        }
+
         let isInsideAnyRadarZone = false;
 
         allRemindersToCheck.forEach(reminder => {
-            if (!reminder || typeof reminder.id !== 'number' || typeof reminder.managedByUser === 'undefined' || !reminder.type || !reminder.time || !reminder.date || !reminder.createdAt) {
-                if (!reminder.isFromRuta) storageNeedsUpdate = true;
-                return;
-            }
-            if (processedIds.has(reminder.id)) {
-                if (!reminder.isFromRuta) storageNeedsUpdate = true;
-                return;
-            }
-            processedIds.add(reminder.id);
-            if (reminder.isFromRuta && snoozedRouteRadars.has(reminder.id)) {
-                const snoozeEndTime = snoozedRouteRadars.get(reminder.id);
-                if (Date.now() < snoozeEndTime) { return; } else { snoozedRouteRadars.delete(reminder.id); }
-            }
-            const isManagedByUser = reminder.managedByUser === true; let keepInStorage = true; let isOverdue = false; let locationConditionMet = false;
-            if (!isManagedByUser) {
-                let reminderLocalDueTime = null; try { const [year, month, day] = reminder.date.split('-').map(Number); const [hour, minute] = reminder.time.split(':').map(Number); reminderLocalDueTime = new Date(year, month - 1, day, hour, minute);
-                    if (isNaN(reminderLocalDueTime.getTime())) { throw new Error("Invalid date/time components"); }
-                    if (reminderLocalDueTime <= now) {
-                        isOverdue = true;
-                        if (reminder.isLocationEnabled && reminder.locationCoordinates) {
-                            if (coords) {
-                                const distance = calculateDistance( coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude );
-                                locationConditionMet = distance <= (reminder.radiusMeters || DEFAULT_LOCATION_RADIUS);
-                            } else { locationConditionMet = false; }
+            if (!reminder || reminder.managedByUser) return;
+            
+            let isOverdue = false;
+            let locationConditionMet = true; 
+
+            try {
+                const [year, month, day] = reminder.date.split('-').map(Number);
+                const [hour, minute] = reminder.time.split(':').map(Number);
+                const reminderLocalDueTime = new Date(year, month - 1, day, hour, minute);
+                
+                if (!isNaN(reminderLocalDueTime.getTime()) && reminderLocalDueTime <= now) {
+                    if (reminder.isLocationEnabled && reminder.locationCoordinates) {
+                        if (coords) {
+                            const distance = calculateDistance(coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude);
+                            locationConditionMet = distance <= (reminder.radiusMeters || DEFAULT_LOCATION_RADIUS);
+                            if (locationConditionMet && (reminder.text.toUpperCase().includes("RADAR:") || reminder.excludeFromList)) {
+                                isInsideAnyRadarZone = true;
+                            }
+                        } else {
+                            locationConditionMet = false;
                         }
                     }
-                } catch (error) {
-                    if (!reminder.isFromRuta) storageNeedsUpdate = true;
-                    keepInStorage = false; isOverdue = false; locationConditionMet = false;
+                    if (locationConditionMet) {
+                        isOverdue = true;
+                    }
                 }
-            }
-            if (isOverdue && locationConditionMet) {
-                overdueReminders.push(reminder);
-                if (!isUnifiedWindowVisibleByLogic || !document.querySelector(`#unified-reminder-window .reminder-slide[data-id="${reminder.id}"]`)) {
-                    newOverdueFound = true;
-                }
-            }
-            
-            const isRadarType = reminder.text.toUpperCase().includes("RADAR");
-            if(isRadarType && reminder.isLocationEnabled && reminder.locationCoordinates && coords) {
-                const distance = calculateDistance(coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude);
-                if (distance <= (reminder.radiusMeters || DEFAULT_LOCATION_RADIUS)) {
-                    isInsideAnyRadarZone = true;
-                }
-            }
+            } catch (e) { /* Fecha/hora inválida, se ignora */ }
 
-            if (keepInStorage && !reminder.isFromRuta && !dynamicRadarReminders.includes(reminder.id)) { validRemindersForStorage.push(reminder); }
+            if (isOverdue) {
+                if (!overdueReminders.some(r => r.id === reminder.id)) {
+                    overdueReminders.push(reminder);
+                }
+            }
         });
-        
-        const dynamicRemindersToKeep = allRemindersToCheck.filter(r => dynamicRadarReminders.includes(r.id));
-        const finalRemindersForStorage = [...validRemindersForStorage, ...dynamicRemindersToKeep];
 
-        if (storageNeedsUpdate || dynamicRadarReminders.length > 0) { 
-            try { 
-                localStorage.setItem('reminders', JSON.stringify(finalRemindersForStorage));
-            } catch (e) { 
-                showToast("Error al actualizar recordatorios tras limpieza.", "error", 5000); 
-            }
-        }
-        
-        let shouldDisplayWindow = false;
         if (overdueReminders.length > 0) {
-            if (!isUnifiedWindowVisibleByLogic || newOverdueFound) {
-                shouldDisplayWindow = true;
-                currentNotificationSlideIndex = 0;
-                if (newOverdueFound) showYellowBorder();
-            } else {
-                const currentDisplayedIds = Array.from(document.querySelectorAll('#unified-reminder-window .reminder-slide')).map(el => parseInt(el.dataset.id));
-                const newOverdueIds = overdueReminders.map(r => r.id);
-                if (currentDisplayedIds.length !== newOverdueIds.length || !currentDisplayedIds.every(id => newOverdueIds.includes(id))) {
-                    shouldDisplayWindow = true;
-                }
-            }
+            displayUnifiedReminderWindow(overdueReminders);
+        } else if (isUnifiedWindowVisibleByLogic) {
+            hideUnifiedReminderWindow();
         }
-        if (shouldDisplayWindow) {
-             displayUnifiedReminderWindow(overdueReminders);
-        } else if (overdueReminders.length === 0 && isUnifiedWindowVisibleByLogic) {
-             hideUnifiedReminderWindow();
-             currentNotificationSlideIndex = 0;
-        }
-        
+
         if (isNavigating && navigationCurrentLocation && !isRecalculatingRoute && !isDeviationModalActive && !isAddReminderAtLocationModeActive) {
             const currentCoords = navigationCurrentLocation;
             if (navigationMapInstance && navigationMapInstance.getSource('route') && navigationMapInstance.getSource('route')._data && typeof turf !== 'undefined') {
@@ -21826,65 +21781,52 @@ function checkReminders() {
                     const routeLineString = turf.lineString(routeGeoJSON.geometry.coordinates);
                     const carPoint = turf.point([currentCoords.longitude, currentCoords.latitude]);
                     const distanceToRoute = turf.pointToLineDistance(carPoint, routeLineString, { units: 'meters' });
-
                     if (distanceToRoute > DEVIATION_THRESHOLD_METERS) {
-                        if (deviationStartTime === 0) {
-                            deviationStartTime = Date.now();
-                        } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
+                        if (deviationStartTime === 0) deviationStartTime = Date.now();
+                        else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
                             showDeviationModal();
                             deviationStartTime = 0;
                         }
                     } else { deviationStartTime = 0; }
                 } catch (e) {
-                    console.error("Error en checkReminders (Turf.js distance calculation):", e);
-                    if (deviationStartTime === 0) { deviationStartTime = Date.now(); } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) { showDeviationModal(); deviationStartTime = 0; }
+                    if (deviationStartTime === 0) deviationStartTime = Date.now();
+                    else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
+                        showDeviationModal();
+                        deviationStartTime = 0;
+                    }
                 }
             } else {
-                if (deviationStartTime === 0) { deviationStartTime = Date.now(); } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) { showDeviationModal(); deviationStartTime = 0; }
+                if (deviationStartTime === 0) deviationStartTime = Date.now();
+                else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
+                    showDeviationModal();
+                    deviationStartTime = 0;
+                }
             }
         } else {
             deviationStartTime = 0;
         }
-        updateReminderCount(); updateButtonStyles();
+
+        updateReminderCount(); 
+        updateButtonStyles();
+        
         let newInterval = isNavigating ? 5000 : 6000;
         if (isNavigating) {
             const distToNextManeuver = distanceToNextManeuverOSRM || Infinity;
-             if (distToNextManeuver < 500 && distToNextManeuver > 0) {
-                newInterval = 1000;
-            } else if (distToNextManeuver < 1000 && distToNextManeuver > 0) {
-                newInterval = 2000;
-            } else {
-                newInterval = 6000;
-            }
+            if (distToNextManeuver < 500 && distToNextManeuver > 0) newInterval = 1000;
+            else if (distToNextManeuver < 1000 && distToNextManeuver > 0) newInterval = 2000;
+            else newInterval = 6000;
         } else if (isInsideAnyRadarZone) {
-             newInterval = 1000;
+            newInterval = 1000;
         }
-        const unifiedWindowCurrentlyVisible = document.getElementById('unified-reminder-window')?.classList.contains('visible');
-        if (unifiedWindowCurrentlyVisible && (isNavigationMapActive)) {
-            newInterval = Math.min(newInterval, 5000);
-        }
+        
         if (newInterval !== currentCheckIntervalDuration) {
             currentCheckIntervalDuration = newInterval;
-            if (reminderCheckIntervalId) { clearInterval(reminderCheckIntervalId); }
+            if (reminderCheckIntervalId) clearInterval(reminderCheckIntervalId);
             reminderCheckIntervalId = setInterval(checkReminders, currentCheckIntervalDuration);
-        }
-        const swiperContainer = document.getElementById('reminder-swiper-container');
-        const windowElement = document.getElementById('unified-reminder-window');
-        if (swiperContainer && overdueReminders.length > 0 && windowElement.classList.contains('visible') && newInterval !== 1000 && newInterval !== 5000) {
-            const totalSlides = overdueReminders.length; let nextSlideIndex = currentNotificationSlideIndex;
-            if (totalSlides > 1) { nextSlideIndex = (currentNotificationSlideIndex + 1) % totalSlides; } else { nextSlideIndex = 0; }
-            if (totalSlides === 1 || nextSlideIndex !== currentNotificationSlideIndex) { currentNotificationSlideIndex = nextSlideIndex; const targetScrollLeft = currentNotificationSlideIndex * swiperContainer.offsetWidth; swiperContainer.scrollTo({ left: targetScrollLeft, behavior: 'smooth' }); setTimeout(updateReminderIndexDisplay, 400); }
-        }
-        const { isMobile, primaryId } = parseUserId(localStorage.getItem('userData_userId'));
-        if (isMobile) {
-            const localTimestamp = parseInt(localStorage.getItem('lastCacheUpdateTimestamp') || '0');
-            const backupPassword = localStorage.getItem('userData_backupPassword');
-            if (backupPassword && localTimestamp > lastMobileSyncTimestamp) {
-                autoSaveFromMobile(primaryId, backupPassword);
-            }
         }
     });
 }
+    
 
 // ===================================================================
 // NOMBRE: handleSimulateGpsPositionClick (MODIFICADA - PARA MAPBOX)
