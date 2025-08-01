@@ -1,4 +1,4 @@
-S6
+S7
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -13082,8 +13082,11 @@ function showAllReminders(options = {}) {
 }
     
 // ===================================================================
-// NOMBRE: showReminderModal (CORREGIDA - LISTENER AÑADIDO)
-// RESUMEN: Muestra el modal para crear o modificar un recordatorio.
+// NOMBRE: showReminderModal (VERSIÓN OPTIMIZADA CON REUTILIZACIÓN DE MAPA)
+// RESUMEN: Muestra el modal de recordatorios. El mapa de vista previa/edición
+//          se crea una sola vez y se reutiliza moviéndolo desde y hacia el
+//          "map garage" para un rendimiento óptimo.
+// ===================================================================
 function showReminderModal(reminder = null, options = {}) {
     const mapShouldReopenAfterForm = sessionStorage.getItem('boardinggate_map_should_reopen_after_form') === 'true';
     const mapContextBeforeThisModal = sessionStorage.getItem('mapContext');
@@ -13245,17 +13248,101 @@ function showReminderModal(reminder = null, options = {}) {
              <button type="button" id="help-reminder" class="action-button secondary">Ayuda</button>
         </div>
     `;
+    
     if (options.onTopOfMap) {
         const mapContainerEl = document.getElementById('reminders-location-map-modal');
-        if (mapContainerEl) {
-            mapContainerEl.appendChild(modal);
-        } else {
-            document.body.appendChild(modal);
-        }
+        if (mapContainerEl) mapContainerEl.appendChild(modal);
+        else document.body.appendChild(modal);
     } else {
         document.body.appendChild(modal);
     }
+
     modal.cleanUpModalTimers = cleanUpModalTimers;
+
+    // Se renombra la función `destroyMap` para reflejar su nuevo propósito.
+    function hideAndStoreReminderMap() {
+        if (reminderModalMap) {
+            const mapGarage = document.getElementById('map-garage');
+            const mapContainerElement = reminderModalMap.getContainer();
+            if (mapGarage && mapContainerElement && mapContainerElement.parentNode !== mapGarage) {
+                mapGarage.appendChild(mapContainerElement);
+            }
+        }
+        const mapContainer = modal.querySelector('#location-map-container');
+        if (mapContainer) {
+            mapContainer.style.display = 'none';
+            mapContainer.classList.remove('preview', 'expanded');
+        }
+        if (reduceMapButton) reduceMapButton.classList.add('hidden');
+        if (locateMeButton) locateMeButton.classList.add('hidden');
+        if (expandMapButton) expandMapButton.style.display = 'block';
+    }
+
+    function initializeOrUpdateMap(centerCoords, radius, isInteractive = false) {
+        const mapGarage = document.getElementById('map-garage');
+        const mapContainerEl = modal.querySelector('#location-map-container');
+        const effectiveLocationEnabled = locationCheckbox.checked;
+        const showMap = effectiveLocationEnabled || isInteractive;
+
+        if (!showMap) {
+            hideAndStoreReminderMap();
+            return;
+        }
+
+        mapContainerEl.style.display = 'block';
+        mapContainerEl.classList.toggle('preview', !isInteractive && effectiveLocationEnabled && centerCoords);
+        mapContainerEl.classList.toggle('expanded', isInteractive && effectiveLocationEnabled);
+        
+        expandMapButton.style.display = (isInteractive && effectiveLocationEnabled) ? 'none' : 'block';
+        
+        const effectiveCoords = centerCoords || { latitude: 40.416775, longitude: -3.703790 };
+        const effectiveRadius = parseInt(radius) || DEFAULT_LOCATION_RADIUS;
+        const zoomLevel = isInteractive ? 13 : 11;
+
+        // Lógica de creación única (si el mapa no existe)
+        if (!reminderModalMap) {
+            const mapDiv = document.createElement('div');
+            mapDiv.id = 'reminder-modal-map-div'; // Asignar ID para Mapbox
+            mapDiv.style.width = '100%'; mapDiv.style.height = '100%';
+            mapGarage.appendChild(mapDiv); // Se crea en el garaje
+
+            reminderModalMap = new mapboxgl.Map({
+                container: mapDiv,
+                style: 'mapbox://styles/mapbox/satellite-streets-v12',
+                center: [effectiveCoords.longitude, effectiveCoords.latitude],
+                zoom: zoomLevel,
+                interactive: true
+            });
+
+            reminderModalMap.on('load', () => {
+                reminderMarker = new mapboxgl.Marker({ draggable: true }).addTo(reminderModalMap);
+                reminderMarker.on('dragend', handleMarkerDragEnd);
+                reminderModalMap.on('click', handleMapClick);
+                reminderModalMap.on('movestart', handleMapMoveStart);
+                reminderModalMap.on('moveend', handleMapMoveEnd);
+            });
+        }
+        
+        const mapDiv = reminderModalMap.getContainer();
+        mapContainerEl.insertBefore(mapDiv, reduceMapButton); // Mover el mapa al modal
+        
+        reminderModalMap.flyTo({ center: [effectiveCoords.longitude, effectiveCoords.latitude], zoom: zoomLevel, duration: 0 });
+        updateMarkerAndCircle(effectiveCoords, effectiveRadius);
+        
+        reminderModalMap.dragPan.enable(isInteractive && effectiveLocationEnabled);
+        reminderModalMap.scrollZoom.enable(isInteractive && effectiveLocationEnabled);
+        reminderModalMap.touchZoomRotate.enable(isInteractive && effectiveLocationEnabled);
+
+        if (reduceMapButton) reduceMapButton.classList.toggle('hidden', !(isInteractive && effectiveLocationEnabled));
+        if (locateMeButton) locateMeButton.classList.toggle('hidden', !(isInteractive && effectiveLocationEnabled));
+
+        setTimeout(() => {
+            if (reminderModalMap && mapContainerEl.offsetHeight > 0) {
+                try { reminderModalMap.resize(); } catch (e) {}
+            }
+        }, 100);
+    }
+
     const parseStatus = modal.querySelector('#parse-status');
     const speechStatus = modal.querySelector('#speech-status');
     let countdownSaveElement = modal.querySelector('#countdown-save');
@@ -13286,12 +13373,11 @@ function showReminderModal(reminder = null, options = {}) {
             radiusSliderGroup.style.display = isChecked ? 'flex' : 'none';
         }
         if(!isChecked) {
-           destroyMap();
+           hideAndStoreReminderMap();
         }
     }
     
     locationCheckbox.addEventListener('change', toggleLocationControlsVisibility);
-    
     toggleLocationControlsVisibility();
 
     const radiusSliderContainer = modal.querySelector('#radius-thumb')?.parentElement;
@@ -13319,27 +13405,18 @@ function showReminderModal(reminder = null, options = {}) {
             const clientX = e.touches ? e.touches[0].clientX : e.clientX;
             let percent = ((clientX - rect.left) / rect.width);
             percent = Math.max(0, Math.min(1, percent));
-            
             const minLog = Math.log(minRadius);
             const maxLog = Math.log(maxRadius);
             let rawRadius = Math.exp(minLog + percent * (maxLog - minLog));
-            
             let step;
-            if (rawRadius < 100) {
-                step = 5; 
-            } else if (rawRadius < 500) {
-                step = 25; 
-            } else {
-                step = 100; 
-            }
-            
+            if (rawRadius < 100) step = 5; 
+            else if (rawRadius < 500) step = 25; 
+            else step = 100;
             currentRadius = Math.round(rawRadius / step) * step;
             currentRadius = Math.max(minRadius, Math.min(maxRadius, currentRadius));
-            
             updateRadiusVisuals();
             resetAndStartCountdown();
         };
-
         const startRadiusDrag = (e) => {
             const moveHandler = (moveEvent) => onRadiusDrag(moveEvent);
             const endDrag = () => {
@@ -13353,90 +13430,9 @@ function showReminderModal(reminder = null, options = {}) {
             document.addEventListener('touchmove', moveHandler);
             document.addEventListener('touchend', endDrag);
         };
-        
         radiusThumb.addEventListener('mousedown', startRadiusDrag);
         radiusThumb.addEventListener('touchstart', startRadiusDrag);
         updateRadiusVisuals();
-    }
-    
-    function initializeOrUpdateMap(centerCoords, radius, isInteractive = false) {
-        const mapDivId = 'reminder-modal-map-div';
-        let mapDiv = document.getElementById(mapDivId);
-        const effectiveLocationEnabled = locationCheckbox.checked;
-        const showMap = effectiveLocationEnabled || isInteractive;
-
-        if (!showMap) {
-            destroyMap();
-            return;
-        }
-
-        mapContainer.style.display = 'block';
-        mapContainer.classList.toggle('preview', !isInteractive && effectiveLocationEnabled && centerCoords);
-        mapContainer.classList.toggle('expanded', isInteractive && effectiveLocationEnabled);
-        
-        expandMapButton.style.display = (isInteractive && effectiveLocationEnabled) ? 'none' : 'block';
-
-        const effectiveCoords = centerCoords || { latitude: 40.416775, longitude: -3.703790 };
-        const effectiveRadius = parseInt(radius) || DEFAULT_LOCATION_RADIUS;
-        
-        const zoomLevel = isInteractive ? 13 : 11;
-        
-        if (!isInteractive && !centerCoords && effectiveLocationEnabled) {
-            destroyMap();
-            return;
-        }
-        
-        const setupMapInteractions = (mapInstance) => {
-            mapInstance.off('click', handleMapClick);
-            mapInstance.off('movestart', handleMapMoveStart);
-            mapInstance.off('moveend', handleMapMoveEnd);
-            if (isInteractive && effectiveLocationEnabled) {
-                mapInstance.on('click', handleMapClick);
-                mapInstance.on('movestart', handleMapMoveStart);
-                mapInstance.on('moveend', handleMapMoveEnd);
-            }
-            mapInstance.dragPan.enable(isInteractive && effectiveLocationEnabled);
-            mapInstance.scrollZoom.enable(isInteractive && effectiveLocationEnabled);
-            mapInstance.touchZoomRotate.enable(isInteractive && effectiveLocationEnabled);
-        };
-        
-        if (!reminderModalMap) {
-            if (!mapDiv) {
-                mapDiv = document.createElement('div');
-                mapDiv.id = mapDivId;
-                mapDiv.style.width = '100%'; mapDiv.style.height = '100%';
-                mapContainer.insertBefore(mapDiv, reduceMapButton);
-            }
-            
-            reminderModalMap = new mapboxgl.Map({
-                container: mapDivId,
-                style: 'mapbox://styles/mapbox/satellite-streets-v12',
-                center: [effectiveCoords.longitude, effectiveCoords.latitude],
-                zoom: zoomLevel,
-                interactive: isInteractive && effectiveLocationEnabled
-            });
-            
-            reminderModalMap.on('load', () => {
-                updateMarkerAndCircle(effectiveCoords, effectiveRadius);
-                setupMapInteractions(reminderModalMap);
-            });
-            
-        } else {
-            reminderModalMap.flyTo({ center: [effectiveCoords.longitude, effectiveCoords.latitude], zoom: zoomLevel });
-            updateMarkerAndCircle(effectiveCoords, effectiveRadius);
-            setupMapInteractions(reminderModalMap);
-        }
-
-        if (reduceMapButton) reduceMapButton.classList.toggle('hidden', !(isInteractive && effectiveLocationEnabled));
-        if (locateMeButton) locateMeButton.classList.toggle('hidden', !(isInteractive && effectiveLocationEnabled));
-
-        if (mapContainer.classList.contains('expanded') || mapContainer.classList.contains('preview')) {
-            setTimeout(() => {
-                if (reminderModalMap && mapContainer.offsetHeight > 0) {
-                    try { reminderModalMap.resize(); } catch (e) {}
-                }
-            }, 100);
-        }
     }
     
     function handleMapClick(e) {
@@ -13465,20 +13461,8 @@ function showReminderModal(reminder = null, options = {}) {
         if (reminderModalMap.getSource(circleId)) {
             reminderModalMap.getSource(circleId).setData(turf.circle(lngLat, radius, { steps: 64, units: 'meters' }));
         } else {
-            reminderModalMap.addSource(circleId, {
-                'type': 'geojson',
-                'data': turf.circle(lngLat, radius, { steps: 64, units: 'meters' })
-            });
-            reminderModalMap.addLayer({
-                'id': circleId,
-                'type': 'fill',
-                'source': circleId,
-                'paint': {
-                    'fill-color': textInput.value.toUpperCase().includes("RADAR:") ? 'rgba(255, 165, 0, 0.2)' : '#ADD8E6',
-                    'fill-opacity': textInput.value.toUpperCase().includes("RADAR:") ? 0.2 : 0.05,
-                    'fill-outline-color': textInput.value.toUpperCase().includes("RADAR:") ? 'rgba(255, 165, 0, 0.2)' : 'blue'
-                }
-            });
+            reminderModalMap.addSource(circleId, { 'type': 'geojson', 'data': turf.circle(lngLat, radius, { steps: 64, units: 'meters' }) });
+            reminderModalMap.addLayer({ 'id': circleId, 'type': 'fill', 'source': circleId, 'paint': { 'fill-color': textInput.value.toUpperCase().includes("RADAR:") ? 'rgba(255, 165, 0, 0.2)' : '#ADD8E6', 'fill-opacity': textInput.value.toUpperCase().includes("RADAR:") ? 0.2 : 0.05, 'fill-outline-color': textInput.value.toUpperCase().includes("RADAR:") ? 'rgba(255, 165, 0, 0.2)' : 'blue' } });
         }
     }
     
@@ -13489,19 +13473,6 @@ function showReminderModal(reminder = null, options = {}) {
         resetAndStartCountdown();
     }
     
-    function destroyMap() {
-        if (reminderModalMap) {
-            try { reminderModalMap.remove(); } catch(e) {}
-            reminderModalMap = null;
-            reminderMarker = null;
-        }
-        mapContainer.style.display = 'none';
-        mapContainer.classList.remove('preview', 'expanded');
-        if (reduceMapButton) reduceMapButton.classList.add('hidden');
-        if (locateMeButton) locateMeButton.classList.add('hidden');
-        if(expandMapButton) expandMapButton.style.display = 'block';
-    }
-    
     function handleLocationCheckboxChange() {
         const wasEnabled = locationEnabledByUser;
         locationEnabledByUser = locationCheckbox.checked;
@@ -13509,20 +13480,13 @@ function showReminderModal(reminder = null, options = {}) {
             if (!mapExpandedManually && !mapContainer.classList.contains('expanded') && currentReminderLocation) {
                 initializeOrUpdateMap(currentReminderLocation, Math.round(currentRadius), false);
             } else if (!mapExpandedManually && !mapContainer.classList.contains('expanded') && !currentReminderLocation) {
-                destroyMap();
+                hideAndStoreReminderMap();
             }
              if (!currentReminderLocation && !wasEnabled) {
-                getCurrentLocation(
-                    (coords) => {
-                        currentReminderLocation = coords;
-                        if (!mapExpandedManually && !mapContainer.classList.contains('expanded') && currentReminderLocation) {
-                            initializeOrUpdateMap(currentReminderLocation, Math.round(currentRadius), false);
-                        }
-                    }
-                );
+                getCurrentLocation( (coords) => { currentReminderLocation = coords; if (!mapExpandedManually && !mapContainer.classList.contains('expanded') && currentReminderLocation) { initializeOrUpdateMap(currentReminderLocation, Math.round(currentRadius), false); } });
             }
         } else {
-            destroyMap();
+            hideAndStoreReminderMap();
         }
         resetAndStartCountdown();
     }
@@ -13530,7 +13494,6 @@ function showReminderModal(reminder = null, options = {}) {
     if (deleteButton) {
         deleteButton.addEventListener('click', () => {
             cleanUpModalTimers(true);
-            
             if (options.onTopOfMap) {
                 if (!isNew) {
                     let reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
@@ -13540,7 +13503,6 @@ function showReminderModal(reminder = null, options = {}) {
                         localStorage.setItem('reminders', JSON.stringify(reminders));
                         markCacheAsDirty();
                         showToast('Recordatorio borrado.', 'success');
-                        
                         const mapObjectIndex = reminderMapObjects.findIndex(obj => obj.reminderId === parsed.id);
                         if (mapObjectIndex !== -1) {
                             const { marker, circleId } = reminderMapObjects[mapObjectIndex];
@@ -13549,22 +13511,17 @@ function showReminderModal(reminder = null, options = {}) {
                             if (circleId && navigationMapInstance.getSource(circleId)) navigationMapInstance.removeSource(circleId);
                             reminderMapObjects.splice(mapObjectIndex, 1);
                         }
-                    } else {
-                        showToast('Recordatorio no encontrado para borrar.', 'warning');
-                    }
+                    } else { showToast('Recordatorio no encontrado para borrar.', 'warning'); }
                 }
-                destroyMap();
+                hideAndStoreReminderMap();
                 if (modal.parentNode) modal.parentNode.removeChild(modal);
-                updateReminderCount();
-                updateButtonStyles();
-                checkReminders();
+                updateReminderCount(); updateButtonStyles(); checkReminders();
                 return;
             }
-
             const mapShouldReopen = mapShouldReopenAfterForm;
             const mapContextToReopen = mapContextBeforeThisModal;
             if (isNew) {
-                destroyMap();
+                hideAndStoreReminderMap();
                 if (modal.parentNode) modal.parentNode.removeChild(modal);
                 if (mapShouldReopen && !document.getElementById('unified-reminder-window')?.classList.contains('visible') && !isNavigationMapActive) {
                     if (mapContextToReopen === 'navigation') openNavigationMap();
@@ -13582,14 +13539,10 @@ function showReminderModal(reminder = null, options = {}) {
                 localStorage.setItem('reminders', JSON.stringify(reminders));
                 markCacheAsDirty();
                 showToast('Recordatorio borrado.', 'success');
-            } else {
-                showToast('Recordatorio no encontrado para borrar', 'warning');
-            }
-            destroyMap();
+            } else { showToast('Recordatorio no encontrado para borrar', 'warning'); }
+            hideAndStoreReminderMap();
             if (modal.parentNode) modal.parentNode.removeChild(modal);
-            updateReminderCount();
-            updateButtonStyles();
-            checkReminders();
+            updateReminderCount(); updateButtonStyles(); checkReminders();
              if (mapShouldReopen && !document.getElementById('unified-reminder-window')?.classList.contains('visible') && !isNavigationMapActive) {
                 if (mapContextToReopen === 'navigation') openNavigationMap();
             } else if (mapShouldReopen) {
@@ -13602,173 +13555,77 @@ function showReminderModal(reminder = null, options = {}) {
 
     if (manageLocationsBtn) {
         manageLocationsBtn.addEventListener('click', () => {
-            showSavedLocationsModal(
-                () => { },
-                (selectedLocationData) => {
+            showSavedLocationsModal( () => { }, (selectedLocationData) => {
                     if (selectedLocationData && typeof selectedLocationData.lat === 'number' && typeof selectedLocationData.lng === 'number') {
                         currentReminderLocation = { latitude: selectedLocationData.lat, longitude: selectedLocationData.lng };
-                        locationCheckbox.checked = true;
-                        locationEnabledByUser = true;
+                        locationCheckbox.checked = true; locationEnabledByUser = true;
                         toggleLocationControlsVisibility();
-
                         currentRadius = typeof selectedLocationData.radius === 'number' && selectedLocationData.radius > 0 ? selectedLocationData.radius : DEFAULT_LOCATION_RADIUS;
                         updateRadiusVisuals();
-
-                        if (mapContainer.classList.contains('expanded')) {
-                            initializeOrUpdateMap(currentReminderLocation, Math.round(currentRadius), true);
-                        } else {
-                            initializeOrUpdateMap(currentReminderLocation, Math.round(currentRadius), false);
-                        }
+                        if (mapContainer.classList.contains('expanded')) { initializeOrUpdateMap(currentReminderLocation, Math.round(currentRadius), true); } 
+                        else { initializeOrUpdateMap(currentReminderLocation, Math.round(currentRadius), false); }
                         showToast(`Ubicación "${selectedLocationData.name || 'Seleccionada'}" aplicada.`, "success");
                         resetAndStartCountdown();
-                    } else {
-                        showToast("Error: Datos de ubicación seleccionada no válidos.", "error");
-                    }
-                },
-                { parentContainer: modal } 
+                    } else { showToast("Error: Datos de ubicación seleccionada no válidos.", "error"); }
+                }, { parentContainer: modal } 
             );
         });
     }
 
-    const handleMapMoveStart = () => {
-        if (reminderModalMap && mapContainer.classList.contains('expanded')) {
-            clearTimeout(mapMoveDebounceTimer);
-            if(reminderModalMap.getLayer('reminder-circle')) reminderModalMap.setPaintProperty('reminder-circle', 'fill-opacity', 0);
-        }
-    };
-
-    const handleMapMoveEnd = () => {
-        clearTimeout(mapMoveDebounceTimer);
-        mapMoveDebounceTimer = setTimeout(() => {
-            if (reminderModalMap && mapContainer.classList.contains('expanded') && reminderModalMap.getLayer('reminder-circle')) {
-                const isRadar = textInput.value.toUpperCase().includes("RADAR:");
-                const fillOpacity = isRadar ? 0.2 : 0.05;
-                reminderModalMap.setPaintProperty('reminder-circle', 'fill-opacity', fillOpacity);
-            }
-        }, 200);
-    };   
+    const handleMapMoveStart = () => { if (reminderModalMap && mapContainer.classList.contains('expanded')) { clearTimeout(mapMoveDebounceTimer); if(reminderModalMap.getLayer('reminder-circle')) reminderModalMap.setPaintProperty('reminder-circle', 'fill-opacity', 0); } };
+    const handleMapMoveEnd = () => { clearTimeout(mapMoveDebounceTimer); mapMoveDebounceTimer = setTimeout(() => { if (reminderModalMap && mapContainer.classList.contains('expanded') && reminderModalMap.getLayer('reminder-circle')) { const isRadar = textInput.value.toUpperCase().includes("RADAR:"); const fillOpacity = isRadar ? 0.2 : 0.05; reminderModalMap.setPaintProperty('reminder-circle', 'fill-opacity', fillOpacity); } }, 200); };   
 
     locationCheckbox.addEventListener('change', handleLocationCheckboxChange);
-
-    if (parsed.isLocationEnabled && parsed.locationCoordinates) {
-        initializeOrUpdateMap(parsed.locationCoordinates, parsed.radiusMeters, false);
-    } else if (parsed.isLocationEnabled && !parsed.locationCoordinates) {
-        destroyMap();
-    } else {
-        destroyMap();
-    }
+    if (parsed.isLocationEnabled && parsed.locationCoordinates) { initializeOrUpdateMap(parsed.locationCoordinates, parsed.radiusMeters, false); } 
+    else if (parsed.isLocationEnabled && !parsed.locationCoordinates) { hideAndStoreReminderMap(); } 
+    else { hideAndStoreReminderMap(); }
 
     if (expandMapButton) {
         expandMapButton.addEventListener('click', () => {
-            if (!locationCheckbox.checked) {
-                locationCheckbox.checked = true;
-                toggleLocationControlsVisibility();
-            }
-            locationEnabledByUser = true;
-            mapExpandedManually = true;
-
+            if (!locationCheckbox.checked) { locationCheckbox.checked = true; toggleLocationControlsVisibility(); }
+            locationEnabledByUser = true; mapExpandedManually = true;
             if (!currentReminderLocation) {
-                locateMeButton.disabled = true;
-                locateMeButton.textContent = 'Buscando...';
+                locateMeButton.disabled = true; locateMeButton.textContent = 'Buscando...';
                 getCurrentLocation(
                     (gpsCoords) => {
                         currentReminderLocation = { latitude: gpsCoords.latitude, longitude: gpsCoords.longitude };
                         initializeOrUpdateMap(gpsCoords, Math.round(currentRadius), true);
-                        if (reminderModalMap) {
-                             reminderModalMap.flyTo({ zoom: 16 });
-                        }
+                        if (reminderModalMap) { reminderModalMap.flyTo({ zoom: 16 }); }
                         locateMeButton.disabled = false; locateMeButton.textContent = 'ESTÁS AQUÍ';
-                    },
-                    (errorMsg) => {
+                    }, (errorMsg) => {
                         initializeOrUpdateMap(null, Math.round(currentRadius), true);
-                        if (reminderModalMap) {
-                            reminderModalMap.flyTo({ zoom: 6 });
-                        }
+                        if (reminderModalMap) { reminderModalMap.flyTo({ zoom: 6 }); }
                         showToast(`Error GPS: ${errorMsg}. Mapa centrado por defecto`, "warning", 3000);
                         locateMeButton.disabled = false; locateMeButton.textContent = 'ESTÁS AQUÍ';
                     }
                 );
-            } else {
-                initializeOrUpdateMap(currentReminderLocation, Math.round(currentRadius), true);
-            }
-
+            } else { initializeOrUpdateMap(currentReminderLocation, Math.round(currentRadius), true); }
             resetAndStartCountdown();
             setTimeout(() => { mapExpandedManually = false; }, 100);
         });
     }
 
-    if (reduceMapButton) {
-        reduceMapButton.addEventListener('click', () => {
-             if (locationEnabledByUser && currentReminderLocation) {
-                 initializeOrUpdateMap(currentReminderLocation, Math.round(currentRadius), false);
-             } else {
-                 destroyMap();
-             }
-             resetAndStartCountdown();
-        });
-    }
-
+    if (reduceMapButton) { reduceMapButton.addEventListener('click', () => { if (locationEnabledByUser && currentReminderLocation) { initializeOrUpdateMap(currentReminderLocation, Math.round(currentRadius), false); } else { hideAndStoreReminderMap(); } resetAndStartCountdown(); }); }
     if (locateMeButton) {
         locateMeButton.addEventListener('click', () => {
              if (!reminderModalMap || !mapContainer.classList.contains('expanded')) return;
-             resetAndStartCountdown();
-             locateMeButton.disabled = true; locateMeButton.textContent = 'Buscando...';
+             resetAndStartCountdown(); locateMeButton.disabled = true; locateMeButton.textContent = 'Buscando...';
              getCurrentLocation(
                  (coords) => {
                      currentReminderLocation = { latitude: coords.latitude, longitude: coords.longitude };
-                     if (reminderModalMap) {
-                        reminderModalMap.flyTo({center: [coords.longitude, coords.latitude], zoom: 16});
-                        updateMarkerAndCircle(coords, Math.round(currentRadius));
-                     }
+                     if (reminderModalMap) { reminderModalMap.flyTo({center: [coords.longitude, coords.latitude], zoom: 16}); updateMarkerAndCircle(coords, Math.round(currentRadius)); }
                      locateMeButton.disabled = false; locateMeButton.textContent = 'ESTÁS AQUÍ';
-                 },
-                 (errorMsg) => {
-                     showToast(`Error al localizar: ${errorMsg}`, 'error');
-                     locateMeButton.disabled = false; locateMeButton.textContent = 'ESTÁS AQUÍ';
-                 }
+                 }, (errorMsg) => { showToast(`Error al localizar: ${errorMsg}`, 'error'); locateMeButton.disabled = false; locateMeButton.textContent = 'ESTÁS AQUÍ'; }
              );
         });
     }
 
-    if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
-        } else {
-        speechStatus.textContent = 'Dictado no soportado.';
-        speechStatus.style.color = '#EF4444';
-    }
+    if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) { } 
+    else { speechStatus.textContent = 'Dictado no soportado.'; speechStatus.style.color = '#EF4444'; }
 
-    function startCountdown() {
-        autoSaveInterval = setInterval(() => {
-            if (!document.body.contains(modal)) {
-                clearInterval(autoSaveInterval);
-                autoSaveInterval = null;
-                return;
-            }
-            countdownSave--;
-            if (countdownSaveElement) countdownSaveElement.textContent = countdownSave;
-            if (countdownSave === 23) {
-                if (document.activeElement === textInput) {
-                    textInput.value += ' ';
-                    textInput.selectionStart = textInput.selectionEnd = textInput.value.length;
-                }
-            }
-            if (countdownSave <= 0) {
-                clearInterval(autoSaveInterval);
-                autoSaveInterval = null;
-                if (saveButton) saveButton.click();
-            }
-        }, 1000);
-    }
-
-    function resetAndStartCountdown() {
-        countdownSave = 25;
-        if (countdownSaveElement) countdownSaveElement.textContent = countdownSave;
-        if (autoSaveInterval) {
-            clearInterval(autoSaveInterval);
-            autoSaveInterval = null;
-        }
-        startCountdown();
-    }
-
+    function startCountdown() { autoSaveInterval = setInterval(() => { if (!document.body.contains(modal)) { clearInterval(autoSaveInterval); autoSaveInterval = null; return; } countdownSave--; if (countdownSaveElement) countdownSaveElement.textContent = countdownSave; if (countdownSave === 23) { if (document.activeElement === textInput) { textInput.value += ' '; textInput.selectionStart = textInput.selectionEnd = textInput.value.length; } } if (countdownSave <= 0) { clearInterval(autoSaveInterval); autoSaveInterval = null; if (saveButton) saveButton.click(); } }, 1000); }
+    function resetAndStartCountdown() { countdownSave = 25; if (countdownSaveElement) countdownSaveElement.textContent = countdownSave; if (autoSaveInterval) { clearInterval(autoSaveInterval); autoSaveInterval = null; } startCountdown(); }
+    
     timeInput.addEventListener('input', (e) => {
         manualTimeInput = true;
         let v = e.target.value.replace(/\D/g, '');
@@ -13921,20 +13778,12 @@ function showReminderModal(reminder = null, options = {}) {
     saveButton.addEventListener('click', (e) => {
         e.preventDefault();
         const form = modal.querySelector('#reminder-form');
-        if (form.checkValidity && !form.checkValidity()) {
-            form.reportValidity();
-            return;
-        }
+        if (form.checkValidity && !form.checkValidity()) { form.reportValidity(); return; }
         cleanUpModalTimers(true);
         const mapShouldReopen = mapShouldReopenAfterForm;
         const mapContextToReopen = mapContextBeforeThisModal;
         const text = textInput.value.trim();
-        if (!text) {
-            parseStatus.textContent = 'Texto obligatorio.';
-            parseStatus.classList.add('text-red-600');
-            resetAndStartCountdown();
-            return;
-        }
+        if (!text) { parseStatus.textContent = 'Texto obligatorio.'; parseStatus.classList.add('text-red-600'); resetAndStartCountdown(); return; }
         let time = timeInput.value.trim();
         let dateStr = dateInput.value.trim();
         const repeatDays = Array.from(modal.querySelectorAll('input[name="repeat"]:checked')).map(input => parseInt(input.value));
@@ -13943,199 +13792,69 @@ function showReminderModal(reminder = null, options = {}) {
         const radius = Math.round(currentRadius);
         const locationCoords = currentReminderLocation;
         const excludeFromListVal = excludeFromListCheckbox.checked;
-        if (isLocationChecked && !locationCoords) {
-            parseStatus.textContent = 'Ubicación activada pero no fijada en el mapa.';
-            parseStatus.classList.add('text-red-600');
-            resetAndStartCountdown();
-            return;
-        }
-        let dateISO = null;
-        let finalTime = time;
-        let reminderType = 'simple';
-        if (dateStr) {
-            if (dateStr.match(/^\d{2}\/\d{2}\/\d{4}$/)) {
-                const [d, m, y] = dateStr.split('/').map(Number);
-                const tD = new Date(Date.UTC(y, m - 1, d));
-                if (!isNaN(tD.getTime()) && tD.getUTCDate() === d && tD.getUTCMonth() + 1 === m && y >= 2000 && y <= 2099) {
-                    dateISO = `${y}-${m.toString().padStart(2, '0')}-${d.toString().padStart(2, '0')}`;
-                } else {
-                    parseStatus.textContent = 'Fecha inválida'; parseStatus.classList.add('text-red-600'); resetAndStartCountdown(); return;
-                }
-            } else {
-                parseStatus.textContent = 'Formato DD/MM/AAAA'; parseStatus.classList.add('text-red-600'); resetAndStartCountdown(); return;
-            }
-        }
-        if (finalTime && !finalTime.match(/^\d{2}:\d{2}$/)) {
-            parseStatus.textContent = 'Formato HH:MM'; parseStatus.classList.add('text-red-600'); resetAndStartCountdown(); return;
-        } else if (finalTime) {
-            const [h, m] = finalTime.split(':').map(Number);
-            if (h > 23 || m > 59) {
-                parseStatus.textContent = 'Hora inválida'; parseStatus.classList.add('text-red-600'); resetAndStartCountdown(); return;
-            }
-        }
-        if (intervalDays !== null && intervalDays > 0) {
-            reminderType = 'interval';
-            if (!dateISO) { const now = new Date(); dateISO = `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`; }
-            if (!finalTime) finalTime = '00:01';
-        } else if (repeatDays.length > 0) {
-            reminderType = 'weekly';
-            if (!dateISO) {
-                const tempCalc = { type: 'weekly', time: finalTime || '00:01', date: null, repeatDays: repeatDays, intervalDays: null };
-                const firstOcc = calculateNextOccurrence(tempCalc, new Date());
-                if (firstOcc) {
-                    dateISO = `${firstOcc.getUTCFullYear()}-${(firstOcc.getUTCMonth() + 1).toString().padStart(2, '0')}-${firstOcc.getUTCDate().toString().padStart(2, '0')}`;
-                    finalTime = finalTime || `${firstOcc.getUTCHours().toString().padStart(2, '0')}:${firstOcc.getUTCMinutes().toString().padStart(2, '0')}`;
-                } else {
-                    const now = new Date(); dateISO = `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`;
-                    if (!finalTime) finalTime = '00:01';
-                }
-            } else { if (!finalTime) finalTime = '00:01'; }
-        } else if (dateISO && finalTime) {
-            reminderType = 'daily';
-        } else if (finalTime) {
-            reminderType = 'daily';
-            const now = new Date(); dateISO = `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`;
-        } else if (dateISO) {
-            reminderType = 'daily';
-            finalTime = '00:01';
-        } else {
-            reminderType = 'simple';
-            const now = new Date(); dateISO = `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`;
-            finalTime = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
-        }
-        const now = new Date();
-        const finalCreatedAt = isNew ? now.toISOString() : (parsed.createdAt || now.toISOString());
-        let finalDateISO = dateISO;
-        if (isNew && (reminderType === 'weekly' || reminderType === 'interval')) {
-            let needsRecalc = false;
-            if (!dateInput.value.trim()) { needsRecalc = true; } 
-            else { try { const [d, m, y] = dateStr.split('/').map(Number); const inputDate = new Date(Date.UTC(y, m - 1, d)); const todayForCompare = new Date(now.getFullYear(), now.getMonth(), now.getDate()); if (inputDate < todayForCompare) { needsRecalc = true; } } catch (e) { needsRecalc = true; } }
-            if (needsRecalc) {
-                const tempCalcForNewCyclic = { type: reminderType, time: finalTime || '00:01', date: null, repeatDays: reminderType === 'weekly' ? repeatDays : [], intervalDays: reminderType === 'interval' ? intervalDays : null };
-                const firstOccurrence = calculateNextOccurrence(tempCalcForNewCyclic, new Date());
-                if (firstOccurrence) { finalDateISO = `${firstOccurrence.getUTCFullYear()}-${(firstOccurrence.getUTCMonth() + 1).toString().padStart(2, '0')}-${firstOccurrence.getUTCDate().toString().padStart(2, '0')}`; } 
-                else { if (!finalDateISO) { finalDateISO = `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`; } }
-            }
-        }
+        if (isLocationChecked && !locationCoords) { parseStatus.textContent = 'Ubicación activada pero no fijada en el mapa.'; parseStatus.classList.add('text-red-600'); resetAndStartCountdown(); return; }
+        let dateISO = null; let finalTime = time; let reminderType = 'simple';
+        if (dateStr) { if (dateStr.match(/^\d{2}\/\d{2}\/\d{4}$/)) { const [d, m, y] = dateStr.split('/').map(Number); const tD = new Date(Date.UTC(y, m - 1, d)); if (!isNaN(tD.getTime()) && tD.getUTCDate() === d && tD.getUTCMonth() + 1 === m && y >= 2000 && y <= 2099) { dateISO = `${y}-${m.toString().padStart(2, '0')}-${d.toString().padStart(2, '0')}`; } else { parseStatus.textContent = 'Fecha inválida'; parseStatus.classList.add('text-red-600'); resetAndStartCountdown(); return; } } else { parseStatus.textContent = 'Formato DD/MM/AAAA'; parseStatus.classList.add('text-red-600'); resetAndStartCountdown(); return; } }
+        if (finalTime && !finalTime.match(/^\d{2}:\d{2}$/)) { parseStatus.textContent = 'Formato HH:MM'; parseStatus.classList.add('text-red-600'); resetAndStartCountdown(); return; } else if (finalTime) { const [h, m] = finalTime.split(':').map(Number); if (h > 23 || m > 59) { parseStatus.textContent = 'Hora inválida'; parseStatus.classList.add('text-red-600'); resetAndStartCountdown(); return; } }
+        if (intervalDays !== null && intervalDays > 0) { reminderType = 'interval'; if (!dateISO) { const now = new Date(); dateISO = `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`; } if (!finalTime) finalTime = '00:01'; } 
+        else if (repeatDays.length > 0) { reminderType = 'weekly'; if (!dateISO) { const tempCalc = { type: 'weekly', time: finalTime || '00:01', date: null, repeatDays: repeatDays, intervalDays: null }; const firstOcc = calculateNextOccurrence(tempCalc, new Date()); if (firstOcc) { dateISO = `${firstOcc.getUTCFullYear()}-${(firstOcc.getUTCMonth() + 1).toString().padStart(2, '0')}-${firstOcc.getUTCDate().toString().padStart(2, '0')}`; finalTime = finalTime || `${firstOcc.getUTCHours().toString().padStart(2, '0')}:${firstOcc.getUTCMinutes().toString().padStart(2, '0')}`; } else { const now = new Date(); dateISO = `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`; if (!finalTime) finalTime = '00:01'; } } else { if (!finalTime) finalTime = '00:01'; } } 
+        else if (dateISO && finalTime) { reminderType = 'daily'; } else if (finalTime) { reminderType = 'daily'; const now = new Date(); dateISO = `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`; } else if (dateISO) { reminderType = 'daily'; finalTime = '00:01'; } 
+        else { reminderType = 'simple'; const now = new Date(); dateISO = `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`; finalTime = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`; }
+        const now = new Date(); const finalCreatedAt = isNew ? now.toISOString() : (parsed.createdAt || now.toISOString()); let finalDateISO = dateISO;
+        if (isNew && (reminderType === 'weekly' || reminderType === 'interval')) { let needsRecalc = false; if (!dateInput.value.trim()) { needsRecalc = true; } else { try { const [d, m, y] = dateStr.split('/').map(Number); const inputDate = new Date(Date.UTC(y, m - 1, d)); const todayForCompare = new Date(now.getFullYear(), now.getMonth(), now.getDate()); if (inputDate < todayForCompare) { needsRecalc = true; } } catch (e) { needsRecalc = true; } } if (needsRecalc) { const tempCalcForNewCyclic = { type: reminderType, time: finalTime || '00:01', date: null, repeatDays: reminderType === 'weekly' ? repeatDays : [], intervalDays: reminderType === 'interval' ? intervalDays : null }; const firstOccurrence = calculateNextOccurrence(tempCalcForNewCyclic, new Date()); if (firstOccurrence) { finalDateISO = `${firstOccurrence.getUTCFullYear()}-${(firstOccurrence.getUTCMonth() + 1).toString().padStart(2, '0')}-${firstOccurrence.getUTCDate().toString().padStart(2, '0')}`; } else { if (!finalDateISO) { finalDateISO = `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`; } } } }
         let reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
-        const newReminder = {
-            id: isNew ? Date.now() : parsed.id,
-            text: `<b>${text.toUpperCase()}</b>`,
-            type: reminderType,
-            time: finalTime || null,
-            date: finalDateISO,
-            repeatDays: reminderType === 'weekly' ? repeatDays : [],
-            intervalDays: reminderType === 'interval' ? intervalDays : null,
-            createdAt: finalCreatedAt,
-            managedByUser: false,
-            isLocationEnabled: isLocationChecked,
-            locationCoordinates: isLocationChecked ? locationCoords : null,
-            radiusMeters: isLocationChecked ? radius : (parsed.radiusMeters || (text.toUpperCase().startsWith("RADAR:") ? 350 : DEFAULT_LOCATION_RADIUS)),
-            excludeFromList: excludeFromListVal,
-            isFromRuta: parsed.isFromRuta || false
-        };
+        const newReminder = { id: isNew ? Date.now() : parsed.id, text: `<b>${text.toUpperCase()}</b>`, type: reminderType, time: finalTime || null, date: finalDateISO, repeatDays: reminderType === 'weekly' ? repeatDays : [], intervalDays: reminderType === 'interval' ? intervalDays : null, createdAt: finalCreatedAt, managedByUser: false, isLocationEnabled: isLocationChecked, locationCoordinates: isLocationChecked ? locationCoords : null, radiusMeters: isLocationChecked ? radius : (parsed.radiusMeters || (text.toUpperCase().startsWith("RADAR:") ? 350 : DEFAULT_LOCATION_RADIUS)), excludeFromList: excludeFromListVal, isFromRuta: parsed.isFromRuta || false };
         if (!newReminder.date || !newReminder.time || !newReminder.createdAt) { showToast("Error GRAVE: Fechas/Hora inválidas al guardar", "error"); resetAndStartCountdown(); return; }
-        
-        if (options.onTopOfMap) {
-            const mapObjectIndex = reminderMapObjects.findIndex(obj => obj.reminderId === newReminder.id);
-            if (mapObjectIndex !== -1) {
-                const { marker, circleId } = reminderMapObjects[mapObjectIndex];
-                if (marker) marker.remove();
-                if (circleId && navigationMapInstance.getLayer(circleId)) navigationMapInstance.removeLayer(circleId);
-                if (circleId && navigationMapInstance.getSource(circleId)) navigationMapInstance.removeSource(circleId);
-                reminderMapObjects.splice(mapObjectIndex, 1);
-            }
-            if(navigationMapInstance) {
-                const newMapObject = plotSingleReminderOnMap(newReminder, navigationMapInstance);
-                if(newMapObject) reminderMapObjects.push(newMapObject);
-            }
-        }
-        
-        if (!isNew) {
-            const index = reminders.findIndex(r => r.id === parsed.id);
-            if (index !== -1) { reminders[index] = newReminder; } 
-            else { newReminder.id = Date.now() + Math.random(); reminders.push(newReminder); }
-        } else { reminders.push(newReminder); }
-        localStorage.setItem('reminders', JSON.stringify(reminders));
-        markCacheAsDirty();
-        destroyMap();
+        if (options.onTopOfMap) { const mapObjectIndex = reminderMapObjects.findIndex(obj => obj.reminderId === newReminder.id); if (mapObjectIndex !== -1) { const { marker, circleId } = reminderMapObjects[mapObjectIndex]; if (marker) marker.remove(); if (circleId && navigationMapInstance.getLayer(circleId)) navigationMapInstance.removeLayer(circleId); if (circleId && navigationMapInstance.getSource(circleId)) navigationMapInstance.removeSource(circleId); reminderMapObjects.splice(mapObjectIndex, 1); } if(navigationMapInstance) { const newMapObject = plotSingleReminderOnMap(newReminder, navigationMapInstance); if(newMapObject) reminderMapObjects.push(newMapObject); } }
+        if (!isNew) { const index = reminders.findIndex(r => r.id === parsed.id); if (index !== -1) { reminders[index] = newReminder; } else { newReminder.id = Date.now() + Math.random(); reminders.push(newReminder); } } else { reminders.push(newReminder); }
+        localStorage.setItem('reminders', JSON.stringify(reminders)); markCacheAsDirty();
+        hideAndStoreReminderMap();
         if (modal.parentNode) modal.parentNode.removeChild(modal);
-        updateReminderCount();
-        updateButtonStyles();
-        checkReminders();
-        if (!options.onTopOfMap) {
-            const unifiedWindowIsVisible = document.getElementById('unified-reminder-window')?.classList.contains('visible');
-            if (mapShouldReopen && !unifiedWindowIsVisible && !isNavigationMapActive) {
-                if (mapContextToReopen === 'navigation') openNavigationMap();
-            } else if (mapShouldReopen && unifiedWindowIsVisible) {
-                 sessionStorage.setItem('boardinggate_map_should_reopen_when_unified_closes', 'true');
-                 if (mapContextToReopen) sessionStorage.setItem('mapContext', mapContextToReopen);
-            }
-        }
-        sessionStorage.removeItem('boardinggate_map_should_reopen_after_form');
-        sessionStorage.removeItem('mapContext');
+        updateReminderCount(); updateButtonStyles(); checkReminders();
+        if (!options.onTopOfMap) { const unifiedWindowIsVisible = document.getElementById('unified-reminder-window')?.classList.contains('visible'); if (mapShouldReopen && !unifiedWindowIsVisible && !isNavigationMapActive) { if (mapContextToReopen === 'navigation') openNavigationMap(); } else if (mapShouldReopen && unifiedWindowIsVisible) { sessionStorage.setItem('boardinggate_map_should_reopen_when_unified_closes', 'true'); if (mapContextToReopen) sessionStorage.setItem('mapContext', mapContextToReopen); } }
+        sessionStorage.removeItem('boardinggate_map_should_reopen_after_form'); sessionStorage.removeItem('mapContext');
     });
 
     modal.querySelector('#cancel-reminder').addEventListener('click', () => {
         cleanUpModalTimers(true);
-        if (options.onTopOfMap) {
-            destroyMap();
-            if (modal.parentNode) modal.parentNode.removeChild(modal);
-            return;
-        }
         const mapShouldReopen = mapShouldReopenAfterForm;
         const mapContextToReopen = mapContextBeforeThisModal;
-        destroyMap();
+        hideAndStoreReminderMap();
         if (modal.parentNode) modal.parentNode.removeChild(modal);
         const unifiedWindowIsVisible = document.getElementById('unified-reminder-window')?.classList.contains('visible');
-        if (mapShouldReopen && !unifiedWindowIsVisible && !isNavigationMapActive) {
-            if (mapContextToReopen === 'navigation') openNavigationMap();
-        }
+        if (mapShouldReopen && !unifiedWindowIsVisible && !isNavigationMapActive) { if (mapContextToReopen === 'navigation') openNavigationMap(); }
         sessionStorage.removeItem('boardinggate_map_should_reopen_after_form');
         sessionStorage.removeItem('mapContext');
     });
 
-    modal.querySelector('#help-reminder').addEventListener('click', () => {
-        showHelpModal({ parentContainer: modal }); 
-    });
+    modal.querySelector('#help-reminder').addEventListener('click', () => { showHelpModal({ parentContainer: modal }); });
 
     clearButton.addEventListener('click', () => {
         textInput.value=''; timeInput.value=''; dateInput.value='';
         modal.querySelectorAll('input[name="repeat"]').forEach(i=>i.checked=false);
-        intervalInput.value='';
-        locationCheckbox.checked = false;
-        toggleLocationControlsVisibility();
-        currentRadius = parsed.radiusMeters || DEFAULT_LOCATION_RADIUS;
-        updateRadiusVisuals();
-        currentReminderLocation = null;
-        destroyMap();
-        excludeFromListCheckbox.checked = false;
-        parseStatus.textContent='';
-        speechStatus.textContent='';
-        manualTimeInput=false;
-        resetAndStartCountdown();
-        textInput.focus();
+        intervalInput.value=''; locationCheckbox.checked = false; toggleLocationControlsVisibility();
+        currentRadius = parsed.radiusMeters || DEFAULT_LOCATION_RADIUS; updateRadiusVisuals();
+        currentReminderLocation = null; hideAndStoreReminderMap();
+        excludeFromListCheckbox.checked = false; parseStatus.textContent=''; speechStatus.textContent=''; manualTimeInput=false;
+        resetAndStartCountdown(); textInput.focus();
     });
 
     modal.querySelector('#view-reminders').addEventListener('click', () => {
         cleanUpModalTimers(true);
         const mapShouldReopen = mapShouldReopenAfterForm;
         const mapContextToReopen = mapContextBeforeThisModal;
-        destroyMap();
+        hideAndStoreReminderMap();
         if (modal.parentNode) modal.parentNode.removeChild(modal);
         fromReminderModal = true;
         if (mapShouldReopen) {
             sessionStorage.setItem('boardinggate_map_was_open_before_table', 'true');
-            if (mapContextToReopen) {
-                sessionStorage.setItem('mapContext', mapContextToReopen);
-            }
+            if (mapContextToReopen) sessionStorage.setItem('mapContext', mapContextToReopen);
         }
         showAllReminders();
     });
     
     textInput.focus();
 }
-
     
 // ===================================================================
 // NOMBRE: closeAlertModal
