@@ -1,4 +1,4 @@
-S11
+S12
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -5249,7 +5249,7 @@ object-fit: contain;
                 <div class="mapbox-control">
                     <input type="checkbox" id="mapbox-primary-checkbox">
                     <div class="mapbox-label-container">
-                        <label for="mapbox-primary-checkbox">Rutas<br>Mapbox</label>
+                        <label for="mapbox-primary-checkbox">Rutas<br>Turf</label>
                     </div>
                 </div>
                 <button id="add-reminder-at-location-button" class="reminders-map-button-action" title="Añadir recordatorio en punto del mapa">
@@ -13082,10 +13082,11 @@ function showAllReminders(options = {}) {
 }
 
 // ===================================================================
-// NOMBRE: showReminderModal (VERSIÓN FINAL CON REUTILIZACIÓN Y RESIZE ROBUSTO)
-// RESUMEN: Muestra el modal de recordatorios. El mapa se crea una vez y se reutiliza.
-//          Se ha corregido la lógica de redimensionamiento para que el mapa siempre
-//          ocupe todo el espacio disponible en su contenedor.
+// NOMBRE: showReminderModal (VERSIÓN FINAL CON MÉTODO CREATE/DESTROY ROBUSTO)
+// RESUMEN: Muestra el modal de recordatorios. Para evitar errores de renderizado y de script,
+//          el mapa se crea desde cero cada vez que se necesita y se destruye
+//          completamente al cerrar el modal. Esto garantiza un estado limpio y un
+//          renderizado correcto en todos los casos.
 // ===================================================================
 function showReminderModal(reminder = null, options = {}) {
     const mapShouldReopenAfterForm = sessionStorage.getItem('boardinggate_map_should_reopen_after_form') === 'true';
@@ -13096,6 +13097,7 @@ function showReminderModal(reminder = null, options = {}) {
     let locationEnabledByUser = false;
     let mapExpandedManually = false;
     let mapMoveDebounceTimer = null;
+
     function cleanUpModalTimers(clearAll = true) {
         if (autoSaveInterval) { clearInterval(autoSaveInterval); autoSaveInterval = null; }
         if (clearAll) {
@@ -13105,11 +13107,13 @@ function showReminderModal(reminder = null, options = {}) {
             parseTimeout = null; restartTimeout = null; focusTimeout = null;
         }
     }
+
     const existingModal = document.querySelector('.reminder-modal');
-    if (existingModal && typeof existingModal.cleanUpModalTimers === 'function') {
-        existingModal.cleanUpModalTimers(true);
+    if (existingModal) {
+        if (typeof existingModal.cleanUpModalTimers === 'function') existingModal.cleanUpModalTimers(true);
         if (existingModal.parentNode) existingModal.parentNode.removeChild(existingModal);
     }
+    
     let isNew = true;
     let parsed = {
          id: null, text: '', time: null, date: null, repeatDays: [], intervalDays: null, type: 'simple',
@@ -13266,17 +13270,19 @@ function showReminderModal(reminder = null, options = {}) {
     const locationCheckbox = modal.querySelector('#location-enabled');
 
     // --- INICIO DE LA CORRECCIÓN ---
-    function hideAndStoreReminderMap() {
+    // Volvemos a la lógica de "Crear y Destruir" que es más robusta en este contexto.
+    function destroyMap() {
         if (reminderModalMap) {
-            const mapGarage = document.getElementById('map-garage');
-            const mapContainerElement = reminderModalMap.getContainer();
-            if (mapGarage && mapContainerElement && mapContainerElement.parentNode !== mapGarage) {
-                mapGarage.appendChild(mapContainerElement);
-            }
+            try { reminderModalMap.remove(); } catch(e) {}
+            reminderModalMap = null;
+            reminderMarker = null;
         }
         if (mapContainer) {
             mapContainer.style.display = 'none';
             mapContainer.classList.remove('preview', 'expanded');
+            // Eliminar el div del mapa para asegurar una recreación limpia
+            const mapDiv = mapContainer.querySelector('#reminder-modal-map-div');
+            if (mapDiv) mapDiv.remove();
         }
         if (reduceMapButton) reduceMapButton.classList.add('hidden');
         if (locateMeButton) locateMeButton.classList.add('hidden');
@@ -13284,19 +13290,15 @@ function showReminderModal(reminder = null, options = {}) {
     }
 
     function initializeOrUpdateMap(centerCoords, radius, isInteractive = false) {
-        const mapGarage = document.getElementById('map-garage');
-        const mapContainerEl = modal.querySelector('#location-map-container');
+        destroyMap(); // Siempre empezamos destruyendo cualquier mapa anterior.
+
         const effectiveLocationEnabled = locationCheckbox.checked;
         const showMap = effectiveLocationEnabled || isInteractive;
+        if (!showMap) return;
 
-        if (!showMap) {
-            hideAndStoreReminderMap();
-            return;
-        }
-
-        mapContainerEl.style.display = 'block';
-        mapContainerEl.classList.toggle('preview', !isInteractive && effectiveLocationEnabled && centerCoords);
-        mapContainerEl.classList.toggle('expanded', isInteractive && effectiveLocationEnabled);
+        mapContainer.style.display = 'block';
+        mapContainer.classList.toggle('preview', !isInteractive && effectiveLocationEnabled && centerCoords);
+        mapContainer.classList.toggle('expanded', isInteractive && effectiveLocationEnabled);
         
         expandMapButton.style.display = (isInteractive && effectiveLocationEnabled) ? 'none' : 'block';
         
@@ -13304,56 +13306,41 @@ function showReminderModal(reminder = null, options = {}) {
         const effectiveRadius = parseInt(radius) || DEFAULT_LOCATION_RADIUS;
         const zoomLevel = isInteractive ? 13 : 11;
 
-        if (!reminderModalMap) {
-            const mapDiv = document.createElement('div');
-            mapDiv.id = 'reminder-modal-map-div';
-            mapDiv.style.width = '100%'; mapDiv.style.height = '100%';
-            mapGarage.appendChild(mapDiv);
+        // Se crea un nuevo div para el mapa cada vez.
+        const mapDiv = document.createElement('div');
+        mapDiv.id = 'reminder-modal-map-div';
+        mapDiv.style.width = '100%'; mapDiv.style.height = '100%';
+        mapContainer.insertBefore(mapDiv, reduceMapButton);
 
-            reminderModalMap = new mapboxgl.Map({
-                container: mapDiv,
-                style: 'mapbox://styles/mapbox/satellite-streets-v12',
-                center: [effectiveCoords.longitude, effectiveCoords.latitude],
-                zoom: zoomLevel,
-                interactive: true
+        reminderModalMap = new mapboxgl.Map({
+            container: mapDiv,
+            style: 'mapbox://styles/mapbox/satellite-streets-v12',
+            center: [effectiveCoords.longitude, effectiveCoords.latitude],
+            zoom: zoomLevel,
+            interactive: isInteractive && effectiveLocationEnabled
+        });
+        
+        reminderModalMap.on('load', () => {
+            updateMarkerAndCircle(effectiveCoords, effectiveRadius);
+            
+            reminderModalMap.on('click', handleMapClick);
+            reminderModalMap.on('movestart', handleMapMoveStart);
+            reminderModalMap.on('moveend', handleMapMoveEnd);
+            
+            // **LA CLAVE ESTÁ AQUÍ**
+            // Forzamos un `resize` en el siguiente ciclo de renderizado del navegador,
+            // garantizando que el contenedor ya tiene sus dimensiones finales.
+            requestAnimationFrame(() => {
+                requestAnimationFrame(() => {
+                    if (reminderModalMap) {
+                        try { reminderModalMap.resize(); } catch (e) {}
+                    }
+                });
             });
-
-            reminderModalMap.on('load', () => {
-                reminderMarker = new mapboxgl.Marker({ draggable: true }).addTo(reminderModalMap);
-                reminderMarker.on('dragend', handleMarkerDragEnd);
-                reminderModalMap.on('click', handleMapClick);
-                reminderModalMap.on('movestart', handleMapMoveStart);
-                reminderModalMap.on('moveend', handleMapMoveEnd);
-            });
-        }
+        });
         
-        const mapDiv = reminderModalMap.getContainer();
-        if (mapDiv.parentNode !== mapContainerEl) {
-            mapContainerEl.insertBefore(mapDiv, reduceMapButton);
-        }
-        
-        reminderModalMap.flyTo({ center: [effectiveCoords.longitude, effectiveCoords.latitude], zoom: zoomLevel, duration: 0 });
-        updateMarkerAndCircle(effectiveCoords, effectiveRadius);
-        
-        reminderModalMap.dragPan.enable(isInteractive && effectiveLocationEnabled);
-        reminderModalMap.scrollZoom.enable(isInteractive && effectiveLocationEnabled);
-        reminderModalMap.touchZoomRotate.enable(isInteractive && effectiveLocationEnabled);
-
         if (reduceMapButton) reduceMapButton.classList.toggle('hidden', !(isInteractive && effectiveLocationEnabled));
         if (locateMeButton) locateMeButton.classList.toggle('hidden', !(isInteractive && effectiveLocationEnabled));
-
-        // **LA CLAVE ESTÁ AQUÍ**
-        // Este setTimeout da tiempo al navegador a aplicar las clases CSS (.preview o .expanded)
-        // y calcular la altura final del contenedor ANTES de que llamemos a resize().
-        setTimeout(() => {
-            if (reminderModalMap && mapContainerEl.offsetHeight > 0) {
-                try { 
-                    reminderModalMap.resize(); 
-                } catch (e) {
-                    console.error("Error al redimensionar el mapa del modal de recordatorio:", e);
-                }
-            }
-        }, 100); // 100ms es un retraso seguro pero imperceptible.
     }
     // --- FIN DE LA CORRECCIÓN ---
     
@@ -13382,7 +13369,7 @@ function showReminderModal(reminder = null, options = {}) {
             radiusSliderGroup.style.display = isChecked ? 'flex' : 'none';
         }
         if(!isChecked) {
-           hideAndStoreReminderMap();
+           destroyMap();
         }
     }
     
@@ -13489,13 +13476,13 @@ function showReminderModal(reminder = null, options = {}) {
             if (!mapExpandedManually && !mapContainer.classList.contains('expanded') && currentReminderLocation) {
                 initializeOrUpdateMap(currentReminderLocation, Math.round(currentRadius), false);
             } else if (!mapExpandedManually && !mapContainer.classList.contains('expanded') && !currentReminderLocation) {
-                hideAndStoreReminderMap();
+                destroyMap();
             }
              if (!currentReminderLocation && !wasEnabled) {
                 getCurrentLocation( (coords) => { currentReminderLocation = coords; if (!mapExpandedManually && !mapContainer.classList.contains('expanded') && currentReminderLocation) { initializeOrUpdateMap(currentReminderLocation, Math.round(currentRadius), false); } });
             }
         } else {
-            hideAndStoreReminderMap();
+            destroyMap();
         }
         resetAndStartCountdown();
     }
@@ -13522,7 +13509,7 @@ function showReminderModal(reminder = null, options = {}) {
                         }
                     } else { showToast('Recordatorio no encontrado para borrar.', 'warning'); }
                 }
-                hideAndStoreReminderMap();
+                destroyMap();
                 if (modal.parentNode) modal.parentNode.removeChild(modal);
                 updateReminderCount(); updateButtonStyles(); checkReminders();
                 return;
@@ -13530,7 +13517,7 @@ function showReminderModal(reminder = null, options = {}) {
             const mapShouldReopen = mapShouldReopenAfterForm;
             const mapContextToReopen = mapContextBeforeThisModal;
             if (isNew) {
-                hideAndStoreReminderMap();
+                destroyMap();
                 if (modal.parentNode) modal.parentNode.removeChild(modal);
                 if (mapShouldReopen && !document.getElementById('unified-reminder-window')?.classList.contains('visible') && !isNavigationMapActive) {
                     if (mapContextToReopen === 'navigation') openNavigationMap();
@@ -13549,7 +13536,7 @@ function showReminderModal(reminder = null, options = {}) {
                 markCacheAsDirty();
                 showToast('Recordatorio borrado.', 'success');
             } else { showToast('Recordatorio no encontrado para borrar', 'warning'); }
-            hideAndStoreReminderMap();
+            destroyMap();
             if (modal.parentNode) modal.parentNode.removeChild(modal);
             updateReminderCount(); updateButtonStyles(); checkReminders();
              if (mapShouldReopen && !document.getElementById('unified-reminder-window')?.classList.contains('visible') && !isNavigationMapActive) {
@@ -13586,8 +13573,8 @@ function showReminderModal(reminder = null, options = {}) {
 
     locationCheckbox.addEventListener('change', handleLocationCheckboxChange);
     if (parsed.isLocationEnabled && parsed.locationCoordinates) { initializeOrUpdateMap(parsed.locationCoordinates, parsed.radiusMeters, false); } 
-    else if (parsed.isLocationEnabled && !parsed.locationCoordinates) { hideAndStoreReminderMap(); } 
-    else { hideAndStoreReminderMap(); }
+    else if (parsed.isLocationEnabled && !parsed.locationCoordinates) { destroyMap(); } 
+    else { destroyMap(); }
 
     if (expandMapButton) {
         expandMapButton.addEventListener('click', () => {
@@ -13614,7 +13601,7 @@ function showReminderModal(reminder = null, options = {}) {
         });
     }
 
-    if (reduceMapButton) { reduceMapButton.addEventListener('click', () => { if (locationEnabledByUser && currentReminderLocation) { initializeOrUpdateMap(currentReminderLocation, Math.round(currentRadius), false); } else { hideAndStoreReminderMap(); } resetAndStartCountdown(); }); }
+    if (reduceMapButton) { reduceMapButton.addEventListener('click', () => { if (locationEnabledByUser && currentReminderLocation) { initializeOrUpdateMap(currentReminderLocation, Math.round(currentRadius), false); } else { destroyMap(); } resetAndStartCountdown(); }); }
     if (locateMeButton) {
         locateMeButton.addEventListener('click', () => {
              if (!reminderModalMap || !mapContainer.classList.contains('expanded')) return;
@@ -13817,7 +13804,7 @@ function showReminderModal(reminder = null, options = {}) {
         if (options.onTopOfMap) { const mapObjectIndex = reminderMapObjects.findIndex(obj => obj.reminderId === newReminder.id); if (mapObjectIndex !== -1) { const { marker, circleId } = reminderMapObjects[mapObjectIndex]; if (marker) marker.remove(); if (circleId && navigationMapInstance.getLayer(circleId)) navigationMapInstance.removeLayer(circleId); if (circleId && navigationMapInstance.getSource(circleId)) navigationMapInstance.removeSource(circleId); reminderMapObjects.splice(mapObjectIndex, 1); } if(navigationMapInstance) { const newMapObject = plotSingleReminderOnMap(newReminder, navigationMapInstance); if(newMapObject) reminderMapObjects.push(newMapObject); } }
         if (!isNew) { const index = reminders.findIndex(r => r.id === parsed.id); if (index !== -1) { reminders[index] = newReminder; } else { newReminder.id = Date.now() + Math.random(); reminders.push(newReminder); } } else { reminders.push(newReminder); }
         localStorage.setItem('reminders', JSON.stringify(reminders)); markCacheAsDirty();
-        hideAndStoreReminderMap();
+        destroyMap();
         if (modal.parentNode) modal.parentNode.removeChild(modal);
         updateReminderCount(); updateButtonStyles(); checkReminders();
         if (!options.onTopOfMap) { const unifiedWindowIsVisible = document.getElementById('unified-reminder-window')?.classList.contains('visible'); if (mapShouldReopen && !unifiedWindowIsVisible && !isNavigationMapActive) { if (mapContextToReopen === 'navigation') openNavigationMap(); } else if (mapShouldReopen && unifiedWindowIsVisible) { sessionStorage.setItem('boardinggate_map_should_reopen_when_unified_closes', 'true'); if (mapContextToReopen) sessionStorage.setItem('mapContext', mapContextToReopen); } }
@@ -13828,7 +13815,7 @@ function showReminderModal(reminder = null, options = {}) {
         cleanUpModalTimers(true);
         const mapShouldReopen = mapShouldReopenAfterForm;
         const mapContextToReopen = mapContextBeforeThisModal;
-        hideAndStoreReminderMap();
+        destroyMap();
         if (modal.parentNode) modal.parentNode.removeChild(modal);
         const unifiedWindowIsVisible = document.getElementById('unified-reminder-window')?.classList.contains('visible');
         if (mapShouldReopen && !unifiedWindowIsVisible && !isNavigationMapActive) { if (mapContextToReopen === 'navigation') openNavigationMap(); }
@@ -13843,7 +13830,7 @@ function showReminderModal(reminder = null, options = {}) {
         modal.querySelectorAll('input[name="repeat"]').forEach(i=>i.checked=false);
         intervalInput.value=''; locationCheckbox.checked = false; toggleLocationControlsVisibility();
         currentRadius = parsed.radiusMeters || DEFAULT_LOCATION_RADIUS; updateRadiusVisuals();
-        currentReminderLocation = null; hideAndStoreReminderMap();
+        currentReminderLocation = null; destroyMap();
         excludeFromListCheckbox.checked = false; parseStatus.textContent=''; speechStatus.textContent=''; manualTimeInput=false;
         resetAndStartCountdown(); textInput.focus();
     });
@@ -13852,7 +13839,7 @@ function showReminderModal(reminder = null, options = {}) {
         cleanUpModalTimers(true);
         const mapShouldReopen = mapShouldReopenAfterForm;
         const mapContextToReopen = mapContextBeforeThisModal;
-        hideAndStoreReminderMap();
+        destroyMap();
         if (modal.parentNode) modal.parentNode.removeChild(modal);
         fromReminderModal = true;
         if (mapShouldReopen) {
@@ -19340,7 +19327,7 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
             essential: true
         };
         
-        const verticalOffsetPercentage = 0.25; 
+        const verticalOffsetPercentage = 0.30; 
         const mapHeight = navigationMapInstance.getCanvas().clientHeight;
         const topPadding = mapHeight * (verticalOffsetPercentage * 2);
         viewOptions.padding = { top: topPadding, bottom: 0, left: 0, right: 0 };
