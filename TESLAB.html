@@ -1,4 +1,4 @@
-L2
+L3
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -19328,7 +19328,6 @@ function drawRouteOnMap(route) {
     }
     console.groupEnd();
 }
-
 // ===================================================================
 // NOMBRE: showRecalculationToast (NUEVA FUNCIÓN AUXILIAR)
 // RESUMEN: Construye y muestra el toast de diagnóstico detallado tras un recálculo.
@@ -19461,6 +19460,10 @@ function checkReminders() {
         }
 
         if (isNavigating && navigationCurrentLocation && !isRecalculatingRoute && !isDeviationModalActive && !isAddReminderAtLocationModeActive) {
+            if (Date.now() < deviationCheckGracePeriodUntil) {
+                console.log("[DESVÍO] Omitiendo comprobación de desvío (período de gracia activo).");
+                return;
+            }
             const currentCoords = navigationCurrentLocation;
             if (navigationMapInstance && navigationMapInstance.getSource('route') && navigationMapInstance.getSource('route')._data && typeof turf !== 'undefined') {
                 try {
@@ -19569,12 +19572,12 @@ function showDeviationModal() {
         modal.classList.remove('hidden');
         const acceptButton = modal.querySelector('#deviation-accept-simple');
         
-        acceptButton.addEventListener('click', (e) => {
+        acceptButton.addEventListener('click', async (e) => {
             e.stopPropagation();
             isRecalculatingRoute = true;
+            console.log("[MODAL DESVÍO] Aceptado en ruta simple. Bloqueo activado. Llamando a recalculateAndDrawRoute...");
             closeModalAndProceed();
-            console.log("[MODAL DESVÍO] Aceptado en ruta simple. Llamando a recalculateAndDrawRoute...");
-            recalculateAndDrawRoute(true, true); 
+            await recalculateAndDrawRoute(true, true); 
         });
         addModalAutoCloseTimer(modal, acceptButton, 'deviation-modal', 3000);
         return; 
@@ -19656,17 +19659,19 @@ function showDeviationModal() {
                 scrollHint.style.display = 'block';
             }        });
     }
-    document.getElementById('deviation-go-to-final').addEventListener('click', (e) => {
+    document.getElementById('deviation-go-to-final').addEventListener('click', async (e) => {
         e.stopPropagation();
         isRecalculatingRoute = true;
-        handleFinalDestinationSelection();
+        console.log("[MODAL DESVÍO] Botón 'Ir a Destino Final' pulsado. Bloqueo activado.");
+        await handleFinalDestinationSelection();
     });
     document.querySelectorAll('.deviation-stage-button').forEach(btn => {
-        btn.addEventListener('click', (e) => {
+        btn.addEventListener('click', async (e) => {
             e.stopPropagation();
             isRecalculatingRoute = true;
+            console.log("[MODAL DESVÍO] Botón de etapa pulsado. Bloqueo activado.");
             const waypointId = parseInt(e.currentTarget.dataset.waypointId);
-            handleStageSelectionFromDeviationModal(waypointId);
+            await handleStageSelectionFromDeviationModal(waypointId);
         });
     });
     document.getElementById('deviation-cancel').addEventListener('click', (e) => {
@@ -19680,13 +19685,72 @@ function showDeviationModal() {
 }
 
 // ===================================================================
+// NOMBRE: handleFinalDestinationSelection (VERSIÓN CORREGIDA Y DEFINITIVA)
+// ===================================================================
+async function handleFinalDestinationSelection() {
+    const finalDestination = navigationWaypoints.find(wp => wp.type === 'F');
+    const startPoint = navigationWaypoints.find(wp => wp.isRecalculatedStart || wp.type === 'S');
+
+    if (!finalDestination || !startPoint) {
+        showToast("Error: No se pudo determinar el inicio o el fin de la ruta.", "error");        closeModalAndProceed();
+        return;
+    }
+
+    navigationWaypoints = [startPoint, finalDestination];
+    
+    closeModalAndProceed();
+    
+    try {
+        await recalculateAndDrawRoute(true, true);
+        renderWaypointMarkers();
+    } catch (error) {
+        showToast("Error al recalcular la ruta hacia el destino final.", "error");
+    }
+}
+
+// ===================================================================
+// NOMBRE: handleStageSelectionFromDeviationModal (VERSIÓN CORREGIDA Y DEFINITIVA)
+// ===================================================================
+async function handleStageSelectionFromDeviationModal(selectedWaypointId) {
+    const selectedIndex = navigationWaypoints.findIndex(wp => wp.id === selectedWaypointId);
+    const startPoint = navigationWaypoints.find(wp => wp.isRecalculatedStart || wp.type === 'S');
+
+    if (selectedIndex === -1 || !startPoint) {
+        showToast("Error: No se encontró la etapa o el punto de inicio.", "error");        closeModalAndProceed();
+        return;
+    }
+
+    // Creamos la nueva lista de waypoints: inicio + etapa seleccionada + las que le siguen.
+    const newWaypoints = [startPoint];
+    for (let i = selectedIndex; i < navigationWaypoints.length; i++) {
+        const wp = navigationWaypoints[i];
+        if (wp && !wp.isInternal && !wp.isRecalculatedStart) {
+            newWaypoints.push(wp);
+        }
+    }
+    
+    navigationWaypoints = newWaypoints;
+    
+    closeModalAndProceed(); 
+    
+    try {
+        await recalculateAndDrawRoute(true, true);
+        renderWaypointMarkers();
+    } catch (error) {
+        showToast("Error al recalcular la ruta hacia la etapa seleccionada.", "error");
+    }
+}
+
+// ===================================================================
 // NOMBRE: recalculateAndDrawRoute (MODIFICADA - YA NO MUESTRA EL TOAST DIRECTAMENTE)
 // RESUMEN: Lógica principal de recálculo. Ya no crea el toast, solo calcula la ruta.
 async function recalculateAndDrawRoute(preserveAccumulatedStats = false, showToastOnComplete = false) {
     clearAlternativeRoutesDisplay(); 
     if (isRecalculatingRoute) {
+        console.log("[RECÁLCULO] Intento de recálculo ignorado: ya hay uno en progreso.");
         return;
     }
+    console.log(`[RECÁLCULO] INICIANDO. preserveStats=${preserveAccumulatedStats}, showToast=${showToastOnComplete}`);
     const wasNavigatingBeforeRecalc = isNavigating;
     isRecalculatingRoute = true;
     
@@ -19732,14 +19796,14 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, showToa
         
         const result = await fetchRouteData(coordsString, currentHeading);
       
-        if (showToastOnComplete) {
-            const existingToast = document.getElementById(recalculateToastId);
-            if(existingToast) existingToast.remove();
-            showRecalculationToast(result, oldRemainingDistance, oldRemainingDuration);
-        }
-
         if (result.error) {
-            throw result.error; }
+            if (showToastOnComplete) {
+                const existingToast = document.getElementById(recalculateToastId);
+                if(existingToast) existingToast.remove();
+                showRecalculationToast(result, 0, 0); // Pasamos 0 para no mostrar comparación
+            }
+            throw result.error; 
+        }
 
         const data = result.routeData;
         navigationCurrentRouteData = data;
@@ -19761,13 +19825,18 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, showToa
         }
 
         if (preserveAccumulatedStats && isNavigating) {
+            console.log("[RECÁLCULO] Preservando estadísticas. Distancia recorrida antes:", totalDistanceTravelledForStats);
             const newRemainingDistance = data.routes[0].distance;
             tripInitialDistanceMeters = totalDistanceTravelledForStats + newRemainingDistance;
-            tripInitialDurationSec = ((Date.now() - navigationStartTimeForStats) / 1000) + data.routes[0].duration;
+            
+            const elapsedSecondsSinceStart = navigationStartTimeForStats ? (Date.now() - navigationStartTimeForStats) / 1000 : 0;
+            tripInitialDurationSec = elapsedSecondsSinceStart + data.routes[0].duration;
             tripInitialOverallEtaTime = new Date(Date.now() + data.routes[0].duration * 1000);
+
             if(data.routes[0].legs.length > 0) {
                  currentStageInitialExpectedEtaTime = new Date(Date.now() + data.routes[0].legs[0].duration * 1000);
             }
+            console.log("[RECÁLCULO] Nuevos totales -> Distancia:", tripInitialDistanceMeters, "Duración:", tripInitialDurationSec);
         } else if (!preserveAccumulatedStats) {
             accumulatedDistanceBeforeCurrentSegment = 0;
             totalDistanceTravelledForStats = 0;
@@ -19788,16 +19857,19 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, showToa
         updateStartNavigationButtonState();
         updateNavigationButtonColor();
         
-        if (!showToastOnComplete) {
-            const existingToast = document.getElementById(recalculateToastId);
-            if(existingToast) existingToast.remove();
-           }
-            
-    } catch (error) {
         if (showToastOnComplete) {
             const existingToast = document.getElementById(recalculateToastId);
             if(existingToast) existingToast.remove();
-        } else {
+            showRecalculationToast(result, oldRemainingDistance, oldRemainingDuration);
+        }
+
+        console.log("[RECÁLCULO] ✅ Éxito.");
+        deviationCheckGracePeriodUntil = Date.now() + 5000;
+        console.log(`[DESVÍO] Período de gracia activado hasta ${new Date(deviationCheckGracePeriodUntil).toLocaleTimeString()}`);
+            
+    } catch (error) {
+        console.error("[RECÁLCULO] ❌ ERROR:", error);
+        if (!showToastOnComplete) {
             showToast(`Error al calcular ruta: ${error.message}`, "error");
         }
         
@@ -19808,9 +19880,9 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, showToa
     } finally {
         isRecalculatingRoute = false;
         isNavigating = wasNavigatingBeforeRecalc; 
+        console.log("[RECÁLCULO] FINALIZADO. Bloqueo liberado.");
     }
 }
-    
 
 // ===================================================================
 // NOMBRE: clearAlternativeRoutesDisplay (VERSIÓN ROBUSTA Y A PRUEBA DE FALLOS)
@@ -19861,38 +19933,6 @@ function clearAlternativeRoutesDisplay() {
 }
     
 
-// ===================================================================
-// NOMBRE: handleStageSelectionFromDeviationModal (VERSIÓN CORREGIDA Y DEFINITIVA)
-// ===================================================================
-async function handleStageSelectionFromDeviationModal(selectedWaypointId) {
-    const selectedIndex = navigationWaypoints.findIndex(wp => wp.id === selectedWaypointId);
-    const startPoint = navigationWaypoints.find(wp => wp.isRecalculatedStart || wp.type === 'S');
-
-    if (selectedIndex === -1 || !startPoint) {
-        showToast("Error: No se encontró la etapa o el punto de inicio.", "error");        closeModalAndProceed();
-        return;
-    }
-
-    // Creamos la nueva lista de waypoints: inicio + etapa seleccionada + las que le siguen.
-    const newWaypoints = [startPoint];
-    for (let i = selectedIndex; i < navigationWaypoints.length; i++) {
-        const wp = navigationWaypoints[i];
-        if (wp && !wp.isInternal && !wp.isRecalculatedStart) {
-            newWaypoints.push(wp);
-        }
-    }
-    
-    navigationWaypoints = newWaypoints;
-    
-    closeModalAndProceed(); 
-    
-    try {
-        await recalculateAndDrawRoute(true);
-        renderWaypointMarkers();
-    } catch (error) {
-        showToast("Error al recalcular la ruta hacia la etapa seleccionada.", "error");
-    }
-}
     
 // ===================================================================
 // NOMBRE: handleSimulateGpsPositionClick (MODIFICADA - PARA MAPBOX)
@@ -22133,26 +22173,6 @@ function closeModalAndProceed() {
     }
     isDeviationModalActive = false;
     deviationStartTime = 0;
-}
-// ===================================================================
-// NOMBRE: handleFinalDestinationSelection (VERSIÓN CORREGIDA Y DEFINITIVA)
-// ===================================================================
-async function handleFinalDestinationSelection() {
-    const finalDestination = navigationWaypoints.find(wp => wp.type === 'F');
-    const startPoint = navigationWaypoints.find(wp => wp.isRecalculatedStart || wp.type === 'S');
-
-    if (!finalDestination || !startPoint) {
-        showToast("Error: No se pudo determinar el inicio o el fin de la ruta.", "error");
-        closeModalAndProceed();
-        return;
-    }
-
-    navigationWaypoints = [startPoint, finalDestination];
-    
-    closeModalAndProceed();
-    
-    // La llamada a renderWaypointMarkers() se elimina de aquí porque ya está en el finally de recalculateAndDrawRoute
-    await recalculateAndDrawRoute(true); 
 }
 
 // ===================================================================
