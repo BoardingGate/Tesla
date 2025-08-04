@@ -1,4 +1,4 @@
-L4
+L5
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -18669,41 +18669,6 @@ function reactivateRealGpsAfterSimulation() {
     }
 }
 // ===================================================================
-// NOMBRE: handleSimulateGpsPositionClick (MODIFICADA - PARA MAPBOX)
-// RESUMEN: Maneja el clic en el mapa durante la simulación GPS manual.
-function handleSimulateGpsPositionClick(e, forceExactPosition = false) {
-    if (!isSimulatingGpsLocation || !navigationMapInstance) return;
-    if (automatedSimulationIntervalId) {
-        stopAutomatedRouteSimulationInternal();
-        showToast("Simulación automática detenida. Posición GPS fijada manualmente.", "info");
-    }
-    let lngLatToUse = [e.lngLat.lng, e.lngLat.lat]; 
-    
-    if (!forceExactPosition && navigationMapInstance.getSource('route') && typeof turf !== 'undefined' && navigationMapInstance.getSource('route')._data) {
-        const routeGeoJSON = navigationMapInstance.getSource('route')._data;
-        if (routeGeoJSON && routeGeoJSON.type === 'Feature' && routeGeoJSON.geometry && routeGeoJSON.geometry.coordinates) {
-            const routeLineString = turf.lineString(routeGeoJSON.geometry.coordinates);
-            const clickPoint = turf.point(lngLatToUse);
-            const nearestPointOnRoute = turf.nearestPointOnLine(routeLineString, clickPoint, { units: 'meters' });
-            
-            if (nearestPointOnRoute && nearestPointOnRoute.properties.dist !== undefined && nearestPointOnRoute.properties.dist < 50) { 
-                lngLatToUse = nearestPointOnRoute.geometry.coordinates;
-            }
-        }
-    }
-
-    simulatedGpsLocation = {
-        latitude: lngLatToUse[1],
-        longitude: lngLatToUse[0],
-        accuracy: 10,
-        heading: navigationCurrentLocation ? navigationCurrentLocation.heading : 0,
-        altitude: navigationCurrentLocation ? navigationCurrentLocation.altitude : 0,
-        speed: 0
-    };
-    processSimulatedGpsPosition(true); 
-    setNavigationMapClickHandler(); 
-}
-// ===================================================================
 // NOMBRE: animateMarkerAndMap (VERSIÓN CORREGIDA - YA NO CONTROLA EL MAPA)
 // RESUMEN: Bucle de animación que mueve y rota suavemente el ICONO del coche.
 // ===================================================================
@@ -19575,6 +19540,7 @@ function showDeviationModal() {
         
         acceptButton.addEventListener('click', async (e) => {
             e.stopPropagation();
+            wasSimulatingBeforeRecalc = !!automatedSimulationIntervalId;
             console.log("[MODAL DESVÍO] Aceptado en ruta simple. Llamando a recalculateAndDrawRoute...");
             closeModalAndProceed();
             await recalculateAndDrawRoute(true, true); 
@@ -19661,12 +19627,14 @@ function showDeviationModal() {
     }
     document.getElementById('deviation-go-to-final').addEventListener('click', async (e) => {
         e.stopPropagation();
+        wasSimulatingBeforeRecalc = !!automatedSimulationIntervalId;
         console.log("[MODAL DESVÍO] Botón 'Ir a Destino Final' pulsado.");
         await handleFinalDestinationSelection();
     });
     document.querySelectorAll('.deviation-stage-button').forEach(btn => {
         btn.addEventListener('click', async (e) => {
             e.stopPropagation();
+            wasSimulatingBeforeRecalc = !!automatedSimulationIntervalId;
             console.log("[MODAL DESVÍO] Botón de etapa pulsado.");
             const waypointId = parseInt(e.currentTarget.dataset.waypointId);
             await handleStageSelectionFromDeviationModal(waypointId);
@@ -19680,62 +19648,6 @@ function showDeviationModal() {
         console.log("[MODAL DESVÍO] Cancelado por el usuario.");
     });
     addModalAutoCloseTimer(modal, document.getElementById('deviation-go-to-final'), 'deviation-modal', 30000);
-}
-
-// ===================================================================
-// NOMBRE: handleFinalDestinationSelection (VERSIÓN CORREGIDA Y DEFINITIVA)
-// ===================================================================
-async function handleFinalDestinationSelection() {
-    const finalDestination = navigationWaypoints.find(wp => wp.type === 'F');
-    const startPoint = navigationWaypoints.find(wp => wp.isRecalculatedStart || wp.type === 'S');
-
-    if (!finalDestination || !startPoint) {
-        showToast("Error: No se pudo determinar el inicio o el fin de la ruta.", "error");        closeModalAndProceed();
-        return;
-    }
-
-    navigationWaypoints = [startPoint, finalDestination];
-    
-    closeModalAndProceed();
-    
-    try {
-        await recalculateAndDrawRoute(true, true);
-        renderWaypointMarkers();
-    } catch (error) {
-        showToast("Error al recalcular la ruta hacia el destino final.", "error");
-    }
-}
-
-// ===================================================================
-// NOMBRE: handleStageSelectionFromDeviationModal (VERSIÓN CORREGIDA Y DEFINITIVA)
-// ===================================================================
-async function handleStageSelectionFromDeviationModal(selectedWaypointId) {
-    const selectedIndex = navigationWaypoints.findIndex(wp => wp.id === selectedWaypointId);
-    const startPoint = navigationWaypoints.find(wp => wp.isRecalculatedStart || wp.type === 'S');
-
-    if (selectedIndex === -1 || !startPoint) {
-        showToast("Error: No se encontró la etapa o el punto de inicio.", "error");        closeModalAndProceed();
-        return;
-    }
-
-    const newWaypoints = [startPoint];
-    for (let i = selectedIndex; i < navigationWaypoints.length; i++) {
-        const wp = navigationWaypoints[i];
-        if (wp && !wp.isInternal && !wp.isRecalculatedStart) {
-            newWaypoints.push(wp);
-        }
-    }
-    
-    navigationWaypoints = newWaypoints;
-    
-    closeModalAndProceed(); 
-    
-    try {
-        await recalculateAndDrawRoute(true, true);
-        renderWaypointMarkers();
-    } catch (error) {
-        showToast("Error al recalcular la ruta hacia la etapa seleccionada.", "error");
-    }
 }
 
 // ===================================================================
@@ -19840,6 +19752,23 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, showToa
             navigationStartTimeForStats = isNavigating ? new Date() : null;
         }
         
+        if (wasSimulatingBeforeRecalc) {
+            console.log("[RECÁLCULO] La simulación estaba activa. Intentando reanudar...");
+            wasSimulatingBeforeRecalc = false; 
+
+            const newRouteLine = turf.lineString(data.routes[0].geometry.coordinates);
+            const carPoint = turf.point([navigationCurrentLocation.longitude, navigationCurrentLocation.latitude]);
+            const nearestPointOnNewLine = turf.nearestPointOnLine(newRouteLine, carPoint, { units: 'meters' });
+
+            simulatedDistanceAlongRoute = nearestPointOnNewLine.properties.location * 1000;
+            
+            console.log(`[RECÁLCULO] Nueva distancia en ruta para reanudar: ${simulatedDistanceAlongRoute.toFixed(2)}m`);
+            
+            setTimeout(() => {
+                startAutomatedRouteSimulation(simulationSpeedKmph, true);
+            }, 500); 
+        }
+
         const newRouteData = data.routes[0];
         updateNavigationProgressDisplay(newRouteData, 0);
         updateTurnByTurnDisplay(newRouteData, 0);
@@ -19879,6 +19808,100 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, showToa
         console.log("[RECÁLCULO] FINALIZADO. Bloqueo liberado.");
     }
 }
+
+// ===================================================================
+// NOMBRE: handleSimulateGpsPositionClick (MODIFICADA - PARA MAPBOX)
+// RESUMEN: Maneja el clic en el mapa durante la simulación GPS manual.
+function handleSimulateGpsPositionClick(e, forceExactPosition = false) {
+    if (!isSimulatingGpsLocation || !navigationMapInstance) return;
+    if (automatedSimulationIntervalId) {
+        stopAutomatedRouteSimulationInternal();
+        showToast("Simulación automática pausada. Forzando desvío...", "info");
+    }
+    let lngLatToUse = [e.lngLat.lng, e.lngLat.lat]; 
+    
+    if (!forceExactPosition && navigationMapInstance.getSource('route') && typeof turf !== 'undefined' && navigationMapInstance.getSource('route')._data) {
+        const routeGeoJSON = navigationMapInstance.getSource('route')._data;
+        if (routeGeoJSON && routeGeoJSON.type === 'Feature' && routeGeoJSON.geometry && routeGeoJSON.geometry.coordinates) {
+            const routeLineString = turf.lineString(routeGeoJSON.geometry.coordinates);
+            const clickPoint = turf.point(lngLatToUse);
+            const nearestPointOnRoute = turf.nearestPointOnLine(routeLineString, clickPoint, { units: 'meters' });
+            
+            if (nearestPointOnRoute && nearestPointOnRoute.properties.dist !== undefined && nearestPointOnRoute.properties.dist < 50) { 
+                lngLatToUse = nearestPointOnRoute.geometry.coordinates;
+            }
+        }
+    }
+
+    simulatedGpsLocation = {
+        latitude: lngLatToUse[1],
+        longitude: lngLatToUse[0],
+        accuracy: 10,
+        heading: navigationCurrentLocation ? navigationCurrentLocation.heading : 0,
+        altitude: navigationCurrentLocation ? navigationCurrentLocation.altitude : 0,
+        speed: 0
+    };
+    processSimulatedGpsPosition(true); 
+    setNavigationMapClickHandler(); 
+}
+    
+
+// ===================================================================
+// NOMBRE: handleFinalDestinationSelection (VERSIÓN CORREGIDA Y DEFINITIVA)
+// ===================================================================
+async function handleFinalDestinationSelection() {
+    const finalDestination = navigationWaypoints.find(wp => wp.type === 'F');
+    const startPoint = navigationWaypoints.find(wp => wp.isRecalculatedStart || wp.type === 'S');
+
+    if (!finalDestination || !startPoint) {
+        showToast("Error: No se pudo determinar el inicio o el fin de la ruta.", "error");        closeModalAndProceed();
+        return;
+    }
+
+    navigationWaypoints = [startPoint, finalDestination];
+    
+    closeModalAndProceed();
+    
+    try {
+        await recalculateAndDrawRoute(true, true);
+        renderWaypointMarkers();
+    } catch (error) {
+        showToast("Error al recalcular la ruta hacia el destino final.", "error");
+    }
+}
+
+// ===================================================================
+// NOMBRE: handleStageSelectionFromDeviationModal (VERSIÓN CORREGIDA Y DEFINITIVA)
+// ===================================================================
+async function handleStageSelectionFromDeviationModal(selectedWaypointId) {
+    const selectedIndex = navigationWaypoints.findIndex(wp => wp.id === selectedWaypointId);
+    const startPoint = navigationWaypoints.find(wp => wp.isRecalculatedStart || wp.type === 'S');
+
+    if (selectedIndex === -1 || !startPoint) {
+        showToast("Error: No se encontró la etapa o el punto de inicio.", "error");        closeModalAndProceed();
+        return;
+    }
+
+    const newWaypoints = [startPoint];
+    for (let i = selectedIndex; i < navigationWaypoints.length; i++) {
+        const wp = navigationWaypoints[i];
+        if (wp && !wp.isInternal && !wp.isRecalculatedStart) {
+            newWaypoints.push(wp);
+        }
+    }
+    
+    navigationWaypoints = newWaypoints;
+    
+    closeModalAndProceed(); 
+    
+    try {
+        await recalculateAndDrawRoute(true, true);
+        renderWaypointMarkers();
+    } catch (error) {
+        showToast("Error al recalcular la ruta hacia la etapa seleccionada.", "error");
+    }
+}
+
 // ===================================================================
 // NOMBRE: clearAlternativeRoutesDisplay (VERSIÓN ROBUSTA Y A PRUEBA DE FALLOS)
 // RESUMEN: Limpia del mapa todas las capas de rutas alternativas y sus etiquetas de forma segura.
