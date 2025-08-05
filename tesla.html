@@ -18727,53 +18727,6 @@ async function fetchRouteData(coordsString, startHeading = null) {
 }  
 
 // ===================================================================
-// NOMBRE: drawRouteOnMap (VERSIÓN FINAL CON CORRECCIÓN DE RACE CONDITION)
-// RESUMEN: Dibuja la ruta, asegurando que el listener para la carga de datos
-//          se establece ANTES de enviar los datos al mapa, evitando falsos timeouts.
-async function drawRouteOnMap(route) {
-    return new Promise((resolve, reject) => {
-        if (!navigationMapInstance || !navigationMapInstance.isStyleLoaded()) {
-            reject(new Error("El mapa no está listo para dibujar."));
-            return;
-        }
-
-        const geojsonData = (route && route.geometry && route.geometry.coordinates.length >= 2) 
-            ? { type: 'Feature', properties: {}, geometry: route.geometry }
-            : { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: [] } };
-
-        const routeSource = navigationMapInstance.getSource('route');
-
-        const timeoutId = setTimeout(() => {
-            navigationMapInstance.off('sourcedata', onSourceData); 
-            reject(new Error("Timeout esperando la confirmación de renderizado del mapa."));
-        }, 7000);
-
-        const onSourceData = (e) => {
-            if (e.sourceId === 'route' && e.isSourceLoaded) {
-                clearTimeout(timeoutId);
-                navigationMapInstance.off('sourcedata', onSourceData);
-                resolve();
-            }
-        };
-        
-        navigationMapInstance.on('sourcedata', onSourceData);
-
-        if (routeSource) {
-            routeSource.setData(geojsonData);
-        } else {
-            navigationMapInstance.addSource('route', { type: 'geojson', data: geojsonData });
-            navigationMapInstance.addLayer({
-                id: 'route',
-                type: 'line',
-                source: 'route',
-                layout: { 'line-join': 'round', 'line-cap': 'round' },
-                paint: getRouteStyleProperties()
-            });
-        }
-        navigationRouteLayer = (geojsonData.geometry.coordinates.length > 0) ? 'route' : null;
-    });
-}
-// ===================================================================
 // NOMBRE: checkReminders (VERSIÓN CON LOG DE DETECCIÓN DE COORDENADAS)
 // ===================================================================
 function checkReminders() {
@@ -18926,202 +18879,6 @@ function checkReminders() {
     });
 }
 // ===================================================================
-// NOMBRE: recalculateAndDrawRoute (VERSIÓN SIN NOTIFICACIÓN DE DESVÍO)
-// RESUMEN: Lógica principal de recálculo, ahora sin mostrar la tostada de notificación al completarse.
-// ===================================================================
-async function recalculateAndDrawRoute(preserveAccumulatedStats = false, showToastOnComplete = false) {
-    if (isRecalculatingRoute) {
-        return;
-    }
-    isRecalculatingRoute = true;
-    
-    const wasNavigatingBeforeRecalc = isNavigating;
-    const recalculateToastId = "recalculating-route-toast";
-    if (showToastOnComplete) {
-       }
-
-    let oldRemainingDistance = 0;
-    let oldRemainingDuration = 0;
-    if (navigationCurrentRouteData?.routes?.[0]) {
-        const route = navigationCurrentRouteData.routes[0];
-        oldRemainingDistance = Math.max(0, route.distance - lastCarDistanceAlongRouteForNavLogic);
-        oldRemainingDuration = route.duration * (oldRemainingDistance / route.distance);
-    }
-
-    try {
-        let freshCoords;
-        if (isSimulatingGpsLocation && simulatedGpsLocation) {
-            freshCoords = simulatedGpsLocation;
-        } else if (navigationCurrentLocation && (Date.now() - lastGpsUpdateTime < 5000)) { 
-            freshCoords = navigationCurrentLocation;
-        } else {
-            freshCoords = await getCurrentLocationAsync();
-        }
-
-        navigationCurrentLocation = { ...navigationCurrentLocation, ...freshCoords };
-        const currentHeading = navigationCurrentLocation.heading;
-
-        let waypointsForAPI = [];
-        if (isNavigating && navigationCurrentLocation) {
-            waypointsForAPI.push({ lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude, isRecalculatedStart: true });
-            const unvisitedWaypoints = navigationWaypoints.filter(wp => !wp.visited);
-            waypointsForAPI.push(...unvisitedWaypoints);
-        } else {
-            waypointsForAPI = [...navigationWaypoints];
-        }
-
-        const validWaypoints = waypointsForAPI.filter(wp => wp && typeof wp.lat === 'number' && typeof wp.lng === 'number');
-
-        if (validWaypoints.length < 2) {
-            throw new Error(`Se necesitan al menos 2 puntos válidos para calcular la ruta. Puntos actuales: ${validWaypoints.length}`);
-        }
-        
-        const coordsString = validWaypoints.map(wp => `${wp.lng},${wp.lat}`).join(';');
-        
-        const result = await fetchRouteData(coordsString, currentHeading);
-      
-        if (result.error) {
-            // --- LÍNEA ELIMINADA ---
-            // Ya no se muestra la tostada de error aquí.
-            throw result.error; 
-        }
-
-        const data = result.routeData;
-        navigationCurrentRouteData = data;
-        
-        await drawRouteOnMap(data.routes[0]);
-        
-        renderWaypointMarkers();
-        await new Promise(resolve => setTimeout(resolve, 50)); 
-
-        if (isNavigating && navigationCurrentLocation) {
-            const viewOptions = {
-                center: [navigationCurrentLocation.longitude, navigationCurrentLocation.latitude],
-                zoom: 17, duration: 1500, essential: true,
-                pitch: navigationMapInstance.getPitch()
-            };
-            if (mapViewMode === 'heading' || mapViewMode === 'perspective') {
-                viewOptions.bearing = navigationCurrentLocation.heading || 0;
-            }
-            navigationMapInstance.easeTo(viewOptions);
-        }
-
-        if (preserveAccumulatedStats && isNavigating) {
-            const newRemainingDistance = data.routes[0].distance;
-            tripInitialDistanceMeters = totalDistanceTravelledForStats + newRemainingDistance;
-            
-            const elapsedSecondsSinceStart = navigationStartTimeForStats ? (Date.now() - navigationStartTimeForStats.getTime()) / 1000 : 0;
-            tripInitialDurationSec = elapsedSecondsSinceStart + data.routes[0].duration;
-            tripInitialOverallEtaTime = new Date(Date.now() + data.routes[0].duration * 1000);
-
-            if(data.routes[0].legs.length > 0) {
-                 currentStageInitialExpectedEtaTime = new Date(Date.now() + data.routes[0].legs[0].duration * 1000);
-            }
-        } else if (!preserveAccumulatedStats) {
-            accumulatedDistanceBeforeCurrentSegment = 0;
-            totalDistanceTravelledForStats = 0;
-            maxDistanceReachedOnRoute = 0;
-            navigationStartTimeForStats = isNavigating ? new Date() : null;
-        }
-        
-        if (wasSimulatingBeforeRecalc) {
-            wasSimulatingBeforeRecalc = false; 
-
-            const newRouteLine = turf.lineString(data.routes[0].geometry.coordinates);
-            const carPoint = turf.point([navigationCurrentLocation.longitude, navigationCurrentLocation.latitude]);
-            const nearestPointOnNewLine = turf.nearestPointOnLine(newRouteLine, carPoint, { units: 'meters' });
-
-            simulatedDistanceAlongRoute = nearestPointOnNewLine.properties.location * 1000;
-            
-            setTimeout(() => {
-                startAutomatedRouteSimulation(simulationSpeedKmph, true);
-            }, 500); 
-        }
-
-        const newRouteData = data.routes[0];
-        updateNavigationProgressDisplay(newRouteData, 0);
-        updateTurnByTurnDisplay(newRouteData, 0);
-        showDestinationName();
-        
-        const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
-        if (radaresRutaCheckbox && radaresRutaCheckbox.checked) { toggleRadaresRuta(true); }
-        const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
-        if (tareasRutaCheckbox && tareasRutaCheckbox.checked) { toggleTareasRuta(true); }
-        
-        updateStartNavigationButtonState();
-        updateNavigationButtonColor();
-        
-      
-    } catch (error) {
-        if (!showToastOnComplete) { 
-            showToast(`Error al calcular ruta: ${error.message}`, "error");
-        }
-        
-        navigationCurrentRouteData = null;
-        updateStartNavigationButtonState(); 
-        updateNavigationButtonColor();
-
-    } finally {
-        isRecalculatingRoute = false;
-        isNavigating = wasNavigatingBeforeRecalc; 
-    }
-}        
-// ===================================================================
-// NOMBRE: handleStageSelectionFromDeviationModal (VERSIÓN CORREGIDA Y DEFINITIVA)
-// ===================================================================
-async function handleStageSelectionFromDeviationModal(selectedWaypointId) {
-    const selectedIndex = navigationWaypoints.findIndex(wp => wp.id === selectedWaypointId);
-    const startPoint = navigationWaypoints.find(wp => wp.isRecalculatedStart || wp.type === 'S');
-
-    if (selectedIndex === -1 || !startPoint) {
-        showToast("Error: No se encontró la etapa o el punto de inicio.", "error");        closeModalAndProceed();
-        return;
-    }
-
-    const newWaypoints = [startPoint];
-    for (let i = selectedIndex; i < navigationWaypoints.length; i++) {
-        const wp = navigationWaypoints[i];
-        if (wp && !wp.isInternal && !wp.isRecalculatedStart) {
-            newWaypoints.push(wp);
-        }
-    }
-    
-    navigationWaypoints = newWaypoints;
-    
-    closeModalAndProceed(); 
-    
-    try {
-        await recalculateAndDrawRoute(true);
-        renderWaypointMarkers();
-    } catch (error) {
-        showToast("Error al recalcular la ruta hacia la etapa seleccionada.", "error");
-    }
-}
-
-// ===================================================================
-// NOMBRE: handleFinalDestinationSelection (VERSIÓN CORREGIDA Y DEFINITIVA)
-// ===================================================================
-async function handleFinalDestinationSelection() {
-    const finalDestination = navigationWaypoints.find(wp => wp.type === 'F');
-    const startPoint = navigationWaypoints.find(wp => wp.isRecalculatedStart || wp.type === 'S');
-
-    if (!finalDestination || !startPoint) {
-        showToast("Error: No se pudo determinar el inicio o el fin de la ruta.", "error");        closeModalAndProceed();
-        return;
-    }
-
-    navigationWaypoints = [startPoint, finalDestination];
-    
-    closeModalAndProceed();
-    
-    try {
-        await recalculateAndDrawRoute(true);
-        renderWaypointMarkers();
-    } catch (error) {
-        showToast("Error al recalcular la ruta hacia el destino final.", "error");
-    }
-}    
-// ===================================================================
 // NOMBRE: clearAlternativeRoutesDisplay (VERSIÓN ROBUSTA Y A PRUEBA DE FALLOS)
 // RESUMEN: Limpia del mapa todas las capas y fuentes de rutas alternativas
 //          inspeccionando el estado actual del mapa, no solo un array global.
@@ -19184,171 +18941,6 @@ function clearAlternativeRoutesDisplay() {
     }
 }
 
-// ===================================================================
-// NOMBRE: showDeviationModal (VERSIÓN CON LOGS DE DEBUG)
-// ===================================================================
-function showDeviationModal() {
-    console.log("[MODAL DESVÍO] Mostrando modal de opciones de desvío...");
-    closeOtherModals('deviation-modal');
-    isDeviationModalActive = true;
-    let modal = document.getElementById('deviation-modal');
-    if (!modal) {
-        modal = document.createElement('div');
-        modal.id = 'deviation-modal';
-        document.body.appendChild(modal);
-    }
-    const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
-    const unvisitedSelectableStages = actualWaypoints.filter(wp => !wp.visited && wp.type !== 'S' && wp.type !== 'S_Recalc' && wp.type !== 'F');
-
-    const iconHtml = `<img src="PNG/APELIGRO.png" alt="Icono de Peligro" style="width: 115px; height: 70px; margin: 0 auto 10px auto; display: block;">`;
-
-    if (unvisitedSelectableStages.length === 0 && actualWaypoints.length <= 2) {
-        console.log("[MODAL DESVÍO] Ruta simple detectada. Mostrando modal simple.");
-        modal.innerHTML = `
-            <style>
-                #deviation-modal {
-                    position: fixed; top: 10px; left: 10px; transform: none; max-width: 480px; width: calc(100% - 20px);
-                    background-color: #E6D6A8; padding: 20px; border-radius: 10px; box-shadow: 0 0 15px rgba(0,0,0,0.5); z-index: 9000; text-align: center;
-                    display: flex;
-                    flex-direction: column;
-                    max-height: 85vh;
-                }
-                #deviation-modal h2 { font-size: 1.5rem; margin-bottom: 10px; color: #333; flex-shrink: 0; }
-                #deviation-modal p { font-size: 1.1rem; line-height: 1.4; margin-bottom: 15px; flex-shrink: 0; font-weight: bold; } /* Texto en negrita */
-                #deviation-modal button { 
-                    padding: 12px 15px; border: none; border-radius: 5px; font-size: 1.1rem; font-weight: bold; cursor: pointer; transition: background-color 0.2s ease;
-                    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-                    flex-shrink: 0;
-                }
-                #deviation-modal #deviation-accept-simple { background-color: #28a745; color: white; }
-            </style>
-            <h2>Desvío Detectado</h2>
-            ${iconHtml}
-            <p id="deviation-modal-message">Se ha detectado un desvío de ruta.</p>
-            <div class="modal-top-buttons" style="justify-content: center;">
-                <button id="deviation-accept-simple">Aceptar <span class="button-countdown-timer"></span></button>
-            </div>
-        `;
-        modal.classList.remove('hidden');
-        const acceptButton = modal.querySelector('#deviation-accept-simple');
-        
-        acceptButton.addEventListener('click', async (e) => {
-            e.stopPropagation();
-            console.log("[MODAL DESVÍO] Aceptado en ruta simple. Llamando a recalculateAndDrawRoute...");
-            closeModalAndProceed();
-            await recalculateAndDrawRoute(true); 
-            // --- CORRECCIÓN: Período de gracia se activa aquí ---
-            deviationCheckGracePeriodUntil = Date.now() + 5000;
-            console.log(`[DESVÍO] Período de gracia activado hasta ${new Date(deviationCheckGracePeriodUntil).toLocaleTimeString()}`);
-        });
-        addModalAutoCloseTimer(modal, acceptButton, 'deviation-modal', 3000);
-        return; 
-    }
-
-    console.log("[MODAL DESVÍO] Ruta multietapa detectada. Mostrando modal completo.");
-    const finalDestination = actualWaypoints[actualWaypoints.length - 1];
-    const stageButtonsHtml = unvisitedSelectableStages.map(wp => {
-        const addressSummary = wp.address ? (wp.address.split(',')[0].trim()) : `Etapa ${wp.label}`;
-        return `<button class="deviation-stage-button" data-waypoint-id="${wp.id}">ETAPA ${wp.label}: ${addressSummary}</button>`;
-    }).join('');
-
-    modal.innerHTML = `
-        <style>
-            #deviation-modal {
-                position: fixed; top: 10px; left: 10px; transform: none; max-width: 480px; width: calc(100% - 20px);
-                background-color: #E6D6A8; padding: 20px; border-radius: 10px; box-shadow: 0 0 15px rgba(0,0,0,0.5); z-index: 9000; text-align: center;
-                display: flex;
-                flex-direction: column;
-                max-height: 85vh;
-            }
-            #deviation-modal h2 { font-size: 1.5rem; margin-bottom: 10px; color: #333; flex-shrink: 0; }
-            #deviation-modal p { font-size: 1rem; line-height: 1.4; margin-bottom: 15px; flex-shrink: 0; font-weight: bold; } /* Texto en negrita */
-            #deviation-modal .deviation-options-container {
-                display: flex;
-                flex-direction: column;
-                flex-grow: 1;
-                overflow: hidden;
-            }
-            #deviation-modal .stage-list-scroll-container {
-                overflow-y: auto;
-                display: flex;
-                flex-direction: column;
-                gap: 10px;
-                padding: 10px;
-                margin: 5px 0;
-                border-top: 2px solid #C0B080;
-                border-bottom: 2px solid #C0B080;
-                background-color: black;
-                border-radius: 6px;
-            }
-            #deviation-modal #scroll-hint-text {
-                font-size: 0.85rem;
-                font-style: italic;
-                color: #555;
-                margin-top: 5px;
-                margin-bottom: -5px;
-                display: none;
-            }
-            #deviation-modal button { 
-                padding: 12px 15px; border: none; border-radius: 5px; font-size: 1.1rem; font-weight: bold; cursor: pointer; transition: background-color 0.2s ease;
-                white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-                flex-shrink: 0;
-            }
-            #deviation-modal #deviation-go-to-final { background-color: #28a745; color: white; margin-bottom: 5px; }
-            #deviation-modal .deviation-stage-button { background-color: #007bff; color: white; }
-            #deviation-modal #deviation-cancel { background-color: #6c757d; color: white; margin-top: 5px; }
-        </style>
-        <h2>Desvío Detectado</h2>
-        ${iconHtml}
-        <p>Elige tu próximo destino. <strong>Nota:</strong> Al seleccionar una etapa, las anteriores se marcarán como visitadas y se omitirán.</p>
-        <div class="deviation-options-container">
-            <button id="deviation-go-to-final">Ir a Destino Final (${finalDestination.address.split(',')[0].trim()})</button>
-            <p id="scroll-hint-text"></p>
-            <div class="stage-list-scroll-container">
-                ${stageButtonsHtml}
-            </div>
-            <button id="deviation-cancel">Cancelar (Seguir Desviado)</button>
-        </div>
-    `;
-    modal.classList.remove('hidden');
-    const scrollContainer = modal.querySelector('.stage-list-scroll-container');
-    const scrollHint = modal.querySelector('#scroll-hint-text');
-    if (scrollContainer && scrollHint) {
-        requestAnimationFrame(() => {
-            if (scrollContainer.scrollHeight > scrollContainer.clientHeight) {
-                const stageCount = scrollContainer.querySelectorAll('.deviation-stage-button').length;
-                scrollHint.textContent = `Hay ${stageCount} etapas sin visitar (deslice para verlas todas y seleccione)`;
-                scrollHint.style.display = 'block';
-            }        });
-    }
-    document.getElementById('deviation-go-to-final').addEventListener('click', async (e) => {
-        e.stopPropagation();
-        console.log("[MODAL DESVÍO] Botón 'Ir a Destino Final' pulsado.");
-        await handleFinalDestinationSelection();
-        // --- CORRECCIÓN: Período de gracia se activa aquí ---
-        deviationCheckGracePeriodUntil = Date.now() + 5000;
-        console.log(`[DESVÍO] Período de gracia activado hasta ${new Date(deviationCheckGracePeriodUntil).toLocaleTimeString()}`);
-    });
-    document.querySelectorAll('.deviation-stage-button').forEach(btn => {
-        btn.addEventListener('click', async (e) => {
-            e.stopPropagation();
-            console.log("[MODAL DESVÍO] Botón de etapa pulsado.");
-            const waypointId = parseInt(e.currentTarget.dataset.waypointId);
-            await handleStageSelectionFromDeviationModal(waypointId);
-            // --- CORRECCIÓN: Período de gracia se activa aquí ---
-            deviationCheckGracePeriodUntil = Date.now() + 5000;
-            console.log(`[DESVÍO] Período de gracia activado hasta ${new Date(deviationCheckGracePeriodUntil).toLocaleTimeString()}`);
-        });
-    });
-    document.getElementById('deviation-cancel').addEventListener('click', (e) => {
-        e.stopPropagation();
-        isDeviationModalActive = false;
-        deviationStartTime = 0;
-        modal.classList.add('hidden');
-        console.log("[MODAL DESVÍO] Cancelado por el usuario.");
-    });
-    addModalAutoCloseTimer(modal, document.getElementById('deviation-go-to-final'), 'deviation-modal', 30000);
-}
 // ===================================================================
 // NOMBRE: handleSimulateGpsPositionClick (MODIFICADA - PARA MAPBOX)
 // RESUMEN: Maneja el clic en el mapa durante la simulación GPS manual.
@@ -19947,12 +19539,16 @@ function startLocateMeReactivationTimer() {
     }, 1000);
 }
 // ===================================================================
-// NOMBRE: handleLocateMeClick (MODIFICADA - NO RENOMBRADA)
-// RESUMEN: Gestiona el clic en los botones "Estás Aquí".
+// NOMBRE: handleLocateMeClick (VERSIÓN FINAL CON RESET DE ESTADO COMPLETO)
+// RESUMEN: Gestiona el clic en los botones "Estás Aquí". Ahora también
+//          resetea la bandera 'isManualZoomActive' para asegurar que las
+//          funciones de zoom automático se reactiven correctamente.
+// ===================================================================
 function handleLocateMeClick(isExplicitAction = false) {
     if (!navigationMapInstance) return;
 
     clearLocateMeReactivationTimer();
+    isManualZoomActive = false;
     
     navigationFollowUser = !navigationFollowUser;
     shouldCenterOnUser = navigationFollowUser;
@@ -19990,6 +19586,7 @@ function handleLocateMeClick(isExplicitAction = false) {
     } else {
         showToast("Seguimiento automático DESACTIVADO.", "info");
         mapPreviousZoomLevel = navigationMapInstance.getZoom();
+        
         if (!isExplicitAction) {
             startLocateMeReactivationTimer();
         }
@@ -19998,7 +19595,6 @@ function handleLocateMeClick(isExplicitAction = false) {
     updateLocateMeButtonsUI();
     updateStartNavigationButtonState();
 }
-
 // ===================================================================
 // NOMBRE: triggerManualMapInteraction (VERSIÓN FINAL CON LÓGICA DE MODOS)
 // RESUMEN: Desactiva temporalmente el seguimiento. Si el modo es 'RUTA', lo cambia a 'OFF'.
@@ -21188,26 +20784,80 @@ async function handleSendToTeslaClick(lat, lng, name) {
         }
     }
 }
+// ===================================================================
+// NOMBRE: clearAllRouteVisualsFromMap (NUEVA FUNCIÓN MAESTRA)
+// RESUMEN: Realiza una limpieza completa y garantizada de TODOS los
+//          elementos visuales de la ruta (marcadores, etiquetas, líneas)
+//          inspeccionando el estado real del mapa, no los arrays.
+// ===================================================================
+function clearAllRouteVisualsFromMap() {
+    if (!navigationMapInstance) return;
+
+    // 1. Eliminar marcadores HTML (Etapas y Etiquetas de Alternativas)
+    // Este método es robusto porque busca los elementos directamente en el DOM del mapa.
+    document.querySelectorAll('.navigation-waypoint-marker').forEach(el => el.remove());
+    document.querySelectorAll('.route-label-marker').forEach(el => el.remove());
+
+    // 2. Eliminar capas y fuentes de Mapbox
+    if (navigationMapInstance.isStyleLoaded()) {
+        const style = navigationMapInstance.getStyle();
+
+        // Eliminar capas (ruta principal y alternativas)
+        if (style && style.layers) {
+            style.layers.forEach(layer => {
+                if (layer.id === 'route' || layer.id.startsWith('alt-layer-')) {
+                    try {
+                        if (navigationMapInstance.getLayer(layer.id)) {
+                            navigationMapInstance.removeLayer(layer.id);
+                        }
+                    } catch (e) {
+                        console.warn(`Error al eliminar capa ${layer.id}: ${e.message}`);
+                    }
+                }
+            });
+        }
+
+        // Eliminar fuentes de datos (ruta principal y alternativas)
+        if (style && style.sources) {
+            Object.keys(style.sources).forEach(sourceId => {
+                if (sourceId === 'route' || sourceId.startsWith('alt-route-')) {
+                    try {
+                        if (navigationMapInstance.getSource(sourceId)) {
+                            navigationMapInstance.removeSource(sourceId);
+                        }
+                    } catch (e) {
+                        console.warn(`Error al eliminar fuente ${sourceId}: ${e.message}`);
+                    }
+                }
+            });
+        }
+    }
+    
+    // 3. Reseteo final de variables de estado de capas
+    navigationRouteLayer = null;
+    alternativeRouteLayers = [];
+}
+
 
 // ===================================================================
-// NOMBRE: resetNavigationState (MODIFICADA - CIERRA MODAL DE INICIO)
+// NOMBRE: resetNavigationState (MODIFICADA - USA LA NUEVA LIMPIEZA MAESTRA)
 // RESUMEN: Reinicia a su estado original TODAS las variables relacionadas
+//          con la navegación, llamando primero a la limpieza visual garantizada.
+// ===================================================================
 function resetNavigationState() {
-    // --- INICIO DE LA MODIFICACIÓN ---
-    // Comprueba si el modal de inicio automático está visible y lo cierra.
+    // --- PASO 1: LIMPIEZA VISUAL COMPLETA Y GARANTIZADA ---
+    clearAllRouteVisualsFromMap();
+
+    // --- PASO 2: LIMPIEZA DEL ESTADO DE LA APLICACIÓN ---
     const autoStartModal = document.getElementById('auto-start-nav-modal');
     if (autoStartModal) {
         hideAutoStartNavigationModal();
         showToast("Inicio automático cancelado: La ruta ha sido modificada/borrada.", "info");
     }
-    // --- FIN DE LA MODIFICACIÓN ---
 
     // Estado de la ruta y navegación
-    clearAllWaypointMarkersFromMap();
- 
     navigationWaypoints = [];
     navigationCurrentRouteData = null;
-    navigationRouteLayer = null;
     isNavigating = false;
     currentRouteNameForSaving = null;
     
@@ -21247,14 +20897,11 @@ function resetNavigationState() {
     hideMapInfoOverlay();
     clearNavigationGraph();
     clearSpeedMarkers();
-    clearAlternativeRoutesDisplay();
-    clearChargingPoints();
     
     // Limpia los contadores visuales
     actualizarContadorRadares(0);
     actualizarContadorTareas(0);
 }
-
 
 // ===================================================================
 // NOMBRE: handleDeleteWaypointClick (MODIFICADA - CIERRA MODAL DE INICIO)
@@ -22150,25 +21797,6 @@ function showDestinationName() {
 }
 
     
-// ===================================================================
-// NOMBRE: closeModalAndProceed (para desvíos)
-// RESUMEN: Cierra el modal de desvío de ruta.
-function closeModalAndProceed() {
-    if (deviationModalTimerId) {
-        clearInterval(deviationModalTimerId);
-        deviationModalTimerId = null;
-    }
-    const modal = document.getElementById('deviation-modal');
-    if (modal) {
-        const anyButton = modal.querySelector('button');
-        if (anyButton) {
-            clearModalAutoCloseTimer(modal, anyButton, 'deviation-modal');
-        }
-        modal.classList.add('hidden');
-    }
-    isDeviationModalActive = false;
-    deviationStartTime = 0;
-}
 
 // ===================================================================
 // NOMBRE: clearModalAutoCloseTimer
@@ -22768,17 +22396,442 @@ async function initializeApp() {
         });
     }
 }
+
+// ===================================================================
+// NOMBRE: showDeviationModal (VERSIÓN FINAL CON LÓGICA DUAL Y TEMPORIZADOR)
+// RESUMEN: Muestra un modal diferente si la ruta es simple o multietapa.
+//          Para rutas multietapa, incluye un temporizador de 10s que
+//          selecciona "Ir a Destino Final" como acción por defecto.
+// ===================================================================
+function showDeviationModal() {
+    if (isDeviationModalActive) return;
+    console.log("[MODAL DESVÍO] Mostrando modal de opciones de desvío...");
+    closeOtherModals('deviation-modal');
+    isDeviationModalActive = true;
+    let modal = document.getElementById('deviation-modal');
+    if (!modal) {
+        modal = document.createElement('div');
+        modal.id = 'deviation-modal';
+        document.body.appendChild(modal);
+    }
+
+    const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
+    const unvisitedSelectableStages = actualWaypoints.filter(wp => !wp.visited && wp.type !== 'S' && wp.type !== 'S_Recalc' && wp.type !== 'F');
+    const iconHtml = `<img src="PNG/APELIGRO.png" alt="Icono de Peligro" style="width: 115px; height: 70px; margin: 0 auto 10px auto; display: block;">`;
+
+    // Lógica dual: Comprobar si hay etapas intermedias sin visitar
+    if (unvisitedSelectableStages.length === 0) {
+        // ESCENARIO 1: RUTA SIMPLE (o solo queda el destino final)
+        console.log("[MODAL DESVÍO] Ruta simple detectada. Mostrando modal informativo y comenzando recálculo automático.");
+        modal.innerHTML = `
+            <style>
+                #deviation-modal h2 { font-size: 1.5rem; margin-bottom: 10px; color: #333; }
+                #deviation-modal p { font-size: 1.1rem; line-height: 1.4; margin-bottom: 15px; font-weight: bold; }
+                #deviation-status-spinner { border: 4px solid rgba(0, 0, 0, 0.1); border-left-color: #28a745; border-radius: 50%; width: 30px; height: 30px; animation: spin 1s linear infinite; margin: 0 auto; }
+                @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+            </style>
+            <h2>Desvío Detectado</h2>
+            ${iconHtml}
+            <p id="deviation-modal-message">Recalculando nueva ruta...</p>
+            <div id="deviation-status-spinner"></div>
+        `;
+        modal.classList.remove('hidden');
+        recalculateAndDrawRoute(true); // Inicia el bucle de recálculo automático
+
+    } else {
+        // ESCENARIO 2: RUTA MULTIETAPA con opciones para el usuario y temporizador
+        console.log("[MODAL DESVÍO] Ruta multietapa detectada. Mostrando modal interactivo con temporizador.");
+        const finalDestination = actualWaypoints[actualWaypoints.length - 1];
+        const stageButtonsHtml = unvisitedSelectableStages.map(wp => {
+            const addressSummary = wp.address ? (wp.address.split(',')[0].trim()) : `Etapa ${wp.label}`;
+            return `<button class="deviation-stage-button" data-waypoint-id="${wp.id}">ETAPA ${wp.label}: ${addressSummary}</button>`;
+        }).join('');
+
+        modal.innerHTML = `
+            <style>
+                 #deviation-modal h2 { font-size: 1.5rem; margin-bottom: 10px; color: #333; flex-shrink: 0; }
+                 #deviation-modal p { font-size: 1rem; line-height: 1.4; margin-bottom: 15px; flex-shrink: 0; font-weight: bold; }
+                 #deviation-modal .deviation-options-container { display: flex; flex-direction: column; flex-grow: 1; overflow: hidden; }
+                 #deviation-modal .stage-list-scroll-container { overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding: 10px; margin: 5px 0; border-top: 2px solid #C0B080; border-bottom: 2px solid #C0B080; background-color: rgba(0,0,0,0.05); border-radius: 6px; }
+                 #deviation-modal #scroll-hint-text { font-size: 0.85rem; font-style: italic; color: #555; margin-top: 5px; margin-bottom: -5px; display: none; }
+                 #deviation-modal button { padding: 12px 15px; border: none; border-radius: 5px; font-size: 1.1rem; font-weight: bold; cursor: pointer; transition: background-color 0.2s ease; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex-shrink: 0; }
+                 #deviation-modal #deviation-go-to-final { background-color: #28a745; color: white; margin-bottom: 5px; }
+                 #deviation-modal .deviation-stage-button { background-color: #007bff; color: white; }
+                 #deviation-modal #deviation-cancel { background-color: #6c757d; color: white; margin-top: 5px; }
+            </style>
+            <h2>Desvío Detectado</h2>
+            ${iconHtml}
+            <p>Elige tu próximo destino o se seleccionará el destino final automáticamente.</p>
+            <div class="deviation-options-container">
+                <button id="deviation-go-to-final">Ir a Destino Final (${finalDestination.address.split(',')[0].trim()}) <span class="button-countdown-timer"></span></button>
+                <p id="scroll-hint-text"></p>
+                <div class="stage-list-scroll-container">
+                    ${stageButtonsHtml}
+                </div>
+                <button id="deviation-cancel">Cancelar (Seguir Desviado)</button>
+            </div>
+        `;
+        modal.classList.remove('hidden');
+
+        const goToFinalButton = document.getElementById('deviation-go-to-final');
+
+        const clearDefaultActionTimer = () => {
+            clearModalAutoCloseTimer(modal, goToFinalButton, 'deviation-modal-default-action');
+        };
+
+        goToFinalButton.addEventListener('click', (e) => {
+            e.stopPropagation();
+            clearDefaultActionTimer();
+            handleFinalDestinationSelection();
+        });
+
+        document.querySelectorAll('.deviation-stage-button').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                clearDefaultActionTimer();
+                const waypointId = parseInt(e.currentTarget.dataset.waypointId);
+                handleStageSelectionFromDeviationModal(waypointId);
+            });
+        });
+
+        document.getElementById('deviation-cancel').addEventListener('click', (e) => {
+            e.stopPropagation();
+            clearDefaultActionTimer();
+            closeModalAndProceed();
+        });
+        
+        // Iniciar el temporizador de 10 segundos como acción por defecto
+        addModalAutoCloseTimer(modal, goToFinalButton, 'deviation-modal-default-action', 10000);
+
+        const scrollContainer = modal.querySelector('.stage-list-scroll-container');
+        const scrollHint = modal.querySelector('#scroll-hint-text');
+        requestAnimationFrame(() => {
+            if (scrollContainer.scrollHeight > scrollContainer.clientHeight) {
+                scrollHint.textContent = `(Deslice para ver las ${unvisitedSelectableStages.length} etapas restantes)`;
+                scrollHint.style.display = 'block';
+            }
+        });
+    }
+}
+
+// ===================================================================
+// NOMBRE: handleFinalDestinationSelection (NUEVA FUNCIÓN)
+// RESUMEN: Maneja la lógica cuando el usuario elige ir al destino final.
+// ===================================================================
+async function handleFinalDestinationSelection() {
+    const finalDestination = navigationWaypoints.find(wp => wp.type === 'F');
+    const startPoint = navigationWaypoints.find(wp => wp.isRecalculatedStart || wp.type === 'S');
+
+    if (!finalDestination || !startPoint) {
+        showToast("Error: No se pudo determinar el inicio o el fin de la ruta.", "error");
+        closeModalAndProceed();
+        return;
+    }
+
+    navigationWaypoints = [startPoint, finalDestination];
+    closeModalAndProceed();
+    
+    try {
+        await recalculateAndDrawRoute(true, true);
+        renderWaypointMarkers();
+        deviationCheckGracePeriodUntil = Date.now() + 5000;
+    } catch (error) {
+        showToast("Error al recalcular la ruta hacia el destino final.", "error");
+    }
+}
+
+// ===================================================================
+// NOMBRE: handleStageSelectionFromDeviationModal (NUEVA FUNCIÓN)
+// RESUMEN: Maneja la lógica cuando el usuario elige una etapa intermedia.
+// ===================================================================
+async function handleStageSelectionFromDeviationModal(selectedWaypointId) {
+    const selectedIndex = navigationWaypoints.findIndex(wp => wp.id === selectedWaypointId);
+    const startPoint = navigationWaypoints.find(wp => wp.isRecalculatedStart || wp.type === 'S');
+
+    if (selectedIndex === -1 || !startPoint) {
+        showToast("Error: No se encontró la etapa o el punto de inicio.", "error");
+        closeModalAndProceed();
+        return;
+    }
+
+    const newWaypoints = [startPoint];
+    for (let i = selectedIndex; i < navigationWaypoints.length; i++) {
+        const wp = navigationWaypoints[i];
+        if (wp && !wp.isInternal && !wp.isRecalculatedStart) {
+            newWaypoints.push(wp);
+        }
+    }
+    
+    navigationWaypoints = newWaypoints;
+    closeModalAndProceed();
+    
+    try {
+        await recalculateAndDrawRoute(true, true);
+        renderWaypointMarkers();
+        deviationCheckGracePeriodUntil = Date.now() + 5000;
+    } catch (error) {
+        showToast("Error al recalcular la ruta hacia la etapa seleccionada.", "error");
+    }
+}
+// ===================================================================
+// NOMBRE: recalculateAndDrawRoute (VERSIÓN DEFINITIVA CON GESTIÓN DE ESTADO ATÓMICA)
+// RESUMEN: Lógica de recálculo final que garantiza que todas las variables
+//          de estado del ETA se actualicen de forma atómica y fiable tras un
+//          cálculo de ruta exitoso, eliminando el error intermitente.
+// ===================================================================
+async function recalculateAndDrawRoute(preserveAccumulatedStats = false, isUserAction = false) {
+    const RETRY_CADENCE_MS = 3000;
+    let attempt = 1;
+    const shouldLoop = !isUserAction;
+
+    while (isDeviationModalActive || attempt === 1) {
+        if (!isDeviationModalActive && attempt > 1) break;
+        
+        console.log(`[RECALC] Intento #${attempt} de recálculo...`);
+        isRecalculatingRoute = true;
+        const wasNavigatingBeforeRecalc = isNavigating;
+
+        try {
+            // 1. PREPARACIÓN DE DATOS
+            const completedDistance = preserveAccumulatedStats ? totalDistanceTravelledForStats : 0;
+
+            let waypointsForAPI = [];
+            let currentHeading = null;
+            if (isNavigating && navigationCurrentLocation) {
+                let freshCoords = (isSimulatingGpsLocation && simulatedGpsLocation) ? simulatedGpsLocation : await getCurrentLocationAsync();
+                navigationCurrentLocation = freshCoords;
+                currentHeading = navigationCurrentLocation.heading;
+                waypointsForAPI.push({ lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude, isRecalculatedStart: true });
+                waypointsForAPI.push(...navigationWaypoints.filter(wp => !wp.visited));
+            } else {
+                waypointsForAPI = navigationCurrentLocation 
+                    ? [{ lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude, isRecalculatedStart: true }, ...navigationWaypoints] 
+                    : [...navigationWaypoints];
+                if (navigationCurrentLocation) currentHeading = navigationCurrentLocation.heading;
+            }
+            
+            const validWaypoints = waypointsForAPI.filter(wp => wp && typeof wp.lat === 'number' && typeof wp.lng === 'number');
+            if (validWaypoints.length < 2) { isRecalculatingRoute = false; return; };
+
+            const coordsString = validWaypoints.map(wp => `${wp.lng},${wp.lat}`).join(';');
+            
+            // 2. CÁLCULO DE LA NUEVA RUTA
+            const result = await fetchRouteData(coordsString, currentHeading);
+            if (result.error) throw result.error;
+
+            const newRouteData = result.routeData;
+            const newRemainingRoute = newRouteData.routes[0];
+
+            // 3. PINTADO SEGURO DE LA NUEVA RUTA
+            await drawRouteOnMap(newRemainingRoute);
+            
+            // 4. ACTUALIZACIÓN ATÓMICA DEL ESTADO Y LA UI
+            navigationCurrentRouteData = newRouteData;
+            
+            if (preserveAccumulatedStats) {
+                // Se actualiza la distancia acumulada para la barra de progreso.
+                accumulatedDistanceBeforeCurrentSegment = completedDistance;
+            }
+
+            // <<< INICIO DE LA CORRECCIÓN DEFINITIVA >>>
+            // Se resetean y recalculan las horas de llegada esperadas CON LOS DATOS DE LA NUEVA RUTA.
+            // Esto es lo que fallaba de forma intermitente. Ahora se garantiza en cada recálculo exitoso.
+            tripInitialOverallEtaTime = new Date(Date.now() + newRemainingRoute.duration * 1000);
+            if (newRemainingRoute.legs && newRemainingRoute.legs.length > 0) {
+                currentStageInitialExpectedEtaTime = new Date(Date.now() + newRemainingRoute.legs[0].duration * 1000);
+            } else {
+                currentStageInitialExpectedEtaTime = null;
+            }
+            // <<< FIN DE LA CORRECCIÓN DEFINITIVA >>>
+
+            // Ahora que el estado es consistente, actualizamos la UI.
+            renderWaypointMarkers();
+            updateNavigationProgressDisplay(newRemainingRoute, 0); // La UI ahora usará las referencias ETA recién actualizadas
+            updateTurnByTurnDisplay(newRemainingRoute, 0);
+            showDestinationName();
+            toggleRadaresRuta(document.getElementById('radares-ruta-checkbox').checked);
+            toggleTareasRuta(document.getElementById('tareas-ruta-checkbox').checked);
+            updateStartNavigationButtonState();
+            updateNavigationButtonColor();
+
+            showToast("¡Ruta recalculada con éxito!", "success");
+            closeModalAndProceed();
+            break; // Salir del bucle
+
+        } catch (error) {
+            console.error(`[RECALC] Fallo en intento #${attempt}:`, error);
+            if (!shouldLoop) {
+                showToast(`Error al calcular ruta: ${error.message}`, "error");
+                break;
+            }
+            await new Promise(resolve => setTimeout(resolve, RETRY_CADENCE_MS));
+        } finally {
+            isRecalculatingRoute = false;
+            isNavigating = wasNavigatingBeforeRecalc;
+            attempt++;
+            if (!isDeviationModalActive) break;
+        }
+    }
+    console.log("[RECALC] Bucle de recálculo finalizado.");
+}
+// ===================================================================
+// NOMBRE: closeModalAndProceed (Sin cambios, pero su rol es clave)
+// RESUMEN: Cierra el modal de desvío y detiene el bucle de recálculo.
+// ===================================================================
+function closeModalAndProceed() {
+    isDeviationModalActive = false;
+    deviationStartTime = 0;
+    const modal = document.getElementById('deviation-modal');
+    if (modal) {
+        modal.classList.add('hidden');
+    }
+
+    if (wasSimulatingBeforeRecalc) {
+        wasSimulatingBeforeRecalc = false; // Se resetea la bandera
+
+        simulatedDistanceAlongRoute = 0; // Resetear el progreso para la nueva ruta.
+   
+        showToast("Desvío recalculado. Reanudando simulación...", "info");
+        setTimeout(() => {
+            startAutomatedRouteSimulation(currentSimulationSpeedKmph, true); 
+        }, 100);
+    }
+}    
+// ===================================================================
+// NOMBRE: handleLocateMeClick (VERSIÓN FINAL CON RESET DE ESTADO COMPLETO)
+// RESUMEN: Gestiona el clic en los botones "Estás Aquí". Ahora también
+//          resetea la bandera 'isManualZoomActive' para asegurar que las
+//          funciones de zoom automático se reactiven correctamente.
+// ===================================================================
+function handleLocateMeClick(isExplicitAction = false) {
+    if (!navigationMapInstance) return;
+
+    // <<< CORRECCIÓN APLICADA: Limpiar todos los temporizadores y banderas de anulación ANTES de hacer nada más. >>>
+    clearLocateMeReactivationTimer();
+    isManualZoomActive = false;
+    
+    navigationFollowUser = !navigationFollowUser;
+    shouldCenterOnUser = navigationFollowUser;
+
+    if (navigationFollowUser) {
+        showToast("Seguimiento automático ACTIVADO.", "info");
+
+        if (navigationCurrentLocation) {
+            const viewOptions = {
+                center: [navigationCurrentLocation.longitude, navigationCurrentLocation.latitude],
+                zoom: mapPreviousZoomLevel || 17,
+                essential: true
+            };
+            mapPreviousZoomLevel = null;
+
+            const mode = mapViewMode || 'static';
+            if(mode === 'heading' || mode === 'perspective') {
+                viewOptions.bearing = navigationCurrentLocation.heading || 0;
+            }
+            if(mode === 'perspective') {
+                viewOptions.pitch = mapPitchValue;
+            } else {
+                viewOptions.pitch = 0;
+            }
+            navigationMapInstance.flyTo(viewOptions);
+
+        } else {
+            // Si no hay ubicación, la pedimos y centramos el mapa.
+            getCurrentLocation(coords => {
+                if (navigationMapInstance) {
+                     navigationMapInstance.flyTo({ center: [coords.longitude, coords.latitude], zoom: 17 });
+                }
+                updateInitialUserPosition(coords, navigationMapInstance);
+            }, () => showToast("No se pudo obtener tu ubicación.", "warning"));
+        }
+    } else {
+        // Se desactiva el seguimiento.
+        showToast("Seguimiento automático DESACTIVADO.", "info");
+        mapPreviousZoomLevel = navigationMapInstance.getZoom();
+        
+        // El temporizador solo se activa si la desactivación es por una acción del usuario en el mapa,
+        // no por un clic explícito en el botón. La función que lo llama (`handleManualMapInteraction`)
+        // se encargará de iniciar el temporizador.
+        if (!isExplicitAction) {
+            startLocateMeReactivationTimer();
+        }
+    }
+    
+    updateLocateMeButtonsUI();
+    updateStartNavigationButtonState();
+}
+// ===================================================================
+// NOMBRE: drawRouteOnMap (REESCRITA - IMPLEMENTA EL SWAP SEGURO)
+// RESUMEN: Encapsula la lógica completa de pintado: destruye la ruta antigua
+//          y crea la nueva, todo dentro de una promesa segura.
+// ===================================================================
+async function drawRouteOnMap(route) {
+    return new Promise((resolve, reject) => {
+        if (!navigationMapInstance || !navigationMapInstance.isStyleLoaded()) {
+            return reject(new Error("El mapa no está listo para dibujar."));
+        }
+
+        const geojsonData = (route && route.geometry && route.geometry.coordinates.length >= 2) 
+            ? { type: 'Feature', properties: {}, geometry: route.geometry }
+            : { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: [] } };
+
+        const cleanupAndReject = (message) => {
+            clearTimeout(timeoutId);
+            navigationMapInstance.off('sourcedata', onSourceData);
+            reject(new Error(message));
+        };
+        
+        const timeoutId = setTimeout(() => {
+            cleanupAndReject("Timeout esperando la confirmación de renderizado del mapa.");
+        }, 7000);
+
+        const onSourceData = (e) => {
+            if (e.sourceId === 'route' && e.isSourceLoaded) {
+                clearTimeout(timeoutId);
+                navigationMapInstance.off('sourcedata', onSourceData);
+                resolve();
+            }
+        };
+        
+        navigationMapInstance.on('sourcedata', onSourceData);
+
+        try {
+            // --- INICIO DEL PROCESO DE SWAP SEGURO ---
+            // 1. Destruir la capa y fuente antiguas si existen
+            if (navigationMapInstance.getLayer('route')) {
+                navigationMapInstance.removeLayer('route');
+            }
+            if (navigationMapInstance.getSource('route')) {
+                navigationMapInstance.removeSource('route');
+            }
+
+            // 2. Añadir la nueva fuente y capa con el nombre permanente 'route'
+            navigationMapInstance.addSource('route', { type: 'geojson', data: geojsonData });
+            navigationMapInstance.addLayer({
+                id: 'route',
+                type: 'line',
+                source: 'route',
+                layout: { 'line-join': 'round', 'line-cap': 'round' },
+                paint: getRouteStyleProperties()
+            });
+            // --- FIN DEL PROCESO DE SWAP ---
+        } catch (error) {
+            cleanupAndReject(`Error al añadir capa/fuente: ${error.message}`);
+        }
+    });
+}
+
+
+    
 // ===================================================================
 // NOMBRE: preflightSync (NUEVA FUNCIÓN)
 // RESUMEN: Se ejecuta ANTES de que se cargue la app. Comprueba si hay datos más nuevos en la nube
 async function preflightSync() {
-    console.log("Preflight Sync: STARTING check.");
     const autoSyncEnabled = JSON.parse(localStorage.getItem('boardinggate_autoBackupOnLoad') || 'false');
     const { primaryId, isMobile } = parseUserId(localStorage.getItem('userData_userId'));
     const backupPassword = localStorage.getItem('userData_backupPassword');
 
     if (!autoSyncEnabled || !primaryId || isMobile || !backupPassword) {
-        console.log("Preflight Sync: SKIPPED (not enabled, no user, or mobile).");
         return;
     }
 
@@ -22792,7 +22845,6 @@ async function preflightSync() {
             if (cloudTimestamp > localTimestamp + 10000) { // 10s de margen
                 const backupCacheData = result.data.contenidoCacheCompleto;
                 if (backupCacheData) {
-                    console.log("Preflight Sync: Cloud data is newer. Updating local storage BEFORE rendering.");
                     showToast('Sincronizando datos desde la nube...', 'info', 3000);
 
                     const currentUserIdentity = localStorage.getItem('userData_userId') || primaryId;
@@ -22806,19 +22858,14 @@ async function preflightSync() {
                     }
                     localStorage.setItem('lastCacheUpdateTimestamp', Date.now().toString());
                 } else {
-                     console.warn("Preflight Sync: Cloud data is newer but cache is empty/corrupt.");
-                }
+                 }
             } else {
-                 console.log("Preflight Sync: Local data is up-to-date or newer.");
-            }
+                 }
         } else {
-             console.log("Preflight Sync: No backup found or error retrieving data for user:", primaryId);
-        }
+             }
     } catch (error) {
-        console.error("Preflight Sync: An error occurred.", error);
-    }
-    console.log("Preflight Sync: FINISHED check.");
-}
+        }
+   }
 
 // ===================================================================
 // NOMBRE: uploadDirtyCacheOnLoad_Car (MODIFICADA)
@@ -22853,7 +22900,6 @@ async function uploadDirtyCacheOnLoad_Car() {
 // NOMBRE: autoSaveFromMobile
 // RESUMEN: Realiza un guardado automático en Firebase, llamado por checkReminders para usuarios móviles.
 async function autoSaveFromMobile(primaryId, backupPassword) {
-    showToast(`Sincronizando cambios con "${primaryId}"...`, 'info', 0, false, 'mobile-autosave');
     const cacheData = {};
     managedKeys.forEach(key => {
         const value = localStorage.getItem(key);
