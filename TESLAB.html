@@ -1,4 +1,4 @@
-DEO1
+DEO2
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -22597,57 +22597,87 @@ async function drawRouteOnMap(route) {
         }
     });
 }
-
-// ===================================================================
-// NOMBRE: recalculateAndDrawRoute (MODIFICADA - BUCLE DE REINTENTO)
-// RESUMEN: Bucle principal que reintenta el cálculo y pintado hasta tener éxito.
-//          Ahora también se llama desde las acciones del usuario en el modal multietapa.
+// = a================================================================
+// NOMBRE: recalculateAndDrawRoute (VERSIÓN FINAL CORREGIDA ANTI-TYPEERROR)
+// RESUMEN: Lógica de recálculo robusta. Ahora gestiona correctamente
+//          la creación de la ruta tanto si el GPS está disponible como si no,
+//          eliminando la causa del TypeError.
 // ===================================================================
 async function recalculateAndDrawRoute(preserveAccumulatedStats = false, isUserAction = false) {
-    const RETRY_CADENCE_MS = 7000;
+    const RETRY_CADENCE_MS = 3000;
     let attempt = 1;
-
-    // Si es una acción del usuario, solo se ejecuta una vez.
-    // Si no, se ejecuta en bucle mientras el modal informativo esté activo.
     const shouldLoop = !isUserAction;
 
     while (isDeviationModalActive || attempt === 1) {
+        if (!isDeviationModalActive && attempt > 1) break; // Si no es un bucle, solo se ejecuta una vez.
+        
         console.log(`[RECALC] Intento #${attempt} de recálculo...`);
         isRecalculatingRoute = true;
         const wasNavigatingBeforeRecalc = isNavigating;
 
         try {
-            let freshCoords = (isSimulatingGpsLocation && simulatedGpsLocation) ? simulatedGpsLocation : await getCurrentLocationAsync();
-            navigationCurrentLocation = { ...navigationCurrentLocation, ...freshCoords };
-            
-            let waypointsForAPI = [{ lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude, isRecalculatedStart: true }];
-            waypointsForAPI.push(...navigationWaypoints.filter(wp => !wp.visited));
+            let waypointsForAPI = [];
+            let currentHeading = null;
+
+            // --- INICIO DE LA LÓGICA CORREGIDA Y ROBUSTA ---
+            if (isNavigating) {
+                // Modo navegación: El inicio SIEMPRE es la posición GPS actual.
+                // Es seguro asumir que navigationCurrentLocation existe porque isNavigating no puede ser true sin él.
+                let freshCoords = (isSimulatingGpsLocation && simulatedGpsLocation) ? simulatedGpsLocation : await getCurrentLocationAsync();
+                navigationCurrentLocation = freshCoords; // Asignación directa y segura.
+                currentHeading = navigationCurrentLocation.heading;
+                waypointsForAPI.push({ lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude, isRecalculatedStart: true });
+                waypointsForAPI.push(...navigationWaypoints.filter(wp => !wp.visited));
+            } else {
+                // Modo planificación: El inicio es el GPS si está disponible, si no, es el primer punto de la lista.
+                if (navigationCurrentLocation) {
+                    currentHeading = navigationCurrentLocation.heading;
+                    // El GPS existe, se añade como primer punto.
+                    waypointsForAPI.push({ lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude, isRecalculatedStart: true });
+                    waypointsForAPI.push(...navigationWaypoints);
+                } else {
+                    // No hay GPS aún, la ruta se calcula usando solo los puntos que el usuario ha añadido.
+                    waypointsForAPI = [...navigationWaypoints];
+                }
+            }
+            // --- FIN DE LA LÓGICA CORREGIDA ---
             
             const validWaypoints = waypointsForAPI.filter(wp => wp && typeof wp.lat === 'number' && typeof wp.lng === 'number');
-            if (validWaypoints.length < 2) throw new Error("Puntos insuficientes para recalcular.");
+            if (validWaypoints.length < 2) {
+                // Esta condición ahora previene el error si el usuario solo ha añadido un punto y aún no hay GPS.
+                // No es un error, simplemente no hay ruta que calcular todavía.
+                isRecalculatingRoute = false;
+                return;
+            };
 
             const coordsString = validWaypoints.map(wp => `${wp.lng},${wp.lat}`).join(';');
             
-            const result = await fetchRouteData(coordsString, navigationCurrentLocation.heading);
+            const result = await fetchRouteData(coordsString, currentHeading);
             if (result.error) throw result.error;
 
             const newRouteData = result.routeData;
             const { sourceId: newSourceId, layerId: newLayerId } = await drawRouteOnMap(newRouteData.routes[0]);
             
-            // --- Intercambio Atómico ---
-            if (navigationMapInstance.getLayer('route')) {
-                navigationMapInstance.removeLayer('route');
-            }
-            if (navigationMapInstance.getSource('route')) {
-                navigationMapInstance.removeSource('route');
-            }
+            // Intercambio Atómico
+            if (navigationMapInstance.getLayer('route')) navigationMapInstance.removeLayer('route');
+            if (navigationMapInstance.getSource('route')) navigationMapInstance.removeSource('route');
             navigationMapInstance.renameLayer(newLayerId, 'route');
             navigationMapInstance.removeSource(newSourceId);
             navigationMapInstance.setPaintProperty('route', 'line-opacity', getRouteStyleProperties()['line-opacity']);
             
             navigationCurrentRouteData = newRouteData;
             
-            if (preserveAccumulatedStats) { /* ... Lógica de preservación de estadísticas ... */ }
+            if (preserveAccumulatedStats) {
+                const newRemainingDistance = newRouteData.routes[0].distance;
+                tripInitialDistanceMeters = totalDistanceTravelledForStats + newRemainingDistance;
+                const elapsedSecondsSinceStart = navigationStartTimeForStats ? (Date.now() - navigationStartTimeForStats.getTime()) / 1000 : 0;
+                tripInitialDurationSec = elapsedSecondsSinceStart + newRouteData.routes[0].duration;
+                tripInitialOverallEtaTime = new Date(Date.now() + newRouteData.routes[0].duration * 1000);
+                if(newRouteData.routes[0].legs.length > 0) {
+                     currentStageInitialExpectedEtaTime = new Date(Date.now() + newRouteData.routes[0].legs[0].duration * 1000);
+                }
+            }
+            
             updateNavigationProgressDisplay(newRouteData.routes[0], 0);
             updateTurnByTurnDisplay(newRouteData.routes[0], 0);
             showDestinationName();
@@ -22656,24 +22686,22 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, isUserA
             updateStartNavigationButtonState();
             updateNavigationButtonColor();
 
-            showToast("¡Ruta recalculada con éxito!", "success");
-            closeModalAndProceed(); // Detiene el bucle (si estaba activo)
-            break; // Salir del bucle en caso de éxito
+            showToast("¡Ruta calculada con éxito!", "success");
+            closeModalAndProceed();
+            break;
 
         } catch (error) {
             console.error(`[RECALC] Fallo en intento #${attempt}:`, error);
             if (!shouldLoop) {
-                // Si es una acción de usuario y falla, mostramos el error y salimos.
-                showToast(`Error al recalcular ruta: ${error.message}`, "error");
+                showToast(`Error al calcular ruta: ${error.message}`, "error");
                 break;
             }
-            // Si es el modo automático, esperamos para reintentar.
             await new Promise(resolve => setTimeout(resolve, RETRY_CADENCE_MS));
         } finally {
             isRecalculatingRoute = false;
             isNavigating = wasNavigatingBeforeRecalc;
             attempt++;
-            if (!isDeviationModalActive) break; // Salir si el modal se cerró
+            if (!isDeviationModalActive) break;
         }
     }
     console.log("[RECALC] Bucle de recálculo finalizado.");
