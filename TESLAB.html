@@ -1,4 +1,4 @@
-DEO5
+DEO6
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -22575,7 +22575,107 @@ async function handleStageSelectionFromDeviationModal(selectedWaypointId) {
         showToast("Error al recalcular la ruta hacia la etapa seleccionada.", "error");
     }
 }
+// ===================================================================
+// NOMBRE: recalculateAndDrawRoute (VERSIÓN DEFINITIVA CON GESTIÓN DE ESTADO ATÓMICA)
+// RESUMEN: Lógica de recálculo final que garantiza que todas las variables
+//          de estado del ETA se actualicen de forma atómica y fiable tras un
+//          cálculo de ruta exitoso, eliminando el error intermitente.
+// ===================================================================
+async function recalculateAndDrawRoute(preserveAccumulatedStats = false, isUserAction = false) {
+    const RETRY_CADENCE_MS = 3000;
+    let attempt = 1;
+    const shouldLoop = !isUserAction;
 
+    while (isDeviationModalActive || attempt === 1) {
+        if (!isDeviationModalActive && attempt > 1) break;
+        
+        console.log(`[RECALC] Intento #${attempt} de recálculo...`);
+        isRecalculatingRoute = true;
+        const wasNavigatingBeforeRecalc = isNavigating;
+
+        try {
+            // 1. PREPARACIÓN DE DATOS
+            const completedDistance = preserveAccumulatedStats ? totalDistanceTravelledForStats : 0;
+
+            let waypointsForAPI = [];
+            let currentHeading = null;
+            if (isNavigating && navigationCurrentLocation) {
+                let freshCoords = (isSimulatingGpsLocation && simulatedGpsLocation) ? simulatedGpsLocation : await getCurrentLocationAsync();
+                navigationCurrentLocation = freshCoords;
+                currentHeading = navigationCurrentLocation.heading;
+                waypointsForAPI.push({ lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude, isRecalculatedStart: true });
+                waypointsForAPI.push(...navigationWaypoints.filter(wp => !wp.visited));
+            } else {
+                waypointsForAPI = navigationCurrentLocation 
+                    ? [{ lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude, isRecalculatedStart: true }, ...navigationWaypoints] 
+                    : [...navigationWaypoints];
+                if (navigationCurrentLocation) currentHeading = navigationCurrentLocation.heading;
+            }
+            
+            const validWaypoints = waypointsForAPI.filter(wp => wp && typeof wp.lat === 'number' && typeof wp.lng === 'number');
+            if (validWaypoints.length < 2) { isRecalculatingRoute = false; return; };
+
+            const coordsString = validWaypoints.map(wp => `${wp.lng},${wp.lat}`).join(';');
+            
+            // 2. CÁLCULO DE LA NUEVA RUTA
+            const result = await fetchRouteData(coordsString, currentHeading);
+            if (result.error) throw result.error;
+
+            const newRouteData = result.routeData;
+            const newRemainingRoute = newRouteData.routes[0];
+
+            // 3. PINTADO SEGURO DE LA NUEVA RUTA
+            await drawRouteOnMap(newRemainingRoute);
+            
+            // 4. ACTUALIZACIÓN ATÓMICA DEL ESTADO Y LA UI
+            navigationCurrentRouteData = newRouteData;
+            
+            if (preserveAccumulatedStats) {
+                // Se actualiza la distancia acumulada para la barra de progreso.
+                accumulatedDistanceBeforeCurrentSegment = completedDistance;
+            }
+
+            // <<< INICIO DE LA CORRECCIÓN DEFINITIVA >>>
+            // Se resetean y recalculan las horas de llegada esperadas CON LOS DATOS DE LA NUEVA RUTA.
+            // Esto es lo que fallaba de forma intermitente. Ahora se garantiza en cada recálculo exitoso.
+            tripInitialOverallEtaTime = new Date(Date.now() + newRemainingRoute.duration * 1000);
+            if (newRemainingRoute.legs && newRemainingRoute.legs.length > 0) {
+                currentStageInitialExpectedEtaTime = new Date(Date.now() + newRemainingRoute.legs[0].duration * 1000);
+            } else {
+                currentStageInitialExpectedEtaTime = null;
+            }
+            // <<< FIN DE LA CORRECCIÓN DEFINITIVA >>>
+
+            // Ahora que el estado es consistente, actualizamos la UI.
+            renderWaypointMarkers();
+            updateNavigationProgressDisplay(newRemainingRoute, 0); // La UI ahora usará las referencias ETA recién actualizadas
+            updateTurnByTurnDisplay(newRemainingRoute, 0);
+            showDestinationName();
+            toggleRadaresRuta(document.getElementById('radares-ruta-checkbox').checked);
+            toggleTareasRuta(document.getElementById('tareas-ruta-checkbox').checked);
+            updateStartNavigationButtonState();
+            updateNavigationButtonColor();
+
+            showToast("¡Ruta recalculada con éxito!", "success");
+            closeModalAndProceed();
+            break; // Salir del bucle
+
+        } catch (error) {
+            console.error(`[RECALC] Fallo en intento #${attempt}:`, error);
+            if (!shouldLoop) {
+                showToast(`Error al calcular ruta: ${error.message}`, "error");
+                break;
+            }
+            await new Promise(resolve => setTimeout(resolve, RETRY_CADENCE_MS));
+        } finally {
+            isRecalculatingRoute = false;
+            isNavigating = wasNavigatingBeforeRecalc;
+            attempt++;
+            if (!isDeviationModalActive) break;
+        }
+    }
+    console.log("[RECALC] Bucle de recálculo finalizado.");
+}
 // ===================================================================
 // NOMBRE: closeModalAndProceed (Sin cambios, pero su rol es clave)
 // RESUMEN: Cierra el modal de desvío y detiene el bucle de recálculo.
@@ -22594,102 +22694,68 @@ function closeModalAndProceed() {
     }
 }
 // ===================================================================
-// NOMBRE: recalculateAndDrawRoute (VERSIÓN SIMPLIFICADA Y CORRECTA)
-// RESUMEN: Llama a fetchRouteData para obtener la ruta y, si tiene éxito,
-//          delega toda la lógica de pintado y swapping a drawRouteOnMap.
+// NOMBRE: handleLocateMeClick (VERSIÓN FINAL CON RESET DE ESTADO COMPLETO)
+// RESUMEN: Gestiona el clic en los botones "Estás Aquí". Ahora también
+//          resetea la bandera 'isManualZoomActive' para asegurar que las
+//          funciones de zoom automático se reactiven correctamente.
 // ===================================================================
-async function recalculateAndDrawRoute(preserveAccumulatedStats = false, isUserAction = false) {
-    const RETRY_CADENCE_MS = 3000;
-    let attempt = 1;
-    const shouldLoop = !isUserAction;
+function handleLocateMeClick(isExplicitAction = false) {
+    if (!navigationMapInstance) return;
 
-    while (isDeviationModalActive || attempt === 1) {
-        if (!isDeviationModalActive && attempt > 1) break;
-        
-        console.log(`[RECALC] Intento #${attempt} de recálculo...`);
-        isRecalculatingRoute = true;
-        const wasNavigatingBeforeRecalc = isNavigating;
+    // <<< CORRECCIÓN APLICADA: Limpiar todos los temporizadores y banderas de anulación ANTES de hacer nada más. >>>
+    clearLocateMeReactivationTimer();
+    isManualZoomActive = false;
+    
+    navigationFollowUser = !navigationFollowUser;
+    shouldCenterOnUser = navigationFollowUser;
 
-        try {
-            let waypointsForAPI = [];
-            let currentHeading = null;
+    if (navigationFollowUser) {
+        showToast("Seguimiento automático ACTIVADO.", "info");
 
-            if (isNavigating && navigationCurrentLocation) {
-                let freshCoords = (isSimulatingGpsLocation && simulatedGpsLocation) ? simulatedGpsLocation : await getCurrentLocationAsync();
-                navigationCurrentLocation = freshCoords;
-                currentHeading = navigationCurrentLocation.heading;
-                waypointsForAPI.push({ lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude, isRecalculatedStart: true });
-                waypointsForAPI.push(...navigationWaypoints.filter(wp => !wp.visited));
-            } else {
-                if (navigationCurrentLocation) {
-                    currentHeading = navigationCurrentLocation.heading;
-                    waypointsForAPI.push({ lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude, isRecalculatedStart: true });
-                    waypointsForAPI.push(...navigationWaypoints);
-                } else {
-                    waypointsForAPI = [...navigationWaypoints];
-                }
-            }
-            
-            const validWaypoints = waypointsForAPI.filter(wp => wp && typeof wp.lat === 'number' && typeof wp.lng === 'number');
-            if (validWaypoints.length < 2) {
-                isRecalculatingRoute = false;
-                return;
+        if (navigationCurrentLocation) {
+            const viewOptions = {
+                center: [navigationCurrentLocation.longitude, navigationCurrentLocation.latitude],
+                zoom: mapPreviousZoomLevel || 17,
+                essential: true
             };
+            mapPreviousZoomLevel = null;
 
-            const coordsString = validWaypoints.map(wp => `${wp.lng},${wp.lat}`).join(';');
-            
-            const result = await fetchRouteData(coordsString, currentHeading);
-            if (result.error) throw result.error;
+            const mode = mapViewMode || 'static';
+            if(mode === 'heading' || mode === 'perspective') {
+                viewOptions.bearing = navigationCurrentLocation.heading || 0;
+            }
+            if(mode === 'perspective') {
+                viewOptions.pitch = mapPitchValue;
+            } else {
+                viewOptions.pitch = 0;
+            }
+            navigationMapInstance.flyTo(viewOptions);
 
-            const newRouteData = result.routeData;
-
-            // --- LLAMADA A LA NUEVA Y ROBUSTA FUNCIÓN DE PINTADO ---
-            await drawRouteOnMap(newRouteData.routes[0]);
-            
-            // Si el pintado tiene éxito, actualizamos el estado y la UI
-            navigationCurrentRouteData = newRouteData;
-            
-            if (preserveAccumulatedStats) {
-                const newRemainingDistance = newRouteData.routes[0].distance;
-                tripInitialDistanceMeters = totalDistanceTravelledForStats + newRemainingDistance;
-                const elapsedSecondsSinceStart = navigationStartTimeForStats ? (Date.now() - navigationStartTimeForStats.getTime()) / 1000 : 0;
-                tripInitialDurationSec = elapsedSecondsSinceStart + newRouteData.routes[0].duration;
-                tripInitialOverallEtaTime = new Date(Date.now() + newRouteData.routes[0].duration * 1000);
-                if(newRouteData.routes[0].legs.length > 0) {
-                     currentStageInitialExpectedEtaTime = new Date(Date.now() + newRouteData.routes[0].legs[0].duration * 1000);
+        } else {
+            // Si no hay ubicación, la pedimos y centramos el mapa.
+            getCurrentLocation(coords => {
+                if (navigationMapInstance) {
+                     navigationMapInstance.flyTo({ center: [coords.longitude, coords.latitude], zoom: 17 });
                 }
-            }
-            
-            renderWaypointMarkers(); // Se redibujan los waypoints sobre la nueva ruta
-            updateNavigationProgressDisplay(newRouteData.routes[0], 0);
-            updateTurnByTurnDisplay(newRouteData.routes[0], 0);
-            showDestinationName();
-            toggleRadaresRuta(document.getElementById('radares-ruta-checkbox').checked);
-            toggleTareasRuta(document.getElementById('tareas-ruta-checkbox').checked);
-            updateStartNavigationButtonState();
-            updateNavigationButtonColor();
-
-            showToast("¡Ruta recalculada con éxito!", "success");
-            closeModalAndProceed();
-            break;
-
-        } catch (error) {
-            console.error(`[RECALC] Fallo en intento #${attempt}:`, error);
-            if (!shouldLoop) {
-                showToast(`Error al calcular ruta: ${error.message}`, "error");
-                break;
-            }
-            await new Promise(resolve => setTimeout(resolve, RETRY_CADENCE_MS));
-        } finally {
-            isRecalculatingRoute = false;
-            isNavigating = wasNavigatingBeforeRecalc;
-            attempt++;
-            if (!isDeviationModalActive) break;
+                updateInitialUserPosition(coords, navigationMapInstance);
+            }, () => showToast("No se pudo obtener tu ubicación.", "warning"));
+        }
+    } else {
+        // Se desactiva el seguimiento.
+        showToast("Seguimiento automático DESACTIVADO.", "info");
+        mapPreviousZoomLevel = navigationMapInstance.getZoom();
+        
+        // El temporizador solo se activa si la desactivación es por una acción del usuario en el mapa,
+        // no por un clic explícito en el botón. La función que lo llama (`handleManualMapInteraction`)
+        // se encargará de iniciar el temporizador.
+        if (!isExplicitAction) {
+            startLocateMeReactivationTimer();
         }
     }
-    console.log("[RECALC] Bucle de recálculo finalizado.");
+    
+    updateLocateMeButtonsUI();
+    updateStartNavigationButtonState();
 }
-
 // ===================================================================
 // NOMBRE: drawRouteOnMap (REESCRITA - IMPLEMENTA EL SWAP SEGURO)
 // RESUMEN: Encapsula la lógica completa de pintado: destruye la ruta antigua
