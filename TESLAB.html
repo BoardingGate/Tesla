@@ -6269,6 +6269,62 @@ function showArrivalStatsModal(freeDriveStatsData = null) {
     addModalAutoCloseTimer(modal, acceptButton, 'arrival-stats-modal', 150000);
 }
 
+// ===================================================================
+// NOMBRE: drawRouteOnMap (REESCRITA - IMPLEMENTA EL SWAP SEGURO)
+// RESUMEN: Encapsula la lógica completa de pintado: destruye la ruta antigua
+//          y crea la nueva, todo dentro de una promesa segura.
+// ===================================================================
+async function drawRouteOnMap(route) {
+    return new Promise((resolve, reject) => {
+        if (!navigationMapInstance || !navigationMapInstance.isStyleLoaded()) {
+            return reject(new Error("El mapa no está listo para dibujar."));
+        }
+
+        const geojsonData = (route && route.geometry && route.geometry.coordinates.length >= 2) 
+            ? { type: 'Feature', properties: {}, geometry: route.geometry }
+            : { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: [] } };
+
+        const cleanupAndReject = (message) => {
+            clearTimeout(timeoutId);
+            navigationMapInstance.off('sourcedata', onSourceData);
+            reject(new Error(message));
+        };
+        
+        const timeoutId = setTimeout(() => {
+            cleanupAndReject("Timeout esperando la confirmación de renderizado del mapa.");
+        }, 7000);
+
+        const onSourceData = (e) => {
+            if (e.sourceId === 'route' && e.isSourceLoaded) {
+                clearTimeout(timeoutId);
+                navigationMapInstance.off('sourcedata', onSourceData);
+                resolve();
+            }
+        };
+        
+        navigationMapInstance.on('sourcedata', onSourceData);
+
+        try {
+            if (navigationMapInstance.getLayer('route')) {
+                navigationMapInstance.removeLayer('route');
+            }
+            if (navigationMapInstance.getSource('route')) {
+                navigationMapInstance.removeSource('route');
+            }
+
+            navigationMapInstance.addSource('route', { type: 'geojson', data: geojsonData });
+            navigationMapInstance.addLayer({
+                id: 'route',
+                type: 'line',
+                source: 'route',
+                layout: { 'line-join': 'round', 'line-cap': 'round' },
+                paint: getRouteStyleProperties()
+            });
+           } catch (error) {
+            cleanupAndReject(`Error al añadir capa/fuente: ${error.message}`);
+        }
+    });
+}
 
     
 // ===================================================================
@@ -18076,45 +18132,6 @@ function hideAddressSuggestionsModal() {
     }
 }    
     
-// ===================================================================
-// NOMBRE: updateWaypointTypesAndLabels (VERSIÓN CORREGIDA Y DEFINITIVA 2)
-// RESUMEN: Actualiza los tipos y etiquetas, esperando a que todas las operaciones asíncronas finalicen.
-async function updateWaypointTypesAndLabels() {
-    const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
-    if (actualWaypoints.length === 0) return;
-
-    await Promise.all(actualWaypoints.map(async (wp, index) => {
-        if (!wp) return;
-
-        if (actualWaypoints.length === 1) {
-            wp.type = 'S';
-            wp.label = 'S';
-        } else if (index === 0) {
-            wp.type = 'S';
-            wp.label = 'S';
-        } else if (index === actualWaypoints.length - 1) {
-            wp.type = 'F';
-            wp.label = 'F';
-        } else {
-            wp.type = 'intermediate';
-            wp.label = String(index);
-        }
-
-        if (!wp.address) {
-            if (typeof wp.lat === 'number' && typeof wp.lng === 'number') {
-                wp.address = await getAddressForWaypoint(wp.lat, wp.lng);
-            } else {
-                wp.address = "Coordenadas no disponibles para dirección";
-            }
-        }
-    }));
-
-    navigationWaypoints.forEach(wp => {
-        if(wp && (wp.isInternal || wp.isRecalculatedStart)) {
-            wp.label = '';
-        }
-    });
-} 
 
 //===================================================================
 // NOMBRE: clearAllLocalData
@@ -18158,31 +18175,6 @@ async function getRouteForSingleLeg(lon1, lat1, lon2, lat2) {
     }
 }    
 
-// ===================================================================
-// NOMBRE: handleSendToTeslaClick
-// RESUMEN: Abre el diálogo nativo para compartir un destino a la app de Tesla.
-async function handleSendToTeslaClick(lat, lng, name) {
-    if (!navigator.share) {
-        showToast("Tu navegador no soporta la función de compartir.", "warning");
-        return;
-    }
-
-    try {
-        const shareData = {
-            title: `Destino: ${name}`,
-            text: `Enviar "${name}" a la app de Tesla para iniciar la navegación.`,
-            url: `https://maps.google.com/?q=${lat},${lng}`
-        };
-
-        await navigator.share(shareData);
-        showToast("Selecciona la app de Tesla para enviar el destino.", "info");
-
-    } catch (err) {
-        if (err.name !== 'AbortError') {
-            showToast(`Error al compartir: ${err.message}`, "error");
-        }
-    } 
-}
 // ===================================================================
 // NOMBRE: translateOcmTerm
 // RESUMEN: Traduce términos comunes de OCM del inglés al castellano.
@@ -18708,31 +18700,6 @@ async function getRouteForSingleLeg(lon1, lat1, lon2, lat2) {
     }
 }    
  
-// ===================================================================
-// NOMBRE: handleSendToTeslaClick
-// RESUMEN: Abre el diálogo nativo para compartir un destino a la app de Tesla.
-async function handleSendToTeslaClick(lat, lng, name) {
-    if (!navigator.share) {
-        showToast("Tu navegador no soporta la función de compartir.", "warning");
-        return;
-    }
-
-    try {
-        const shareData = {
-            title: `Destino: ${name}`,
-            text: `Enviar "${name}" a la app de Tesla para iniciar la navegación.`,
-            url: `https://maps.google.com/?q=${lat},${lng}`
-        };
-
-        await navigator.share(shareData);
-        showToast("Selecciona la app de Tesla para enviar el destino.", "info");
-
-    } catch (err) {
-        if (err.name !== 'AbortError') {
-            showToast(`Error al compartir: ${err.message}`, "error");
-        }
-    }
-}
     
 // ===================================================================
 // NOMBRE: translateOcmTerm
@@ -23026,8 +22993,6 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, isUserA
     console.log("[RECALC] Bucle de recálculo finalizado sin éxito.");
 }
 
-    
-    
 // ===================================================================
 // NOMBRE: closeModalAndProceed (Sin cambios, pero su rol es clave)
 // RESUMEN: Cierra el modal de desvío y detiene el bucle de recálculo.
@@ -23104,67 +23069,6 @@ function handleLocateMeClick(isExplicitAction = false) {
     updateLocateMeButtonsUI();
     updateStartNavigationButtonState();
 }    
-// ===================================================================
-// NOMBRE: drawRouteOnMap (REESCRITA - IMPLEMENTA EL SWAP SEGURO)
-// RESUMEN: Encapsula la lógica completa de pintado: destruye la ruta antigua
-//          y crea la nueva, todo dentro de una promesa segura.
-// ===================================================================
-async function drawRouteOnMap(route) {
-    return new Promise((resolve, reject) => {
-        if (!navigationMapInstance || !navigationMapInstance.isStyleLoaded()) {
-            return reject(new Error("El mapa no está listo para dibujar."));
-        }
-
-        const geojsonData = (route && route.geometry && route.geometry.coordinates.length >= 2) 
-            ? { type: 'Feature', properties: {}, geometry: route.geometry }
-            : { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: [] } };
-
-        const cleanupAndReject = (message) => {
-            clearTimeout(timeoutId);
-            navigationMapInstance.off('sourcedata', onSourceData);
-            reject(new Error(message));
-        };
-        
-        const timeoutId = setTimeout(() => {
-            cleanupAndReject("Timeout esperando la confirmación de renderizado del mapa.");
-        }, 7000);
-
-        const onSourceData = (e) => {
-            if (e.sourceId === 'route' && e.isSourceLoaded) {
-                clearTimeout(timeoutId);
-                navigationMapInstance.off('sourcedata', onSourceData);
-                resolve();
-            }
-        };
-        
-        navigationMapInstance.on('sourcedata', onSourceData);
-
-        try {
-            // --- INICIO DEL PROCESO DE SWAP SEGURO ---
-            // 1. Destruir la capa y fuente antiguas si existen
-            if (navigationMapInstance.getLayer('route')) {
-                navigationMapInstance.removeLayer('route');
-            }
-            if (navigationMapInstance.getSource('route')) {
-                navigationMapInstance.removeSource('route');
-            }
-
-            // 2. Añadir la nueva fuente y capa con el nombre permanente 'route'
-            navigationMapInstance.addSource('route', { type: 'geojson', data: geojsonData });
-            navigationMapInstance.addLayer({
-                id: 'route',
-                type: 'line',
-                source: 'route',
-                layout: { 'line-join': 'round', 'line-cap': 'round' },
-                paint: getRouteStyleProperties()
-            });
-            // --- FIN DEL PROCESO DE SWAP ---
-        } catch (error) {
-            cleanupAndReject(`Error al añadir capa/fuente: ${error.message}`);
-        }
-    });
-}
-
 
     
 // ===================================================================
