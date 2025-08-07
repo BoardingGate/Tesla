@@ -1,4 +1,4 @@
-Z03
+Z04
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -6299,28 +6299,33 @@ async function proceedWithRecalculation(action) {
 
 
 // ===================================================================
-// NOMBRE: checkAndMarkWaypointsAsVisited (VERSIÓN SOLO PARA DIAGNÓSTICO)
-// RESUMEN: Imprime en consola el estado 'visited' de cada etapa visible
-//          para verificar su estado en cada ciclo de comprobación.
+// NOMBRE: checkAndMarkWaypointsAsVisited (VERSIÓN CON LÓGICA DE ACUMULACIÓN CORREGIDA)
+// RESUMEN: Corrige el error lógico "off-by-one" que marcaba la primera etapa
+//          como visitada. La distancia de cada tramo ahora se usa para evaluar la
+//          llegada a la etapa correcta.
 // ===================================================================
 function checkAndMarkWaypointsAsVisited(route, carDistanceAlongRoute, currentCoords) {
-    // Primero, se ejecuta la lógica original para actualizar el estado.
     if (!route || !route.legs || !currentCoords) return;
 
-    const actualWaypointsOriginal = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
-    if (actualWaypointsOriginal.length === 0) return;
+    // Se obtienen solo las etapas "reales" que el usuario ha puesto, en el orden correcto.
+    const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
+    if (actualWaypoints.length === 0) return;
     
-    actualWaypointsOriginal[0].visited = true;
+    // El punto de partida siempre está visitado.
+    actualWaypoints[0].visited = true;
 
     let distanceToStartOfLeg = 0;
 
+    // Se itera sobre los tramos de la ruta (leg 0 es S->1, leg 1 es 1->2, etc.)
     for (let legIndex = 0; legIndex < route.legs.length; legIndex++) {
         const leg = route.legs[legIndex];
-        const targetWaypoint = actualWaypointsOriginal[legIndex + 1];
+        // El waypoint de destino para este tramo es el siguiente en el array de waypoints.
+        const targetWaypoint = actualWaypoints[legIndex + 1];
 
         if (leg && targetWaypoint) {
             const distanceToEndOfThisLeg = distanceToStartOfLeg + (leg.distance || 0);
             
+            // Si el waypoint ya está visitado, simplemente acumulamos la distancia y pasamos al siguiente.
             if (targetWaypoint.visited) {
                 distanceToStartOfLeg = distanceToEndOfThisLeg;
                 continue;
@@ -6334,7 +6339,7 @@ function checkAndMarkWaypointsAsVisited(route, carDistanceAlongRoute, currentCoo
                 if (physicalDistanceToFinal <= WAYPOINT_VISITED_THRESHOLD_METERS) {
                     targetWaypoint.visited = true;
                 }
-            } else {
+            } else { // Es una etapa intermedia
                 const tripHasPhysicallyStarted = isNavigating && navigationStartTimeForStats;
                 const hasClearedStartBuffer = carDistanceAlongRoute > 20;
                 
@@ -6342,26 +6347,12 @@ function checkAndMarkWaypointsAsVisited(route, carDistanceAlongRoute, currentCoo
                     targetWaypoint.visited = true;
                 }
             }
+            
+            // Actualizamos la distancia para el siguiente tramo.
             distanceToStartOfLeg = distanceToEndOfThisLeg;
         }
     }
-
-    // <<< INICIO DEL CÓDIGO DE DIAGNÓSTICO >>>
-    // Después de que la lógica se ejecute, imprimimos el estado final de las etapas.
-    console.log(`%c---------- ESTADO DE ETAPAS ----------`, 'color: #FFD700; font-weight: bold; background-color: #333; padding: 2px 5px; border-radius: 3px;');
-    const actualWaypointsFinal = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
-    
-    actualWaypointsFinal.forEach(wp => {
-        const addressSummary = wp.address ? wp.address.split(',')[0] : 'Dirección Desconocida';
-        const visitedStatus = wp.visited ? '%cVISITADA' : '%cPENDIENTE';
-        const color = wp.visited ? 'color: #90EE90;' : 'color: #FF6347;';
-        
-        console.log(`Etapa ${wp.label} (${addressSummary}):`, visitedStatus, color);
-    });
-    console.log(`%c------------------------------------`, 'color: #FFD700; font-weight: bold; background-color: #333; padding: 2px 5px; border-radius: 3px;');
-    // <<< FIN DEL CÓDIGO DE DIAGNÓSTICO >>>
 }
-
 
     
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
@@ -12588,10 +12579,12 @@ function restoreBackup() {
         graphLabels = [];
     }
     
-
 // ===================================================================
-// NOMBRE: updateTurnByTurnDisplay (VERSIÓN CON TARJETA MÍNIMA Y ETA INTEGRADO)
-// RESUMEN: Actualiza la barra de giro y gestiona la visibilidad
+// NOMBRE: updateTurnByTurnDisplay (VERSIÓN CON CORRECCIÓN DE MANIOBRA INICIAL)
+// RESUMEN: Soluciona el error que mostraba "Ha llegado" al inicio. Ahora ignora
+//          las maniobras de "llegada" que OSRM coloca al principio de un tramo
+//          y solo muestra la llegada real cuando la proximidad es < 50m.
+// ===================================================================
 function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     const topInfoBar = document.getElementById('navigation-top-info-bar');
     const intersectionPreviewWindow = document.getElementById('intersection-preview-map-window');
@@ -12668,42 +12661,40 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
 
     const waypointsForRequest = navigationWaypoints.filter(wp => wp);
     
-    let finalStepToShow;
+    let nextStepToDisplay;
     let tempLegIdx = currentLegIndex;
-    let tempStepIdx = currentStepIndex + 1;
+    let tempStepIdx = currentStepIndex;
 
     while (true) {
-        if (tempLegIdx >= route.legs.length) {
-            finalStepToShow = route.legs[route.legs.length - 1].steps[route.legs[route.legs.length - 1].steps.length - 1];
-            break;
-        }
-
-        let leg = route.legs[tempLegIdx];
-        if (tempStepIdx >= leg.steps.length) {
+        tempStepIdx++;
+        if (tempLegIdx >= route.legs.length || tempStepIdx >= route.legs[tempLegIdx].steps.length) {
             tempLegIdx++;
             tempStepIdx = 0;
-            continue;
+        }
+
+        if (tempLegIdx >= route.legs.length) {
+            nextStepToDisplay = route.legs[route.legs.length - 1].steps[route.legs[route.legs.length - 1].steps.length - 1];
+            break;
         }
         
-        const candidateStep = leg.steps[tempStepIdx];
+        const candidateStep = route.legs[tempLegIdx].steps[tempStepIdx];
         const isArrival = candidateStep.maneuver.type === 'arrive';
         const isDeparture = candidateStep.maneuver.type === 'depart';
         
         const arrivalWaypoint = isArrival ? waypointsForRequest[tempLegIdx + 1] : null; 
         const departureWaypoint = isDeparture ? waypointsForRequest[tempLegIdx] : null;
 
-        if (isArrival && arrivalWaypoint?.isInternal) {
-            tempStepIdx++;
+        if ((isArrival && arrivalWaypoint?.isInternal) || (isDeparture && departureWaypoint?.isInternal)) {
             continue;
-        } else if (isDeparture && departureWaypoint?.isInternal) {
-            tempStepIdx++;
-            continue;
-        } else {
-            finalStepToShow = candidateStep;
-            break;
         }
+        
+        if (currentStepIndex === 0 && isArrival) {
+            continue;
+        }
+        
+        nextStepToDisplay = candidateStep;
+        break;
     }
-    let nextStepToDisplay = finalStepToShow;
 
     const currentStepForProgress = route.legs[currentLegIndex].steps[currentStepIndex];
     const distanceToNextManeuver = Math.max(0, distanceToEndOfCurrentStepForProgress - carDistance);
@@ -12746,17 +12737,15 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
                         const formattedTime = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
                         deviationHtml = `<span style="${style}">[${sign}${formattedTime}]</span>`;
                     }
-                    etaHtml = `<div style="font-size: 0.68em; margin-top: 2px; text-align: center; ">
-                       <span>${etaText}</span>
-                       <span style="margin-left: 8px;">${deviationHtml}</span>  </div>`;
-                   }
+                    
+                    etaHtml = `<div style="font-size: 0.68em; margin-top: 2px; text-align: center; ">${etaText} ${deviationHtml}</div>`;
+                }
 
                 miniNavCard.innerHTML = `
                     <div>${distanceText}</div>
                     ${etaHtml}
                 `;
                 miniNavCard.style.display = 'block';
-                // --- FIN DE LA MODIFICACIÓN ---
             } else {
                 miniNavCard.style.display = 'none';
             }
@@ -12773,13 +12762,20 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     
     if (nextStepToDisplay && nextStepToDisplay.maneuver) {
         const isArrivalManeuver = nextStepToDisplay.maneuver.type === 'arrive';
-        const isVeryCloseToArrival = distanceToNextManeuver < 50;
+        const isFinalLeg = currentLegIndex === route.legs.length - 1;
         
-        let stepForDisplayText;
-        if (isArrivalManeuver && !isVeryCloseToArrival) {
-            stepForDisplayText = currentStepForProgress;
-        } else {
-            stepForDisplayText = nextStepToDisplay;
+        let stepForDisplayText = nextStepToDisplay;
+        let showArrivalMessage = false;
+
+        if (isArrivalManeuver) {
+            const distanceToEndOfLeg = calculateDistanceToEndOfStep(route, currentLegIndex, route.legs[currentLegIndex].steps.length - 1);
+            const distanceToArrival = Math.max(0, distanceToEndOfLeg - carDistance);
+
+            if (distanceToArrival < 50) {
+                showArrivalMessage = true;
+            } else {
+                stepForDisplayText = currentStepForProgress;
+            }
         }
         
         const maneuver = stepForDisplayText.maneuver;
@@ -12787,9 +12783,7 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
         let maneuverText = "";
         let streetNameText = stepForDisplayText.name || '';
         
-        if (maneuver.type === 'arrive') {
-            const isFinalLeg = currentLegIndex === route.legs.length - 1;
-
+        if (showArrivalMessage) {
             if (isFinalLeg) {
                 maneuverText = "Ha llegado a su destino";
                 streetNameText = '';
