@@ -1,4 +1,4 @@
-X05
+X06
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -2650,7 +2650,7 @@ p.ocm-price-info {
 
 .map-control-orientation-altitude {
     transform: none !important;
-    background-color: rgba(0,0,0,0.5);
+    background-color: rgba(0,0,0,0.7);
     color: white;padding: 8px;
     border-radius: 3px; box-shadow: 0 1px 5px rgba(0,0,0,0.40);
     text-align: center;  display: flex; flex-direction: column;
@@ -19005,6 +19005,169 @@ function checkReminders() {
         }
     });
 }
+
+// ===================================================================
+// NOMBRE: checkReminders (VERSIÓN FINAL CON RECUPERACIÓN OPTIMIZADA)
+// RESUMEN: Bucle principal que detecta el estado de "ETA a cero" de forma
+//          altamente eficiente antes de disparar un recálculo.
+// ===================================================================
+function checkReminders() {
+    // ... (toda la lógica inicial de la función, sincronización móvil, etc., permanece igual) ...
+    const { primaryId, isMobile } = parseUserId(localStorage.getItem('userData_userId'));
+    // ... etc ...
+
+    const now = new Date();
+    
+    // --- INICIO DE LA LÓGICA DE RECUPERACIÓN (VERSIÓN OPTIMIZADA) ---
+
+    // 1. "Guardián Rápido": Se ejecuta en cada ciclo. Es una comprobación muy barata.
+    // Usamos encadenamiento opcional (?.) para máxima seguridad y brevedad.
+    if (isNavigating && navigationCurrentRouteData?.routes?.[0]?.distance < 10) {
+        
+        // 2. "Verificador de Contexto": Solo se ejecuta si el guardián rápido lo permite.
+        const finalWaypoint = navigationWaypoints.length > 0 ? navigationWaypoints[navigationWaypoints.length - 1] : null;
+
+        // Condición de estado corrupto: La ruta tiene distancia cero, PERO el destino final NO está marcado como visitado.
+        if (finalWaypoint && !finalWaypoint.visited) {
+            console.error("[SAFETY NET] Se ha detectado un estado de ETA a cero persistente. Disparando recálculo de recuperación.");
+            showToast("Detectado error de ETA. Recuperando la ruta...", "warning");
+            
+            // Llama a la función de recálculo para forzar la obtención de una nueva ruta correcta.
+            recalculateAndDrawRoute(true); 
+            
+            return; // Detiene la ejecución de este ciclo para dar tiempo a que se recalcule.
+        }
+    }
+    // --- FIN DE LA LÓGICA DE RECUPERACIÓN ---
+    
+    // El resto de la función 'checkReminders' continúa exactamente como la tenías...
+    if (isRecalculatingRoute && recalculationAttempts > 0) return;
+    
+    const overdueReminders = [];
+    new Promise((resolve) => {
+        if (isSimulatingGpsLocation && simulatedGpsLocation) resolve(simulatedGpsLocation);
+        else if (navigationCurrentLocation) resolve(navigationCurrentLocation);
+        else if ('geolocation' in navigator) getCurrentLocation(coords => resolve(coords), () => resolve(null));
+        else resolve(null);
+    }).then(async coords => {
+        // ... (el resto del código de la función sin cambios) ...
+        let allRemindersToCheck = JSON.parse(localStorage.getItem('reminders') || '[]');
+        
+        if (isNavigating) {
+            allRemindersToCheck = allRemindersToCheck.filter(r => !r.isDynamicRadar);
+            allRemindersToCheck.push(...radaresEnRutaActual);
+        }
+
+        let isInsideAnyRadarZone = false;
+
+        allRemindersToCheck.forEach(reminder => {
+            if (!reminder || reminder.managedByUser) return;
+            
+            let isOverdue = false;
+            let locationConditionMet = true; 
+
+            try {
+                const [year, month, day] = reminder.date.split('-').map(Number);
+                const [hour, minute] = reminder.time.split(':').map(Number);
+                const reminderLocalDueTime = new Date(year, month - 1, day, hour, minute);
+                
+                if (!isNaN(reminderLocalDueTime.getTime()) && reminderLocalDueTime <= now) {
+                    if (reminder.isLocationEnabled && reminder.locationCoordinates) {
+                        if (coords) {
+                            const distance = calculateDistance(coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude);
+                            locationConditionMet = distance <= (reminder.radiusMeters || DEFAULT_LOCATION_RADIUS);
+                            if (locationConditionMet && (reminder.text.toUpperCase().includes("RADAR") || reminder.excludeFromList)) {
+                                isInsideAnyRadarZone = true;
+                            }
+                        } else {
+                            locationConditionMet = false;
+                        }
+                    }
+                    if (locationConditionMet) {
+                        isOverdue = true;
+                    }
+                }
+            } catch (e) { /* Fecha/hora inválida, se ignora */ }
+
+            if (isOverdue) {
+                if (!overdueReminders.some(r => r.id === reminder.id)) {
+                    overdueReminders.push(reminder);
+                }
+            }
+        });
+
+        if (overdueReminders.length > 0) {
+            displayUnifiedReminderWindow(overdueReminders);
+        } else if (isUnifiedWindowVisibleByLogic) {
+            hideUnifiedReminderWindow();
+        }
+
+        if (isNavigating && navigationCurrentLocation && !isRecalculatingRoute && !isDeviationModalActive && !isAddReminderAtLocationModeActive) {
+            if (Date.now() < deviationCheckGracePeriodUntil) {
+                console.log("[DESVÍO] Omitiendo comprobación de desvío (período de gracia activo).");
+                return;
+            }
+            const currentCoords = navigationCurrentLocation;
+            if (navigationMapInstance && navigationMapInstance.getSource('route') && navigationMapInstance.getSource('route')._data && typeof turf !== 'undefined') {
+                try {
+                    const routeGeoJSON = navigationMapInstance.getSource('route')._data;
+                    const routeLineString = turf.lineString(routeGeoJSON.geometry.coordinates);
+                    const carPoint = turf.point([currentCoords.longitude, currentCoords.latitude]);
+                    const distanceToRoute = turf.pointToLineDistance(carPoint, routeLineString, { units: 'meters' });
+                    if (distanceToRoute > DEVIATION_THRESHOLD_METERS) {
+                        if (deviationStartTime === 0) {
+                            deviationStartTime = Date.now();
+                        } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
+                            console.error(`[DESVÍO] ¡Desvío Confirmado! Coordenadas de detección:`, {
+                                latitude: coords.latitude,
+                                longitude: coords.longitude
+                            });
+                            showDeviationModal(); 
+                            deviationStartTime = 0;
+                        }
+                    } else {
+                        deviationStartTime = 0;
+                    }
+                } catch (e) {
+                    if (deviationStartTime === 0) deviationStartTime = Date.now();
+                    else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
+                        showDeviationModal();
+                        deviationStartTime = 0;
+                    }
+                }
+            } else {
+                if (deviationStartTime === 0) deviationStartTime = Date.now();
+                else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
+                    showDeviationModal();
+                    deviationStartTime = 0;
+                }
+            }
+        } else {
+            deviationStartTime = 0;
+        }
+
+        updateReminderCount(); 
+        updateButtonStyles();
+        
+        let newInterval = isNavigating ? 3500 : 6000;
+        if (isNavigating) {
+            const distToNextManeuver = distanceToNextManeuverOSRM || Infinity;
+            if (distToNextManeuver < 500 && distToNextManeuver > 0) newInterval = 1000;
+            else if (distToNextManeuver < 1000 && distToNextManeuver > 0) newInterval = 2000;
+            else newInterval = 3500;
+        } else if (isInsideAnyRadarZone) {
+            newInterval = 1000;
+        }
+        
+        if (newInterval !== currentCheckIntervalDuration) {
+            currentCheckIntervalDuration = newInterval;
+            if (reminderCheckIntervalId) clearInterval(reminderCheckIntervalId);
+            reminderCheckIntervalId = setInterval(checkReminders, currentCheckIntervalDuration);
+        }
+    });
+}
+
+    
 // ===================================================================
 // NOMBRE: handleSimulateGpsPositionClick (MODIFICADA - PARA MAPBOX)
 // RESUMEN: Maneja el clic en el mapa durante la simulación GPS manual.
