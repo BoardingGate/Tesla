@@ -1,4 +1,4 @@
-Z06
+Z01
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -6296,8 +6296,6 @@ async function proceedWithRecalculation(action) {
     }
     await recalculateAndDrawRoute(true);
 }
-
-
 // ===================================================================
 // NOMBRE: checkAndMarkWaypointsAsVisited (VERSIÓN CON LÓGICA DE ACUMULACIÓN CORREGIDA)
 // RESUMEN: Corrige el error lógico "off-by-one" que marcaba la primera etapa
@@ -6307,54 +6305,46 @@ async function proceedWithRecalculation(action) {
 function checkAndMarkWaypointsAsVisited(route, carDistanceAlongRoute, currentCoords) {
     if (!route || !route.legs || !currentCoords) return;
 
-    // Se obtienen solo las etapas "reales" que el usuario ha puesto, en el orden correcto.
-    const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
-    if (actualWaypoints.length === 0) return;
-    
-    // El punto de partida siempre está visitado.
-    actualWaypoints[0].visited = true;
+    let cumulativeDistance = 0; // Distancia acumulada ANTES del tramo actual.
+    navigationWaypoints.forEach((wp, index) => {
+        if (wp) {
+            const isStartPoint = wp.type === 'S' || wp.isRecalculatedStart;
+            const isIntermediate = wp.type === 'intermediate';
+            const isFinal = wp.type === 'F';
 
-    let distanceToStartOfLeg = 0;
+            if (isStartPoint) {
+                wp.visited = true;
+            } else if (isIntermediate && (index - 1) < route.legs.length) {
+                const leg = route.legs[index - 1];
+                if (leg) {
+                    // <<< CORRECCIÓN CLAVE >>>
+                    // Se calcula la distancia hasta el final de ESTA etapa antes de hacer nada más.
+                    const distanceToEndOfThisLeg = cumulativeDistance + (leg.distance || 0);
 
-    // Se itera sobre los tramos de la ruta (leg 0 es S->1, leg 1 es 1->2, etc.)
-    for (let legIndex = 0; legIndex < route.legs.length; legIndex++) {
-        const leg = route.legs[legIndex];
-        // El waypoint de destino para este tramo es el siguiente en el array de waypoints.
-        const targetWaypoint = actualWaypoints[legIndex + 1];
+                    const tripHasPhysicallyStarted = isNavigating && navigationStartTimeForStats;
+                    const hasClearedStartBuffer = carDistanceAlongRoute > 20;
 
-        if (leg && targetWaypoint) {
-            const distanceToEndOfThisLeg = distanceToStartOfLeg + (leg.distance || 0);
-            
-            // Si el waypoint ya está visitado, simplemente acumulamos la distancia y pasamos al siguiente.
-            if (targetWaypoint.visited) {
-                distanceToStartOfLeg = distanceToEndOfThisLeg;
-                continue;
-            }
-            
-            const isFinalLeg = (legIndex === route.legs.length - 1);
-            
-            if (isFinalLeg) {
-                const finalDestinationCoords = leg.steps.slice(-1)[0].maneuver.location;
+                    // La comprobación ahora usa la distancia correcta para esta etapa.
+                    if (tripHasPhysicallyStarted && hasClearedStartBuffer && carDistanceAlongRoute >= distanceToEndOfThisLeg - WAYPOINT_VISITED_THRESHOLD_METERS) {
+                        wp.visited = true;
+                    }
+                    
+                    // Solo DESPUÉS de la comprobación, se actualiza la distancia acumulada para la SIGUIENTE etapa.
+                    cumulativeDistance = distanceToEndOfThisLeg;
+                }
+            } else if (isFinal) {
+                const finalDestinationCoords = route.legs[route.legs.length - 1].steps.slice(-1)[0].maneuver.location;
                 const physicalDistanceToFinal = calculateDistance(currentCoords.latitude, currentCoords.longitude, finalDestinationCoords[1], finalDestinationCoords[0]);
-                if (physicalDistanceToFinal <= WAYPOINT_VISITED_THRESHOLD_METERS) {
-                    targetWaypoint.visited = true;
-                }
-            } else { // Es una etapa intermedia
-                const tripHasPhysicallyStarted = isNavigating && navigationStartTimeForStats;
-                const hasClearedStartBuffer = carDistanceAlongRoute > 20;
                 
-                if (tripHasPhysicallyStarted && hasClearedStartBuffer && carDistanceAlongRoute >= distanceToEndOfThisLeg - WAYPOINT_VISITED_THRESHOLD_METERS) {
-                    targetWaypoint.visited = true;
+                if (physicalDistanceToFinal <= WAYPOINT_VISITED_THRESHOLD_METERS) {
+                    wp.visited = true;
                 }
             }
-            
-            // Actualizamos la distancia para el siguiente tramo.
-            distanceToStartOfLeg = distanceToEndOfThisLeg;
         }
-    }
+    });
 }
-
     
+
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 // NOMBRE: findChargingPointsOnRoute (CORREGIDA - ROBUSTA CONTRA ERUDA)
 // RESUMEN: Busca PDRs de OCM y gestiona el estado de la búsqueda.
@@ -12579,12 +12569,10 @@ function restoreBackup() {
         graphLabels = [];
     }
     
+
 // ===================================================================
-// NOMBRE: updateTurnByTurnDisplay (VERSIÓN CON CORRECCIÓN DE MANIOBRA INICIAL)
-// RESUMEN: Soluciona el error que mostraba "Ha llegado" al inicio. Ahora ignora
-//          las maniobras de "llegada" que OSRM coloca al principio de un tramo
-//          y solo muestra la llegada real cuando la proximidad es < 50m.
-// ===================================================================
+// NOMBRE: updateTurnByTurnDisplay (VERSIÓN CON TARJETA MÍNIMA Y ETA INTEGRADO)
+// RESUMEN: Actualiza la barra de giro y gestiona la visibilidad
 function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     const topInfoBar = document.getElementById('navigation-top-info-bar');
     const intersectionPreviewWindow = document.getElementById('intersection-preview-map-window');
@@ -12661,40 +12649,42 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
 
     const waypointsForRequest = navigationWaypoints.filter(wp => wp);
     
-    let nextStepToDisplay;
+    let finalStepToShow;
     let tempLegIdx = currentLegIndex;
-    let tempStepIdx = currentStepIndex;
+    let tempStepIdx = currentStepIndex + 1;
 
     while (true) {
-        tempStepIdx++;
-        if (tempLegIdx >= route.legs.length || tempStepIdx >= route.legs[tempLegIdx].steps.length) {
-            tempLegIdx++;
-            tempStepIdx = 0;
-        }
-
         if (tempLegIdx >= route.legs.length) {
-            nextStepToDisplay = route.legs[route.legs.length - 1].steps[route.legs[route.legs.length - 1].steps.length - 1];
+            finalStepToShow = route.legs[route.legs.length - 1].steps[route.legs[route.legs.length - 1].steps.length - 1];
             break;
         }
+
+        let leg = route.legs[tempLegIdx];
+        if (tempStepIdx >= leg.steps.length) {
+            tempLegIdx++;
+            tempStepIdx = 0;
+            continue;
+        }
         
-        const candidateStep = route.legs[tempLegIdx].steps[tempStepIdx];
+        const candidateStep = leg.steps[tempStepIdx];
         const isArrival = candidateStep.maneuver.type === 'arrive';
         const isDeparture = candidateStep.maneuver.type === 'depart';
         
         const arrivalWaypoint = isArrival ? waypointsForRequest[tempLegIdx + 1] : null; 
         const departureWaypoint = isDeparture ? waypointsForRequest[tempLegIdx] : null;
 
-        if ((isArrival && arrivalWaypoint?.isInternal) || (isDeparture && departureWaypoint?.isInternal)) {
+        if (isArrival && arrivalWaypoint?.isInternal) {
+            tempStepIdx++;
             continue;
-        }
-        
-        if (currentStepIndex === 0 && isArrival) {
+        } else if (isDeparture && departureWaypoint?.isInternal) {
+            tempStepIdx++;
             continue;
+        } else {
+            finalStepToShow = candidateStep;
+            break;
         }
-        
-        nextStepToDisplay = candidateStep;
-        break;
     }
+    let nextStepToDisplay = finalStepToShow;
 
     const currentStepForProgress = route.legs[currentLegIndex].steps[currentStepIndex];
     const distanceToNextManeuver = Math.max(0, distanceToEndOfCurrentStepForProgress - carDistance);
@@ -12737,15 +12727,17 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
                         const formattedTime = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
                         deviationHtml = `<span style="${style}">[${sign}${formattedTime}]</span>`;
                     }
-                    
-                    etaHtml = `<div style="font-size: 0.68em; margin-top: 2px; text-align: center; ">${etaText} ${deviationHtml}</div>`;
-                }
+                    etaHtml = `<div style="font-size: 0.68em; margin-top: 2px; text-align: center; ">
+                       <span>${etaText}</span>
+                       <span style="margin-left: 8px;">${deviationHtml}</span>  </div>`;
+                   }
 
                 miniNavCard.innerHTML = `
                     <div>${distanceText}</div>
                     ${etaHtml}
                 `;
                 miniNavCard.style.display = 'block';
+                // --- FIN DE LA MODIFICACIÓN ---
             } else {
                 miniNavCard.style.display = 'none';
             }
@@ -12762,20 +12754,13 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     
     if (nextStepToDisplay && nextStepToDisplay.maneuver) {
         const isArrivalManeuver = nextStepToDisplay.maneuver.type === 'arrive';
-        const isFinalLeg = currentLegIndex === route.legs.length - 1;
+        const isVeryCloseToArrival = distanceToNextManeuver < 50;
         
-        let stepForDisplayText = nextStepToDisplay;
-        let showArrivalMessage = false;
-
-        if (isArrivalManeuver) {
-            const distanceToEndOfLeg = calculateDistanceToEndOfStep(route, currentLegIndex, route.legs[currentLegIndex].steps.length - 1);
-            const distanceToArrival = Math.max(0, distanceToEndOfLeg - carDistance);
-
-            if (distanceToArrival < 50) {
-                showArrivalMessage = true;
-            } else {
-                stepForDisplayText = currentStepForProgress;
-            }
+        let stepForDisplayText;
+        if (isArrivalManeuver && !isVeryCloseToArrival) {
+            stepForDisplayText = currentStepForProgress;
+        } else {
+            stepForDisplayText = nextStepToDisplay;
         }
         
         const maneuver = stepForDisplayText.maneuver;
@@ -12783,7 +12768,9 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
         let maneuverText = "";
         let streetNameText = stepForDisplayText.name || '';
         
-        if (showArrivalMessage) {
+        if (maneuver.type === 'arrive') {
+            const isFinalLeg = currentLegIndex === route.legs.length - 1;
+
             if (isFinalLeg) {
                 maneuverText = "Ha llegado a su destino";
                 streetNameText = '';
@@ -22376,607 +22363,6 @@ async function autoSaveFromMobile(primaryId, backupPassword) {
     }
 }
 
-
-// ===================================================================
-// NOMBRE: recalculateAndDrawRoute (VERSIÓN CON BLOQUEO DE SINCRONIZACIÓN)
-// RESUMEN: Implementa un "cerrojo" (isRecalculatingRoute) para prevenir que
-//          checkReminders se ejecute con datos desincronizados durante la petición de red.
-// ===================================================================
-async function recalculateAndDrawRoute(preserveAccumulatedStats = false, isUserAction = false) {
-    if (isRecalculatingRoute) {
-        console.warn("[RECALC] Intento de recálculo mientras otro ya está en progreso. Ignorando.");
-        return;
-    }
-
-    isRecalculatingRoute = true; // <<< CERROJO ACTIVADO
-    const wasNavigatingBeforeRecalc = isNavigating;
-
-    try {
-        const completedDistance = preserveAccumulatedStats ? totalDistanceTravelledForStats : 0;
-
-        let waypointsForAPI = [];
-        let currentHeading = null;
-        if (isNavigating && navigationCurrentLocation) {
-            currentHeading = navigationCurrentLocation.heading;
-            waypointsForAPI.push({ lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude, isRecalculatedStart: true });
-            waypointsForAPI.push(...navigationWaypoints.filter(wp => !wp.visited));
-        } else {
-            waypointsForAPI = navigationCurrentLocation 
-                ? [{ lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude, isRecalculatedStart: true }, ...navigationWaypoints] 
-                : [...navigationWaypoints];
-            if (navigationCurrentLocation) currentHeading = navigationCurrentLocation.heading;
-        }
-        
-        const validWaypoints = waypointsForAPI.filter(wp => wp && typeof wp.lat === 'number' && typeof wp.lng === 'number');
-        if (validWaypoints.length < 2) { 
-            handleLoadOrDeleteRouteClick(null);
-            return; 
-        };
-
-        const coordsString = validWaypoints.map(wp => `${wp.lng},${wp.lat}`).join(';');
-        
-        const result = await fetchRouteData(coordsString, currentHeading);
-        if (result.error) throw result.error;
-
-        const newRouteData = result.routeData;
-        const newRemainingRoute = newRouteData.routes[0];
-
-        await drawRouteOnMap(newRemainingRoute);
-        
-        navigationCurrentRouteData = newRouteData;
-        
-        if (preserveAccumulatedStats) {
-            accumulatedDistanceBeforeCurrentSegment = completedDistance;
-        }
-
-        tripInitialOverallEtaTime = new Date(Date.now() + newRemainingRoute.duration * 1000);
-        if (newRemainingRoute.legs && newRemainingRoute.legs.length > 0) {
-            currentStageInitialExpectedEtaTime = new Date(Date.now() + newRemainingRoute.legs[0].duration * 1000);
-        } else {
-            currentStageInitialExpectedEtaTime = null;
-        }
-
-        renderWaypointMarkers();
-        updateNavigationProgressDisplay(newRemainingRoute, 0);
-        updateTurnByTurnDisplay(newRemainingRoute, 0);
-        showDestinationName();
-        toggleRadaresRuta(document.getElementById('radares-ruta-checkbox').checked);
-        toggleTareasRuta(document.getElementById('tareas-ruta-checkbox').checked);
-        updateStartNavigationButtonState();
-        updateNavigationButtonColor();
-
-        if (isUserAction) {
-            showToast("¡Ruta recalculada con éxito!", "success");
-        }
-        closeModalAndProceed();
-
-    } catch (error) {
-        showToast(`Error al calcular ruta: ${error.message}`, "error");
-        handleLoadOrDeleteRouteClick(null);
-    } finally {
-        isRecalculatingRoute = false; // <<< CERROJO LIBERADO
-        isNavigating = wasNavigatingBeforeRecalc;
-    }
-}
-
-// ===================================================================
-// NOMBRE: checkReminders (VERSIÓN CON RESPETO AL "CERROJO")
-// RESUMEN: Ahora comprueba la variable `isRecalculatingRoute` antes de
-//          ejecutar su lógica para evitar actualizaciones con datos inconsistentes.
-// ===================================================================
-function checkReminders() {
-    if (isRecalculatingRoute) {
-        return;
-    }
-
-    const { primaryId, isMobile } = parseUserId(localStorage.getItem('userData_userId'));
-    const autoSyncEnabled = JSON.parse(localStorage.getItem('boardinggate_autoBackupOnLoad') || 'false');
-    const backupPassword = localStorage.getItem('userData_backupPassword');
-
-    if (isMobile && autoSyncEnabled && primaryId && backupPassword) {
-        const localTimestamp = parseInt(localStorage.getItem('lastCacheUpdateTimestamp') || '0');
-        if (localTimestamp > lastMobileSyncTimestamp) {
-            autoSaveFromMobile(primaryId, backupPassword);
-            lastMobileSyncTimestamp = localTimestamp; 
-        }
-    }
-
-    const now = new Date();
-    
-    if (!isNavigating) {
-        const timeSinceLastCheck = now - lastDynamicRadarCheck;
-        const currentReminders = JSON.parse(localStorage.getItem('reminders') || '[]');
-        const hasExistingDynamicRadars = currentReminders.some(r => r.isDynamicRadar === true);
-
-        if (timeSinceLastCheck > 30 * 60 * 1000 || !hasExistingDynamicRadars) {
-            updateDynamicRadars(true);
-        }
-    }
-    
-    if (isRecalculatingRoute && recalculationAttempts > 0) return;
-    
-    const overdueReminders = [];
-    new Promise((resolve) => {
-        if (isSimulatingGpsLocation && simulatedGpsLocation) resolve(simulatedGpsLocation);
-        else if (navigationCurrentLocation) resolve(navigationCurrentLocation);
-        else if ('geolocation' in navigator) getCurrentLocation(coords => resolve(coords), () => resolve(null));
-        else resolve(null);
-    }).then(async coords => {
-        let allRemindersToCheck = JSON.parse(localStorage.getItem('reminders') || '[]');
-        
-        if (isNavigating) {
-            allRemindersToCheck = allRemindersToCheck.filter(r => !r.isDynamicRadar);
-            allRemindersToCheck.push(...radaresEnRutaActual);
-        }
-
-        let isInsideAnyRadarZone = false;
-
-        allRemindersToCheck.forEach(reminder => {
-            if (!reminder || reminder.managedByUser) return;
-            
-            let isOverdue = false;
-            let locationConditionMet = true; 
-
-            try {
-                const [year, month, day] = reminder.date.split('-').map(Number);
-                const [hour, minute] = reminder.time.split(':').map(Number);
-                const reminderLocalDueTime = new Date(year, month - 1, day, hour, minute);
-                
-                if (!isNaN(reminderLocalDueTime.getTime()) && reminderLocalDueTime <= now) {
-                    if (reminder.isLocationEnabled && reminder.locationCoordinates) {
-                        if (coords) {
-                            const distance = calculateDistance(coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude);
-                            locationConditionMet = distance <= (reminder.radiusMeters || DEFAULT_LOCATION_RADIUS);
-                            if (locationConditionMet && (reminder.text.toUpperCase().includes("RADAR") || reminder.excludeFromList)) {
-                                isInsideAnyRadarZone = true;
-                            }
-                        } else {
-                            locationConditionMet = false;
-                        }
-                    }
-                    if (locationConditionMet) {
-                        isOverdue = true;
-                    }
-                }
-            } catch (e) { /* Fecha/hora inválida, se ignora */ }
-
-            if (isOverdue) {
-                if (!overdueReminders.some(r => r.id === reminder.id)) {
-                    overdueReminders.push(reminder);
-                }
-            }
-        });
-
-        if (overdueReminders.length > 0) {
-            displayUnifiedReminderWindow(overdueReminders);
-        } else if (isUnifiedWindowVisibleByLogic) {
-            hideUnifiedReminderWindow();
-        }
-
-        if (isNavigating && navigationCurrentLocation && !isRecalculatingRoute && !isDeviationModalActive && !isAddReminderAtLocationModeActive) {
-            if (Date.now() < deviationCheckGracePeriodUntil) {
-                return;
-            }
-            const currentCoords = navigationCurrentLocation;
-            if (navigationMapInstance && navigationMapInstance.getSource('route') && navigationMapInstance.getSource('route')._data && typeof turf !== 'undefined') {
-                try {
-                    const routeGeoJSON = navigationMapInstance.getSource('route')._data;
-                    const routeLineString = turf.lineString(routeGeoJSON.geometry.coordinates);
-                    const carPoint = turf.point([currentCoords.longitude, currentCoords.latitude]);
-                    const distanceToRoute = turf.pointToLineDistance(carPoint, routeLineString, { units: 'meters' });
-                    if (distanceToRoute > DEVIATION_THRESHOLD_METERS) {
-                        if (deviationStartTime === 0) {
-                            deviationStartTime = Date.now();
-                        } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
-                            showDeviationModal(); 
-                            deviationStartTime = 0;
-                        }
-                    } else {
-                        deviationStartTime = 0;
-                    }
-                } catch (e) {
-                    if (deviationStartTime === 0) deviationStartTime = Date.now();
-                    else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
-                        showDeviationModal();
-                        deviationStartTime = 0;
-                    }
-                }
-            } else {
-                if (deviationStartTime === 0) deviationStartTime = Date.now();
-                else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
-                    showDeviationModal();
-                    deviationStartTime = 0;
-                }
-            }
-        } else {
-            deviationStartTime = 0;
-        }
-
-        updateReminderCount(); 
-        updateButtonStyles();
-        
-        let newInterval = isNavigating ? 3500 : 6000;
-        if (isNavigating) {
-            const distToNextManeuver = distanceToNextManeuverOSRM || Infinity;
-            if (distToNextManeuver < 500 && distToNextManeuver > 0) newInterval = 1000;
-            else if (distToNextManeuver < 1000 && distToNextManeuver > 0) newInterval = 2000;
-            else newInterval = 3500;
-        } else if (isInsideAnyRadarZone) {
-            newInterval = 1000;
-        }
-        
-        if (newInterval !== currentCheckIntervalDuration) {
-            currentCheckIntervalDuration = newInterval;
-            if (reminderCheckIntervalId) clearInterval(reminderCheckIntervalId);
-            reminderCheckIntervalId = setInterval(checkReminders, currentCheckIntervalDuration);
-        }
-    });
-}
-
-// ===================================================================
-// NOMBRE: checkAndMarkWaypointsAsVisited (VERSIÓN CON LÓGICA DE ACUMULACIÓN CORREGIDA)
-// RESUMEN: Corrige el error lógico "off-by-one" que marcaba la primera etapa
-//          como visitada. La distancia de cada tramo ahora se usa para evaluar la
-//          llegada a la etapa correcta.
-// ===================================================================
-function checkAndMarkWaypointsAsVisited(route, carDistanceAlongRoute, currentCoords) {
-    if (!route || !route.legs || !currentCoords) return;
-
-    // Se obtienen solo las etapas "reales" que el usuario ha puesto, en el orden correcto.
-    const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
-    if (actualWaypoints.length === 0) return;
-    
-    // El punto de partida siempre está visitado.
-    actualWaypoints[0].visited = true;
-
-    let distanceToStartOfLeg = 0;
-
-    // Se itera sobre los tramos de la ruta (leg 0 es S->1, leg 1 es 1->2, etc.)
-    for (let legIndex = 0; legIndex < route.legs.length; legIndex++) {
-        const leg = route.legs[legIndex];
-        // El waypoint de destino para este tramo es el siguiente en el array de waypoints.
-        const targetWaypoint = actualWaypoints[legIndex + 1];
-
-        if (leg && targetWaypoint) {
-            const distanceToEndOfThisLeg = distanceToStartOfLeg + (leg.distance || 0);
-            
-            // Si el waypoint ya está visitado, simplemente acumulamos la distancia y pasamos al siguiente.
-            if (targetWaypoint.visited) {
-                distanceToStartOfLeg = distanceToEndOfThisLeg;
-                continue;
-            }
-            
-            const isFinalLeg = (legIndex === route.legs.length - 1);
-            
-            if (isFinalLeg) {
-                const finalDestinationCoords = leg.steps.slice(-1)[0].maneuver.location;
-                const physicalDistanceToFinal = calculateDistance(currentCoords.latitude, currentCoords.longitude, finalDestinationCoords[1], finalDestinationCoords[0]);
-                if (physicalDistanceToFinal <= WAYPOINT_VISITED_THRESHOLD_METERS) {
-                    targetWaypoint.visited = true;
-                }
-            } else { // Es una etapa intermedia
-                const tripHasPhysicallyStarted = isNavigating && navigationStartTimeForStats;
-                const hasClearedStartBuffer = carDistanceAlongRoute > 20;
-                
-                if (tripHasPhysicallyStarted && hasClearedStartBuffer && carDistanceAlongRoute >= distanceToEndOfThisLeg - WAYPOINT_VISITED_THRESHOLD_METERS) {
-                    targetWaypoint.visited = true;
-                }
-            }
-            
-            // Actualizamos la distancia para el siguiente tramo.
-            distanceToStartOfLeg = distanceToEndOfThisLeg;
-        }
-    }
-}
-
-// ===================================================================
-// NOMBRE: updateTurnByTurnDisplay (VERSIÓN CON CORRECCIÓN DE MANIOBRA INICIAL)
-// RESUMEN: Soluciona el error que mostraba "Ha llegado" al inicio. Ahora ignora
-//          las maniobras de "llegada" que OSRM coloca al principio de un tramo
-//          y solo muestra la llegada real cuando la proximidad es < 50m.
-// ===================================================================
-function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
-    const topInfoBar = document.getElementById('navigation-top-info-bar');
-    const intersectionPreviewWindow = document.getElementById('intersection-preview-map-window');
-    const helperLeft = document.getElementById('direction-card-izquierda');
-    const helperRight = document.getElementById('direction-card-derecha');
-    const progressBar = document.getElementById('navigation-bottom-progress-bar');
-    const miniNavCard = document.getElementById('mini-nav-info-card'); 
-
-    if (helperLeft) helperLeft.style.display = 'none';
-    if (helperRight) helperRight.style.display = 'none';
-    
-    if (!route || !topInfoBar || !route.legs || route.legs.length === 0) {
-        if (topInfoBar) topInfoBar.style.display = 'none';
-        if (miniNavCard) miniNavCard.style.display = 'none'; 
-        if (intersectionPreviewWindow && !intersectionPreviewWindow.classList.contains('hidden') && intersectionPreviewWindow.dataset.source !== 'click') hideIntersectionPreviewMap();
-        return;
-    }
-    if (!isNavigating && (!navigationCurrentRouteData || navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart).length < 2)) {
-         if (topInfoBar) topInfoBar.style.display = 'none';
-         if (miniNavCard) miniNavCard.style.display = 'none'; 
-         if (intersectionPreviewWindow && !intersectionPreviewWindow.classList.contains('hidden') && intersectionPreviewWindow.dataset.source !== 'click') hideIntersectionPreviewMap();
-         return;
-    }
-
-    topInfoBar.style.display = 'flex';
-    const turnIconContainer = document.getElementById('turn-icon-container-styled');
-    const turnIconDisplayEl = document.getElementById('turn-icon-display');
-    const maneuverTextEl = document.getElementById('maneuver-text-display');
-    const distanceFormattedEl = document.getElementById('distance-to-turn-formatted');
-    const streetEl = document.getElementById('street-name-display');
-    const progressBarEl = document.getElementById('distance-progress-bar-to-turn');
-    
-    if (turnIconDisplayEl) {
-        turnIconDisplayEl.style.width = '100%';
-        turnIconDisplayEl.style.height = '100%';
-        turnIconDisplayEl.style.display = 'flex';
-        turnIconDisplayEl.style.alignItems = 'center';
-        turnIconDisplayEl.style.justifyContent = 'center';
-    }
-
-    const carDistance = Math.min(Math.max(0, carDistanceAlongTheRoute), route.distance);
-    let distanceCoveredInRoute = 0;
-    let currentLegIndex = -1, currentStepIndex = -1;
-    let distanceToEndOfCurrentStepForProgress = 0;
-    let previousStepForPath = null;
-    
-    for (let i = 0; i < route.legs.length; i++) {
-        const leg = route.legs[i];
-        for (let j = 0; j < leg.steps.length; j++) {
-            const step = leg.steps[j];
-            if (carDistance < distanceCoveredInRoute + step.distance) {
-                currentLegIndex = i; currentStepIndex = j;
-                distanceToEndOfCurrentStepForProgress = distanceCoveredInRoute + step.distance;
-                if (j > 0) { previousStepForPath = leg.steps[j - 1]; } 
-                else if (i > 0) { previousStepForPath = route.legs[i-1].steps[route.legs[i-1].steps.length - 1]; }
-                break;
-            }
-            distanceCoveredInRoute += step.distance;
-        }
-        if (currentLegIndex === -1 && i === route.legs.length -1) {
-             currentLegIndex = route.legs.length - 1;
-             currentStepIndex = route.legs[currentLegIndex].steps.length - 1;
-        } else if (currentLegIndex !== -1) {
-            break;
-        }
-    }
-    if (currentLegIndex === -1) {
-        currentLegIndex = route.legs.length - 1;
-        currentStepIndex = route.legs[currentLegIndex].steps.length - 1;
-    }
-
-    currentLegIndexNav = currentLegIndex;
-    currentStepIndexNav = currentStepIndex;
-
-    const waypointsForRequest = navigationWaypoints.filter(wp => wp);
-    
-    let nextStepToDisplay;
-    let tempLegIdx = currentLegIndex;
-    let tempStepIdx = currentStepIndex;
-
-    while (true) {
-        tempStepIdx++;
-        if (tempLegIdx >= route.legs.length || tempStepIdx >= route.legs[tempLegIdx].steps.length) {
-            tempLegIdx++;
-            tempStepIdx = 0;
-        }
-
-        if (tempLegIdx >= route.legs.length) {
-            nextStepToDisplay = route.legs[route.legs.length - 1].steps[route.legs[route.legs.length - 1].steps.length - 1];
-            break;
-        }
-        
-        const candidateStep = route.legs[tempLegIdx].steps[tempStepIdx];
-        const isArrival = candidateStep.maneuver.type === 'arrive';
-        const isDeparture = candidateStep.maneuver.type === 'depart';
-        
-        const arrivalWaypoint = isArrival ? waypointsForRequest[tempLegIdx + 1] : null; 
-        const departureWaypoint = isDeparture ? waypointsForRequest[tempLegIdx] : null;
-
-        if ((isArrival && arrivalWaypoint?.isInternal) || (isDeparture && departureWaypoint?.isInternal)) {
-            continue;
-        }
-        
-        if (currentStepIndex === 0 && isArrival) {
-            continue;
-        }
-        
-        nextStepToDisplay = candidateStep;
-        break;
-    }
-
-    const currentStepForProgress = route.legs[currentLegIndex].steps[currentStepIndex];
-    const distanceToNextManeuver = Math.max(0, distanceToEndOfCurrentStepForProgress - carDistance);
-    const distanceIntoCurrentStep = currentStepForProgress.distance - distanceToNextManeuver;
-    navigationTargetZoom = compassAndModeControl ? compassAndModeControl.mapViewMode : 'static';
-
-    const now = Date.now();
-    const infoOverlay = document.getElementById('map-info-overlay');
-
-    if (!isProgressBarLocked && !isMapImmersiveModeActive && now > progressBarForceShowUntil) {
-        const shouldHide = distanceToNextManeuver > 1000 && distanceIntoCurrentStep > 100;
-        progressBar.classList.toggle('progress-bar-auto-hidden', shouldHide);
-        if (infoOverlay) {
-            infoOverlay.style.display = shouldHide ? 'none' : 'block';
-        }
-        if (miniNavCard) {
-            if (shouldHide) {
-                const distanceText = distanceToNextManeuver < 1000 ? `${Math.round(distanceToNextManeuver / 5) * 5} m` : `${(distanceToNextManeuver / 1000).toFixed(1)} km`;
-                let etaHtml = '';
-
-                const remainingDistanceTotal = Math.max(0, route.distance - carDistanceAlongTheRoute);
-                const remainingDurationTotal = route.distance > 0 ? route.duration * (remainingDistanceTotal / route.distance) : 0;
-                const currentFinalEta = new Date(Date.now() + remainingDurationTotal * 1000);
-
-                if (isNavigating && tripInitialOverallEtaTime) {
-                    const etaText = currentFinalEta.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-                    const finalDeviationMs = currentFinalEta.getTime() - tripInitialOverallEtaTime.getTime();
-                    
-                    let deviationHtml = '';
-                    if (typeof finalDeviationMs === 'number' && !isNaN(finalDeviationMs) && Math.abs(finalDeviationMs) >= 1000) {
-                        const totalSeconds = Math.round(Math.abs(finalDeviationMs) / 1000);
-                        const minutes = Math.floor(totalSeconds / 60);
-                        const seconds = totalSeconds % 60;
-                        const sign = finalDeviationMs > 0 ? '+' : '-';
-                        
-                        const shadowColor = finalDeviationMs > 0 ? 'red' : 'green';
-                        
-                        const style = `color: white; text-shadow: 0 0 5px ${shadowColor}, 0 0 7px ${shadowColor};`;
-                    
-                        const formattedTime = `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
-                        deviationHtml = `<span style="${style}">[${sign}${formattedTime}]</span>`;
-                    }
-                    
-                    etaHtml = `<div style="font-size: 0.68em; margin-top: 2px; text-align: center; ">${etaText} ${deviationHtml}</div>`;
-                }
-
-                miniNavCard.innerHTML = `
-                    <div>${distanceText}</div>
-                    ${etaHtml}
-                `;
-                miniNavCard.style.display = 'block';
-            } else {
-                miniNavCard.style.display = 'none';
-            }
-        }
-    } else {
-        progressBar.classList.remove('progress-bar-auto-hidden');
-        if (infoOverlay) {
-            infoOverlay.style.display = 'block';
-        }
-        if (miniNavCard) {
-            miniNavCard.style.display = 'none';
-        }
-    }
-    
-    if (nextStepToDisplay && nextStepToDisplay.maneuver) {
-        const isArrivalManeuver = nextStepToDisplay.maneuver.type === 'arrive';
-        const isFinalLeg = currentLegIndex === route.legs.length - 1;
-        
-        let stepForDisplayText = nextStepToDisplay;
-        let showArrivalMessage = false;
-
-        if (isArrivalManeuver) {
-            const distanceToEndOfLeg = calculateDistanceToEndOfStep(route, currentLegIndex, route.legs[currentLegIndex].steps.length - 1);
-            const distanceToArrival = Math.max(0, distanceToEndOfLeg - carDistance);
-
-            if (distanceToArrival < 50) {
-                showArrivalMessage = true;
-            } else {
-                stepForDisplayText = currentStepForProgress;
-            }
-        }
-        
-        const maneuver = stepForDisplayText.maneuver;
-        const type = maneuver.type || '';
-        let maneuverText = "";
-        let streetNameText = stepForDisplayText.name || '';
-        
-        if (showArrivalMessage) {
-            if (isFinalLeg) {
-                maneuverText = "Ha llegado a su destino";
-                streetNameText = '';
-            } else {
-                const totalStages = navigationWaypoints.filter(wp => !wp.isInternal && !wp.isRecalculatedStart).length - 1;
-                const stageNumber = currentLegIndex + 1;
-                maneuverText = `Ha llegado a la etapa ${stageNumber} de ${totalStages}`;
-                streetNameText = '';
-            }
-        } else {
-            maneuverText = getManeuverInstructionText(maneuver);
-            if (type === 'depart' || type.includes('roundabout') || type === 'end of road') {
-                streetNameText = '';
-            }
-        }
-        
-        if (turnIconDisplayEl) {
-            const iconFilename = getManeuverIconFilename(maneuver);
-            if (iconFilename !== lastDisplayedManeuverIcon) {
-                const iconUrl = `https://boardinggate.github.io/Tesla/${iconFilename}`;
-                turnIconDisplayEl.innerHTML = `<img src="${iconUrl}" alt="${maneuverText}" style="width: 95%; height: 95%; object-fit: contain; ">`;
-                lastDisplayedManeuverIcon = iconFilename;
-            }
-        }
-        
-        maneuverTextEl.textContent = maneuverText ? `${maneuverText} ` : '';
-        streetEl.textContent = streetNameText;
-        
-        distanceToNextManeuverOSRM = distanceToNextManeuver;
-        distanceFormattedEl.textContent = distanceToNextManeuver < 1000 ? `${Math.round(distanceToNextManeuver / 5) * 5} m` : `${(distanceToNextManeuver / 1000).toFixed(1)} km`;
-        const progressPercent = (currentStepForProgress.distance > 0) ? ((currentStepForProgress.distance - distanceToNextManeuver) / currentStepForProgress.distance) * 100 : (distanceToNextManeuver === 0 ? 100 : 0);
-        if(progressBarEl) progressBarEl.style.width = `${Math.min(100, Math.max(0, progressPercent))}%`;
-
-        if (isNavigating && previousStepForPath && navigationMapInstance.getSource('completed-segments') && navigationCurrentLocation) {
-             if (previousStepForPath.geometry && previousStepForPath.geometry.coordinates) {
-                const segmentGeoJSON = turf.lineString(previousStepForPath.geometry.coordinates);
-                if (segmentGeoJSON.geometry.coordinates.length >= 2) {
-                    const isNewSegment = !lastProcessedStepManeuverLocation || 
-                                         lastProcessedStepManeuverLocation[0] !== previousStepForPath.maneuver.location[0] ||
-                                         lastProcessedStepManeuverLocation[1] !== previousStepForPath.maneuver.location[1];
-                    if (isNewSegment) {
-                        completedSegmentsGeoJSON.features.push(segmentGeoJSON);
-                        navigationMapInstance.getSource('completed-segments').setData(completedSegmentsGeoJSON);
-                        lastProcessedStepManeuverLocation = previousStepForPath.maneuver.location;
-                    }
-                }
-            }
-        }
-        
-        const isRelevantIntersectionManeuver = type !== 'continue' && type !== 'new name' && type !== 'depart' && type !== 'straight';
-        if (isNavigating && distanceToNextManeuver < 800 && distanceToNextManeuver >= 100 && isRelevantIntersectionManeuver && (!intersectionPreviewWindow || intersectionPreviewWindow.classList.contains('hidden') || intersectionPreviewWindow.dataset.source !== 'click') && (currentLegIndex + '_' + currentStepIndex) !== lastAutoShownManeuverId) {
-            showIntersectionPreviewMap(nextStepToDisplay, route, false, 10000);
-            lastAutoShownManeuverId = currentLegIndex + '_' + currentStepIndex;
-        } else if (intersectionPreviewWindow && !intersectionPreviewWindow.classList.contains('hidden') && intersectionPreviewWindow.dataset.source !== 'click' && (distanceToNextManeuver >= 800 || distanceToNextManeuver < 100 || !isRelevantIntersectionManeuver)) {
-            hideIntersectionPreviewMap();
-        }
-        
-        const heading = navigationCurrentLocation?.heading;
-        const isSouthOriented = heading > 135 && heading <= 225;
-        const isEastOriented = heading > 45 && heading <= 135;
-        const isWestOriented = heading > 225 && heading <= 315;
-        const isNearIntersection = distanceToNextManeuver < 180;
-
-        if (turnIconContainer) {
-            turnIconContainer.classList.remove('maneuver-highlight', 'maneuver-highlight-south');
-            turnIconContainer.style.backgroundColor = 'white';
-            if (isNearIntersection && isNavigating) {
-                if (isSouthOriented) {
-                    turnIconContainer.classList.add('maneuver-highlight-south');
-                    turnIconContainer.style.backgroundColor = 'yellow';
-                } else if (isEastOriented || isWestOriented) {
-                    turnIconContainer.classList.add('maneuver-highlight');
-                    turnIconContainer.style.backgroundColor = 'yellow';
-                } else {
-                    turnIconContainer.classList.add('maneuver-highlight');
-                }
-            }
-        }
-
-    } else {
-        if (turnIconDisplayEl) {
-            const iconFilename = 'PNG/arrive.png';
-            if (iconFilename !== lastDisplayedManeuverIcon) {
-                turnIconDisplayEl.innerHTML = `<img src="https://boardinggate.github.io/Tesla/PNG/arrive.png" style="width:95%; height:95%; object-fit:contain;">`;
-                lastDisplayedManeuverIcon = iconFilename;
-            }
-        }
-        maneuverTextEl.textContent = '';
-        streetEl.textContent = 'Has llegado a tu destino';
-        distanceFormattedEl.textContent = '0 m';
-        if(progressBarEl) progressBarEl.style.width = '100%';
-        distanceToNextManeuverOSRM = Infinity;
-        if (miniNavCard) miniNavCard.style.display = 'none';
-        if (intersectionPreviewWindow && !intersectionPreviewWindow.classList.contains('hidden') && intersectionPreviewWindow.dataset.source !== 'click') hideIntersectionPreviewMap();
-        if (turnIconContainer) {
-            turnIconContainer.classList.remove('maneuver-highlight', 'maneuver-highlight-south');
-            turnIconContainer.style.backgroundColor = 'white';
-        }
-    }
-}
-
-
-    
 // ===================================================================
 // NOMBRE: DOMContentLoaded (MODIFICADO)
 // RESUMEN: Punto de entrada principal. Ahora espera a la sincronización pre-vuelo ANTES de inicializar la app.
