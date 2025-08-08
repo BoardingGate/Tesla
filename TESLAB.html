@@ -1,4 +1,4 @@
-CHECK 18
+CHECK 19
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -5540,6 +5540,222 @@ async function checkReminders() {
     }
 }
 
+¡Entendido! Vamos a añadir un log de depuración muy detallado para "cazar" exactamente qué está pasando. Esta es la mejor forma de proceder cuando la lógica parece correcta pero el resultado no lo es.
+
+La idea es que, dentro de `checkReminders`, por cada recordatorio que sea un radar (manual o dinámico), imprimamos en la consola toda la información relevante y el resultado de cada paso de la comprobación. Así veremos en tiempo real por qué un radar en concreto no está siendo marcado como "vencido".
+
+---
+
+### **Plan de Acción: El "Modo Detective"**
+
+1.  **Modificar `checkReminders`:** Añadiremos un bloque `if (isRadarType)` dentro del bucle principal.
+2.  **Recopilar Datos:** Dentro de ese bloque, recogeremos todas las variables clave:
+    *   Nombre del radar.
+    *   Su ID.
+    *   Su `dueTimeUTC` (la fecha de vencimiento pre-calculada).
+    *   La hora actual (`nowTime`).
+    *   Si tenemos coordenadas del coche (`coords`).
+    *   La distancia calculada al radar.
+    *   El radio del radar.
+3.  **Evaluar y Marcar:** Crearemos "banderas" (variables `true`/`false`) para cada una de las 3 condiciones que nos interesan:
+    *   `isTimeOverdue`: ¿Ha pasado la hora de vencimiento?
+    *   `isLocationConditionMet`: ¿Está el coche dentro del radio?
+    *   `shouldNotify`: ¿Se cumplen ambas condiciones?
+4.  **Imprimir en Consola:** Mostraremos un `console.log` con todos estos datos de forma clara y estructurada.
+
+Esto nos dará una "radiografía" completa de lo que `checkReminders` está "pensando" en cada ciclo para cada radar.
+
+---
+
+### **Función `checkReminders` con Log de Depuración Detallado**
+
+Reemplaza tu función `checkReminders` con esta versión. Es el único cambio necesario.
+
+```javascript
+// ===================================================================
+// NOMBRE: checkReminders (VERSIÓN OPTIMIZADA FINAL)
+// RESUMEN: Bucle optimizado que usa la caché, la ubicación GPS existente y filtra por relevancia de ruta.
+async function checkReminders() {
+    const now = Date.now();
+
+    // TAREA 1: Sincronización Móvil (optimizado)
+    if (isMobileSession && (now - lastMobileSyncCheck > 6000)) {
+        lastMobileSyncCheck = now;
+        const { primaryId } = parseUserId(localStorage.getItem('userData_userId'));
+        const autoSyncEnabled = JSON.parse(localStorage.getItem('boardinggate_autoBackupOnLoad') || 'false');
+        const backupPassword = localStorage.getItem('userData_backupPassword');
+
+        if (autoSyncEnabled && primaryId && backupPassword) {
+            const localTimestamp = parseInt(localStorage.getItem('lastCacheUpdateTimestamp') || '0');
+            if (localTimestamp > lastMobileSyncTimestamp) {
+                autoSaveFromMobile(primaryId, backupPassword);
+                lastMobileSyncTimestamp = localTimestamp;
+            }
+        }
+    }
+
+    // TAREA 2: Carga de Radares Dinámicos
+    if (!isNavigating) {
+        const timeSinceLastCheck = now - lastMobileSyncCheck;
+        const hasExistingDynamicRadars = processedRemindersCache.some(r => r.isDynamicRadar === true);
+        if (timeSinceLastCheck > 30 * 60 * 1000 || !hasExistingDynamicRadars) {
+            updateDynamicRadars(true);
+        }
+    }
+
+    // TAREA 3: Red de Seguridad para ETA
+    if (isNavigating && navigationCurrentRouteData?.routes?.[0]?.distance < 10) {
+        const finalWaypoint = navigationWaypoints[navigationWaypoints.length - 1];
+        if (finalWaypoint && !finalWaypoint.visited) {
+            recalculateAndDrawRoute(true);
+            return;
+        }
+    }
+    
+    // TAREA 4: Gestión de la Caché
+    if (isCacheDirty) {
+        rebuildProcessedRemindersCache();
+    }
+    
+    // TAREA 5: Bucle Principal de Comprobación
+    const overdueReminders = [];
+    let coords = navigationCurrentLocation;
+
+    if (!coords && (processedRemindersCache.some(r => r.isLocationEnabled) || !isNavigating)) {
+        coords = await getCurrentLocationAsync().catch(() => null);
+    }
+    
+    const nowTime = now;
+    let isNearActiveLocationPoint = false; 
+    let remindersToCheck = [];
+
+    if (isNavigating) {
+        remindersToCheck = [...tareasEnRutaActual, ...radaresEnRutaActual];
+        processedRemindersCache.forEach(reminder => {
+            if (!reminder.isLocationEnabled) {
+                remindersToCheck.push(reminder);
+            }
+        });
+        remindersToCheck = remindersToCheck.filter((r, index, self) => 
+            index === self.findIndex(t => t.id === r.id)
+        );
+    } else {
+        remindersToCheck = processedRemindersCache;
+    }
+    
+    remindersToCheck.forEach(reminder => {
+        if (!reminder) return;
+        
+        const isRadarType = reminder.text.toUpperCase().includes("RADAR") || reminder.excludeFromList;
+
+        // Lógica para acelerar el ciclo (comprobación de proximidad)
+        if (coords && reminder.isLocationEnabled && reminder.locationCoordinates) {
+            const distance = calculateDistance(coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude);
+            if (distance <= (reminder.radiusMeters || DEFAULT_LOCATION_RADIUS)) {
+                if (isRadarType) { // Acelerar solo si es radar
+                    isNearActiveLocationPoint = true;
+                }
+            }
+        }
+
+        if (reminder.managedByUser) return;
+
+        let isOverdue = false;
+        let locationConditionMet = false; // Inicializar a false
+        const dueTime = reminder.dueTimeUTC;
+
+        // --- INICIO DEL LOG DE DEPURACIÓN DETALLADO PARA RADARES ---
+        if (isRadarType) {
+            const isTimeOverdue = dueTime && dueTime <= nowTime;
+            let distanceToRadar = Infinity;
+            
+            if (coords && reminder.locationCoordinates) {
+                distanceToRadar = calculateDistance(coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude);
+                locationConditionMet = distanceToRadar <= (reminder.radiusMeters || DEFAULT_LOCATION_RADIUS);
+            }
+            
+            const shouldNotify = isTimeOverdue && locationConditionMet;
+
+            console.log(
+                `%c[RADAR CHECK] %c${reminder.text.replace(/<[^>]*>/g, '')}`,
+                'color: #FFD700; font-weight: bold;',
+                'color: #FFFFFF;',
+                {
+                    ID: reminder.id,
+                    VENCIDO: `${isTimeOverdue} (Vence: ${dueTime ? new Date(dueTime).toLocaleString() : 'N/A'}, Ahora: ${new Date(nowTime).toLocaleString()})`,
+                    EN_RADIO: `${locationConditionMet} (Dist: ${distanceToRadar.toFixed(0)}m, Radio: ${reminder.radiusMeters || DEFAULT_LOCATION_RADIUS}m)`,
+                    NOTIFICAR: shouldNotify
+                }
+            );
+        }
+        // --- FIN DEL LOG DE DEPURACIÓN ---
+
+        if (dueTime && dueTime <= nowTime) {
+            if (reminder.isLocationEnabled && reminder.locationCoordinates) {
+                if (coords) {
+                    const distance = calculateDistance(coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude);
+                    locationConditionMet = distance <= (reminder.radiusMeters || DEFAULT_LOCATION_RADIUS);
+                }
+            } else {
+                locationConditionMet = true; // Si no es de ubicación, la condición de ubicación se cumple
+            }
+            
+            if (locationConditionMet) {
+                isOverdue = true;
+            }
+        }
+
+        if (isOverdue && !overdueReminders.some(r => r.id === reminder.id)) {
+            overdueReminders.push(reminder);
+        }
+    });
+    
+    if (overdueReminders.length > 0) {
+        displayUnifiedReminderWindow(overdueReminders);
+    } else if (isUnifiedWindowVisibleByLogic) {
+        hideUnifiedReminderWindow();
+    }
+
+    // TAREA 6: Actualizar UI y ajustar intervalo
+    updateReminderCount();
+    updateButtonStyles();
+
+    let newInterval;
+    const speed = window.currentSpeedKmh || 0;
+
+    if (isNearActiveLocationPoint) {
+        newInterval = 1000;
+    } else if (speed > 85) {
+        newInterval = 3000;
+    } else if (speed > 40) {
+        newInterval = 5000;
+    } else if (speed > 5) {
+        newInterval = 8000;
+    } else {
+        newInterval = 15000;
+    }
+
+    if (newInterval !== currentCheckIntervalDuration) {
+        currentCheckIntervalDuration = newInterval;
+        if (reminderCheckIntervalId) clearInterval(reminderCheckIntervalId);
+        reminderCheckIntervalId = setInterval(checkReminders, currentCheckIntervalDuration);
+    }
+}
+```
+
+**Cómo Usar el Nuevo Log:**
+
+1.  Reemplaza la función en tu código.
+2.  Recarga la página y reproduce el escenario donde el radar manual no se notifica.
+3.  Abre la consola de `eruda`.
+4.  Busca las líneas que empiezan con **`[RADAR CHECK]`**. Verás una entrada por cada radar que se está procesando en ese ciclo.
+5.  Analiza la línea correspondiente a tu radar manual:
+    *   **VENCIDO:** Debería ser `true`. Si es `false`, el problema está en la fecha/hora con la que se guardó. Fíjate en la fecha de vencimiento y la hora actual para comparar.
+    *   **EN_RADIO:** Debería ser `true` cuando estés pasando por él. Fíjate en la distancia calculada (`Dist`) y compárala con el `Radio`.
+    *   **NOTIFICAR:** Solo será `true` si las dos anteriores son `true`.
+
+Este log nos dirá exactamente cuál de las tres condiciones (ser un radar, estar vencido, estar cerca) está fallando.
+    
 
 
 // ===================================================================
