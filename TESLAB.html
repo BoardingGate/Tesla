@@ -1,4 +1,4 @@
-CHECK 16
+CHECK 17
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -5261,7 +5261,6 @@ async function updateDynamicRadars(isInitialLoadCheck = false) {
     }
 }
 
-
 // ===================================================================
 // NOMBRE: toggleRadaresRuta (VERSIÓN FINAL ANTI-DUPLICADOS Y CON CONTEO COMPLETO)
 // RESUMEN: Activa/desactiva la visualización de radares en la ruta, unificando dinámicos y manuales sin duplicados.
@@ -5287,7 +5286,7 @@ async function toggleRadaresRuta(activo) {
 
             const routeLineString = turf.lineString(navigationMapInstance.getSource('route')._data.geometry.coordinates);
             
-            // --- PASO 1: "Adoptar" todos los radares existentes (manuales y dinámicos) que estén en la ruta ---
+            // --- PASO 1: "Adoptar" todos los radares existentes en la caché que estén en la ruta ---
             processedRemindersCache.forEach(reminder => {
                 const isRadarType = (reminder.text.toUpperCase().includes("RADAR") || reminder.excludeFromList);
                 if (isRadarType && reminder.isLocationEnabled && reminder.locationCoordinates) {
@@ -5295,6 +5294,7 @@ async function toggleRadaresRuta(activo) {
                     const nearestPointOnRoute = turf.nearestPointOnLine(routeLineString, radarPoint, { units: 'meters' });
 
                     if (nearestPointOnRoute.properties.dist <= RUTA_RADAR_PROXIMITY_THRESHOLD) {
+                        // Añadimos el objeto completo de la caché, que ya tiene dueTimeUTC
                         radaresEnRutaActual.push({
                             ...reminder,
                             isFromRuta: true,
@@ -5325,19 +5325,22 @@ async function toggleRadaresRuta(activo) {
                 if (window.radarsSpatialIndex[cellId]) candidateRadars.push(...window.radarsSpatialIndex[cellId]);
             });
             const uniqueCandidates = [...new Set(candidateRadars)];
+            
+            let newRadarsAddedToLocalStorage = false;
+            let remindersFromStorage = JSON.parse(localStorage.getItem('reminders') || '[]');
 
             uniqueCandidates.forEach(radar => {
                 const radarPoint = turf.point([radar.lon, radar.lat]);
                 const nearestPointOnRoute = turf.nearestPointOnLine(routeLineString, radarPoint, { units: 'meters' });
 
                 if (nearestPointOnRoute.properties.dist <= RUTA_RADAR_PROXIMITY_THRESHOLD) {
-                    const radarYaExiste = processedRemindersCache.some(rem => 
+                    const radarYaExisteEnCache = processedRemindersCache.some(rem => 
                         rem.isLocationEnabled && rem.locationCoordinates &&
                         Math.abs(rem.locationCoordinates.latitude - radar.lat) < COORD_EPSILON &&
                         Math.abs(rem.locationCoordinates.longitude - radar.lon) < COORD_EPSILON
                     );
 
-                    if (!radarYaExiste) {
+                    if (!radarYaExisteEnCache) {
                         const now = new Date();
                         const radarData = {
                             id: Date.now() + Math.random() + radaresEnRutaActual.length,
@@ -5348,15 +5351,25 @@ async function toggleRadaresRuta(activo) {
                             managedByUser: false, isLocationEnabled: true,
                             locationCoordinates: { latitude: radar.lat, longitude: radar.lon },
                             radiusMeters: 350, excludeFromList: true,
-                            isFromRuta: true,
+                            isFromRuta: true, // Marcar como de ruta para limpieza
+                            isDynamicRadar: true, // Marcar como dinámico
                             distanceOnRoute: nearestPointOnRoute.properties.location
                         };
+                        
+                        remindersFromStorage.push(radarData); // Añadir al array de storage
+                        radaresEnRutaActual.push(radarData); // Añadir a la lista de ruta activa
+                        newRadarsAddedToLocalStorage = true;
+
                         const mapObject = plotSingleReminderOnMap(radarData, navigationMapInstance);
                         if (mapObject) reminderMapObjects.push(mapObject);
-                        radaresEnRutaActual.push(radarData);
                     }
                 }
             });
+
+            if (newRadarsAddedToLocalStorage) {
+                localStorage.setItem('reminders', JSON.stringify(remindersFromStorage));
+                markRemindersCacheAsDirty(); // MUY IMPORTANTE: Forzar reconstrucción de caché en el siguiente ciclo
+            }
 
         } catch (error) {
             showToast(`Error al procesar radares en ruta: ${error.message}`, "error");
@@ -5371,6 +5384,7 @@ async function toggleRadaresRuta(activo) {
         radaresRutaCheckbox.checked = activo;
     }
 }
+
 
 // ===================================================================
 // NOMBRE: checkReminders (VERSIÓN OPTIMIZADA FINAL)
@@ -5429,28 +5443,22 @@ async function checkReminders() {
     let isNearActiveLocationPoint = false; 
     let remindersToCheck = [];
 
-    // Lógica de filtrado por ruta
-    if (isNavigating && navigationMapInstance?.getSource('route')?.['_data']) {
-        const routeLineString = turf.lineString(navigationMapInstance.getSource('route')._data.geometry.coordinates);
-        
-        const filteredCacheReminders = processedRemindersCache.filter(reminder => {
-            if (!reminder.isLocationEnabled || !reminder.locationCoordinates) {
-                return true; 
+    // --- LÓGICA DE FILTRADO UNIFICADA ---
+    if (isNavigating) {
+        // En navegación, la lista a comprobar es la construida por toggleTareasRuta y toggleRadaresRuta
+        remindersToCheck = [...tareasEnRutaActual, ...radaresEnRutaActual];
+        // Añadir recordatorios no geolocalizados de la caché principal
+        processedRemindersCache.forEach(reminder => {
+            if (!reminder.isLocationEnabled) {
+                remindersToCheck.push(reminder);
             }
-            const isRadarAddedByRoute = radaresEnRutaActual.some(r => r.id === reminder.id);
-            if (isRadarAddedByRoute) return false; 
-
-            const taskPoint = turf.point([reminder.locationCoordinates.longitude, reminder.locationCoordinates.latitude]);
-            const distanceToRoute = turf.pointToLineDistance(taskPoint, routeLineString, { units: 'kilometers' });
-            return distanceToRoute <= 0.075; 
         });
-
-        remindersToCheck = [...filteredCacheReminders, ...radaresEnRutaActual];
+        // Eliminar duplicados por si acaso
         remindersToCheck = remindersToCheck.filter((r, index, self) => 
             index === self.findIndex(t => t.id === r.id)
         );
-
     } else {
+        // Si no se navega, se comprueba toda la caché
         remindersToCheck = processedRemindersCache;
     }
     
@@ -5469,16 +5477,7 @@ async function checkReminders() {
         let isOverdue = false;
         let locationConditionMet = true;
 
-        const dueTime = reminder.dueTimeUTC !== undefined ? reminder.dueTimeUTC : (()=>{
-            if(reminder.date && reminder.time) {
-                try {
-                    const [y,m,d] = reminder.date.split('-').map(Number);
-                    const [h,min] = reminder.time.split(':').map(Number);
-                    return new Date(Date.UTC(y,m-1,d,h,min)).getTime();
-                } catch(e) { return null; }
-            }
-            return null;
-        })();
+        const dueTime = reminder.dueTimeUTC; // Usar siempre el de la caché
 
         if (dueTime && dueTime <= nowTime) {
             if (reminder.isLocationEnabled && reminder.locationCoordinates) {
@@ -5509,11 +5508,9 @@ async function checkReminders() {
     updateReminderCount();
     updateButtonStyles();
 
-    // --- LÓGICA DE INTERVALO UNIVERSAL ADAPTATIVO POR VELOCIDAD ---
     let newInterval;
     const speed = window.currentSpeedKmh || 0;
-
-    if (isNearActiveLocationPoint) {
+        if (isNearActiveLocationPoint) {
         newInterval = 1000; // 1. Prioridad Máxima: Cerca de un punto de interés (1s).
     } else if (speed > 115) {
         newInterval = 4000; // 2. Alta velocidad (>85 km/h) -> Chequeo frecuente (3s).
@@ -5535,6 +5532,7 @@ async function checkReminders() {
         reminderCheckIntervalId = setInterval(checkReminders, currentCheckIntervalDuration);
     }
 }
+
 // ===================================================================
 // NOMBRE: toggleTareasRuta (VERSIÓN OPTIMIZADA Y CORREGIDA PARA MAPBOX)
 // RESUMEN: Muestra tareas en la ruta. Optimizado para evitar recalculos innecesarios.
