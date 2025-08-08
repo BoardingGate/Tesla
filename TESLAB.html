@@ -5260,6 +5260,7 @@ async function updateDynamicRadars(isInitialLoadCheck = false) {
         showToast(`Error al actualizar radares: ${error.message}`, "error");
     }
 }
+
 // ===================================================================
 // NOMBRE: checkReminders (VERSIÓN OPTIMIZADA FINAL)
 // RESUMEN: Bucle optimizado que usa la caché, la ubicación GPS existente y filtra por relevancia de ruta.
@@ -5315,23 +5316,28 @@ async function checkReminders() {
     
     const nowTime = now;
     let isInsideAnyRadarZone = false;
-    let remindersToCheck = processedRemindersCache;
+    let remindersToCheck = [];
 
-    // --- INICIO DE LA OPTIMIZACIÓN POR RUTA ---
+    // --- INICIO DE LA LÓGICA DE FILTRADO CORREGIDA ---
     if (isNavigating && navigationMapInstance?.getSource('route')?.['_data']) {
         const routeLineString = turf.lineString(navigationMapInstance.getSource('route')._data.geometry.coordinates);
-        remindersToCheck = processedRemindersCache.filter(reminder => {
+        
+        // 1. Filtra los recordatorios de la caché principal
+        const filteredCacheReminders = processedRemindersCache.filter(reminder => {
             if (!reminder.isLocationEnabled || !reminder.locationCoordinates) {
                 return true; // Siempre incluir recordatorios no geolocalizados
             }
             const taskPoint = turf.point([reminder.locationCoordinates.longitude, reminder.locationCoordinates.latitude]);
             const distanceToRoute = turf.pointToLineDistance(taskPoint, routeLineString, { units: 'kilometers' });
-            return distanceToRoute <= 3; // Solo comprobar recordatorios a menos de 3km de la ruta
+            return distanceToRoute <= 3;
         });
-    }
-    // --- FIN DE LA OPTIMIZACIÓN POR RUTA ---
 
-    // --- INICIO: Log de depuración para contar los tipos de recordatorios procesados ---
+        remindersToCheck = [...filteredCacheReminders, ...radaresEnRutaActual];
+
+    } else {
+        remindersToCheck = processedRemindersCache;
+    }
+   
     let countTimeBased = 0;
     let countLocationBased = 0;
     let countRadar = 0;
@@ -5346,29 +5352,36 @@ async function checkReminders() {
         }
     });
     console.log(`[CheckReminders] Procesando ${remindersToCheck.length} recordatorios (Tiempo: ${countTimeBased}, Ubicación: ${countLocationBased}, Radares: ${countRadar})`);
-    // --- FIN: Log de depuración ---
-
+    
     remindersToCheck.forEach(reminder => {
         if (!reminder) return;
         
         const isRadarType = reminder.text.toUpperCase().includes("RADAR") || reminder.excludeFromList;
 
-        // --- INICIO DE LA LÓGICA CORREGIDA ---
-        // Comprobamos la proximidad a CUALQUIER radar, independientemente de si está vencido, para acelerar el ciclo.
         if (coords && reminder.isLocationEnabled && reminder.locationCoordinates && isRadarType) {
             const distance = calculateDistance(coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude);
             if (distance <= (reminder.radiusMeters || DEFAULT_LOCATION_RADIUS)) {
                 isInsideAnyRadarZone = true;
             }
         }
-        // --- FIN DE LA LÓGICA CORREGIDA ---
 
         if (reminder.managedByUser) return;
 
         let isOverdue = false;
         let locationConditionMet = true;
 
-        if (reminder.dueTimeUTC && reminder.dueTimeUTC <= nowTime) {
+        const dueTime = reminder.dueTimeUTC !== undefined ? reminder.dueTimeUTC : (()=>{
+            if(reminder.date && reminder.time) {
+                try {
+                    const [y,m,d] = reminder.date.split('-').map(Number);
+                    const [h,min] = reminder.time.split(':').map(Number);
+                    return new Date(Date.UTC(y,m-1,d,h,min)).getTime();
+                } catch(e) { return null; }
+            }
+            return null;
+        })();
+
+        if (dueTime && dueTime <= nowTime) {
             if (reminder.isLocationEnabled && reminder.locationCoordinates) {
                 if (coords) {
                     const distance = calculateDistance(coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude);
@@ -20543,9 +20556,8 @@ function parseKML(kmlText) {
     }
     return placemarks;
 }
-
 // ===================================================================
-// NOMBRE: toggleRadaresRuta (VERSIÓN OPTIMIZADA)
+// NOMBRE: toggleRadaresRuta (VERSIÓN OPTIMIZADA Y CORREGIDA PARA MAPBOX)
 // RESUMEN: Activa/desactiva la visualización de radares en la ruta actual usando la caché y el índice espacial.
 async function toggleRadaresRuta(activo) {
     const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
@@ -20574,6 +20586,7 @@ async function toggleRadaresRuta(activo) {
 
             const routeLineString = turf.lineString(navigationMapInstance.getSource('route')._data.geometry.coordinates);
             
+            // --- INICIO PARTE 1: BÚSQUEDA DE RADARES DINÁMICOS (KML) ---
             const intersectingCells = new Set();
             const routeCoords = routeLineString.geometry.coordinates;
             for (let i = 0; i < routeCoords.length; i++) {
@@ -20602,12 +20615,6 @@ async function toggleRadaresRuta(activo) {
                 const nearestPointOnRoute = turf.nearestPointOnLine(routeLineString, radarPoint, { units: 'meters' });
                 
                 if (nearestPointOnRoute && nearestPointOnRoute.properties.dist !== undefined && nearestPointOnRoute.properties.dist <= RUTA_RADAR_PROXIMITY_THRESHOLD) {
-                    const radarYaExisteEnMapa = reminderMapObjects.some(obj => 
-                        obj.marker &&
-                        Math.abs(obj.marker.getLngLat().lat - radar.lat) < COORD_EPSILON &&
-                        Math.abs(obj.marker.getLngLat().lng - radar.lon) < COORD_EPSILON
-                    );
-
                     const now = new Date();
                     const radarData = {
                         id: Date.now() + Math.random() + radaresEnRutaActual.length,
@@ -20621,17 +20628,34 @@ async function toggleRadaresRuta(activo) {
                         isFromRuta: true,
                         distanceOnRoute: nearestPointOnRoute.properties.location
                     };
-
-                    if (!radarYaExisteEnMapa) {
-                        const mapObject = plotSingleReminderOnMap(radarData, navigationMapInstance);
-                        if (mapObject) {
-                            reminderMapObjects.push(mapObject);
-                        }
+                    const mapObject = plotSingleReminderOnMap(radarData, navigationMapInstance);
+                    if (mapObject) {
+                        reminderMapObjects.push(mapObject);
                     }
-                    
                     radaresEnRutaActual.push(radarData);
                 }
             });
+            processedRemindersCache.forEach(reminder => {
+                if (!reminder.isLocationEnabled || !reminder.locationCoordinates) return;
+
+                const isManualRadar = (reminder.text.toUpperCase().includes("RADAR") || reminder.excludeFromList) && !reminder.isDynamicRadar;
+                if (!isManualRadar) return;
+
+                const radarPoint = turf.point([reminder.locationCoordinates.longitude, reminder.locationCoordinates.latitude]);
+                const nearestPointOnRoute = turf.nearestPointOnLine(routeLineString, radarPoint, { units: 'meters' });
+
+                if (nearestPointOnRoute && nearestPointOnRoute.properties.dist !== undefined && nearestPointOnRoute.properties.dist <= RUTA_RADAR_PROXIMITY_THRESHOLD) {
+                    // Evitar duplicados si el usuario ha creado un radar manual que ya es dinámico
+                    if (!radaresEnRutaActual.some(r => r.id === reminder.id)) {
+                        radaresEnRutaActual.push({
+                            ...reminder,
+                            isFromRuta: true, // Marcarlo como relevante para la ruta
+                            distanceOnRoute: nearestPointOnRoute.properties.location
+                        });
+                    }
+                }
+            });
+           
         } catch (error) {
             showToast(`Error al procesar radares en ruta: ${error.message}`, "error");
         }
