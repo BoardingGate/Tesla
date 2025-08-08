@@ -1,4 +1,4 @@
-CHECK 05
+CHECK 06
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -5159,101 +5159,6 @@ class CombinedMapControl {
 
 
 // ===================================================================
-// NOMBRE: markRemindersCacheAsDirty (NUEVA FUNCIÓN)
-// RESUMEN: Marca la caché de recordatorios en memoria como "sucia" para forzar su reconstrucción.
-function markRemindersCacheAsDirty() {
-    isCacheDirty = true;
-}
-
-// ===================================================================
-// NOMBRE: rebuildProcessedRemindersCache (NUEVA FUNCIÓN)
-// RESUMEN: Procesa y cachea los recordatorios desde localStorage para optimizar las comprobaciones.
-function rebuildProcessedRemindersCache() {
-    try {
-        const allReminders = JSON.parse(localStorage.getItem('reminders') || '[]');
-        const now = new Date();
-        processedRemindersCache = allReminders.map(reminder => {
-            let dueTimeUTC = null;
-            if (reminder.date && reminder.time) {
-                try {
-                    const [year, month, day] = reminder.date.split('-').map(Number);
-                    const [hour, minute] = reminder.time.split(':').map(Number);
-                    const dueDate = new Date(Date.UTC(year, month - 1, day, hour, minute));
-                    if (!isNaN(dueDate.getTime())) {
-                        dueTimeUTC = dueDate.getTime();
-                    }
-                } catch (e) {
-                    // Ignorar fechas inválidas
-                }
-            }
-            return { ...reminder, dueTimeUTC: dueTimeUTC };
-        });
-        isCacheDirty = false;
-        console.log(`[CACHE] Caché de recordatorios reconstruida con ${processedRemindersCache.length} elementos.`);
-    } catch (e) {
-        console.error("Error al reconstruir la caché de recordatorios:", e);
-        processedRemindersCache = [];
-    }
-}
-
-// ===================================================================
-// NOMBRE: startDeviationChecker (NUEVA FUNCIÓN)
-// RESUMEN: Inicia un temporizador dedicado para la comprobación de desvío de ruta.
-function startDeviationChecker() {
-    stopDeviationChecker(); // Asegura que no haya intervalos duplicados
-    console.log("[DESVÍO] Iniciando comprobador de desvío cada 5 segundos.");
-    deviationCheckIntervalId = setInterval(() => {
-        if (!isNavigating || !navigationCurrentLocation || isRecalculatingRoute || isDeviationModalActive || isAddReminderAtLocationModeActive) {
-            deviationStartTime = 0;
-            return;
-        }
-        if (Date.now() < deviationCheckGracePeriodUntil) {
-            return;
-        }
-        const currentCoords = navigationCurrentLocation;
-        const routeSource = navigationMapInstance?.getSource('route');
-        if (routeSource && routeSource._data && typeof turf !== 'undefined') {
-            try {
-                const routeGeoJSON = routeSource._data;
-                const routeLineString = turf.lineString(routeGeoJSON.geometry.coordinates);
-                const carPoint = turf.point([currentCoords.longitude, currentCoords.latitude]);
-                const distanceToRoute = turf.pointToLineDistance(carPoint, routeLineString, { units: 'meters' });
-
-                if (distanceToRoute > DEVIATION_THRESHOLD_METERS) {
-                    if (deviationStartTime === 0) {
-                        deviationStartTime = Date.now();
-                    } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
-                        showDeviationModal();
-                        deviationStartTime = 0;
-                    }
-                } else {
-                    deviationStartTime = 0;
-                }
-            } catch (e) {
-                // Error en turf, iniciar contador como fallback
-                if (deviationStartTime === 0) deviationStartTime = Date.now();
-                else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
-                    showDeviationModal();
-                    deviationStartTime = 0;
-                }
-            }
-        }
-    }, 5000); // Frecuencia de 5 segundos
-}
-
-// ===================================================================
-// NOMBRE: stopDeviationChecker (NUEVA FUNCIÓN)
-// RESUMEN: Detiene el temporizador de comprobación de desvío.
-function stopDeviationChecker() {
-    if (deviationCheckIntervalId) {
-        console.log("[DESVÍO] Deteniendo comprobador de desvío.");
-        clearInterval(deviationCheckIntervalId);
-        deviationCheckIntervalId = null;
-        deviationStartTime = 0;
-    }
-}
-
-// ===================================================================
 // NOMBRE: updateDynamicRadars (MODIFICADA - Lógica de Navegación vs. Radio)
 // RESUMEN: Carga radares dinámicos según el contexto (en ruta o en radio).
 async function updateDynamicRadars(isInitialLoadCheck = false) {
@@ -5360,12 +5265,12 @@ async function updateDynamicRadars(isInitialLoadCheck = false) {
 }
 
 // ===================================================================
-// NOMBRE: checkReminders (VERSIÓN OPTIMIZADA)
-// RESUMEN: Bucle principal optimizado que utiliza la caché en memoria y separa la lógica de desvío.
-function checkReminders() {
+// NOMBRE: checkReminders (VERSIÓN OPTIMIZADA FINAL)
+// RESUMEN: Bucle optimizado que usa la caché, la ubicación GPS existente y filtra por relevancia de ruta.
+async function checkReminders() {
     const now = Date.now();
 
-    // TAREA 1: Sincronización Móvil (limitada y solo en modo móvil)
+    // TAREA 1: Sincronización Móvil (optimizado)
     if (isMobileSession && (now - lastMobileSyncCheck > 6000)) {
         lastMobileSyncCheck = now;
         const { primaryId } = parseUserId(localStorage.getItem('userData_userId'));
@@ -5381,7 +5286,7 @@ function checkReminders() {
         }
     }
 
-    // TAREA 2: Carga de Radares Dinámicos (solo si no se navega)
+    // TAREA 2: Carga de Radares Dinámicos
     if (!isNavigating) {
         const timeSinceLastCheck = now - lastDynamicRadarCheck;
         const hasExistingDynamicRadars = processedRemindersCache.some(r => r.isDynamicRadar === true);
@@ -5390,83 +5295,196 @@ function checkReminders() {
         }
     }
 
-    // TAREA 3: Red de Seguridad para ETA atascado
+    // TAREA 3: Red de Seguridad para ETA
     if (isNavigating && navigationCurrentRouteData?.routes?.[0]?.distance < 10) {
-        const finalWaypoint = navigationWaypoints.length > 0 ? navigationWaypoints[navigationWaypoints.length - 1] : null;
+        const finalWaypoint = navigationWaypoints[navigationWaypoints.length - 1];
         if (finalWaypoint && !finalWaypoint.visited) {
             recalculateAndDrawRoute(true);
             return;
         }
     }
     
-    // TAREA 4: Comprobación de la Caché de Recordatorios (El "Corazón" Optimizado)
+    // TAREA 4: Gestión de la Caché
     if (isCacheDirty) {
         rebuildProcessedRemindersCache();
     }
     
+    // TAREA 5: Bucle Principal de Comprobación
     const overdueReminders = [];
-    new Promise(resolve => {
-        if (isSimulatingGpsLocation && simulatedGpsLocation) resolve(simulatedGpsLocation);
-        else if (navigationCurrentLocation) resolve(navigationCurrentLocation);
-        else resolve(null); // No esperar al GPS si no está disponible de inmediato
-    }).then(coords => {
-        const nowDate = new Date();
-        const nowTime = nowDate.getTime();
-        let isInsideAnyRadarZone = false;
-        
-        processedRemindersCache.forEach(reminder => {
-            if (!reminder || reminder.managedByUser) return;
-            let isOverdue = false;
-            let locationConditionMet = true;
+    let coords = navigationCurrentLocation;
 
-            if (reminder.dueTimeUTC && reminder.dueTimeUTC <= nowTime) {
-                if (reminder.isLocationEnabled && reminder.locationCoordinates) {
-                    if (coords) {
-                        const distance = calculateDistance(coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude);
-                        locationConditionMet = distance <= (reminder.radiusMeters || DEFAULT_LOCATION_RADIUS);
-                        if (locationConditionMet && (reminder.text.toUpperCase().includes("RADAR") || reminder.excludeFromList)) {
-                            isInsideAnyRadarZone = true;
-                        }
-                    } else {
-                        locationConditionMet = false;
-                    }
-                }
-                if (locationConditionMet) {
-                    isOverdue = true;
-                }
-            }
+    if (!coords && (processedRemindersCache.some(r => r.isLocationEnabled) || !isNavigating)) {
+        coords = await getCurrentLocationAsync().catch(() => null);
+    }
+    
+    const nowTime = now;
+    let isInsideAnyRadarZone = false;
+    let remindersToCheck = processedRemindersCache;
 
-            if (isOverdue && !overdueReminders.some(r => r.id === reminder.id)) {
-                overdueReminders.push(reminder);
+    // --- INICIO DE LA OPTIMIZACIÓN POR RUTA ---
+    if (isNavigating && navigationMapInstance?.getSource('route')?.['_data']) {
+        const routeLineString = turf.lineString(navigationMapInstance.getSource('route')._data.geometry.coordinates);
+        remindersToCheck = processedRemindersCache.filter(reminder => {
+            if (!reminder.isLocationEnabled || !reminder.locationCoordinates) {
+                return true; // Siempre incluir recordatorios no geolocalizados
             }
+            const taskPoint = turf.point([reminder.locationCoordinates.longitude, reminder.locationCoordinates.latitude]);
+            const distanceToRoute = turf.pointToLineDistance(taskPoint, routeLineString, { units: 'kilometers' });
+            return distanceToRoute <= 3; // Solo comprobar recordatorios a menos de 3km de la ruta
         });
-        
-        if (overdueReminders.length > 0) {
-            displayUnifiedReminderWindow(overdueReminders);
-        } else if (isUnifiedWindowVisibleByLogic) {
-            hideUnifiedReminderWindow();
+    }
+    // --- FIN DE LA OPTIMIZACIÓN POR RUTA ---
+
+    remindersToCheck.forEach(reminder => {
+        if (!reminder || reminder.managedByUser) return;
+        let isOverdue = false;
+        let locationConditionMet = true;
+
+        if (reminder.dueTimeUTC && reminder.dueTimeUTC <= nowTime) {
+            if (reminder.isLocationEnabled && reminder.locationCoordinates) {
+                if (coords) {
+                    const distance = calculateDistance(coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude);
+                    locationConditionMet = distance <= (reminder.radiusMeters || DEFAULT_LOCATION_RADIUS);
+                    if (locationConditionMet && (reminder.text.toUpperCase().includes("RADAR") || reminder.excludeFromList)) {
+                        isInsideAnyRadarZone = true;
+                    }
+                } else {
+                    locationConditionMet = false;
+                }
+            }
+            if (locationConditionMet) {
+                isOverdue = true;
+            }
         }
 
-        // TAREA 5: Actualizar contadores
-        updateReminderCount();
-        updateButtonStyles();
-
-        // TAREA 6: Ajuste de intervalo dinámico
-        let newInterval = isNavigating ? 3500 : 6000;
-        if (isNavigating) {
-            const distToNextManeuver = distanceToNextManeuverOSRM || Infinity;
-            if (distToNextManeuver < 500 && distToNextManeuver > 0) newInterval = 1000;
-            else if (distToNextManeuver < 1000 && distToNextManeuver > 0) newInterval = 2000;
-        } else if (isInsideAnyRadarZone) {
-            newInterval = 1000;
-        }
-        if (newInterval !== currentCheckIntervalDuration) {
-            currentCheckIntervalDuration = newInterval;
-            if (reminderCheckIntervalId) clearInterval(reminderCheckIntervalId);
-            reminderCheckIntervalId = setInterval(checkReminders, currentCheckIntervalDuration);
+        if (isOverdue && !overdueReminders.some(r => r.id === reminder.id)) {
+            overdueReminders.push(reminder);
         }
     });
+    
+    if (overdueReminders.length > 0) {
+        displayUnifiedReminderWindow(overdueReminders);
+    } else if (isUnifiedWindowVisibleByLogic) {
+        hideUnifiedReminderWindow();
+    }
+
+    // TAREA 6: Actualizar UI y ajustar intervalo
+    updateReminderCount();
+    updateButtonStyles();
+
+    let newInterval = isNavigating ? 3500 : 6000;
+    if (isNavigating) {
+        const distToNextManeuver = distanceToNextManeuverOSRM || Infinity;
+        if (distToNextManeuver < 500 && distToNextManeuver > 0) newInterval = 1000;
+        else if (distToNextManeuver < 1000 && distToNextManeuver > 0) newInterval = 2000;
+    } else if (isInsideAnyRadarZone) {
+        newInterval = 1000;
+    }
+    if (newInterval !== currentCheckIntervalDuration) {
+        currentCheckIntervalDuration = newInterval;
+        if (reminderCheckIntervalId) clearInterval(reminderCheckIntervalId);
+        reminderCheckIntervalId = setInterval(checkReminders, currentCheckIntervalDuration);
+    }
 }
+
+
+
+    
+// ===================================================================
+// NOMBRE: markRemindersCacheAsDirty (NUEVA FUNCIÓN)
+// RESUMEN: Marca la caché de recordatorios en memoria como "sucia" para forzar su reconstrucción.
+function markRemindersCacheAsDirty() {
+    isCacheDirty = true;
+}
+
+// ===================================================================
+// NOMBRE: rebuildProcessedRemindersCache (NUEVA FUNCIÓN)
+// RESUMEN: Procesa y cachea los recordatorios desde localStorage para optimizar las comprobaciones.
+function rebuildProcessedRemindersCache() {
+    try {
+        const allReminders = JSON.parse(localStorage.getItem('reminders') || '[]');
+        const now = new Date();
+        processedRemindersCache = allReminders.map(reminder => {
+            let dueTimeUTC = null;
+            if (reminder.date && reminder.time) {
+                try {
+                    const [year, month, day] = reminder.date.split('-').map(Number);
+                    const [hour, minute] = reminder.time.split(':').map(Number);
+                    const dueDate = new Date(Date.UTC(year, month - 1, day, hour, minute));
+                    if (!isNaN(dueDate.getTime())) {
+                        dueTimeUTC = dueDate.getTime();
+                    }
+                } catch (e) {
+                    // Ignorar fechas inválidas
+                }
+            }
+            return { ...reminder, dueTimeUTC: dueTimeUTC };
+        });
+        isCacheDirty = false;
+        console.log(`[CACHE] Caché de recordatorios reconstruida con ${processedRemindersCache.length} elementos.`);
+    } catch (e) {
+        console.error("Error al reconstruir la caché de recordatorios:", e);
+        processedRemindersCache = [];
+    }
+}
+
+// ===================================================================
+// NOMBRE: startDeviationChecker (NUEVA FUNCIÓN)
+// RESUMEN: Inicia un temporizador dedicado para la comprobación de desvío de ruta.
+function startDeviationChecker() {
+    stopDeviationChecker(); // Asegura que no haya intervalos duplicados
+    console.log("[DESVÍO] Iniciando comprobador de desvío cada 5 segundos.");
+    deviationCheckIntervalId = setInterval(() => {
+        if (!isNavigating || !navigationCurrentLocation || isRecalculatingRoute || isDeviationModalActive || isAddReminderAtLocationModeActive) {
+            deviationStartTime = 0;
+            return;
+        }
+        if (Date.now() < deviationCheckGracePeriodUntil) {
+            return;
+        }
+        const currentCoords = navigationCurrentLocation;
+        const routeSource = navigationMapInstance?.getSource('route');
+        if (routeSource && routeSource._data && typeof turf !== 'undefined') {
+            try {
+                const routeGeoJSON = routeSource._data;
+                const routeLineString = turf.lineString(routeGeoJSON.geometry.coordinates);
+                const carPoint = turf.point([currentCoords.longitude, currentCoords.latitude]);
+                const distanceToRoute = turf.pointToLineDistance(carPoint, routeLineString, { units: 'meters' });
+
+                if (distanceToRoute > DEVIATION_THRESHOLD_METERS) {
+                    if (deviationStartTime === 0) {
+                        deviationStartTime = Date.now();
+                    } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
+                        showDeviationModal();
+                        deviationStartTime = 0;
+                    }
+                } else {
+                    deviationStartTime = 0;
+                }
+            } catch (e) {
+                // Error en turf, iniciar contador como fallback
+                if (deviationStartTime === 0) deviationStartTime = Date.now();
+                else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
+                    showDeviationModal();
+                    deviationStartTime = 0;
+                }
+            }
+        }
+    }, 5000); // Frecuencia de 5 segundos
+}
+
+// ===================================================================
+// NOMBRE: stopDeviationChecker (NUEVA FUNCIÓN)
+// RESUMEN: Detiene el temporizador de comprobación de desvío.
+function stopDeviationChecker() {
+    if (deviationCheckIntervalId) {
+        console.log("[DESVÍO] Deteniendo comprobador de desvío.");
+        clearInterval(deviationCheckIntervalId);
+        deviationCheckIntervalId = null;
+        deviationStartTime = 0;
+    }
+}
+
 
 // ===================================================================
 // NOMBRE: toggleNavigationState (MODIFICADA - Inicia/Detiene el checker de desvío)
