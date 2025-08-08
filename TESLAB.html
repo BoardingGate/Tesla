@@ -22103,6 +22103,156 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, isUserA
     console.log("[RECALC] Bucle de recálculo finalizado sin éxito.");
 }    
 
+
+
+
+// ===================================================================
+// NOMBRE: recalculateAndDrawRoute (VERSIÓN DEFINITIVA CON GESTIÓN DE ESTADO ATÓMICA)
+// RESUMEN: Lógica de recálculo final que garantiza que todas las variables
+async function recalculateAndDrawRoute(preserveAccumulatedStats = false, isUserAction = false) {
+    const RETRY_CADENCE_MS = 3000;
+    const MAX_RETRIES = 5; // Límite para evitar bucles infinitos
+    let attempt = 1;
+
+    // Bucle de reintento para máxima robustez ante fallos de red o del servidor
+    while (attempt <= MAX_RETRIES) {
+        // Solo continuamos el bucle si el modal de desvío sigue activo, o si es el primer intento
+        if (!isDeviationModalActive && attempt > 1) break;
+        
+        console.log(`[RECALC] Intento #${attempt} de ${MAX_RETRIES}...`);
+        isRecalculatingRoute = true;
+        const wasNavigatingBeforeRecalc = isNavigating;
+
+        try {
+            // <<< INICIO DE LA CORRECCIÓN CLAVE: USO DIRECTO DE LA VARIABLE DE ESTADO >>>
+            // En lugar de recalcular, usamos directamente la distancia total que ya hemos registrado.
+            // Esta es la "fuente de verdad" del progreso del viaje.
+            const completedDistance = preserveAccumulatedStats ? totalDistanceTravelledForStats : 0;
+            // <<< FIN DE LA CORRECCIÓN CLAVE >>>
+
+            let waypointsForAPI = [];
+            let currentHeading = null;
+            
+            // --- Lógica de planificación vs. navegación (sin cambios) ---
+            if (!isNavigating) {
+                console.log("[RECALC] Modo Planificación: Calculando ruta desde la lista de waypoints definida.");
+                waypointsForAPI = [...navigationWaypoints];
+                currentHeading = null;
+            } else { 
+                console.log("[RECALC] Modo Navegación Activa: Recalculando desde la posición GPS actual.");
+                if (navigationCurrentLocation) {
+                    currentHeading = navigationCurrentLocation.heading;
+                    waypointsForAPI.push({ lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude, isRecalculatedStart: true });
+                    waypointsForAPI.push(...navigationWaypoints.filter(wp => !wp.visited));
+                } else {
+                    waypointsForAPI = [...navigationWaypoints];
+                }
+            }
+            // --- Fin de la lógica ---
+
+            const validWaypoints = waypointsForAPI.filter(wp => wp && typeof wp.lat === 'number' && typeof wp.lng === 'number');
+            if (validWaypoints.length < 2) { 
+                isRecalculatingRoute = false; 
+                return;
+            };
+
+            const coordsString = validWaypoints.map(wp => `${wp.lng},${wp.lat}`).join(';');
+            
+            const result = await fetchRouteData(coordsString, currentHeading);
+            if (result.error) throw result.error;
+
+            const newRouteData = result.routeData;
+            const newRemainingRoute = newRouteData.routes[0];
+
+            // --- Guardia de Calidad (sin cambios) ---
+            if (newRemainingRoute && newRemainingRoute.distance < 10) { 
+                const startPointOfRecalc = validWaypoints[0];
+                const endPointOfRecalc = validWaypoints[validWaypoints.length - 1];
+                const physicalDistanceToDestination = calculateDistance(
+                    startPointOfRecalc.lat, 
+                    startPointOfRecalc.lng, 
+                    endPointOfRecalc.lat, 
+                    endPointOfRecalc.lng
+                );
+                if (physicalDistanceToDestination > WAYPOINT_VISITED_THRESHOLD_METERS) {
+                    console.warn(`[GUARDIA DE CALIDAD] Ruta de distancia cero (${newRemainingRoute.distance.toFixed(1)}m) recibida, pero la distancia física al destino es de ${physicalDistanceToDestination.toFixed(1)}m. Forzando reintento.`);
+                    throw new Error("Ruta inválida (distancia cero) recibida del servidor.");
+                }
+            }
+            // --- Fin de la Guardia de Calidad ---
+
+            await drawRouteOnMap(newRemainingRoute);
+            
+            navigationCurrentRouteData = newRouteData;
+            
+            // <<< INICIO DE LA CORRECCIÓN CLAVE: REINICIO ATÓMICO DEL ESTADO >>>
+            // Después de obtener la nueva ruta (sin importar el proveedor),
+            // forzamos un reinicio limpio de las variables que dependen de la
+            // estructura interna de la ruta.
+            
+            if (preserveAccumulatedStats) {
+                // Preservamos el progreso real del viaje.
+                accumulatedDistanceBeforeCurrentSegment = completedDistance;
+            } else {
+                // Si no se preservan (inicio de nueva ruta), se resetean.
+                accumulatedDistanceBeforeCurrentSegment = 0;
+            }
+
+            // Reseteamos los "punteros" que leen la estructura de la ruta.
+            // Ahora leerán desde el principio del "nuevo libro".
+            currentLegIndexNav = 0;
+            currentStepIndexNav = 0;
+            lastProcessedStepIdentifier = null;
+            lastProcessedStepForLock = null;
+            lastDisplayedManeuverIcon = null;
+
+            // La "promesa" del ETA de la siguiente etapa se recalcula basándose
+            // en los datos frescos de la nueva ruta. El ETA final no se toca aquí.
+            if (newRemainingRoute.legs && newRemainingRoute.legs.length > 0) {
+                currentStageInitialExpectedEtaTime = new Date(Date.now() + newRemainingRoute.legs[0].duration * 1000);
+            } else {
+                currentStageInitialExpectedEtaTime = null;
+            }
+            // <<< FIN DE LA CORRECCIÓN CLAVE >>>
+            
+            renderWaypointMarkers();
+            updateNavigationProgressDisplay(newRemainingRoute, 0); // Se llama con progreso 0 en el *nuevo* tramo
+            updateTurnByTurnDisplay(newRemainingRoute, 0); // Igual aquí
+            showDestinationName();
+            toggleRadaresRuta(document.getElementById('radares-ruta-checkbox').checked);
+            toggleTareasRuta(document.getElementById('tareas-ruta-checkbox').checked);
+            updateStartNavigationButtonState();
+            updateNavigationButtonColor();
+
+            showToast("¡Ruta recalculada con éxito!", "success");
+            closeModalAndProceed();
+            return; // Salimos de la función con éxito
+            
+        } catch (error) {
+            console.error(`[RECALC] Fallo en intento #${attempt}:`, error);
+            if (attempt === MAX_RETRIES) {
+                showToast("Fallo al recalcular la ruta tras varios intentos. Comprueba tu conexión.", "error");
+                closeModalAndProceed();
+            } else {
+                showToast(`Error al recalcular (${attempt}/${MAX_RETRIES}). Reintentando...`, "warning");
+                await new Promise(resolve => setTimeout(resolve, RETRY_CADENCE_MS));
+            }
+        } finally {
+            isRecalculatingRoute = false;
+            isNavigating = wasNavigatingBeforeRecalc;
+            attempt++;
+        }
+    }
+    console.log("[RECALC] Bucle de recálculo finalizado sin éxito.");
+}
+
+
+
+
+
+
+
+    
 // ===================================================================
 // NOMBRE: closeModalAndProceed (MODIFICADA)
 // RESUMEN: Cierra el modal de desvío y llama a la reanudación de simulación.
