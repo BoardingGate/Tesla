@@ -1,4 +1,4 @@
-Z01-104
+Z01-105
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -16715,6 +16715,189 @@ function startAutomatedRouteSimulation(speedKmph, continueFromCurrentState = fal
 }  
 
 // ===================================================================
+// NOMBRE: startAutomatedRouteSimulation (VERSIÓN DEFINITIVA CORREGIDA)
+// RESUMEN: Inicia o REANUDA la simulación automática de una ruta.
+// ===================================================================
+function startAutomatedRouteSimulation(speedKmph, continueFromCurrentState = false) {
+    if (!isSimulatingGpsLocation) {
+        isSimulatingGpsLocation = true;
+        if (locationWatchId !== null && navigator.geolocation) {
+            navigator.geolocation.clearWatch(locationWatchId);
+            locationWatchId = null;
+        }
+        const simulateGpsButton = document.getElementById('toggle-simulate-gps-button');
+        if (simulateGpsButton) {
+            simulateGpsButton.classList.add('active-simulate-gps-mode');
+            simulateGpsButton.title = "Desactivar Simulación GPS (Volver a GPS Real)";
+        }
+    }
+    const routeSource = navigationMapInstance ? navigationMapInstance.getSource('route') : null;
+    const hasRouteData = routeSource && routeSource._data && routeSource._data.geometry && routeSource._data.geometry.coordinates.length >= 2;
+
+    if (!hasRouteData || navigationWaypoints.filter(wp => !wp.isInternal && !wp.isRecalculatedStart).length < 2) {
+        // ... (lógica de error, sin cambios)
+        return;
+    }
+    if (automatedSimulationIntervalId) clearInterval(automatedSimulationIntervalId);
+    
+    simulationSpeedKmph = speedKmph;
+    currentSimulationSpeedKmph = speedKmph;
+    
+    // --- INICIO DE LA LÓGICA CORREGIDA ---
+    if (!continueFromCurrentState) {
+        // ESTO SOLO SE EJECUTA AL INICIAR UNA SIMULACIÓN NUEVA
+        wasSimulatingBeforeRecalc = false;
+        simulatedDistanceAlongRoute = 0;
+        lastCarDistanceAlongRouteForNavLogic = 0;
+        lastValidCarDistanceForDisplay = 0;
+        navigationStartTimeForStats = null;
+        totalDistanceTravelledForStats = 0;
+        maxSpeedDuringTrip = 0;
+        clearSpeedMarkers();
+        
+        const routeGeoJSON = navigationCurrentRouteData.routes[0].geometry;
+        const startWaypoint = navigationWaypoints.find(wp => wp.type === 'S' || wp.isRecalculatedStart) || navigationWaypoints[0];
+        lastPositionForStats = { latitude: startWaypoint.lat, longitude: startWaypoint.lng };
+        
+        let initialHeading = 0;
+        if (routeGeoJSON.coordinates.length >= 2) {
+            const firstPoint = turf.point(routeGeoJSON.coordinates[0]);
+            const secondPoint = turf.point(routeGeoJSON.coordinates[1]);
+            initialHeading = turf.bearing(firstPoint, secondPoint);
+            if (initialHeading < 0) initialHeading += 360;
+        }
+        simulatedGpsLocation = {
+            latitude: startWaypoint.lat,
+            longitude: startWaypoint.lng,
+            accuracy: 5, heading: initialHeading, altitude: (navigationCurrentLocation?.altitude) ?? 0, speed: 0
+        };
+        maxSpeedCoordinates = { lat: startWaypoint.lat, lng: startWaypoint.lng };
+        processSimulatedGpsPosition(true);
+
+    } else {
+        // ESTO SE EJECUTA AL REANUDAR TRAS UN DESVÍO
+        // Recalibramos el progreso a la nueva ruta
+        const route = navigationCurrentRouteData.routes[0];
+        const carPointTurf = turf.point([simulatedGpsLocation.longitude, simulatedGpsLocation.latitude]);
+        const routeLineStringTurf = turf.lineString(route.geometry.coordinates);
+        const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
+        const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
+        
+        // NO reseteamos `simulatedDistanceAlongRoute`, sino que lo AJUSTAMOS a la nueva ruta.
+        simulatedDistanceAlongRoute = turf.length(lineSliceToNearestTurf, { units: 'meters' });
+        lastCarDistanceAlongRouteForNavLogic = simulatedDistanceAlongRoute;
+    }
+    // --- FIN DE LA LÓGICA CORREGIDA ---
+
+    if (isSimulatingFreeDrive) {
+        const startCoords = simulatedGpsLocation || { latitude: navigationWaypoints[0].lat, longitude: navigationWaypoints[0].lng };
+        startFreeDrive(startCoords);
+    }
+    
+    const route = navigationCurrentRouteData.routes[0];
+    const totalRouteDistance = route.distance;
+    if (!continueFromCurrentState) {
+        showToast(`Simulación automática de ruta iniciada a ${speedKmph.toFixed(0)} km/h (velocidad variable).`, "info");
+    }
+    setNavigationMapClickHandler(); 
+    
+    let simulationStepIndex = 0;
+    let simulationLegIndex = 0;
+    
+    // Recalcular el estado actual del step/leg basado en la distancia
+    let tempDistance = 0;
+    for (let i = 0; i < route.legs.length; i++) {
+        let legFound = false;
+        for (let j = 0; j < route.legs[i].steps.length; j++) {
+            tempDistance += route.legs[i].steps[j].distance;
+            if (simulatedDistanceAlongRoute < tempDistance) {
+                simulationLegIndex = i;
+                simulationStepIndex = j;
+                legFound = true;
+                break;
+            }
+        }
+        if (legFound) break;
+    }
+
+    let distanceToEndOfCurrentStep = calculateDistanceToEndOfStep(route, simulationLegIndex, simulationStepIndex);
+
+    automatedSimulationIntervalId = setInterval(() => {
+        const speedMps = (currentSimulationSpeedKmph * 1000) / 3600;
+        const distanceIncrement = speedMps * (SIMULATION_TICK_INTERVAL_MS / 1000);
+        simulatedDistanceAlongRoute += distanceIncrement;
+
+        if (navigationStartTimeForStats) {
+            totalDistanceTravelledForStats += distanceIncrement;
+        }
+        
+        if (simulatedDistanceAlongRoute > distanceToEndOfCurrentStep) {
+            simulationStepIndex++;
+            if (route.legs[simulationLegIndex] && simulationStepIndex >= route.legs[simulationLegIndex].steps.length) {
+                simulationStepIndex = 0;
+                simulationLegIndex++;
+            }
+            if (simulationLegIndex < route.legs.length && route.legs[simulationLegIndex]) {
+                const currentStep = route.legs[simulationLegIndex].steps[simulationStepIndex];
+                if (currentStep) { 
+                    const multiplier = getRandomSpeedMultiplierForManeuver(currentStep.maneuver);
+                    currentSimulationSpeedKmph = Math.max(20, Math.min(5000, simulationSpeedKmph * (1 + multiplier)));
+                    distanceToEndOfCurrentStep = calculateDistanceToEndOfStep(route, simulationLegIndex, simulationStepIndex);
+                }
+            }
+        }
+      
+        if (simulatedDistanceAlongRoute >= totalRouteDistance) {
+            stopAutomatedRouteSimulationInternal();
+            const routeGeoJSON = navigationCurrentRouteData.routes[0].geometry;
+            const endPointCoords = routeGeoJSON.coordinates[routeGeoJSON.coordinates.length - 1];
+            simulatedGpsLocation = {
+                ...simulatedGpsLocation,
+                latitude: endPointCoords[1],
+                longitude: endPointCoords[0],
+                speed: 0
+            };
+            processSimulatedGpsPosition(true);
+            showToast("Simulación de ruta completada. Modo simulación por clic activo.", "success");
+            const mapDiv = document.getElementById('reminders-location-map-div');
+            if (mapDiv) mapDiv.classList.add('simulating-gps-click-mode'); 
+            if (isNavigating || (!isNavigating && navigationWaypoints.length > 0)) {
+                 showArrivalStatsModal();
+            }
+            setNavigationMapClickHandler();
+            return;
+        }
+        const turfLine = turf.lineString(route.geometry.coordinates);
+        const pointOnLine = turf.along(turfLine, simulatedDistanceAlongRoute / 1000, { units: 'kilometers' });
+        if (pointOnLine && pointOnLine.geometry && pointOnLine.geometry.coordinates) {
+            const [lng, lat] = pointOnLine.geometry.coordinates;
+            let headingSim = 0;
+            const lookAheadDistance = Math.min(distanceIncrement * 2, totalRouteDistance - simulatedDistanceAlongRoute);
+            if (simulatedDistanceAlongRoute + lookAheadDistance <= totalRouteDistance && lookAheadDistance > 0) {
+                const nextPointOnLine = turf.along(turfLine, (simulatedDistanceAlongRoute + lookAheadDistance) / 1000, { units: 'kilometers' });
+                if (nextPointOnLine && nextPointOnLine.geometry && nextPointOnLine.geometry.coordinates) {
+                    headingSim = turf.bearing(pointOnLine, nextPointOnLine);
+                    if (headingSim < 0) headingSim += 360;
+                }
+            } else {
+                if (simulatedGpsLocation && typeof simulatedGpsLocation.heading === 'number' && simulatedGpsLocation.heading !== null) {
+                    headingSim = simulatedGpsLocation.heading;
+                }
+            }
+            simulatedGpsLocation = {
+                latitude: lat,
+                longitude: lng,
+                accuracy: 5,
+                heading: headingSim,
+                altitude: (navigationCurrentLocation?.altitude) ?? 0,
+                speed: speedMps
+            };
+            processSimulatedGpsPosition(false);
+        }
+    }, SIMULATION_TICK_INTERVAL_MS);
+}    
+
+// ===================================================================
 // NOMBRE: showIntersectionPreviewMap (VERSIÓN CON POSICIÓN CORREGIDA)
 // RESUMEN: Muestra el minimapa de maniobras alineado en la esquina superior
 //          izquierda de la barra de progreso, superponiéndose a ella.
@@ -21831,116 +22014,6 @@ async function handleStageSelectionFromDeviationModal(selectedWaypointId) {
         showToast("Error al recalcular la ruta hacia la etapa seleccionada.", "error");
     }
 }
-
-
-
-// ===================================================================
-// NOMBRE: handleFinalDestinationSelection (VERSIÓN DEFINITIVA CORREGIDA)
-// RESUMEN: Maneja la lógica para ir al destino final, creando un nuevo
-//          punto de partida desde la ubicación actual del desvío.
-// ===================================================================
-async function handleFinalDestinationSelection() {
-    const finalDestination = navigationWaypoints.find(wp => wp.type === 'F');
-    
-    // --- INICIO DE LA CORRECCIÓN CLAVE ---
-    // Creamos un nuevo punto de partida explícito desde la ubicación actual (el punto del clic).
-    // No buscamos el 'S' antiguo.
-    if (!navigationCurrentLocation) {
-        showToast("Error: Se ha perdido la ubicación del desvío.", "error");
-        closeModalAndProceed();
-        return;
-    }
-
-    const newStartPoint = {
-        id: Date.now() - 1,
-        lat: navigationCurrentLocation.latitude,
-        lng: navigationCurrentLocation.longitude,
-        type: 'S_Recalc', // Usamos un tipo especial para identificarlo
-        label: 'S',
-        address: 'Punto de Desvío',
-        visited: true,
-        isRecalculatedStart: true // Bandera clave
-    };
-    // --- FIN DE LA CORRECCIÓN CLAVE ---
-
-    if (!finalDestination) {
-        showToast("Error: No se pudo determinar el fin de la ruta.", "error");
-        closeModalAndProceed();
-        return;
-    }
-
-    // La nueva ruta es simplemente desde nuestra nueva posición hasta el final.
-    navigationWaypoints = [newStartPoint, finalDestination];
-    
-    closeModalAndProceed();
-    
-    try {
-        await recalculateAndDrawRoute(true, true);
-        renderWaypointMarkers();
-        deviationCheckGracePeriodUntil = Date.now() + 5000;
-    } catch (error) {
-        showToast("Error al recalcular la ruta hacia el destino final.", "error");
-    }
-}
-
-// ===================================================================
-// NOMBRE: handleStageSelectionFromDeviationModal (VERSIÓN DEFINITIVA CORREGIDA)
-// RESUMEN: Maneja la lógica para ir a una etapa intermedia, creando un nuevo
-//          punto de partida desde la ubicación actual del desvío.
-// ===================================================================
-async function handleStageSelectionFromDeviationModal(selectedWaypointId) {
-    const selectedIndex = navigationWaypoints.findIndex(wp => wp.id === selectedWaypointId);
-    
-    // --- INICIO DE LA CORRECCIÓN CLAVE ---
-    // Igual que en la otra función, creamos un nuevo punto de partida explícito.
-    if (!navigationCurrentLocation) {
-        showToast("Error: Se ha perdido la ubicación del desvío.", "error");
-        closeModalAndProceed();
-        return;
-    }
-    
-    const newStartPoint = {
-        id: Date.now() - 1,
-        lat: navigationCurrentLocation.latitude,
-        lng: navigationCurrentLocation.longitude,
-        type: 'S_Recalc',
-        label: 'S',
-        address: 'Punto de Desvío',
-        visited: true,
-        isRecalculatedStart: true
-    };
-    // --- FIN DE LA CORRECCIÓN CLAVE ---
-
-    if (selectedIndex === -1) {
-        showToast("Error: No se encontró la etapa seleccionada.", "error");
-        closeModalAndProceed();
-        return;
-    }
-
-    // Construimos la nueva ruta: desde el nuevo inicio, y luego todas las etapas
-    // restantes a partir de la que el usuario seleccionó.
-    const newWaypoints = [newStartPoint];
-    for (let i = selectedIndex; i < navigationWaypoints.length; i++) {
-        const wp = navigationWaypoints[i];
-        if (wp && !wp.isInternal && !wp.isRecalculatedStart) {
-            newWaypoints.push(wp);
-        }
-    }
-    
-    navigationWaypoints = newWaypoints;
-    closeModalAndProceed();
-    
-    try {
-        await recalculateAndDrawRoute(true, true);
-        renderWaypointMarkers();
-        deviationCheckGracePeriodUntil = Date.now() + 5000;
-    } catch (error) {
-        showToast("Error al recalcular la ruta hacia la etapa seleccionada.", "error");
-    }
-}
-
-    
-
     
 
 // ===================================================================
@@ -22097,6 +22170,29 @@ function closeModalAndProceed() {
             startAutomatedRouteSimulation(currentSimulationSpeedKmph, true); 
         }, 100);
     }
+
+    // ===================================================================
+// NOMBRE: closeModalAndProceed (MODIFICADA)
+// RESUMEN: Cierra el modal de desvío y llama a la reanudación de simulación.
+// ===================================================================
+function closeModalAndProceed() {
+    isDeviationModalActive = false;
+    deviationStartTime = 0;
+    const modal = document.getElementById('deviation-modal');
+    if (modal) {
+        modal.classList.add('hidden');
+    }
+
+    if (wasSimulatingBeforeRecalc) {
+        wasSimulatingBeforeRecalc = false; // Se resetea la bandera
+
+        showToast("Desvío recalculado. Reanudando simulación...", "info");
+        setTimeout(() => {
+            // ¡CAMBIO CLAVE! Pasamos 'true' para indicar que es una reanudación.
+            startAutomatedRouteSimulation(currentSimulationSpeedKmph, true); 
+        }, 100);
+    }
+}
 } 
 // ===================================================================
 // NOMBRE: handleLocateMeClick (VERSIÓN CORREGIDA SIN INTERFERENCIAS)
