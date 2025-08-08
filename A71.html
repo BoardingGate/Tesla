@@ -1,4 +1,4 @@
-Z01-107
+Z01
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -16550,6 +16550,169 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
     handleAutoZoom();
 }
 
+// ===================================================================
+// NOMBRE: startAutomatedRouteSimulation (VERSIÓN ORIGINAL Y CORRECTA)
+// RESUMEN: Inicia la simulación automática de una ruta.
+// ===================================================================
+function startAutomatedRouteSimulation(speedKmph, continueFromCurrentState = false) {
+    if (!isSimulatingGpsLocation) {
+        isSimulatingGpsLocation = true;
+        if (locationWatchId !== null && navigator.geolocation) {
+            navigator.geolocation.clearWatch(locationWatchId);
+            locationWatchId = null;
+        }
+        const simulateGpsButton = document.getElementById('toggle-simulate-gps-button');
+        if (simulateGpsButton) {
+            simulateGpsButton.classList.add('active-simulate-gps-mode');
+            simulateGpsButton.title = "Desactivar Simulación GPS (Volver a GPS Real)";
+        }
+    }
+    const routeSource = navigationMapInstance ? navigationMapInstance.getSource('route') : null;
+    const hasRouteData = routeSource && routeSource._data && routeSource._data.geometry && routeSource._data.geometry.coordinates.length >= 2;
+
+    if (!hasRouteData || navigationWaypoints.filter(wp => !wp.isInternal && !wp.isRecalculatedStart).length < 2) {
+        showToast("No hay ruta válida para simular.", "warning");
+        stopAutomatedRouteSimulationInternal();
+        if (isSimulatingGpsLocation) {
+            const mapDiv = document.getElementById('reminders-location-map-div');
+            if (mapDiv) mapDiv.classList.add('simulating-gps-click-mode');
+            setNavigationMapClickHandler();
+        }
+        return;
+    }
+    if (automatedSimulationIntervalId) clearInterval(automatedSimulationIntervalId);
+    
+    
+    simulationSpeedKmph = speedKmph;
+    currentSimulationSpeedKmph = speedKmph;
+    
+    if (!continueFromCurrentState) {
+        simulatedDistanceAlongRoute = 0;
+        lastCarDistanceAlongRouteForNavLogic = 0;
+        lastValidCarDistanceForDisplay = 0;
+
+        navigationStartTimeForStats = null;
+        totalDistanceTravelledForStats = 0;
+        maxSpeedDuringTrip = 0;
+        
+        const routeGeoJSON = navigationCurrentRouteData.routes[0].geometry;
+        const startWaypoint = navigationWaypoints.find(wp => wp.type === 'S' || wp.isRecalculatedStart) || navigationWaypoints[0];
+        lastPositionForStats = { latitude: startWaypoint.lat, longitude: startWaypoint.lng };
+        
+        let initialHeading = 0;
+        if (routeGeoJSON.coordinates.length >= 2) {
+            const firstPoint = turf.point(routeGeoJSON.coordinates[0]);
+            const secondPoint = turf.point(routeGeoJSON.coordinates[1]);
+            initialHeading = turf.bearing(firstPoint, secondPoint);
+            if (initialHeading < 0) initialHeading += 360;
+        }
+        simulatedGpsLocation = {
+            latitude: startWaypoint.lat,
+            longitude: startWaypoint.lng,
+            accuracy: 5,
+            heading: initialHeading,
+            altitude: (navigationCurrentLocation?.altitude) ?? 0,
+            speed: 0
+        };
+        maxSpeedCoordinates = { lat: startWaypoint.lat, lng: startWaypoint.lng };
+        if (maxSpeedMarkerObjects && maxSpeedMarkerObjects.length > 0) {
+            maxSpeedMarkerObjects.forEach(marker => marker.remove());
+            maxSpeedMarkerObjects = [];
+        }
+        if (speedMilestoneMarkerObjects && speedMilestoneMarkerObjects.length > 0) {
+            speedMilestoneMarkerObjects.forEach(marker => marker.remove());
+            speedMilestoneMarkerObjects = [];
+        }
+        processSimulatedGpsPosition(true);
+    }
+    
+    if (isSimulatingFreeDrive) {
+        const startCoords = simulatedGpsLocation || { latitude: navigationWaypoints[0].lat, longitude: navigationWaypoints[0].lng };
+        startFreeDrive(startCoords);
+    }
+    
+    const route = navigationCurrentRouteData.routes[0];
+    const totalRouteDistance = route.distance;
+    showToast(`Simulación automática de ruta iniciada a ${speedKmph.toFixed(0)} km/h (velocidad variable).`, "info");
+    setNavigationMapClickHandler(); 
+    let simulationStepIndex = 0;
+    let simulationLegIndex = 0;
+    let distanceToEndOfCurrentStep = calculateDistanceToEndOfStep(route, 0, 0);
+    automatedSimulationIntervalId = setInterval(() => {
+        const speedMps = (currentSimulationSpeedKmph * 1000) / 3600;
+        const distanceIncrement = speedMps * (SIMULATION_TICK_INTERVAL_MS / 1000);
+        simulatedDistanceAlongRoute += distanceIncrement;
+
+        if (navigationStartTimeForStats) {
+            totalDistanceTravelledForStats += distanceIncrement;
+        }
+        
+        if (simulatedDistanceAlongRoute > distanceToEndOfCurrentStep) {
+            simulationStepIndex++;
+            if (route.legs[simulationLegIndex] && simulationStepIndex >= route.legs[simulationLegIndex].steps.length) {
+                simulationStepIndex = 0;
+                simulationLegIndex++;
+            }
+            if (simulationLegIndex < route.legs.length && route.legs[simulationLegIndex]) {
+                const currentStep = route.legs[simulationLegIndex].steps[simulationStepIndex];
+                if (currentStep) { 
+                    const multiplier = getRandomSpeedMultiplierForManeuver(currentStep.maneuver);
+                    let newSpeed = simulationSpeedKmph * (1 + multiplier);
+                    currentSimulationSpeedKmph = Math.max(20, Math.min(5000, newSpeed));
+                    distanceToEndOfCurrentStep = calculateDistanceToEndOfStep(route, simulationLegIndex, simulationStepIndex);
+                }
+            }
+        }
+      
+        if (simulatedDistanceAlongRoute >= totalRouteDistance) {
+            stopAutomatedRouteSimulationInternal();
+            const routeGeoJSON = navigationCurrentRouteData.routes[0].geometry;
+            const endPointCoords = routeGeoJSON.coordinates[routeGeoJSON.coordinates.length - 1];
+            simulatedGpsLocation = {
+                ...simulatedGpsLocation,
+                latitude: endPointCoords[1],
+                longitude: endPointCoords[0],
+                speed: 0
+            };
+            processSimulatedGpsPosition(true);
+            showToast("Simulación de ruta completada. Modo simulación por clic activo.", "success");
+            const mapDiv = document.getElementById('reminders-location-map-div');
+            if (mapDiv) mapDiv.classList.add('simulating-gps-click-mode'); 
+            if (isNavigating || (!isNavigating && navigationWaypoints.length > 0)) {
+                 showArrivalStatsModal();
+            }
+            setNavigationMapClickHandler();
+            return;
+        }
+        const turfLine = turf.lineString(route.geometry.coordinates);
+        const pointOnLine = turf.along(turfLine, simulatedDistanceAlongRoute / 1000, { units: 'kilometers' });
+        if (pointOnLine && pointOnLine.geometry && pointOnLine.geometry.coordinates) {
+            const [lng, lat] = pointOnLine.geometry.coordinates;
+            let headingSim = 0;
+            const lookAheadDistance = Math.min(distanceIncrement * 2, totalRouteDistance - simulatedDistanceAlongRoute);
+            if (simulatedDistanceAlongRoute + lookAheadDistance <= totalRouteDistance && lookAheadDistance > 0) {
+                const nextPointOnLine = turf.along(turfLine, (simulatedDistanceAlongRoute + lookAheadDistance) / 1000, { units: 'kilometers' });
+                if (nextPointOnLine && nextPointOnLine.geometry && nextPointOnLine.geometry.coordinates) {
+                    headingSim = turf.bearing(pointOnLine, nextPointOnLine);
+                    if (headingSim < 0) headingSim += 360;
+                }
+            } else {
+                if (simulatedGpsLocation && typeof simulatedGpsLocation.heading === 'number' && simulatedGpsLocation.heading !== null) {
+                    headingSim = simulatedGpsLocation.heading;
+                }
+            }
+            simulatedGpsLocation = {
+                latitude: lat,
+                longitude: lng,
+                accuracy: 5,
+                heading: headingSim,
+                altitude: (navigationCurrentLocation?.altitude) ?? 0,
+                speed: speedMps
+            };
+            processSimulatedGpsPosition(false);
+        }
+    }, SIMULATION_TICK_INTERVAL_MS);
+}  
 
 // ===================================================================
 // NOMBRE: startAutomatedRouteSimulation (VERSIÓN FINAL CON REINICIO CORRECTO)
@@ -21974,6 +22137,29 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, isUserA
 }    
 
 // ===================================================================
+// NOMBRE: closeModalAndProceed (Sin cambios, pero su rol es clave)
+// RESUMEN: Cierra el modal de desvío y detiene el bucle de recálculo.
+// ===================================================================
+function closeModalAndProceed() {
+    isDeviationModalActive = false;
+    deviationStartTime = 0;
+    const modal = document.getElementById('deviation-modal');
+    if (modal) {
+        modal.classList.add('hidden');
+    }
+
+    if (wasSimulatingBeforeRecalc) {
+        wasSimulatingBeforeRecalc = false; // Se resetea la bandera
+
+        simulatedDistanceAlongRoute = 0; // Resetear el progreso para la nueva ruta.
+   
+        showToast("Desvío recalculado. Reanudando simulación...", "info");
+        setTimeout(() => {
+            startAutomatedRouteSimulation(currentSimulationSpeedKmph, true); 
+        }, 100);
+    }
+
+    // ===================================================================
 // NOMBRE: closeModalAndProceed (MODIFICADA)
 // RESUMEN: Cierra el modal de desvío y llama a la reanudación de simulación.
 // ===================================================================
@@ -21987,8 +22173,7 @@ function closeModalAndProceed() {
 
     if (wasSimulatingBeforeRecalc) {
         wasSimulatingBeforeRecalc = false; // Se resetea la bandera
-//      simulatedDistanceAlongRoute = 0; // Resetear el progreso para la nueva ruta.
-   
+
         showToast("Desvío recalculado. Reanudando simulación...", "info");
         setTimeout(() => {
             // ¡CAMBIO CLAVE! Pasamos 'true' para indicar que es una reanudación.
