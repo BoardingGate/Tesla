@@ -1,4 +1,4 @@
-V02
+CHECK 01
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -4879,6 +4879,11 @@ class CombinedMapControl {
         lastTimestamp: null
     };
 
+    let processedRemindersCache = [];
+    let isCacheDirty = true;
+    let lastMobileSyncCheck = 0;
+    let deviationCheckIntervalId = null;
+
     let zoomToggleMemory = null;
     let locateMeReactivationTimer = null;
     let locateMeCountdownInterval = null;
@@ -5151,6 +5156,118 @@ class CombinedMapControl {
             }
         }).join(', ');
 
+
+// ===================================================================
+// NOMBRE: markRemindersCacheAsDirty (NUEVA FUNCIÓN)
+// RESUMEN: Marca la caché de recordatorios en memoria como "sucia" para forzar su reconstrucción.
+function markRemindersCacheAsDirty() {
+    isCacheDirty = true;
+}
+
+// ===================================================================
+// NOMBRE: rebuildProcessedRemindersCache (NUEVA FUNCIÓN)
+// RESUMEN: Procesa y cachea los recordatorios desde localStorage para optimizar las comprobaciones.
+function rebuildProcessedRemindersCache() {
+    try {
+        const allReminders = JSON.parse(localStorage.getItem('reminders') || '[]');
+        const now = new Date();
+        processedRemindersCache = allReminders.map(reminder => {
+            let dueTimeUTC = null;
+            if (reminder.date && reminder.time) {
+                try {
+                    const [year, month, day] = reminder.date.split('-').map(Number);
+                    const [hour, minute] = reminder.time.split(':').map(Number);
+                    const dueDate = new Date(Date.UTC(year, month - 1, day, hour, minute));
+                    if (!isNaN(dueDate.getTime())) {
+                        dueTimeUTC = dueDate.getTime();
+                    }
+                } catch (e) {
+                    // Ignorar fechas inválidas
+                }
+            }
+            return { ...reminder, dueTimeUTC: dueTimeUTC };
+        });
+        isCacheDirty = false;
+        console.log(`[CACHE] Caché de recordatorios reconstruida con ${processedRemindersCache.length} elementos.`);
+    } catch (e) {
+        console.error("Error al reconstruir la caché de recordatorios:", e);
+        processedRemindersCache = [];
+    }
+}
+
+// ===================================================================
+// NOMBRE: startDeviationChecker (NUEVA FUNCIÓN)
+// RESUMEN: Inicia un temporizador dedicado para la comprobación de desvío de ruta.
+function startDeviationChecker() {
+    stopDeviationChecker(); // Asegura que no haya intervalos duplicados
+    console.log("[DESVÍO] Iniciando comprobador de desvío cada 5 segundos.");
+    deviationCheckIntervalId = setInterval(() => {
+        if (!isNavigating || !navigationCurrentLocation || isRecalculatingRoute || isDeviationModalActive || isAddReminderAtLocationModeActive) {
+            deviationStartTime = 0;
+            return;
+        }
+        if (Date.now() < deviationCheckGracePeriodUntil) {
+            return;
+        }
+        const currentCoords = navigationCurrentLocation;
+        const routeSource = navigationMapInstance?.getSource('route');
+        if (routeSource && routeSource._data && typeof turf !== 'undefined') {
+            try {
+                const routeGeoJSON = routeSource._data;
+                const routeLineString = turf.lineString(routeGeoJSON.geometry.coordinates);
+                const carPoint = turf.point([currentCoords.longitude, currentCoords.latitude]);
+                const distanceToRoute = turf.pointToLineDistance(carPoint, routeLineString, { units: 'meters' });
+
+                if (distanceToRoute > DEVIATION_THRESHOLD_METERS) {
+                    if (deviationStartTime === 0) {
+                        deviationStartTime = Date.now();
+                    } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
+                        showDeviationModal();
+                        deviationStartTime = 0;
+                    }
+                } else {
+                    deviationStartTime = 0;
+                }
+            } catch (e) {
+                // Error en turf, iniciar contador como fallback
+                if (deviationStartTime === 0) deviationStartTime = Date.now();
+                else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
+                    showDeviationModal();
+                    deviationStartTime = 0;
+                }
+            }
+        }
+    }, 5000); // Frecuencia de 5 segundos
+}
+
+// ===================================================================
+// NOMBRE: stopDeviationChecker (NUEVA FUNCIÓN)
+// RESUMEN: Detiene el temporizador de comprobación de desvío.
+function stopDeviationChecker() {
+    if (deviationCheckIntervalId) {
+        console.log("[DESVÍO] Deteniendo comprobador de desvío.");
+        clearInterval(deviationCheckIntervalId);
+        deviationCheckIntervalId = null;
+        deviationStartTime = 0;
+    }
+}
+
+
+    
+    
+
+
+
+
+
+
+
+
+
+
+    
+
+    
 // ===================================================================
 // NOMBRE: checkAndIncrementPoiCount (VERSIÓN CORREGIDA PARA CLIENTE)
 // RESUMEN: Verifica el límite global y actualiza el contador del usuario
@@ -8236,119 +8353,6 @@ function showRadarSpeedModal(callbackOnSelect) {
     });
 }
 
-// ===================================================================
-// NOMBRE: updateDynamicRadars (VERSIÓN FINAL CON LÓGICA DE UBICACIÓN ROBUSTA)
-// RESUMEN: Actualiza radares usando la última ubicación conocida o pidiendo una nueva como fallback.
-async function updateDynamicRadars(isInitialLoadCheck = false) {
-    const now = Date.now();
-    const timeSinceLastCheck = now - lastDynamicRadarCheck;
-
-    if (isInitialLoadCheck) {
-        const currentReminders = JSON.parse(localStorage.getItem('reminders') || '[]');
-        const hasExistingDynamicRadars = currentReminders.some(r => r.isDynamicRadar === true);
-
-        if (timeSinceLastCheck < 30 * 60 * 1000 && hasExistingDynamicRadars) {
-            return; 
-        } else if (timeSinceLastCheck < 30 * 60 * 1000 && !hasExistingDynamicRadars) {
-            }
-    }
-    
-    lastDynamicRadarCheck = now;
-    
-    if (!isInitialLoadCheck) {
-         showToast("Actualizando radares dinámicos cercanos...", "info", 3000, false, "radar-update");
-    }
-
-    if (!window.radarsCache || !window.radarsSpatialIndex) {
-        await initializeRadarCache();
-        if (!window.radarsCache || !window.radarsSpatialIndex) {
-            showToast("No se pudo inicializar la base de datos de radares.", "error");
-            return;
-        }
-    }
-    
-    try {
-        // --- INICIO DE LA LÓGICA MEJORADA ---
-        let coords = null;
-        // 1. Prioriza la última ubicación conocida y reciente del seguimiento continuo.
-        if (navigationCurrentLocation && (Date.now() - lastGpsUpdateTime < 30000)) { // 30 segundos de margen
-            coords = navigationCurrentLocation;
-        } else {
-            // 2. Si no hay ubicación reciente, solicita una nueva.
-            coords = await getCurrentLocationAsync();
-        }
-
-        // 3. Si ambos métodos fallan, lanza un error controlado.
-        if (!coords) {
-            throw new Error("Ubicación del vehículo no disponible.");
-        }
-        // --- FIN DE LA LÓGICA MEJORADA ---
-        
-        let reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
-        reminders = reminders.filter(r => !r.isDynamicRadar);
-        
-        const DYNAMIC_RADAR_SEARCH_RADIUS_KM = 45;
-        const R = 6371;
-        const rad = DYNAMIC_RADAR_SEARCH_RADIUS_KM / R;
-        const latRad = coords.latitude * Math.PI / 180;
-        const GRID_SIZE = 0.1;
-
-        const latMin = coords.latitude - (rad * 180 / Math.PI);
-        const latMax = coords.latitude + (rad * 180 / Math.PI);
-        const deltaLon = Math.asin(Math.sin(rad) / Math.cos(latRad));
-        const lonMin = coords.longitude - (deltaLon * 180 / Math.PI);
-        const lonMax = coords.longitude + (deltaLon * 180 / Math.PI);
-        
-        const latIndexMin = Math.floor(latMin / GRID_SIZE);
-        const latIndexMax = Math.floor(latMax / GRID_SIZE);
-        const lonIndexMin = Math.floor(lonMin / GRID_SIZE);
-        const lonIndexMax = Math.floor(lonMax / GRID_SIZE);
-        
-        const candidateRadars = new Set();
-        for (let i = latIndexMin; i <= latIndexMax; i++) {
-            for (let j = lonIndexMin; j <= lonIndexMax; j++) {
-                const cellId = `cell_${i}_${j}`;
-                if (window.radarsSpatialIndex[cellId]) {
-                    window.radarsSpatialIndex[cellId].forEach(radar => candidateRadars.add(radar));
-                }
-            }
-        }
-
-        let newRadarsCount = 0;
-        candidateRadars.forEach(radar => {
-            const distance = calculateDistance(coords.latitude, coords.longitude, radar.lat, radar.lon);
-            if (distance <= (DYNAMIC_RADAR_SEARCH_RADIUS_KM * 1000)) {
-                const now = new Date();
-                const newRadar = {
-                    id: Date.now() + Math.random() + newRadarsCount,
-                    text: `<b>RADAR: ${radar.name}</b>`,
-                    type: 'simple', time: '00:01',
-                    date: `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`,
-                    createdAt: now.toISOString(), managedByUser: false,
-                    isLocationEnabled: true, locationCoordinates: { latitude: radar.lat, longitude: radar.lon },
-                    radiusMeters: 400, excludeFromList: true,
-                    isDynamicRadar: true 
-                };
-                reminders.push(newRadar);
-                newRadarsCount++;
-            }
-        });
-        
-        localStorage.setItem('reminders', JSON.stringify(reminders));
-        
-        const existingToast = document.getElementById("radar-update");
-        if(existingToast) existingToast.remove();
-        
-        if (isNavigationMapActive && navigationMapInstance) {
-            plotRemindersOnNavigationMap();
-        }
-        updateReminderCount();
-        updateButtonStyles();
-
-    } catch (error) {
-        showToast(`Error al actualizar radares: ${error.message}`, "error");
-    }
-}
     
 // ===================================================================
 // NOMBRE: checkForExcessiveRadars
@@ -16250,153 +16254,6 @@ function initializeNavigationGraph() {
     startGraphIntervalTimer();
     updateNavigationGraphVisibilityAndMode();
 }
-// = a================================================================
-// NOMBRE: toggleNavigationState (VERSIÓN CON CORRECCIÓN DE PITCH)
-// RESUMEN: Inicia/detiene navegación. Ahora respeta el pitch guardado por el usuario al iniciar.
-async function toggleNavigationState(isRecalculationStop = false) {
-    const startNavButton = document.getElementById('start-navigation-button');
-    const startNavImg = startNavButton ? startNavButton.querySelector('img') : null;
-    const mapContainer = document.getElementById('reminders-location-map-div');
-
-  //  let reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
-  //  const dynamicRadarsExist = reminders.some(r => r.isDynamicRadar);
-  //  if (dynamicRadarsExist) {
-  //      reminders = reminders.filter(r => !r.isDynamicRadar);
-  //      localStorage.setItem('reminders', JSON.stringify(reminders));
-  //      plotRemindersOnNavigationMap();
-  //  }
-    
-    if (isNavigating) {
-        if (isSimulatingGpsLocation) {
-            stopAutomatedRouteSimulation();
-        }
-        if (!isRecalculationStop && !isArrivalSequenceStarted) {
-            if (!document.getElementById('arrival-stats-modal') || document.getElementById('arrival-stats-modal').classList.contains('hidden')) {
-                showArrivalStatsModal();
-            }
-        }
-        isNavigating = false;
-        navigationFollowUser = false;
-        
-    } else if (isFreeDriveActive) {
-        stopFreeDrive();
-        
-    } else {
-        const hasEnoughWaypointsForRoute = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart).length >= 2;
-        const hasRouteData = navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0];
-
-        if (hasEnoughWaypointsForRoute && hasRouteData) {
-            isArrivalSequenceStarted = false;
-            hideAutoStartNavigationModal();
-            clearAlternativeRoutesDisplay();
-            
-            clearSpeedMarkers();
-            
-            const waypointsForRecents = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
-            await Promise.all(waypointsForRecents.map(async (wp) => {
-                if (!wp.address) {
-                    wp.address = await getAddressForWaypoint(wp.lat, wp.lng);
-                }
-            }));
-         
-            const lastWpForName = waypointsForRecents[waypointsForRecents.length - 1];
-            const isMultiStageForName = waypointsForRecents.length > 2;
-            const suggestedName = await getSuggestedRouteName(lastWpForName.lat, lastWpForName.lng, isMultiStageForName, waypointsForRecents.length);
-            
-            const routeForRecents = { name: currentRouteNameForSaving || suggestedName, waypoints: waypointsForRecents };
-            addRouteToRecents(routeForRecents);
-            clearNavigationGraph();
-
-            navigationWaypoints.forEach(wp => { if(wp) { if (wp.type === 'S' || wp.type === 'S_Recalc') { wp.visited = true; } else { wp.visited = false; } if (wp.marker) wp.marker.setDraggable(false); } });
-            
-            getCurrentLocation(
-                (initialCoords) => { navigationCurrentLocation = initialCoords; updateInitialUserPosition(initialCoords, navigationMapInstance); },
-                (errorMsg) => { showToast(`No se pudo obtener tu ubicación inicial: ${errorMsg}. El mapa se centrará cuando el GPS esté listo.`, "warning", 5000); }
-            );
-            startGpsWatching();
-            const loadingToast = document.getElementById("gps-init-toast"); if (loadingToast) loadingToast.remove(); activeToasts = activeToasts.filter(t => t.id !== "gps-init-toast");
-            
-            isNavigating = true;
-            
-            mapHeaderButtonsVisible = false;
-            toggleMapHeaderRowsVisibility(false);
-            
-            const routeData = navigationCurrentRouteData.routes[0];
-            if (routeData) {
-                tripInitialDurationSec = routeData.duration;
-                tripInitialDistanceMeters = routeData.distance;
-                tripInitialOverallEtaTime = new Date(Date.now() + routeData.duration * 1000);
-                if (routeData.legs && routeData.legs.length > 0) {
-                    currentStageInitialExpectedEtaTime = new Date(Date.now() + routeData.legs[0].duration * 1000);
-                }
-            }
-            
-            tripStartLocationForStats = navigationCurrentLocation ? { ...navigationCurrentLocation } : null;
-            navigationStartTimeForStats = null;
-            totalDistanceTravelledForStats = 0;
-            maxDistanceReachedOnRoute = 0;
-            maxSpeedDuringTrip = 0;
-            maxSpeedCoordinates = null;
-            maxAltitudeDuringTrip = -Infinity;
-            minAltitudeDuringTrip = Infinity;
-            lastPositionForStats = navigationCurrentLocation ? {...navigationCurrentLocation} : null;
-            accumulatedDeviationMs = 0;
-            accumulatedDistanceBeforeCurrentSegment = 0;
-            
-            showToast("Navegación iniciada. Esperando movimiento...", "success");
-            currentGraphMode = localStorage.getItem(GRAPH_STATE_KEY) || 'Desviación ETA';
-            initializeNavigationGraph();
-            
-            const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox'); if (radaresRutaCheckbox && radaresRutaCheckbox.checked) { toggleRadaresRuta(true); }
-            const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox'); if (tareasRutaCheckbox && tareasRutaCheckbox.checked) { toggleTareasRuta(true); }
-
-            if (navigationMapInstance) {
-                shouldCenterOnUser = true; 
-                navigationFollowUser = true;
-                const locateMeButton = document.getElementById('locate-me-on-reminders-map');
-                if (locateMeButton) {
-                    const locateMeImg = locateMeButton.querySelector('img');
-                    if (locateMeImg) locateMeImg.src = "PNG/DEJARSEGUIR.PNG";
-                    locateMeButton.title = "Dejar de centrar el mapa en mi posición";
-                }
-                const startCoords = navigationCurrentLocation 
-                    ? [navigationCurrentLocation.longitude, navigationCurrentLocation.latitude] 
-                    : [navigationWaypoints[0].lng, navigationWaypoints[0].lat];
-                const savedViewMode = localStorage.getItem(MAP_VIEW_MODE_KEY) || 'static';
-                const modeDetails = MAP_VIEW_MODES[Object.keys(MAP_VIEW_MODES).find(key => MAP_VIEW_MODES[key].mode === savedViewMode)] || MAP_VIEW_MODES.NORTE;
-                
-                let pitchToUse = 0;
-                if (modeDetails.mode === 'static') {
-                    pitchToUse = 0; 
-                } else {
-                    pitchToUse = mapPitchValue; 
-                }
-                const initialFlyToOptions = { center: startCoords, zoom: 17.5, pitch: pitchToUse, essential: true, duration: 1500 };
-
-                mapPreviousZoomLevel = null;
-                if ((modeDetails.mode === 'heading' || modeDetails.mode === 'perspective') && navigationCurrentLocation && navigationCurrentLocation.heading !== null) {
-                    initialFlyToOptions.bearing = navigationCurrentLocation.heading;
-                } else {
-                    initialFlyToOptions.bearing = modeDetails.bearing;
-                }
-                navigationMapInstance.flyTo(initialFlyToOptions);
-            }
-        } else {
-            try {
-                const initialCoords = await getCurrentLocationAsync();
-                startFreeDrive(initialCoords);
-            } catch (error) {
-                showToast(`No se pudo obtener la ubicación para iniciar el modo libre: ${error.message}`, "error");
-            }
-        }
-    }
-
-    updateStartNavigationButtonState();
-    updateNavigationButtonColor();
-    setNavigationMapClickHandler(); 
-    actualizarContadorRadares(radaresEnRutaActual.length);
-    actualizarContadorTareas(tareasEnRutaActual.length);
-}
 
 
 // ===================================================================
@@ -18029,177 +17886,6 @@ async function fetchRouteData(coordsString, startHeading = null) {
 
 
 
-// ===================================================================
-// NOMBRE: checkReminders (VERSIÓN FINAL CON GUARDIÁN DE SEGUIMIENTO Y RECUPERACIÓN DE ETA)
-// RESUMEN: Bucle principal que ahora incluye una red de seguridad para reactivar
-//          el seguimiento del coche si se desactiva accidentalmente durante la navegación.
-// ===================================================================
-function checkReminders() {
-    
-    const { primaryId, isMobile } = parseUserId(localStorage.getItem('userData_userId'));
-    const autoSyncEnabled = JSON.parse(localStorage.getItem('boardinggate_autoBackupOnLoad') || 'false');
-    const backupPassword = localStorage.getItem('userData_backupPassword');
-
-    if (isMobile && autoSyncEnabled && primaryId && backupPassword) {
-        const localTimestamp = parseInt(localStorage.getItem('lastCacheUpdateTimestamp') || '0');
-        if (localTimestamp > lastMobileSyncTimestamp) {
-            autoSaveFromMobile(primaryId, backupPassword);
-            lastMobileSyncTimestamp = localTimestamp; 
-        }
-    }
-
-    const now = new Date();
-    
-    if (!isNavigating) {
-        const timeSinceLastCheck = now - lastDynamicRadarCheck;
-        const currentReminders = JSON.parse(localStorage.getItem('reminders') || '[]');
-        const hasExistingDynamicRadars = currentReminders.some(r => r.isDynamicRadar === true);
-
-        if (timeSinceLastCheck > 30 * 60 * 1000 || !hasExistingDynamicRadars) {
-            updateDynamicRadars(true);
-        }
-    }
-    
-    if (isNavigating && navigationCurrentRouteData?.routes?.[0]?.distance < 10) {
-        const finalWaypoint = navigationWaypoints.length > 0 ? navigationWaypoints[navigationWaypoints.length - 1] : null;
-        if (finalWaypoint && !finalWaypoint.visited) {
-            console.error("[SAFETY NET] Se ha detectado un estado de ETA a cero persistente. Disparando recálculo de recuperación.");
-            showToast("Detectado error de ETA. Recuperando la ruta...", "warning");
-            recalculateAndDrawRoute(true); 
-            return;
-        }
-    }
-
-    if (isRecalculatingRoute && recalculationAttempts > 0) return;
-    
-    const overdueReminders = [];
-    new Promise((resolve) => {
-        if (isSimulatingGpsLocation && simulatedGpsLocation) resolve(simulatedGpsLocation);
-        else if (navigationCurrentLocation) resolve(navigationCurrentLocation);
-        else if ('geolocation' in navigator) getCurrentLocation(coords => resolve(coords), () => resolve(null));
-        else resolve(null);
-    }).then(async coords => {
-        
-        if (isNavigating && !navigationFollowUser && !window.followMeReactivationTimer) {
-            console.warn("[GUARDIÁN DE SEGUIMIENTO] El seguimiento estaba inactivo durante la navegación sin un temporizador. Reactivando forzosamente.");
-            handleLocateMeClick(true); // Se llama a la función que activa el seguimiento y centra el mapa.
-        }
-       
-        let allRemindersToCheck = JSON.parse(localStorage.getItem('reminders') || '[]');
-        
-        if (isNavigating) {
-            allRemindersToCheck = allRemindersToCheck.filter(r => !r.isDynamicRadar);
-            allRemindersToCheck.push(...radaresEnRutaActual);
-        }
-
-        let isInsideAnyRadarZone = false;
-
-        allRemindersToCheck.forEach(reminder => {
-            if (!reminder || reminder.managedByUser) return;
-            
-            let isOverdue = false;
-            let locationConditionMet = true; 
-
-            try {
-                const [year, month, day] = reminder.date.split('-').map(Number);
-                const [hour, minute] = reminder.time.split(':').map(Number);
-                const reminderLocalDueTime = new Date(year, month - 1, day, hour, minute);
-                
-                if (!isNaN(reminderLocalDueTime.getTime()) && reminderLocalDueTime <= now) {
-                    if (reminder.isLocationEnabled && reminder.locationCoordinates) {
-                        if (coords) {
-                            const distance = calculateDistance(coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude);
-                            locationConditionMet = distance <= (reminder.radiusMeters || DEFAULT_LOCATION_RADIUS);
-                            if (locationConditionMet && (reminder.text.toUpperCase().includes("RADAR") || reminder.excludeFromList)) {
-                                isInsideAnyRadarZone = true;
-                            }
-                        } else {
-                            locationConditionMet = false;
-                        }
-                    }
-                    if (locationConditionMet) {
-                        isOverdue = true;
-                    }
-                }
-            } catch (e) { /* Fecha/hora inválida, se ignora */ }
-
-            if (isOverdue) {
-                if (!overdueReminders.some(r => r.id === reminder.id)) {
-                    overdueReminders.push(reminder);
-                }
-            }
-        });
-
-        if (overdueReminders.length > 0) {
-            displayUnifiedReminderWindow(overdueReminders);
-        } else if (isUnifiedWindowVisibleByLogic) {
-            hideUnifiedReminderWindow();
-        }
-
-        if (isNavigating && navigationCurrentLocation && !isRecalculatingRoute && !isDeviationModalActive && !isAddReminderAtLocationModeActive) {
-            if (Date.now() < deviationCheckGracePeriodUntil) {
-                console.log("[DESVÍO] Omitiendo comprobación de desvío (período de gracia activo).");
-                return;
-            }
-            const currentCoords = navigationCurrentLocation;
-            if (navigationMapInstance && navigationMapInstance.getSource('route') && navigationMapInstance.getSource('route')._data && typeof turf !== 'undefined') {
-                try {
-                    const routeGeoJSON = navigationMapInstance.getSource('route')._data;
-                    const routeLineString = turf.lineString(routeGeoJSON.geometry.coordinates);
-                    const carPoint = turf.point([currentCoords.longitude, currentCoords.latitude]);
-                    const distanceToRoute = turf.pointToLineDistance(carPoint, routeLineString, { units: 'meters' });
-                    if (distanceToRoute > DEVIATION_THRESHOLD_METERS) {
-                        if (deviationStartTime === 0) {
-                            deviationStartTime = Date.now();
-                        } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
-                            console.error(`[DESVÍO] ¡Desvío Confirmado! Coordenadas de detección:`, {
-                                latitude: coords.latitude,
-                                longitude: coords.longitude
-                            });
-                            showDeviationModal(); 
-                            deviationStartTime = 0;
-                        }
-                    } else {
-                        deviationStartTime = 0;
-                    }
-                } catch (e) {
-                    if (deviationStartTime === 0) deviationStartTime = Date.now();
-                    else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
-                        showDeviationModal();
-                        deviationStartTime = 0;
-                    }
-                }
-            } else {
-                if (deviationStartTime === 0) deviationStartTime = Date.now();
-                else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
-                    showDeviationModal();
-                    deviationStartTime = 0;
-                }
-            }
-        } else {
-            deviationStartTime = 0;
-        }
-
-        updateReminderCount(); 
-        updateButtonStyles();
-        
-        let newInterval = isNavigating ? 3500 : 6000;
-        if (isNavigating) {
-            const distToNextManeuver = distanceToNextManeuverOSRM || Infinity;
-            if (distToNextManeuver < 500 && distToNextManeuver > 0) newInterval = 1000;
-            else if (distToNextManeuver < 1000 && distToNextManeuver > 0) newInterval = 2000;
-            else newInterval = 3500;
-        } else if (isInsideAnyRadarZone) {
-            newInterval = 1000;
-        }
-        
-        if (newInterval !== currentCheckIntervalDuration) {
-            currentCheckIntervalDuration = newInterval;
-            if (reminderCheckIntervalId) clearInterval(reminderCheckIntervalId);
-            reminderCheckIntervalId = setInterval(checkReminders, currentCheckIntervalDuration);
-        }
-    });
-}
     
 // ===================================================================
 // NOMBRE: handleSimulateGpsPositionClick (MODIFICADA - PARA MAPBOX)
