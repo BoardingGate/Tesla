@@ -1,4 +1,4 @@
-CHECK 23
+CHECK 24
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -8947,6 +8947,313 @@ function updateProgressBarLockIcon() {
 }
 
 // ===================================================================
+// NOMBRE: openNavigationMap (VERSIÓN CON ANIMACIÓN DE GIRO PERSONALIZADA)
+// RESUMEN: Al abrir, el mapa realiza un vuelo desde Texas hasta España antes de localizar al usuario.
+// ===================================================================
+async function openNavigationMap() {
+    const { primaryId: userId } = parseUserId(localStorage.getItem('userData_userId'));
+    if (userId && userId.toLowerCase() !== 'boardinggate') {
+        const toastId = "map-access-check";
+        try {
+            const adminDocRef = window.doc(window.db, "user_data", "boardinggate");
+            const userDocRef = window.doc(window.db, "user_data", userId);
+            
+            const [adminSnap, userSnap] = await Promise.all([window.getDoc(adminDocRef), window.getDoc(userDocRef)]);
+            
+            let maxSessions = Infinity;
+            if (adminSnap.exists() && typeof adminSnap.data().max_monthly_sessions === 'number') {
+                maxSessions = adminSnap.data().max_monthly_sessions;
+            }
+            
+            let userMonthlyCount = 0;
+            if (userSnap.exists()) {
+                const userData = userSnap.data();
+                const now = new Date();
+                const currentMonthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+                if (userData.map_sessions_last_month === currentMonthStr) {
+                    userMonthlyCount = userData.map_sessions_month || 0;
+                }
+            }
+
+            const existingToast = document.getElementById(toastId);
+            if(existingToast) existingToast.remove();
+            
+            if (userMonthlyCount >= maxSessions) {
+                showToast("HA SUPERADO EL NÚMERO MÁXIMO DE SESIONES MENSUALES DE MAPA, consulte con el administrador", "error", 10000);
+                return; 
+            }
+        } catch (error) {
+            const existingToast = document.getElementById(toastId);
+            if(existingToast) existingToast.remove();
+            showToast("No se pudo verificar el límite de sesiones. Acceso permitido.", "warning");
+        }
+    }
+
+                           
+    isGeolocated = false;
+    const mainContent = document.querySelector('main'); if (mainContent) mainContent.style.display = 'none';
+    const footer = document.querySelector('footer'); if (footer) footer.style.display = 'none';
+    const noticesContainer = document.querySelector('.notices-icon-container'); if (noticesContainer) noticesContainer.style.display = 'none';
+    const sideControls = document.querySelectorAll('.toggle-image, .toggle-sign, .scroll-toggle-button'); sideControls.forEach(el => el.style.display = 'none');
+    document.querySelectorAll('#config-button, #personal-button, #radar-button, #home-button, #reload-button, #keyword-assignment-button, #password-toggle-button, #versions-button, #info-button, #accident-alert-button').forEach(el => el.style.display = 'none');
+    const gridFilter = document.getElementById('grid-filter-container'); if (gridFilter) gridFilter.style.display = 'none';
+
+    isNavigationMapActive = true;
+    sessionStorage.setItem('mapContext', 'navigation');
+    closeOtherModals('reminders-location-map-modal');
+    
+    const mapModal = document.getElementById('reminders-location-map-modal');
+    if (!mapModal) { console.error("Error crítico: El modal del mapa no se encuentra en el HTML."); isNavigationMapActive = false; return; }
+    
+    mapModal.classList.remove('map-modal-hidden');
+    const mapActualContainer = document.getElementById('mapbox-map-actual-container');
+    
+    if (navigationMapInstance) {
+        handleLoadOrDeleteRouteClick(null);
+        setNavigationMapClickHandler();
+        setTimeout(() => { if (navigationMapInstance) navigationMapInstance.resize(); }, 100);
+        
+    } else {
+        try {
+            const savedLayerName = localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO";
+            const finalLayerName = MAP_LEGACY_NAME_MAP[savedLayerName] || savedLayerName;
+            const initialStyle = MAP_STYLES[finalLayerName] || MAP_STYLES["HÍBRIDO"];
+            showToast("INICIALIZANDO MAPA...", "info", 0, false, "map-init-toast");
+  
+            // --- INICIO DE LA MODIFICACIÓN: Coordenadas de inicio para el giro ---
+            const startCoordsTexas = { lat: 30.3715, lng: -97.1903 };
+            navigationMapInstance = new mapboxgl.Map({
+                container: mapActualContainer,
+                style: initialStyle, 
+                center: [startCoordsTexas.lng, startCoordsTexas.lat],
+                zoom: 2.8,
+            // --- FIN DE LA MODIFICACIÓN ---
+                pitch: 0,
+                bearing: 0,
+                attributionControl: false, 
+                accessToken: mapboxgl.accessToken
+            });
+            
+            setMapImmersiveMode(true);
+            
+            incrementMapSessionCount();
+            mapSessionStartTime = Date.now();
+            
+            const customControls = new CustomMapControlsGroup();
+            navigationMapInstance.addControl(customControls, 'bottom-right');
+            
+            compassAndModeControl = new CompassAndStatsControl();
+            navigationMapInstance.addControl(compassAndModeControl, 'bottom-left');
+
+            if (!navigationMapInstance._interactionListenersAttached) {
+                navigationMapInstance.on('dragstart', handleManualMapInteraction);
+                navigationMapInstance.on('zoomstart', handleManualMapInteraction);
+                navigationMapInstance.on('pitchstart', handleManualMapInteraction);
+                navigationMapInstance.on('dragend', handleManualMapInteraction);
+                navigationMapInstance.on('zoomend', handleManualMapInteraction);
+                navigationMapInstance.on('pitchend', handleManualMapInteraction);
+                navigationMapInstance.on('moveend', (e) => {
+                    if (e.originalEvent) { 
+                        const newPitch = navigationMapInstance.getPitch();
+                        if (Math.abs(newPitch - mapPitchValue) > 0.1) {
+                            mapPitchValue = newPitch;
+                            saveSettings();
+                        }
+                    }
+                });
+                navigationMapInstance._interactionListenersAttached = true; 
+            }
+            
+            navigationMapInstance.on('error', (e) => {
+                if (e.error && e.error.message.includes("Token")) {
+                    showToast("Error de Token de Mapbox. Revisa los permisos (scopes) en tu cuenta.", "error", 10000);
+                }
+            });
+            
+            navigationMapInstance.on('load', async function() {
+                try {
+                    const initToast = document.getElementById("map-init-toast");
+                    if (initToast) initToast.remove();
+
+                    await loadAndAddMapImages(navigationMapInstance);
+                    reAddCustomMapLayersAndSources(navigationMapInstance);
+                    
+                    processTrafficAlerts();
+                    
+                    // <<< LÍNEA AÑADIDA PARA ACTUALIZACIÓN DE GROSOR EN TIEMPO REAL >>>
+                    navigationMapInstance.on('pitch', updateLineWidthsOnPitchChange);
+                    
+                    mapPreviousZoomLevelForPDRs = navigationMapInstance.getZoom();
+                    navigationMapInstance.on('zoomend', updateAllIconSizes);
+                    navigationMapInstance.on('zoomend', updateTrafficAlertIconSizes);
+                    toggleMapHeaderRowsVisibility(mapHeaderButtonsVisible);
+
+                    navigationMapInstance.on('click', async (e) => {
+                        if (isAddReminderAtLocationModeActive) { handleMapClickToAddReminder(e); return; }
+                        if (isSimulatingGpsLocation) { handleSimulateGpsPositionClick(e); return; }
+                        if (isNavigating) { return; }
+
+                        const point = e.point;
+                        const lngLat = e.lngLat;
+                        
+                        const pdrLayers = ['pdr-simple-circle-layer', 'pdr-cards-layer-bg'];
+                        const pdrFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: pdrLayers });
+                        if (pdrFeatures.length > 0) {
+                            const pdrIndex = pdrFeatures[0].properties.index;
+                            const fullPdrData = window.lastOcmApiResponse.find(p => p.ID === pdrFeatures[0].properties.ocmId);
+                            if (fullPdrData) {
+                                showChargingPointModal(fullPdrData, pdrIndex);
+                            }
+                            return;
+                        }
+
+                        const reminderLayers = ['reminders-circles-layer', 'reminders-icons-layer'];
+                        const reminderFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: reminderLayers });
+                        if (reminderFeatures.length > 0) {
+                            const reminderId = reminderFeatures[0].properties.reminderId;
+                            showReminderActionModal(reminderId);
+                            return;
+                        }
+
+                        const mapboxPoiLayers = ['poi-label'];
+                        const features = navigationMapInstance.queryRenderedFeatures(point, { layers: mapboxPoiLayers });
+                        const validPoiFeature = features.find(f => {
+                             if (!f.properties) return false;
+                             const poiName = f.properties.name || f.properties.name_en || f.properties.text;
+                             return f.layer.id === 'poi-label' && poiName;
+                        });
+
+                        if (validPoiFeature) {
+                            const properties = validPoiFeature.properties;
+                            const poiName = properties.name || properties.name_en || properties.text;
+                            let categories = [];
+                            if (properties.poi_category && Array.isArray(properties.poi_category)) { categories = properties.poi_category; } 
+                            else if (properties.category) { categories = properties.category.split(',').map(c => c.trim()); } 
+                            else if (properties.maki) { categories = [properties.maki]; }
+                            
+                            const featureForModal = { properties: { name: poiName, categories: categories }, geometry: validPoiFeature.geometry };
+                            showPoiInfoModal(featureForModal);
+                        } else {
+                            addWaypoint(lngLat);
+                        }
+                    });
+                    
+                    enablePoiInteractivity(navigationMapInstance);
+                    setNavigationMapClickHandler();
+                    
+                    // --- INICIO DE LA MODIFICACIÓN: Animación de giro del globo ---
+                    const globeSpinPromise = new Promise(resolve => {
+                        const startCoords = { lat: 30.3715, lng: -97.1903 }; // Texas
+                        const endCoords = { lat: 40.3748, lng: -3.7354 };   // Madrid
+                        const duration = 2500; // 2.5 segundos
+
+                        // Calcular la distancia de la rotación "larga" hacia el oeste
+                        const directLngDiff = endCoords.lng - startCoords.lng;
+                        const totalLngChange = -(360 - directLngDiff); // Negativo para ir hacia la izquierda (oeste)
+                        const totalLatChange = endCoords.lat - startCoords.lat;
+
+                        const startTimestamp = performance.now();
+
+                        function animateSpin(timestamp) {
+                            const elapsedTime = timestamp - startTimestamp;
+                            let progress = Math.min(elapsedTime / duration, 1);
+                            
+                            // Función de suavizado (ease-out)
+                            progress = 1 - Math.pow(1 - progress, 3);
+
+                            const currentLng = startCoords.lng + (totalLngChange * progress);
+                            const currentLat = startCoords.lat + (totalLatChange * progress);
+                            
+                            navigationMapInstance.setCenter([currentLng, currentLat]);
+
+                            if (progress < 1) {
+                                requestAnimationFrame(animateSpin);
+                            } else {
+                                navigationMapInstance.setCenter([endCoords.lng, endCoords.lat]); // Asegurar la posición final
+                                resolve();
+                            }
+                        }
+                        requestAnimationFrame(animateSpin);
+                    });
+
+                    await globeSpinPromise; // Esperar a que el giro del globo termine
+                    // --- FIN DE LA MODIFICACIÓN ---
+
+                    async function getGpsWithRetries() {
+                        const toastId = "gps-locate-toast";
+                        showToast("LOCALIZANDO VEHÍCULO...", "info", 0, false, toastId);
+                        
+                        while (true) {
+                            try {
+                                const coords = await getCurrentLocationAsync(); // Usa la nueva función asíncrona
+                                const loadingToast = document.getElementById(toastId);
+                                if (loadingToast) loadingToast.remove();
+                                return coords; // Éxito, devuelve las coordenadas y sale del bucle
+                            } catch (error) {
+                                showToast(`No se pudo obtener la ubicación. Reintentando en 3 segundos...`, "warning", 0, false, toastId);
+                                await new Promise(resolve => setTimeout(resolve, 3000)); // Espera 3 segundos
+                            }
+                        }
+                    }
+
+                    const currentPos = await getGpsWithRetries();
+                    
+                    setMapImmersiveMode(false);
+                    navigationFollowUser = true;
+                    shouldCenterOnUser = true;
+                    updateLocateMeButtonsUI();
+                    toggleMapControls(true);
+                    navigationCurrentLocation = currentPos;
+                    updateInitialUserPosition(currentPos, navigationMapInstance);
+                    
+                    if (navigationMapInstance) {
+                        navigationMapInstance.flyTo({
+                            center: [currentPos.longitude, currentPos.latitude],
+                            zoom: 17,
+                            bearing: 0,
+                            pitch: 50,
+                            duration: 2300
+                        });
+                    }
+                    startGpsWatching();
+                    
+                } catch (loadError) {
+                    showToast(`Error crítico al cargar los recursos del mapa: ${loadError.message}`, "error", 10000);
+                }
+            });
+        } catch (initError) {
+             if (mapActualContainer) mapActualContainer.innerHTML = `<div style="color:red; text-align:center; padding:20px; background: rgba(0,0,0,0.7); height:100%; display:flex; align-items:center; justify-content:center; flex-direction:column;"><h2>Error al cargar el mapa</h2><p>${initError.message}</p><p style="margin-top:10px; font-size:0.9rem;">Por favor, revisa tu token de Mapbox y sus permisos (scopes).</p></div>`;
+             isNavigationMapActive = false;
+        }
+    }
+    
+    assignMapButtonListeners();
+    const lockButton = document.getElementById('toggle-progress-bar-lock');
+    if (lockButton && !lockButton.dataset.listenerAttached) {
+        lockButton.addEventListener('click', handleProgressBarLockToggle);
+        lockButton.dataset.listenerAttached = 'true';
+    }
+    updateProgressBarLockIcon();
+    
+    const radaresCheckbox = document.getElementById('radares-ruta-checkbox');
+    if (radaresCheckbox) radaresCheckbox.checked = localStorage.getItem(RADARES_RUTA_CHECKED_KEY) === 'true';
+    const tareasCheckbox = document.getElementById('tareas-ruta-checkbox');
+    if (tareasCheckbox) tareasCheckbox.checked = localStorage.getItem(TAREAS_RUTA_CHECKED_KEY) === 'true';
+    const mapboxCheckbox = document.getElementById('mapbox-primary-checkbox');
+    if (mapboxCheckbox) mapboxCheckbox.checked = localStorage.getItem('boardinggate_useMapboxAsPrimary') === 'true';
+    currentGraphMode = localStorage.getItem(GRAPH_STATE_KEY) || 'Desviación ETA';
+    mapViewMode = localStorage.getItem(MAP_VIEW_MODE_KEY) || 'static';
+    isAutoZoomActive = localStorage.getItem(AUTO_ZOOM_ACTIVE_KEY) === 'true';
+    const autoBtn = document.getElementById('zoom-auto-button');
+    if (autoBtn) autoBtn.classList.toggle('active', isAutoZoomActive);
+    toggleMapHeaderRowsVisibility(mapHeaderButtonsVisible);
+    updateStartNavigationButtonState();
+    updateNavigationButtonColor();
+    toggleMapLocationSearchVisibility(!isNavigating);
+}
+    
+
+// ===================================================================
 // NOMBRE: loadRouteFromObject (VERSIÓN FINAL Y ROBUSTA CONTRA MOVIMIENTO)
 // RESUMEN: "Salva" la ubicación GPS actual ANTES de limpiar, garantizando un recálculo fiable.
 async function loadRouteFromObject(routeObject, autoStartNavigation = false) {
@@ -10785,7 +11092,7 @@ async function reAddCustomMapLayersAndSources(mapInstance) {
     // Ya no se añade la fuente 'traffic-alerts-source'
 
     mapInstance.addLayer({ id: 'route', type: 'line', source: 'route', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: getRouteStyleProperties() });
-    mapInstance.addLayer({ id: 'completed-segments-layer', type: 'line', source: 'completed-segments', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': 'green', 'line-width': 6, 'line-opacity': 0.8 } });
+    mapInstance.addLayer({ id: 'completed-segments-layer', type: 'line', source: 'completed-segments', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': 'green', 'line-width': (navigationMapInstance && navigationMapInstance.getPitch() > 5) ? 10 : 6, 'line-opacity': 0.8 } });
     
     mapInstance.addLayer({ id: 'speed-markers-circle-bg', type: 'circle', source: 'speed-markers-source', paint: { 'circle-radius': 15, 'circle-color': ['case', ['==', ['get', 'type'], 'maxSpeed'], '#4B0082', '#36454F'], 'circle-stroke-width': 2, 'circle-stroke-color': 'white' } });
     mapInstance.addLayer({ id: 'speed-markers-text', type: 'symbol', source: 'speed-markers-source', layout: { 'text-field': ['get', 'speedText'], 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': 11, 'text-allow-overlap': true }, paint: { 'text-color': 'white' } });
@@ -10805,7 +11112,31 @@ async function reAddCustomMapLayersAndSources(mapInstance) {
     mapInstance.addLayer({ id: 'reminders-icons-layer', type: 'symbol', source: 'reminders-geojson-source', filter: ['==', ['get', 'isRadar'], false], layout: { 'icon-image': 'reminder-icon', 'icon-size': ['interpolate', ['linear'], ['zoom'], 10, 0.4, 14, 0.6, 17, 0.8], 'icon-allow-overlap': true, 'icon-anchor': 'bottom' } });
 }
 
+// ===================================================================
+// NOMBRE: updateLineWidthsOnPitchChange (NUEVA FUNCIÓN SIMPLE)
+// RESUMEN: Ajusta el grosor de las líneas de ruta según la inclinación.
+function updateLineWidthsOnPitchChange() {
+    if (!navigationMapInstance || !navigationMapInstance.isStyleLoaded()) return;
 
+    const isPitched = navigationMapInstance.getPitch() > 5;
+    const mainWidth = isPitched ? 16 : 12;
+    const altWidth = isPitched ? 12 : 8;
+    const completedWidth = isPitched ? 10 : 6;
+
+    try {
+        if (navigationMapInstance.getLayer('route')) {
+            navigationMapInstance.setPaintProperty('route', 'line-width', mainWidth);
+        }
+        if (navigationMapInstance.getLayer('completed-segments-layer')) {
+            navigationMapInstance.setPaintProperty('completed-segments-layer', 'line-width', completedWidth);
+        }
+        alternativeRouteLayers.forEach(alt => {
+            if (navigationMapInstance.getLayer(alt.layerId)) {
+                navigationMapInstance.setPaintProperty(alt.layerId, 'line-width', altWidth);
+            }
+        });
+    } catch (e) { /* Ignorar errores si la capa no existe */ }
+}
                                                                                                                                                                                                                                                                                                      
 // ===================================================================
 // NOMBRE: openChatModal (MODIFICADA)
@@ -11564,7 +11895,7 @@ function drawAlternativeRoutes(waypointId, routesData) {
                 layout: { 'line-join': 'round', 'line-cap': 'round' },
                 paint: {
                     'line-color': config.color,
-                    'line-width': 8,
+                    'line-width': (navigationMapInstance && navigationMapInstance.getPitch() > 5) ? 12 : 8,
                     'line-opacity': 0.8
                 }
             });
@@ -18244,8 +18575,8 @@ function getRouteStyleProperties() {
     const isStreetsView = activeLayerName === 'CALLES';
     
     return {
-        'line-color': isStreetsView ? 'blue' : 'yellow',
-        'line-width': 12,
+        'line-color': isStreetsView ? 'blue' : 'yellow',        
+        'line-width': (navigationMapInstance && navigationMapInstance.getPitch() > 5) ? 16 : 12,
         'line-opacity': isStreetsView ? 0.7 : 0.9
     };
 }
@@ -19292,308 +19623,7 @@ function getCurrentLocationAsync() {
         );
     });
 }
-// ===================================================================
-// NOMBRE: openNavigationMap (VERSIÓN CON ANIMACIÓN DE GIRO PERSONALIZADA)
-// RESUMEN: Al abrir, el mapa realiza un vuelo desde Texas hasta España antes de localizar al usuario.
-// ===================================================================
-async function openNavigationMap() {
-    const { primaryId: userId } = parseUserId(localStorage.getItem('userData_userId'));
-    if (userId && userId.toLowerCase() !== 'boardinggate') {
-        const toastId = "map-access-check";
-        try {
-            const adminDocRef = window.doc(window.db, "user_data", "boardinggate");
-            const userDocRef = window.doc(window.db, "user_data", userId);
-            
-            const [adminSnap, userSnap] = await Promise.all([window.getDoc(adminDocRef), window.getDoc(userDocRef)]);
-            
-            let maxSessions = Infinity;
-            if (adminSnap.exists() && typeof adminSnap.data().max_monthly_sessions === 'number') {
-                maxSessions = adminSnap.data().max_monthly_sessions;
-            }
-            
-            let userMonthlyCount = 0;
-            if (userSnap.exists()) {
-                const userData = userSnap.data();
-                const now = new Date();
-                const currentMonthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
-                if (userData.map_sessions_last_month === currentMonthStr) {
-                    userMonthlyCount = userData.map_sessions_month || 0;
-                }
-            }
 
-            const existingToast = document.getElementById(toastId);
-            if(existingToast) existingToast.remove();
-            
-            if (userMonthlyCount >= maxSessions) {
-                showToast("HA SUPERADO EL NÚMERO MÁXIMO DE SESIONES MENSUALES DE MAPA, consulte con el administrador", "error", 10000);
-                return; 
-            }
-        } catch (error) {
-            const existingToast = document.getElementById(toastId);
-            if(existingToast) existingToast.remove();
-            showToast("No se pudo verificar el límite de sesiones. Acceso permitido.", "warning");
-        }
-    }
-
-                           
-    isGeolocated = false;
-    const mainContent = document.querySelector('main'); if (mainContent) mainContent.style.display = 'none';
-    const footer = document.querySelector('footer'); if (footer) footer.style.display = 'none';
-    const noticesContainer = document.querySelector('.notices-icon-container'); if (noticesContainer) noticesContainer.style.display = 'none';
-    const sideControls = document.querySelectorAll('.toggle-image, .toggle-sign, .scroll-toggle-button'); sideControls.forEach(el => el.style.display = 'none');
-    document.querySelectorAll('#config-button, #personal-button, #radar-button, #home-button, #reload-button, #keyword-assignment-button, #password-toggle-button, #versions-button, #info-button, #accident-alert-button').forEach(el => el.style.display = 'none');
-    const gridFilter = document.getElementById('grid-filter-container'); if (gridFilter) gridFilter.style.display = 'none';
-
-    isNavigationMapActive = true;
-    sessionStorage.setItem('mapContext', 'navigation');
-    closeOtherModals('reminders-location-map-modal');
-    
-    const mapModal = document.getElementById('reminders-location-map-modal');
-    if (!mapModal) { console.error("Error crítico: El modal del mapa no se encuentra en el HTML."); isNavigationMapActive = false; return; }
-    
-    mapModal.classList.remove('map-modal-hidden');
-    const mapActualContainer = document.getElementById('mapbox-map-actual-container');
-    
-    if (navigationMapInstance) {
-        handleLoadOrDeleteRouteClick(null);
-        setNavigationMapClickHandler();
-        setTimeout(() => { if (navigationMapInstance) navigationMapInstance.resize(); }, 100);
-        
-    } else {
-        try {
-            const savedLayerName = localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO";
-            const finalLayerName = MAP_LEGACY_NAME_MAP[savedLayerName] || savedLayerName;
-            const initialStyle = MAP_STYLES[finalLayerName] || MAP_STYLES["HÍBRIDO"];
-            showToast("INICIALIZANDO MAPA...", "info", 0, false, "map-init-toast");
-  
-            // --- INICIO DE LA MODIFICACIÓN: Coordenadas de inicio para el giro ---
-            const startCoordsTexas = { lat: 30.3715, lng: -97.1903 };
-            navigationMapInstance = new mapboxgl.Map({
-                container: mapActualContainer,
-                style: initialStyle, 
-                center: [startCoordsTexas.lng, startCoordsTexas.lat],
-                zoom: 2.8,
-            // --- FIN DE LA MODIFICACIÓN ---
-                pitch: 0,
-                bearing: 0,
-                attributionControl: false, 
-                accessToken: mapboxgl.accessToken
-            });
-            
-            setMapImmersiveMode(true);
-            
-            incrementMapSessionCount();
-            mapSessionStartTime = Date.now();
-            
-            const customControls = new CustomMapControlsGroup();
-            navigationMapInstance.addControl(customControls, 'bottom-right');
-            
-            compassAndModeControl = new CompassAndStatsControl();
-            navigationMapInstance.addControl(compassAndModeControl, 'bottom-left');
-
-            if (!navigationMapInstance._interactionListenersAttached) {
-                navigationMapInstance.on('dragstart', handleManualMapInteraction);
-                navigationMapInstance.on('zoomstart', handleManualMapInteraction);
-                navigationMapInstance.on('pitchstart', handleManualMapInteraction);
-                navigationMapInstance.on('dragend', handleManualMapInteraction);
-                navigationMapInstance.on('zoomend', handleManualMapInteraction);
-                navigationMapInstance.on('pitchend', handleManualMapInteraction);
-                navigationMapInstance.on('moveend', (e) => {
-                    if (e.originalEvent) { 
-                        const newPitch = navigationMapInstance.getPitch();
-                        if (Math.abs(newPitch - mapPitchValue) > 0.1) {
-                            mapPitchValue = newPitch;
-                            saveSettings();
-                        }
-                    }
-                });
-                navigationMapInstance._interactionListenersAttached = true; 
-            }
-            
-            navigationMapInstance.on('error', (e) => {
-                if (e.error && e.error.message.includes("Token")) {
-                    showToast("Error de Token de Mapbox. Revisa los permisos (scopes) en tu cuenta.", "error", 10000);
-                }
-            });
-            
-            navigationMapInstance.on('load', async function() {
-                try {
-                    const initToast = document.getElementById("map-init-toast");
-                    if (initToast) initToast.remove();
-
-                    await loadAndAddMapImages(navigationMapInstance);
-                    reAddCustomMapLayersAndSources(navigationMapInstance);
-                    
-                    processTrafficAlerts();
-                    
-                    mapPreviousZoomLevelForPDRs = navigationMapInstance.getZoom();
-                    navigationMapInstance.on('zoomend', updateAllIconSizes);
-                    navigationMapInstance.on('zoomend', updateTrafficAlertIconSizes);
-                    toggleMapHeaderRowsVisibility(mapHeaderButtonsVisible);
-
-                    navigationMapInstance.on('click', async (e) => {
-                        if (isAddReminderAtLocationModeActive) { handleMapClickToAddReminder(e); return; }
-                        if (isSimulatingGpsLocation) { handleSimulateGpsPositionClick(e); return; }
-                        if (isNavigating) { return; }
-
-                        const point = e.point;
-                        const lngLat = e.lngLat;
-                        
-                        const pdrLayers = ['pdr-simple-circle-layer', 'pdr-cards-layer-bg'];
-                        const pdrFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: pdrLayers });
-                        if (pdrFeatures.length > 0) {
-                            const pdrIndex = pdrFeatures[0].properties.index;
-                            const fullPdrData = window.lastOcmApiResponse.find(p => p.ID === pdrFeatures[0].properties.ocmId);
-                            if (fullPdrData) {
-                                showChargingPointModal(fullPdrData, pdrIndex);
-                            }
-                            return;
-                        }
-
-                        const reminderLayers = ['reminders-circles-layer', 'reminders-icons-layer'];
-                        const reminderFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: reminderLayers });
-                        if (reminderFeatures.length > 0) {
-                            const reminderId = reminderFeatures[0].properties.reminderId;
-                            showReminderActionModal(reminderId);
-                            return;
-                        }
-
-                        const mapboxPoiLayers = ['poi-label'];
-                        const features = navigationMapInstance.queryRenderedFeatures(point, { layers: mapboxPoiLayers });
-                        const validPoiFeature = features.find(f => {
-                             if (!f.properties) return false;
-                             const poiName = f.properties.name || f.properties.name_en || f.properties.text;
-                             return f.layer.id === 'poi-label' && poiName;
-                        });
-
-                        if (validPoiFeature) {
-                            const properties = validPoiFeature.properties;
-                            const poiName = properties.name || properties.name_en || properties.text;
-                            let categories = [];
-                            if (properties.poi_category && Array.isArray(properties.poi_category)) { categories = properties.poi_category; } 
-                            else if (properties.category) { categories = properties.category.split(',').map(c => c.trim()); } 
-                            else if (properties.maki) { categories = [properties.maki]; }
-                            
-                            const featureForModal = { properties: { name: poiName, categories: categories }, geometry: validPoiFeature.geometry };
-                            showPoiInfoModal(featureForModal);
-                        } else {
-                            addWaypoint(lngLat);
-                        }
-                    });
-                    
-                    enablePoiInteractivity(navigationMapInstance);
-                    setNavigationMapClickHandler();
-                    
-                    // --- INICIO DE LA MODIFICACIÓN: Animación de giro del globo ---
-                    const globeSpinPromise = new Promise(resolve => {
-                        const startCoords = { lat: 30.3715, lng: -97.1903 }; // Texas
-                        const endCoords = { lat: 40.3748, lng: -3.7354 };   // Madrid
-                        const duration = 2500; // 2.5 segundos
-
-                        // Calcular la distancia de la rotación "larga" hacia el oeste
-                        const directLngDiff = endCoords.lng - startCoords.lng;
-                        const totalLngChange = -(360 - directLngDiff); // Negativo para ir hacia la izquierda (oeste)
-                        const totalLatChange = endCoords.lat - startCoords.lat;
-
-                        const startTimestamp = performance.now();
-
-                        function animateSpin(timestamp) {
-                            const elapsedTime = timestamp - startTimestamp;
-                            let progress = Math.min(elapsedTime / duration, 1);
-                            
-                            // Función de suavizado (ease-out)
-                            progress = 1 - Math.pow(1 - progress, 3);
-
-                            const currentLng = startCoords.lng + (totalLngChange * progress);
-                            const currentLat = startCoords.lat + (totalLatChange * progress);
-                            
-                            navigationMapInstance.setCenter([currentLng, currentLat]);
-
-                            if (progress < 1) {
-                                requestAnimationFrame(animateSpin);
-                            } else {
-                                navigationMapInstance.setCenter([endCoords.lng, endCoords.lat]); // Asegurar la posición final
-                                resolve();
-                            }
-                        }
-                        requestAnimationFrame(animateSpin);
-                    });
-
-                    await globeSpinPromise; // Esperar a que el giro del globo termine
-                    // --- FIN DE LA MODIFICACIÓN ---
-
-                    async function getGpsWithRetries() {
-                        const toastId = "gps-locate-toast";
-                        showToast("LOCALIZANDO VEHÍCULO...", "info", 0, false, toastId);
-                        
-                        while (true) {
-                            try {
-                                const coords = await getCurrentLocationAsync(); // Usa la nueva función asíncrona
-                                const loadingToast = document.getElementById(toastId);
-                                if (loadingToast) loadingToast.remove();
-                                return coords; // Éxito, devuelve las coordenadas y sale del bucle
-                            } catch (error) {
-                                showToast(`No se pudo obtener la ubicación. Reintentando en 3 segundos...`, "warning", 0, false, toastId);
-                                await new Promise(resolve => setTimeout(resolve, 3000)); // Espera 3 segundos
-                            }
-                        }
-                    }
-
-                    const currentPos = await getGpsWithRetries();
-                    
-                    setMapImmersiveMode(false);
-                    navigationFollowUser = true;
-                    shouldCenterOnUser = true;
-                    updateLocateMeButtonsUI();
-                    toggleMapControls(true);
-                    navigationCurrentLocation = currentPos;
-                    updateInitialUserPosition(currentPos, navigationMapInstance);
-                    
-                    if (navigationMapInstance) {
-                        navigationMapInstance.flyTo({
-                            center: [currentPos.longitude, currentPos.latitude],
-                            zoom: 17,
-                            bearing: 0,
-                            pitch: 50,
-                            duration: 2300
-                        });
-                    }
-                    startGpsWatching();
-                    
-                } catch (loadError) {
-                    showToast(`Error crítico al cargar los recursos del mapa: ${loadError.message}`, "error", 10000);
-                }
-            });
-        } catch (initError) {
-             if (mapActualContainer) mapActualContainer.innerHTML = `<div style="color:red; text-align:center; padding:20px; background: rgba(0,0,0,0.7); height:100%; display:flex; align-items:center; justify-content:center; flex-direction:column;"><h2>Error al cargar el mapa</h2><p>${initError.message}</p><p style="margin-top:10px; font-size:0.9rem;">Por favor, revisa tu token de Mapbox y sus permisos (scopes).</p></div>`;
-             isNavigationMapActive = false;
-        }
-    }
-    
-    assignMapButtonListeners();
-    const lockButton = document.getElementById('toggle-progress-bar-lock');
-    if (lockButton && !lockButton.dataset.listenerAttached) {
-        lockButton.addEventListener('click', handleProgressBarLockToggle);
-        lockButton.dataset.listenerAttached = 'true';
-    }
-    updateProgressBarLockIcon();
-    
-    const radaresCheckbox = document.getElementById('radares-ruta-checkbox');
-    if (radaresCheckbox) radaresCheckbox.checked = localStorage.getItem(RADARES_RUTA_CHECKED_KEY) === 'true';
-    const tareasCheckbox = document.getElementById('tareas-ruta-checkbox');
-    if (tareasCheckbox) tareasCheckbox.checked = localStorage.getItem(TAREAS_RUTA_CHECKED_KEY) === 'true';
-    const mapboxCheckbox = document.getElementById('mapbox-primary-checkbox');
-    if (mapboxCheckbox) mapboxCheckbox.checked = localStorage.getItem('boardinggate_useMapboxAsPrimary') === 'true';
-    currentGraphMode = localStorage.getItem(GRAPH_STATE_KEY) || 'Desviación ETA';
-    mapViewMode = localStorage.getItem(MAP_VIEW_MODE_KEY) || 'static';
-    isAutoZoomActive = localStorage.getItem(AUTO_ZOOM_ACTIVE_KEY) === 'true';
-    const autoBtn = document.getElementById('zoom-auto-button');
-    if (autoBtn) autoBtn.classList.toggle('active', isAutoZoomActive);
-    toggleMapHeaderRowsVisibility(mapHeaderButtonsVisible);
-    updateStartNavigationButtonState();
-    updateNavigationButtonColor();
-    toggleMapLocationSearchVisibility(!isNavigating);
-}
     
 // ===================================================================
 // NOMBRE: displayChargingPointsOnMap (VERSIÓN GEOJSON CON DISPONIBILIDAD)
