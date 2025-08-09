@@ -5157,11 +5157,9 @@ class CombinedMapControl {
             }
         }).join(', ');
 
-
 // ===================================================================
-// NOMBRE: updateInitialUserPosition (VERSIÓN FINAL CON BLINDAJE ANTI-ERROR)
-// RESUMEN: Orquesta el movimiento del mapa, validando explícitamente el zoom
-//          para prevenir errores fatales y garantizar la continuidad de la animación.
+// NOMBRE: updateInitialUserPosition (VERSIÓN CON ORQUESTACIÓN DE PITCH Y ZOOM)
+// RESUMEN: Orquesta el movimiento del mapa, aplicando el zoom y la inclinación calculados por las funciones auxiliares.
 // ===================================================================
 function updateInitialUserPosition(coords, mapInstanceToUse) {
     if (!mapInstanceToUse || !coords || typeof coords.latitude !== 'number' || typeof coords.longitude !== 'number' || isNaN(coords.latitude) || isNaN(coords.longitude)) {
@@ -5333,23 +5331,25 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
         return;
     }
 
-    let targetZoom = handleProgressiveManeuverZoom(
+    // --- INICIO DE LA ORQUESTACIÓN MODIFICADA ---
+    const maneuverCameraAdjustments = handleProgressiveManeuverZoom(
         navigationCurrentRouteData?.routes?.[0]?.legs?.[currentLegIndexNav]?.steps?.[currentStepIndexNav],
         distanceToNextManeuverOSRM,
         lastCarDistanceAlongRouteForNavLogic
     );
 
+    let targetZoom = maneuverCameraAdjustments ? maneuverCameraAdjustments.zoom : null;
+    let targetPitch = maneuverCameraAdjustments ? maneuverCameraAdjustments.pitch : null;
+
     if (targetZoom === null) {
         targetZoom = handleAutoZoom();
     }
     
-    // --- INICIO DEL BLINDAJE DE SEGURIDAD ---
     if (targetZoom !== null && (typeof targetZoom !== 'number' || isNaN(targetZoom))) {
         console.error(`[VALIDACIÓN] Se ha detectado un valor de zoom inválido (${targetZoom}). Se anulará el cambio de zoom en este ciclo para prevenir un error.`);
-        targetZoom = null; // Anulamos el valor inválido para que no se pase a Mapbox
+        targetZoom = null;
     }
-    // --- FIN DEL BLINDAJE DE SEGURIDAD ---
-
+    
     const viewOptions = {
         center: lngLat,
         duration: 1000,
@@ -5367,15 +5367,21 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
     if (mapViewMode === 'heading' || mapViewMode === 'perspective') {
         viewOptions.bearing = validatedHeading; 
     }
-    viewOptions.pitch = (mapViewMode === 'perspective') ? mapPitchValue : 0;
+
+    // Lógica de inclinación priorizada
+    if (targetPitch !== null && typeof targetPitch === 'number' && !isNaN(targetPitch)) {
+        viewOptions.pitch = targetPitch; // 1. Prioridad: Inclinación dinámica de la maniobra
+    } else {
+        viewOptions.pitch = (mapViewMode === 'perspective') ? mapPitchValue : 0; // 2. Fallback: Inclinación del modo de vista
+    }
 
     if (targetZoom !== null && !isManualZoomActive) {
         viewOptions.zoom = targetZoom;
     }
 
     navigationMapInstance.easeTo(viewOptions);
+    // --- FIN DE LA ORQUESTACIÓN MODIFICADA ---
 }    
-    
     
 // ===================================================================
 // NOMBRE: updateDynamicRadars (MODIFICADA - Lógica de Navegación vs. Radio)
@@ -10102,8 +10108,9 @@ function findNextValidStep(route, currentLeg, currentStep) {
 }
 
 // ===================================================================
-// NOMBRE: handleProgressiveManeuverZoom (MODIFICADA - SOLO CALCULA, NO EJECUTA)
-// RESUMEN: Gestiona la máquina de estados del zoom progresivo para maniobras y devuelve el zoom objetivo.
+// NOMBRE: handleProgressiveManeuverZoom (MODIFICADA - AÑADE CÁLCULO DE PITCH)
+// RESUMEN: Gestiona la máquina de estados del zoom y la inclinación para maniobras.
+// ===================================================================
 function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDistanceAlongRouteForNavLogic) {
     if (isManualZoomActive) return null;
 
@@ -10114,6 +10121,10 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
     
     const route = navigationCurrentRouteData?.routes?.[0];
     if (!route) return null;
+
+    // --- INICIO DE NUEVAS VARIABLES Y LÓGICA DE ESTADO ---
+    let pitchBeforeManeuver = null; // Guardará la inclinación original del usuario
+    // --- FIN DE NUEVAS VARIABLES ---
 
     const maxZoomForMap = navigationMapInstance.getMaxZoom() || 19;
     const currentMapLayerName = (localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "satélite + calles").toLowerCase();
@@ -10131,26 +10142,37 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
 
     const distanceIntoCurrentStep = currentStep.distance - distanceToManeuver;
     let targetZoom = null;
+    let targetPitch = null; // Nueva variable para la inclinación
 
     switch (progressiveZoomState) {
         case 'zooming-out':
             isZoomedForManeuver = true;
+            // Usamos la inclinación que guardamos al entrar en la maniobra
+            pitchBeforeManeuver = window.pitchBeforeManeuver || mapPitchValue;
+
             const nextStepAfterCurrent = findNextValidStep(route, currentLegIndexNav, currentStepIndexNav);
             const distanceToNextStep = nextStepAfterCurrent ? calculateDistanceToEndOfStep(route, nextStepAfterCurrent.legIndex, nextStepAfterCurrent.stepIndex) - carDistanceAlongRouteForNavLogic : Infinity;
             
             if (nextStepAfterCurrent && distanceToNextStep < HOLD_ZOOM_THRESHOLD) {
                 targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
+                targetPitch = Math.max(0, pitchBeforeManeuver - 6);
             } else {
                 if (distanceIntoCurrentStep > PROGRESSIVE_ZOOM_EXIT_END_DISTANCE || mapPreviousZoomLevelForProgressive === null) {
                     targetZoom = mapPreviousZoomLevelForProgressive;
+                    targetPitch = pitchBeforeManeuver; // Volver a la inclinación original
                     progressiveZoomState = 'none';
                     mapPreviousZoomLevelForProgressive = null;
+                    window.pitchBeforeManeuver = null; // Limpiar estado
                     isZoomedForManeuver = false;
                 } else if (distanceIntoCurrentStep >= PROGRESSIVE_ZOOM_EXIT_START_DISTANCE) {
                     const progress = (distanceIntoCurrentStep - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE) / (PROGRESSIVE_ZOOM_EXIT_END_DISTANCE - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE);
                     targetZoom = MANEUVER_PEAK_ZOOM_LEVEL - (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * Math.min(1, progress);
+                    // Recuperar la inclinación progresivamente
+                    targetPitch = (pitchBeforeManeuver - 6) + (6 * progress);
+                    targetPitch = Math.max(0, targetPitch); // Asegurarse de no ser negativo
                 } else {
                     targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
+                    targetPitch = Math.max(0, pitchBeforeManeuver - 6);
                 }
             }
             break;
@@ -10159,32 +10181,50 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
             if (distanceToManeuver <= PROGRESSIVE_ZOOM_START_DISTANCE && distanceToManeuver > PROGRESSIVE_ZOOM_PEAK_DISTANCE) {
                 if (progressiveZoomState !== 'zooming-in' && progressiveZoomState !== 'holding') {
                     mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
+                    window.pitchBeforeManeuver = mapPitchValue; // Guardar la inclinación actual
                 }
                 progressiveZoomState = 'zooming-in';
+                pitchBeforeManeuver = window.pitchBeforeManeuver;
+
                 let progress = (PROGRESSIVE_ZOOM_START_DISTANCE - distanceToManeuver) / (PROGRESSIVE_ZOOM_START_DISTANCE - PROGRESSIVE_ZOOM_PEAK_DISTANCE);
                 progress = easeInOutQuad(progress);
                 targetZoom = mapPreviousZoomLevelForProgressive + (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * progress;
+                // Reducir la inclinación progresivamente
+                targetPitch = pitchBeforeManeuver - (6 * progress);
+                targetPitch = Math.max(0, targetPitch);
                 isZoomedForManeuver = true;
+
             } else if (distanceToManeuver <= PROGRESSIVE_ZOOM_PEAK_DISTANCE) {
-                if (progressiveZoomState !== 'holding' && mapPreviousZoomLevelForProgressive === null) {
-                    mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
+                if (progressiveZoomState !== 'holding') {
+                    if(mapPreviousZoomLevelForProgressive === null) mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
+                    if(window.pitchBeforeManeuver === null) window.pitchBeforeManeuver = mapPitchValue;
                 }
                 progressiveZoomState = 'holding';
+                pitchBeforeManeuver = window.pitchBeforeManeuver;
                 targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
+                // Mantener la inclinación mínima
+                targetPitch = Math.max(0, pitchBeforeManeuver - 6);
                 isZoomedForManeuver = true;
+
             } else {
                 if (progressiveZoomState !== 'none' && mapPreviousZoomLevelForProgressive !== null) {
                     targetZoom = mapPreviousZoomLevelForProgressive;
+                    targetPitch = window.pitchBeforeManeuver;
                 }
                 progressiveZoomState = 'none';
                 mapPreviousZoomLevelForProgressive = null;
+                window.pitchBeforeManeuver = null; // Limpiar estado
                 isZoomedForManeuver = false;
             }
             break;
     }
-    return targetZoom;
-}
-    
+
+    // Devolvemos un objeto con ambos valores, o null si no hay cambios.
+    if (targetZoom !== null && targetPitch !== null) {
+        return { zoom: targetZoom, pitch: targetPitch };
+    }
+    return null;
+}    
 // ===================================================================
 // NOMBRE: clearModalAutoCloseTimer
 // RESUMEN: Limpia un temporizador de autocierre de un modal.
