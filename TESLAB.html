@@ -1,4 +1,4 @@
-S02
+S03 zoom central
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -7393,11 +7393,10 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, isUserA
     console.log("[RECALC] Bucle de recálculo finalizado sin éxito.");
 }
 
-    
 // ===================================================================
-// NOMBRE: updateInitialUserPosition (VERSIÓN OPTIMIZADA CON FALLBACK)
-// RESUMEN: Calcula la posición en ruta de forma eficiente, con un mecanismo de seguridad.
-// ===================================================================
+// NOMBRE: updateInitialUserPosition (VERSIÓN CON ORQUESTACIÓN CENTRALIZADA)
+// RESUMEN: Es el único responsable de mover el mapa, combinando la posición del GPS
+//          con los cálculos de zoom de las funciones auxiliares.
 function updateInitialUserPosition(coords, mapInstanceToUse) {
     if (!mapInstanceToUse || !coords || typeof coords.latitude !== 'number' || typeof coords.longitude !== 'number') {
         return;
@@ -7497,69 +7496,22 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
         compassAndModeControl.updateMaxSpeed(maxSpeedDuringTrip);
     }
 
-    const shouldFollow = (shouldCenterOnUser || navigationFollowUser);
-
-    if (!shouldFollow) {
-        return;
-    }
-
-    if (!isRecalculatingRoute && navigationMapInstance) {
-        const animationDuration = 1000;
-        const targetZoom = handleProgressiveManeuverZoom(navigationCurrentRouteData?.routes?.[0]?.legs?.[currentLegIndexNav]?.steps?.[currentStepIndexNav], distanceToNextManeuverOSRM, lastCarDistanceAlongRouteForNavLogic);
-        const viewOptions = {
-            center: lngLat,
-            duration: animationDuration,
-            essential: true
-        };
-
-        const mapHeight = navigationMapInstance.getCanvas().clientHeight;
-        const mapWidth = navigationMapInstance.getCanvas().clientWidth;
-        const verticalPadding = mapHeight * Math.abs(mapOffsetY / 100);
-        const horizontalPadding = mapWidth * Math.abs(mapOffsetX / 100);
-
-        viewOptions.padding = {
-            top: mapOffsetY > 0 ? verticalPadding : 0,
-            bottom: mapOffsetY < 0 ? verticalPadding : 0,
-            left: mapOffsetX > 0 ? horizontalPadding : 0,
-            right: mapOffsetX < 0 ? horizontalPadding : 0
-        };
-
-        if (targetZoom !== null && !isManualZoomActive) {
-            viewOptions.zoom = targetZoom;
-        }
-
-        if (mapViewMode === 'heading' || mapViewMode === 'perspective') {
-            viewOptions.bearing = currentHeading;
-        }
-
-        if (mapViewMode === 'perspective') {
-            viewOptions.pitch = mapPitchValue;
-        } else {
-            viewOptions.pitch = 0;
-        }
-
-        navigationMapInstance.easeTo(viewOptions);
-    }
-    
-    // <<< INICIO DEL NUEVO BLOQUE DE CÁLCULO DUAL (OPTIMIZADO + FALLBACK) >>>
+    // --- CÁLCULO DE PROGRESO EN RUTA (OPTIMIZADO) ---
     if(isNavigating && navigationCurrentRouteData && navigationCurrentRouteData.routes[0] && coords) {
         const route = navigationCurrentRouteData.routes[0];
         let carDistTurf = 0;
         const hasPrecalculatedData = route.totalPrecalculatedDistance !== undefined;
 
         if (hasPrecalculatedData) {
-            // ---- RUTA A: MÉTODO OPTIMIZADO ----
             const carPoint = turf.point([coords.longitude, coords.latitude]);
             let bestMatch = { distance: Infinity, legIndex: -1, stepIndex: -1 };
-            
             const searchStartLeg = Math.max(0, currentLegIndexNav);
             let stepsChecked = 0;
-            const MAX_STEPS_TO_CHECK = 8; // Ventana de búsqueda: paso actual + 7 siguientes
+            const MAX_STEPS_TO_CHECK = 8;
 
             for (let l = searchStartLeg; l < route.legs.length && stepsChecked < MAX_STEPS_TO_CHECK; l++) {
                 const leg = route.legs[l];
                 const searchStartStep = (l === currentLegIndexNav) ? currentStepIndexNav : 0;
-                
                 for (let s = searchStartStep; s < leg.steps.length && stepsChecked < MAX_STEPS_TO_CHECK; s++) {
                     const step = leg.steps[s];
                     if (step.geometry && step.geometry.coordinates) {
@@ -7576,39 +7528,31 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
             if (bestMatch.legIndex !== -1) {
                 currentLegIndexNav = bestMatch.legIndex;
                 currentStepIndexNav = bestMatch.stepIndex;
-
                 const bestStep = route.legs[currentLegIndexNav].steps[currentStepIndexNav];
                 const cumulativeDistance = bestStep.cumulativeDistance || 0;
                 let distanceAlongStep = 0;
-                
                 try {
                     const stepLine = turf.lineString(bestStep.geometry.coordinates);
                     const nearestPoint = turf.nearestPointOnLine(stepLine, carPoint, { units: 'meters' });
                     const startOfStepPoint = turf.point(bestStep.geometry.coordinates[0]);
                     const sliceToPoint = turf.lineSlice(startOfStepPoint, nearestPoint, stepLine);
                     distanceAlongStep = turf.length(sliceToPoint, { units: 'meters' });
-                } catch (e) {
-                    distanceAlongStep = 0;
-                }
+                } catch (e) { distanceAlongStep = 0; }
                 carDistTurf = cumulativeDistance + distanceAlongStep;
             }
-
         } else {
-            // ---- RUTA B: MÉTODO DE SEGURIDAD (EL ORIGINAL) ----
-            if (!window.optimizationHasFailed) { // Para mostrar el mensaje solo una vez por ruta
+            if (!window.optimizationHasFailed) {
                 console.warn("[OPTIMIZATION FALLBACK] La ruta actual no tiene datos pre-calculados. Usando método de cálculo de distancia original (menos eficiente).");
                 window.optimizationHasFailed = true;
             }
-            if (navigationMapInstance.getSource('route') && navigationMapInstance.getSource('route')._data && typeof turf !== 'undefined') {
-                try {
-                    const carPointTurf = turf.point([coords.longitude, coords.latitude]);
-                    const routeGeoJSON = navigationMapInstance.getSource('route')._data;
-                    const routeLineStringTurf = turf.lineString(routeGeoJSON.geometry.coordinates);
-                    const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
-                    const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
-                    carDistTurf = turf.length(lineSliceToNearestTurf, { units: 'meters' });
-                } catch (e) { /* Fallback ya está en marcha */ }
-            }
+            try {
+                const carPointTurf = turf.point([coords.longitude, coords.latitude]);
+                const routeGeoJSON = navigationMapInstance.getSource('route')._data;
+                const routeLineStringTurf = turf.lineString(routeGeoJSON.geometry.coordinates);
+                const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
+                const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
+                carDistTurf = turf.length(lineSliceToNearestTurf, { units: 'meters' });
+            } catch (e) {}
         }
         
         const totalRouteLength = route.distance;
@@ -7624,23 +7568,59 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
         renderWaypointMarkers();
         updateTurnByTurnDisplay(route, lastCarDistanceAlongRouteForNavLogic);
         updateNavigationProgressDisplay(route, lastCarDistanceAlongRouteForNavLogic);
-
     } else if (isFreeDriveActive) {
         updateNavigationProgressDisplay(null, 0);
     }
-    // <<< FIN DEL BLOQUE DE CÁLCULO DUAL >>>
+
+    // --- ORQUESTACIÓN CENTRALIZADA DEL MOVIMIENTO DEL MAPA ---
+    const shouldFollow = (shouldCenterOnUser || navigationFollowUser);
+    if (!shouldFollow || isRecalculatingRoute || !navigationMapInstance) {
+        return;
+    }
+
+    // 1. Calcular el zoom prioritario (maniobra tiene prioridad)
+    let targetZoom = handleProgressiveManeuverZoom(
+        navigationCurrentRouteData?.routes?.[0]?.legs?.[currentLegIndexNav]?.steps?.[currentStepIndexNav],
+        distanceToNextManeuverOSRM,
+        lastCarDistanceAlongRouteForNavLogic
+    );
+
+    // 2. Si no hay zoom de maniobra, calcular el zoom por velocidad
+    if (targetZoom === null) {
+        targetZoom = handleAutoZoom();
+    }
     
-    handleAutoZoom();
+    // 3. Construir el objeto de opciones para la animación del mapa
+    const viewOptions = {
+        center: lngLat,
+        duration: 1000,
+        essential: true
+    };
+    
+    // 4. Añadir padding, bearing y pitch
+    const mapHeight = navigationMapInstance.getCanvas().clientHeight;
+    const mapWidth = navigationMapInstance.getCanvas().clientWidth;
+    viewOptions.padding = {
+        top: mapOffsetY > 0 ? mapHeight * Math.abs(mapOffsetY / 100) : 0,
+        bottom: mapOffsetY < 0 ? mapHeight * Math.abs(mapOffsetY / 100) : 0,
+        left: mapOffsetX > 0 ? mapWidth * Math.abs(mapOffsetX / 100) : 0,
+        right: mapOffsetX < 0 ? mapWidth * Math.abs(mapOffsetX / 100) : 0
+    };
+    if (mapViewMode === 'heading' || mapViewMode === 'perspective') {
+        viewOptions.bearing = currentHeading;
+    }
+    viewOptions.pitch = (mapViewMode === 'perspective') ? mapPitchValue : 0;
+
+    // 5. Añadir el zoom calculado solo si es necesario y no hay interacción manual
+    if (targetZoom !== null && !isManualZoomActive) {
+        viewOptions.zoom = targetZoom;
+    }
+
+    // 6. Ejecutar la única llamada de movimiento
+    navigationMapInstance.easeTo(viewOptions);
 }
 
-
-
-
-
-
-
-
-    
+  
 
     
 // ===================================================================
@@ -10117,9 +10097,10 @@ function findNextValidStep(route, currentLeg, currentStep) {
     }
     return null;
 }
-// --- FIN: Funciones de Ayuda ---
 
-// <<< CAMBIO CLAVE AQUÍ: Se añade el nuevo argumento 'carDistanceAlongRouteForNavLogic' >>>
+// ===================================================================
+// NOMBRE: handleProgressiveManeuverZoom (MODIFICADA - SOLO CALCULA, NO EJECUTA)
+// RESUMEN: Gestiona la máquina de estados del zoom progresivo para maniobras y devuelve el zoom objetivo.
 function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDistanceAlongRouteForNavLogic) {
     if (isManualZoomActive) return null;
 
@@ -10152,8 +10133,6 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
         case 'zooming-out':
             isZoomedForManeuver = true;
             const nextStepAfterCurrent = findNextValidStep(route, currentLegIndexNav, currentStepIndexNav);
-            
-            // <<< CAMBIO CLAVE AQUÍ: Se usa el nuevo argumento >>>
             const distanceToNextStep = nextStepAfterCurrent ? calculateDistanceToEndOfStep(route, nextStepAfterCurrent.legIndex, nextStepAfterCurrent.stepIndex) - carDistanceAlongRouteForNavLogic : Infinity;
             
             if (nextStepAfterCurrent && distanceToNextStep < HOLD_ZOOM_THRESHOLD) {
@@ -10201,7 +10180,8 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
             break;
     }
     return targetZoom;
-}    
+}
+    
 // ===================================================================
 // NOMBRE: clearModalAutoCloseTimer
 // RESUMEN: Limpia un temporizador de autocierre de un modal.
