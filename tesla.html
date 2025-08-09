@@ -5155,6 +5155,373 @@ class CombinedMapControl {
             }
         }).join(', ');
 
+
+// ===================================================================
+// NOMBRE: handleProgressiveManeuverZoom (VERSIÓN CON INCLINACIÓN ADAPTATIVA)
+// RESUMEN: Gestiona el zoom y la inclinación de forma diferente para modos 2D y 3D.
+// ===================================================================
+function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDistanceAlongRouteForNavLogic) {
+    if (isManualZoomActive) return null;
+
+    if (!isNavigating || !navigationMapInstance || !currentStep) {
+        if (isZoomedForManeuver) isZoomedForManeuver = false;
+        return null;
+    }
+    
+    const route = navigationCurrentRouteData?.routes?.[0];
+    if (!route) return null;
+
+    let pitchBeforeManeuver = null;
+
+    const maxZoomForMap = navigationMapInstance.getMaxZoom() || 19;
+    const currentMapLayerName = (localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "satélite + calles").toLowerCase();
+    const isSatelliteWithLabels = currentMapLayerName.includes("satélite + calles");
+    const MANEUVER_PEAK_ZOOM_LEVEL = isSatelliteWithLabels ? Math.min(17.5, maxZoomForMap) : Math.min(18.5, maxZoomForMap);
+    const HOLD_ZOOM_THRESHOLD = 250;
+    
+    const currentStepIdentifier = `${currentLegIndexNav}_${currentStepIndexNav}`;
+    if (lastProcessedStepIdentifier !== null && lastProcessedStepIdentifier !== currentStepIdentifier) {
+        if (progressiveZoomState === 'zooming-in' || progressiveZoomState === 'holding') {
+            progressiveZoomState = 'zooming-out';
+        }
+    }
+    lastProcessedStepIdentifier = currentStepIdentifier;
+
+    const distanceIntoCurrentStep = currentStep.distance - distanceToManeuver;
+    let targetZoom = null;
+    let targetPitch = null;
+
+    switch (progressiveZoomState) {
+        case 'zooming-out':
+            isZoomedForManeuver = true;
+            pitchBeforeManeuver = window.pitchBeforeManeuver !== null ? window.pitchBeforeManeuver : navigationMapInstance.getPitch();
+
+            const nextStepAfterCurrent = findNextValidStep(route, currentLegIndexNav, currentStepIndexNav);
+            const distanceToNextStep = nextStepAfterCurrent ? calculateDistanceToEndOfStep(route, nextStepAfterCurrent.legIndex, nextStepAfterCurrent.stepIndex) - carDistanceAlongRouteForNavLogic : Infinity;
+            
+            if (nextStepAfterCurrent && distanceToNextStep < HOLD_ZOOM_THRESHOLD) {
+                targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
+                // Mantener inclinación máxima de la maniobra si hay otra cerca
+                if (mapViewMode === 'perspective') {
+                    targetPitch = pitchBeforeManeuver * 0.90;
+                } else {
+                    targetPitch = 45;
+                }
+            } else {
+                if (distanceIntoCurrentStep > PROGRESSIVE_ZOOM_EXIT_END_DISTANCE || mapPreviousZoomLevelForProgressive === null) {
+                    targetZoom = mapPreviousZoomLevelForProgressive;
+                    targetPitch = pitchBeforeManeuver; // Volver a la inclinación original
+                    progressiveZoomState = 'none';
+                    mapPreviousZoomLevelForProgressive = null;
+                    window.pitchBeforeManeuver = null;
+                    isZoomedForManeuver = false;
+                } else if (distanceIntoCurrentStep >= PROGRESSIVE_ZOOM_EXIT_START_DISTANCE) {
+                    const progress = (distanceIntoCurrentStep - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE) / (PROGRESSIVE_ZOOM_EXIT_END_DISTANCE - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE);
+                    targetZoom = MANEUVER_PEAK_ZOOM_LEVEL - (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * Math.min(1, progress);
+                    // Lógica DUAL para recuperar inclinación
+                    if (mapViewMode === 'perspective') {
+                        const pitchReduction = pitchBeforeManeuver * 0.10;
+                        targetPitch = (pitchBeforeManeuver - pitchReduction) + (pitchReduction * progress);
+                    } else {
+                        targetPitch = 45 - (45 * progress);
+                    }
+                } else {
+                    targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
+                    // Lógica DUAL para mantener inclinación
+                    if (mapViewMode === 'perspective') {
+                        targetPitch = pitchBeforeManeuver * 0.90;
+                    } else {
+                        targetPitch = 45;
+                    }
+                }
+            }
+            break;
+
+        default:
+            if (distanceToManeuver <= PROGRESSIVE_ZOOM_START_DISTANCE && distanceToManeuver > PROGRESSIVE_ZOOM_PEAK_DISTANCE) {
+                if (progressiveZoomState !== 'zooming-in' && progressiveZoomState !== 'holding') {
+                    mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
+                    window.pitchBeforeManeuver = navigationMapInstance.getPitch();
+                }
+                progressiveZoomState = 'zooming-in';
+                pitchBeforeManeuver = window.pitchBeforeManeuver;
+
+                let progress = (PROGRESSIVE_ZOOM_START_DISTANCE - distanceToManeuver) / (PROGRESSIVE_ZOOM_START_DISTANCE - PROGRESSIVE_ZOOM_PEAK_DISTANCE);
+                progress = easeInOutQuad(progress);
+                targetZoom = mapPreviousZoomLevelForProgressive + (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * progress;
+                
+                // <<< INICIO DE LA LÓGICA DE INCLINACIÓN DUAL >>>
+                if (mapViewMode === 'perspective') {
+                    const pitchReduction = pitchBeforeManeuver * 0.10;
+                    targetPitch = pitchBeforeManeuver - (pitchReduction * progress);
+                } else { // Modos 2D
+                    targetPitch = pitchBeforeManeuver + (45 * progress);
+                }
+                // <<< FIN DE LA LÓGICA DE INCLINACIÓN DUAL >>>
+                
+                isZoomedForManeuver = true;
+
+            } else if (distanceToManeuver <= PROGRESSIVE_ZOOM_PEAK_DISTANCE) {
+                if (progressiveZoomState !== 'holding') {
+                    if(mapPreviousZoomLevelForProgressive === null) mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
+                    if(window.pitchBeforeManeuver === null) window.pitchBeforeManeuver = navigationMapInstance.getPitch();
+                }
+                progressiveZoomState = 'holding';
+                pitchBeforeManeuver = window.pitchBeforeManeuver;
+                targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
+                
+                // Mantener la inclinación máxima de la maniobra
+                if (mapViewMode === 'perspective') {
+                    targetPitch = pitchBeforeManeuver * 0.90;
+                } else {
+                    targetPitch = 45;
+                }
+                isZoomedForManeuver = true;
+
+            } else {
+                if (progressiveZoomState !== 'none' && mapPreviousZoomLevelForProgressive !== null) {
+                    targetZoom = mapPreviousZoomLevelForProgressive;
+                    targetPitch = window.pitchBeforeManeuver;
+                }
+                progressiveZoomState = 'none';
+                mapPreviousZoomLevelForProgressive = null;
+                window.pitchBeforeManeuver = null;
+                isZoomedForManeuver = false;
+            }
+            break;
+    }
+
+    if (targetZoom !== null && targetPitch !== null) {
+        // Aseguramos que los valores de inclinación estén siempre dentro de los límites válidos
+        targetPitch = Math.max(0, Math.min(85, targetPitch));
+        return { zoom: targetZoom, pitch: targetPitch };
+    }
+    return null;
+}
+
+// ===================================================================
+// NOMBRE: updateInitialUserPosition (VERSIÓN FINAL CON BLINDAJE Y PITCH DINÁMICO)
+// RESUMEN: Orquesta el movimiento del mapa, aplicando el zoom y la inclinación calculados.
+// ===================================================================
+function updateInitialUserPosition(coords, mapInstanceToUse) {
+    if (!mapInstanceToUse || !coords || typeof coords.latitude !== 'number' || typeof coords.longitude !== 'number' || isNaN(coords.latitude) || isNaN(coords.longitude)) {
+        console.warn("[GPS] Datos de coordenadas inválidos recibidos. Omitiendo actualización.");
+        return;
+    }
+    lastGpsUpdateTime = Date.now();
+
+    const lngLat = new mapboxgl.LngLat(coords.longitude, coords.latitude);
+    initialUserLocationMarkerLat = coords.latitude;
+    initialUserLocationMarkerLng = coords.longitude;
+
+    let validatedHeading = null;
+    if (coords.heading !== null && typeof coords.heading === 'number' && !isNaN(coords.heading) && coords.heading >= 0) {
+        validatedHeading = coords.heading;
+    } else if (window.lastPositionForSpeedCalc && typeof turf !== 'undefined') {
+        const lastPoint = turf.point([window.lastPositionForSpeedCalc.longitude, window.lastPositionForSpeedCalc.latitude]);
+        const currentPoint = turf.point([coords.longitude, coords.latitude]);
+        if (turf.distance(lastPoint, currentPoint, { units: 'meters' }) > 1) {
+            const bearing = turf.bearing(lastPoint, currentPoint);
+            validatedHeading = (bearing < 0) ? bearing + 360 : bearing;
+        }
+    }
+    if (validatedHeading === null) {
+        validatedHeading = (markerAnimationState.currentIconRotation + 90 + 360) % 360; 
+    }
+
+    if (!initialUserLocationMarker) {
+        const vehicleIconElement = document.createElement('div');
+        vehicleIconElement.style.width = '48px';
+        vehicleIconElement.style.height = '48px';
+        vehicleIconElement.innerHTML = `<img src="PNG/AVANCE.PNG" alt="Coche" style="width:100%; height:100%; object-fit:contain;">`;
+        initialUserLocationMarker = new mapboxgl.Marker({ element: vehicleIconElement, rotationAlignment: 'map', anchor: 'center' })
+            .setLngLat(lngLat)
+            .addTo(mapInstanceToUse);
+    }
+
+    if (!markerAnimationState.currentLngLat) {
+        markerAnimationState.currentLngLat = lngLat;
+    }
+   
+    markerAnimationState.targetLngLat = lngLat;
+    markerAnimationState.targetIconRotation = validatedHeading - 90; 
+    if (!markerAnimationState.animationFrameId) {
+        markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
+    }
+
+    if (compassAndModeControl) {
+        compassAndModeControl.updateOrientation(validatedHeading);
+        compassAndModeControl.updateAltitude(coords.altitude);
+        if (window.lastPositionForSpeedCalc && typeof coords.speed === 'number' && coords.speed !== null) {
+            const distM = calculateDistance(window.lastPositionForSpeedCalc.latitude, window.lastPositionForSpeedCalc.longitude, coords.latitude, coords.longitude);
+            const timeS = (Date.now() - window.lastPositionForSpeedCalc.time) / 1000;
+            if (timeS > 0 && distM >= 0) {
+                let speedMs = coords.speed;
+                if (typeof speedMs !== 'number' || speedMs === null || speedMs < 0) { speedMs = distM / timeS; }
+                window.currentSpeedKmh = speedMs * 3.6;
+            } else { window.currentSpeedKmh = 0; }
+        } else {
+            if (typeof coords.speed === 'number' && coords.speed !== null && coords.speed >= 0) { window.currentSpeedKmh = coords.speed * 3.6; } else { window.currentSpeedKmh = 0; }
+        }
+        window.lastPositionForSpeedCalc = { latitude: coords.latitude, longitude: coords.longitude, time: Date.now() };
+        const isTripActive = isNavigating || isFreeDriveActive;
+        if (isTripActive) {
+            if (window.currentSpeedKmh > maxSpeedDuringTrip) {
+                maxSpeedDuringTrip = window.currentSpeedKmh;
+                if (coords) { maxSpeedCoordinates = { lat: coords.latitude, lng: coords.longitude }; }
+            }
+            if (coords.altitude !== null && !isNaN(coords.altitude)) {
+                maxAltitudeDuringTrip = Math.max(maxAltitudeDuringTrip, coords.altitude);
+                minAltitudeDuringTrip = Math.min(minAltitudeDuringTrip, coords.altitude);
+            }
+            SPEED_MILESTONES.forEach(milestone => {
+                if (window.currentSpeedKmh > milestone && milestone > lastSpeedMilestone) {
+                    lastSpeedMilestone = milestone;
+                    const newMilestoneFeature = {
+                        type: 'Feature',
+                        geometry: {
+                            type: 'Point',
+                            coordinates: [coords.longitude, coords.latitude]
+                        },
+                        properties: { type: 'milestone', speedText: String(milestone) }
+                    };
+                    speedMarkerFeatures.push(newMilestoneFeature);
+                    if (navigationMapInstance.getSource('speed-markers-source')) {
+                        navigationMapInstance.getSource('speed-markers-source').setData({ type: 'FeatureCollection', features: speedMarkerFeatures });
+                    }
+                }
+            });
+        }
+        compassAndModeControl.updateCurrentSpeed(window.currentSpeedKmh);
+        compassAndModeControl.updateAverageSpeed(window.averageSpeedKmh);
+        compassAndModeControl.updateMaxSpeed(maxSpeedDuringTrip);
+    }
+
+    if(isNavigating && navigationCurrentRouteData && navigationCurrentRouteData.routes[0] && coords) {
+        const route = navigationCurrentRouteData.routes[0];
+        let carDistTurf = 0;
+        const hasPrecalculatedData = route.totalPrecalculatedDistance !== undefined;
+        if (hasPrecalculatedData) {
+            const carPoint = turf.point([coords.longitude, coords.latitude]);
+            let bestMatch = { distance: Infinity, legIndex: -1, stepIndex: -1 };
+            const searchStartLeg = Math.max(0, currentLegIndexNav);
+            let stepsChecked = 0;
+            const MAX_STEPS_TO_CHECK = 8;
+            for (let l = searchStartLeg; l < route.legs.length && stepsChecked < MAX_STEPS_TO_CHECK; l++) {
+                const leg = route.legs[l];
+                const searchStartStep = (l === currentLegIndexNav) ? currentStepIndexNav : 0;
+                for (let s = searchStartStep; s < leg.steps.length && stepsChecked < MAX_STEPS_TO_CHECK; s++) {
+                    const step = leg.steps[s];
+                    if (step.geometry && step.geometry.coordinates) {
+                        const stepLine = turf.lineString(step.geometry.coordinates);
+                        const distToLine = turf.pointToLineDistance(carPoint, stepLine, { units: 'meters' });
+                        if (distToLine < bestMatch.distance) {
+                            bestMatch = { distance: distToLine, legIndex: l, stepIndex: s };
+                        }
+                    }
+                    stepsChecked++;
+                }
+            }
+            if (bestMatch.legIndex !== -1) {
+                currentLegIndexNav = bestMatch.legIndex;
+                currentStepIndexNav = bestMatch.stepIndex;
+                const bestStep = route.legs[currentLegIndexNav].steps[currentStepIndexNav];
+                const cumulativeDistance = bestStep.cumulativeDistance || 0;
+                let distanceAlongStep = 0;
+                try {
+                    const stepLine = turf.lineString(bestStep.geometry.coordinates);
+                    const nearestPoint = turf.nearestPointOnLine(stepLine, carPoint, { units: 'meters' });
+                    const startOfStepPoint = turf.point(bestStep.geometry.coordinates[0]);
+                    const sliceToPoint = turf.lineSlice(startOfStepPoint, nearestPoint, stepLine);
+                    distanceAlongStep = turf.length(sliceToPoint, { units: 'meters' });
+                } catch (e) { distanceAlongStep = 0; }
+                carDistTurf = cumulativeDistance + distanceAlongStep;
+            }
+        } else {
+            if (!window.optimizationHasFailed) {
+                console.warn("[OPTIMIZATION FALLBACK] La ruta actual no tiene datos pre-calculados. Usando método de cálculo de distancia original (menos eficiente).");
+                window.optimizationHasFailed = true;
+            }
+            try {
+                const carPointTurf = turf.point([coords.longitude, coords.latitude]);
+                const routeGeoJSON = navigationMapInstance.getSource('route')._data;
+                const routeLineStringTurf = turf.lineString(routeGeoJSON.geometry.coordinates);
+                const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
+                const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
+                carDistTurf = turf.length(lineSliceToNearestTurf, { units: 'meters' });
+            } catch (e) {}
+        }
+        
+        const totalRouteLength = route.distance;
+        if (carDistTurf >= 0 && carDistTurf <= totalRouteLength + 500) {
+            if (carDistTurf > lastCarDistanceAlongRouteForNavLogic - 100) {
+                 lastCarDistanceAlongRouteForNavLogic = carDistTurf;
+            }
+        } else if (carDistTurf > totalRouteLength + 500) {
+            lastCarDistanceAlongRouteForNavLogic = totalRouteLength;
+        }
+        checkAndMarkWaypointsAsVisited(route, lastCarDistanceAlongRouteForNavLogic, coords);
+        renderWaypointMarkers();
+        updateTurnByTurnDisplay(route, lastCarDistanceAlongRouteForNavLogic);
+        updateNavigationProgressDisplay(route, lastCarDistanceAlongRouteForNavLogic);
+    } else if (isFreeDriveActive) {
+        updateNavigationProgressDisplay(null, 0);
+    }
+    
+    const shouldFollow = (shouldCenterOnUser || navigationFollowUser);
+    if (!shouldFollow || isRecalculatingRoute || !navigationMapInstance) {
+        return;
+    }
+
+    const maneuverCameraAdjustments = handleProgressiveManeuverZoom(
+        navigationCurrentRouteData?.routes?.[0]?.legs?.[currentLegIndexNav]?.steps?.[currentStepIndexNav],
+        distanceToNextManeuverOSRM,
+        lastCarDistanceAlongRouteForNavLogic
+    );
+
+    let targetZoom = maneuverCameraAdjustments ? maneuverCameraAdjustments.zoom : null;
+    let targetPitch = maneuverCameraAdjustments ? maneuverCameraAdjustments.pitch : null;
+
+    if (targetZoom === null) {
+        targetZoom = handleAutoZoom();
+    }
+    
+    if (targetZoom !== null && (typeof targetZoom !== 'number' || isNaN(targetZoom))) {
+        console.error(`[VALIDACIÓN] Se ha detectado un valor de zoom inválido (${targetZoom}). Se anulará el cambio de zoom en este ciclo para prevenir un error.`);
+        targetZoom = null;
+    }
+    
+    const viewOptions = {
+        center: lngLat,
+        duration: 1000,
+        essential: true
+    };
+    
+    const mapHeight = navigationMapInstance.getCanvas().clientHeight;
+    const mapWidth = navigationMapInstance.getCanvas().clientWidth;
+    viewOptions.padding = {
+        top: mapOffsetY > 0 ? mapHeight * Math.abs(mapOffsetY / 100) : 0,
+        bottom: mapOffsetY < 0 ? mapHeight * Math.abs(mapOffsetY / 100) : 0,
+        left: mapOffsetX > 0 ? mapWidth * Math.abs(mapOffsetX / 100) : 0,
+        right: mapOffsetX < 0 ? mapWidth * Math.abs(mapOffsetX / 100) : 0
+    };
+    if (mapViewMode === 'heading' || mapViewMode === 'perspective') {
+        viewOptions.bearing = validatedHeading; 
+    }
+
+    if (targetPitch !== null && typeof targetPitch === 'number' && !isNaN(targetPitch)) {
+        viewOptions.pitch = targetPitch;
+    } else {
+        viewOptions.pitch = (mapViewMode === 'perspective') ? mapPitchValue : 0;
+    }
+
+    if (targetZoom !== null && !isManualZoomActive) {
+        viewOptions.zoom = targetZoom;
+    }
+
+    navigationMapInstance.easeTo(viewOptions);
+}
+    
 // ===================================================================
 // NOMBRE: updateDynamicRadars (MODIFICADA - Lógica de Navegación vs. Radio)
 // RESUMEN: Carga radares dinámicos según el contexto (en ruta o en radio).
@@ -5654,13 +6021,18 @@ function rebuildProcessedRemindersCache() {
         processedRemindersCache = [];
     }
 }
+
 // ===================================================================
-// NOMBRE: startDeviationChecker (NUEVA FUNCIÓN)
-// RESUMEN: Inicia un temporizador dedicado para la comprobación de desvío de ruta.
+// NOMBRE: startDeviationChecker (VERSIÓN OPTIMIZADA)
+// RESUMEN: Inicia un temporizador que comprueba el desvío de ruta de forma eficiente,
+//          analizando solo un pequeño segmento de la ruta alrededor de la posición actual.
+// ===================================================================
 function startDeviationChecker() {
-    stopDeviationChecker(); // Asegura que no haya intervalos duplicados
-    console.log("[DESVÍO] Iniciando comprobador de desvío cada 5 segundos.");
+    stopDeviationChecker();
+    console.log("[DESVÍO] Iniciando comprobador de desvío optimizado (cada 5 segundos).");
+    
     deviationCheckIntervalId = setInterval(() => {
+        // Condiciones para no ejecutar la comprobación (sin cambios)
         if (!isNavigating || !navigationCurrentLocation || isRecalculatingRoute || isDeviationModalActive || isAddReminderAtLocationModeActive) {
             deviationStartTime = 0;
             return;
@@ -5668,36 +6040,82 @@ function startDeviationChecker() {
         if (Date.now() < deviationCheckGracePeriodUntil) {
             return;
         }
-        const currentCoords = navigationCurrentLocation;
-        const routeSource = navigationMapInstance?.getSource('route');
-        if (routeSource && routeSource._data && typeof turf !== 'undefined') {
-            try {
-                const routeGeoJSON = routeSource._data;
-                const routeLineString = turf.lineString(routeGeoJSON.geometry.coordinates);
-                const carPoint = turf.point([currentCoords.longitude, currentCoords.latitude]);
-                const distanceToRoute = turf.pointToLineDistance(carPoint, routeLineString, { units: 'meters' });
 
-                if (distanceToRoute > DEVIATION_THRESHOLD_METERS) {
-                    if (deviationStartTime === 0) {
-                        deviationStartTime = Date.now();
-                    } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
-                        showDeviationModal();
-                        deviationStartTime = 0;
+        const route = navigationCurrentRouteData?.routes?.[0];
+        // Comprobación de que la ruta y los datos necesarios existen
+        if (!route || !route.legs || !route.legs[currentLegIndexNav] || !route.legs[currentLegIndexNav].steps[currentStepIndexNav] || typeof turf === 'undefined') {
+            return;
+        }
+
+        try {
+            const carPoint = turf.point([navigationCurrentLocation.longitude, navigationCurrentLocation.latitude]);
+            
+            // --- INICIO DE LA OPTIMIZACIÓN ---
+            // 1. Construir la "mini-ruta" o "ventana de comprobación"
+            const searchWindowCoords = [];
+            const stepsToInclude = 5; // Revisamos el paso actual y los 4 siguientes
+
+            let legIdx = currentLegIndexNav;
+            let stepIdx = currentStepIndexNav;
+            
+            for (let i = 0; i < stepsToInclude && legIdx < route.legs.length; i++) {
+                const currentLeg = route.legs[legIdx];
+                if (stepIdx < currentLeg.steps.length) {
+                    const currentStep = currentLeg.steps[stepIdx];
+                    if (currentStep.geometry && currentStep.geometry.coordinates) {
+                        // Añadimos las coordenadas del paso, evitando duplicar el primer punto si no es el primer paso
+                        if (searchWindowCoords.length > 0) {
+                            searchWindowCoords.push(...currentStep.geometry.coordinates.slice(1));
+                        } else {
+                            searchWindowCoords.push(...currentStep.geometry.coordinates);
+                        }
                     }
+                    stepIdx++;
                 } else {
-                    deviationStartTime = 0;
+                    legIdx++;
+                    stepIdx = 0;
+                    // Saltamos el paso si pasamos a la siguiente pierna para evitar huecos en la geometría
+                    i--; 
                 }
-            } catch (e) {
-                // Error en turf, iniciar contador como fallback
-                if (deviationStartTime === 0) deviationStartTime = Date.now();
-                else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
+            }
+
+            // Si no tenemos suficientes coordenadas, la comprobación no es fiable, así que salimos.
+            if (searchWindowCoords.length < 2) {
+                deviationStartTime = 0; // Reseteamos el contador si no podemos comprobar
+                return;
+            }
+
+            // 2. Crear la línea de la ventana y calcular la distancia
+            const routeWindowLineString = turf.lineString(searchWindowCoords);
+            const distanceToRoute = turf.pointToLineDistance(carPoint, routeWindowLineString, { units: 'meters' });
+            // --- FIN DE LA OPTIMIZACIÓN ---
+
+            // 3. La lógica de detección de desvío es exactamente la misma que antes
+            if (distanceToRoute > DEVIATION_THRESHOLD_METERS) {
+                if (deviationStartTime === 0) {
+                    deviationStartTime = Date.now();
+                } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
                     showDeviationModal();
                     deviationStartTime = 0;
                 }
+            } else {
+                deviationStartTime = 0;
+            }
+        } catch (e) {
+            // En caso de error en Turf (muy improbable con geometrías pequeñas),
+            // se mantiene la lógica de seguridad original.
+            console.error("[DESVÍO] Error en el cálculo de distancia optimizado:", e);
+            if (deviationStartTime === 0) {
+                deviationStartTime = Date.now();
+            } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
+                showDeviationModal();
+                deviationStartTime = 0;
             }
         }
-    }, 5000); // Frecuencia de 5 segundos
+    }, 5000);
 }
+
+    
 
 // ===================================================================
 // NOMBRE: stopDeviationChecker (NUEVA FUNCIÓN)
@@ -7340,254 +7758,7 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, isUserA
     console.log("[RECALC] Bucle de recálculo finalizado sin éxito.");
 }
 
-    
-// ===================================================================
-// NOMBRE: updateInitialUserPosition (VERSIÓN OPTIMIZADA CON FALLBACK)
-// RESUMEN: Calcula la posición en ruta de forma eficiente, con un mecanismo de seguridad.
-// ===================================================================
-function updateInitialUserPosition(coords, mapInstanceToUse) {
-    if (!mapInstanceToUse || !coords || typeof coords.latitude !== 'number' || typeof coords.longitude !== 'number') {
-        return;
-    }
-    lastGpsUpdateTime = Date.now();
 
-    const lngLat = new mapboxgl.LngLat(coords.longitude, coords.latitude);
-    initialUserLocationMarkerLat = coords.latitude;
-    initialUserLocationMarkerLng = coords.longitude;
-
-    let effectiveHeading = null;
-    if (coords.heading !== null && typeof coords.heading === 'number' && coords.heading >= 0) {
-        effectiveHeading = coords.heading;
-    } else if (window.lastPositionForSpeedCalc && typeof turf !== 'undefined') {
-        const lastPoint = turf.point([window.lastPositionForSpeedCalc.longitude, window.lastPositionForSpeedCalc.latitude]);
-        const currentPoint = turf.point([coords.longitude, coords.latitude]);
-        if (turf.distance(lastPoint, currentPoint, { units: 'meters' }) > 1) {
-            const bearing = turf.bearing(lastPoint, currentPoint);
-            effectiveHeading = (bearing < 0) ? bearing + 360 : bearing;
-        }
-    }
-
-    const currentHeading = (effectiveHeading !== null) ? effectiveHeading : (currentMapBearing || 0);
-
-    if (!initialUserLocationMarker) {
-        const vehicleIconElement = document.createElement('div');
-        vehicleIconElement.style.width = '48px';
-        vehicleIconElement.style.height = '48px';
-        vehicleIconElement.innerHTML = `<img src="PNG/AVANCE.PNG" alt="Coche" style="width:100%; height:100%; object-fit:contain;">`;
-
-        initialUserLocationMarker = new mapboxgl.Marker({ element: vehicleIconElement, rotationAlignment: 'map', anchor: 'center' })
-            .setLngLat(lngLat)
-            .addTo(mapInstanceToUse);
-    }
-
-    if (!markerAnimationState.currentLngLat) {
-        markerAnimationState.currentLngLat = lngLat;
-    }
-   
-    markerAnimationState.targetLngLat = lngLat;
-    markerAnimationState.targetIconRotation = currentHeading - 90;
-    if (!markerAnimationState.animationFrameId) {
-        markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
-    }
-
-    if (compassAndModeControl) {
-        compassAndModeControl.updateOrientation(currentHeading);
-        compassAndModeControl.updateAltitude(coords.altitude);
-        if (window.lastPositionForSpeedCalc && typeof coords.speed === 'number' && coords.speed !== null) {
-            const distM = calculateDistance(window.lastPositionForSpeedCalc.latitude, window.lastPositionForSpeedCalc.longitude, coords.latitude, coords.longitude);
-            const timeS = (Date.now() - window.lastPositionForSpeedCalc.time) / 1000;
-            if (timeS > 0 && distM >= 0) {
-                let speedMs = coords.speed;
-                if (typeof speedMs !== 'number' || speedMs === null || speedMs < 0) { speedMs = distM / timeS; }
-                window.currentSpeedKmh = speedMs * 3.6;
-            } else { window.currentSpeedKmh = 0; }
-        } else {
-            if (typeof coords.speed === 'number' && coords.speed !== null && coords.speed >= 0) { window.currentSpeedKmh = coords.speed * 3.6; } else { window.currentSpeedKmh = 0; }
-        }
-        window.lastPositionForSpeedCalc = { latitude: coords.latitude, longitude: coords.longitude, time: Date.now() };
-        const isTripActive = isNavigating || isFreeDriveActive;
-        if (isTripActive) {
-            if (window.currentSpeedKmh > maxSpeedDuringTrip) {
-                maxSpeedDuringTrip = window.currentSpeedKmh;
-                if (coords) { maxSpeedCoordinates = { lat: coords.latitude, lng: coords.longitude }; }
-            }
-            if (coords.altitude !== null && !isNaN(coords.altitude)) {
-                maxAltitudeDuringTrip = Math.max(maxAltitudeDuringTrip, coords.altitude);
-                minAltitudeDuringTrip = Math.min(minAltitudeDuringTrip, coords.altitude);
-            }
-            SPEED_MILESTONES.forEach(milestone => {
-                if (window.currentSpeedKmh > milestone && milestone > lastSpeedMilestone) {
-                    lastSpeedMilestone = milestone;
-                    const newMilestoneFeature = {
-                        type: 'Feature',
-                        geometry: {
-                            type: 'Point',
-                            coordinates: [coords.longitude, coords.latitude]
-                        },
-                        properties: {
-                            type: 'milestone',
-                            speedText: String(milestone)
-                        }
-                    };
-                    speedMarkerFeatures.push(newMilestoneFeature);
-                    if (navigationMapInstance.getSource('speed-markers-source')) {
-                        navigationMapInstance.getSource('speed-markers-source').setData({
-                            type: 'FeatureCollection',
-                            features: speedMarkerFeatures
-                        });
-                    }
-                }
-            });
-        }
-        compassAndModeControl.updateCurrentSpeed(window.currentSpeedKmh);
-        compassAndModeControl.updateAverageSpeed(window.averageSpeedKmh);
-        compassAndModeControl.updateMaxSpeed(maxSpeedDuringTrip);
-    }
-
-    const shouldFollow = (shouldCenterOnUser || navigationFollowUser);
-
-    if (!shouldFollow) {
-        return;
-    }
-
-    if (!isRecalculatingRoute && navigationMapInstance) {
-        const animationDuration = 1000;
-        const targetZoom = handleProgressiveManeuverZoom(navigationCurrentRouteData?.routes?.[0]?.legs?.[currentLegIndexNav]?.steps?.[currentStepIndexNav], distanceToNextManeuverOSRM, lastCarDistanceAlongRouteForNavLogic);
-        const viewOptions = {
-            center: lngLat,
-            duration: animationDuration,
-            essential: true
-        };
-
-        const mapHeight = navigationMapInstance.getCanvas().clientHeight;
-        const mapWidth = navigationMapInstance.getCanvas().clientWidth;
-        const verticalPadding = mapHeight * Math.abs(mapOffsetY / 100);
-        const horizontalPadding = mapWidth * Math.abs(mapOffsetX / 100);
-
-        viewOptions.padding = {
-            top: mapOffsetY > 0 ? verticalPadding : 0,
-            bottom: mapOffsetY < 0 ? verticalPadding : 0,
-            left: mapOffsetX > 0 ? horizontalPadding : 0,
-            right: mapOffsetX < 0 ? horizontalPadding : 0
-        };
-
-        if (targetZoom !== null && !isManualZoomActive) {
-            viewOptions.zoom = targetZoom;
-        }
-
-        if (mapViewMode === 'heading' || mapViewMode === 'perspective') {
-            viewOptions.bearing = currentHeading;
-        }
-
-        if (mapViewMode === 'perspective') {
-            viewOptions.pitch = mapPitchValue;
-        } else {
-            viewOptions.pitch = 0;
-        }
-
-        navigationMapInstance.easeTo(viewOptions);
-    }
-    
-    // <<< INICIO DEL NUEVO BLOQUE DE CÁLCULO DUAL (OPTIMIZADO + FALLBACK) >>>
-    if(isNavigating && navigationCurrentRouteData && navigationCurrentRouteData.routes[0] && coords) {
-        const route = navigationCurrentRouteData.routes[0];
-        let carDistTurf = 0;
-        const hasPrecalculatedData = route.totalPrecalculatedDistance !== undefined;
-
-        if (hasPrecalculatedData) {
-            // ---- RUTA A: MÉTODO OPTIMIZADO ----
-            const carPoint = turf.point([coords.longitude, coords.latitude]);
-            let bestMatch = { distance: Infinity, legIndex: -1, stepIndex: -1 };
-            
-            const searchStartLeg = Math.max(0, currentLegIndexNav);
-            let stepsChecked = 0;
-            const MAX_STEPS_TO_CHECK = 8; // Ventana de búsqueda: paso actual + 7 siguientes
-
-            for (let l = searchStartLeg; l < route.legs.length && stepsChecked < MAX_STEPS_TO_CHECK; l++) {
-                const leg = route.legs[l];
-                const searchStartStep = (l === currentLegIndexNav) ? currentStepIndexNav : 0;
-                
-                for (let s = searchStartStep; s < leg.steps.length && stepsChecked < MAX_STEPS_TO_CHECK; s++) {
-                    const step = leg.steps[s];
-                    if (step.geometry && step.geometry.coordinates) {
-                        const stepLine = turf.lineString(step.geometry.coordinates);
-                        const distToLine = turf.pointToLineDistance(carPoint, stepLine, { units: 'meters' });
-                        if (distToLine < bestMatch.distance) {
-                            bestMatch = { distance: distToLine, legIndex: l, stepIndex: s };
-                        }
-                    }
-                    stepsChecked++;
-                }
-            }
-            
-            if (bestMatch.legIndex !== -1) {
-                currentLegIndexNav = bestMatch.legIndex;
-                currentStepIndexNav = bestMatch.stepIndex;
-
-                const bestStep = route.legs[currentLegIndexNav].steps[currentStepIndexNav];
-                const cumulativeDistance = bestStep.cumulativeDistance || 0;
-                let distanceAlongStep = 0;
-                
-                try {
-                    const stepLine = turf.lineString(bestStep.geometry.coordinates);
-                    const nearestPoint = turf.nearestPointOnLine(stepLine, carPoint, { units: 'meters' });
-                    const startOfStepPoint = turf.point(bestStep.geometry.coordinates[0]);
-                    const sliceToPoint = turf.lineSlice(startOfStepPoint, nearestPoint, stepLine);
-                    distanceAlongStep = turf.length(sliceToPoint, { units: 'meters' });
-                } catch (e) {
-                    distanceAlongStep = 0;
-                }
-                carDistTurf = cumulativeDistance + distanceAlongStep;
-            }
-
-        } else {
-            // ---- RUTA B: MÉTODO DE SEGURIDAD (EL ORIGINAL) ----
-            if (!window.optimizationHasFailed) { // Para mostrar el mensaje solo una vez por ruta
-                console.warn("[OPTIMIZATION FALLBACK] La ruta actual no tiene datos pre-calculados. Usando método de cálculo de distancia original (menos eficiente).");
-                window.optimizationHasFailed = true;
-            }
-            if (navigationMapInstance.getSource('route') && navigationMapInstance.getSource('route')._data && typeof turf !== 'undefined') {
-                try {
-                    const carPointTurf = turf.point([coords.longitude, coords.latitude]);
-                    const routeGeoJSON = navigationMapInstance.getSource('route')._data;
-                    const routeLineStringTurf = turf.lineString(routeGeoJSON.geometry.coordinates);
-                    const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
-                    const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
-                    carDistTurf = turf.length(lineSliceToNearestTurf, { units: 'meters' });
-                } catch (e) { /* Fallback ya está en marcha */ }
-            }
-        }
-        
-        const totalRouteLength = route.distance;
-        if (carDistTurf >= 0 && carDistTurf <= totalRouteLength + 500) {
-            if (carDistTurf > lastCarDistanceAlongRouteForNavLogic - 100) {
-                 lastCarDistanceAlongRouteForNavLogic = carDistTurf;
-            }
-        } else if (carDistTurf > totalRouteLength + 500) {
-            lastCarDistanceAlongRouteForNavLogic = totalRouteLength;
-        }
-
-        checkAndMarkWaypointsAsVisited(route, lastCarDistanceAlongRouteForNavLogic, coords);
-        renderWaypointMarkers();
-        updateTurnByTurnDisplay(route, lastCarDistanceAlongRouteForNavLogic);
-        updateNavigationProgressDisplay(route, lastCarDistanceAlongRouteForNavLogic);
-
-    } else if (isFreeDriveActive) {
-        updateNavigationProgressDisplay(null, 0);
-    }
-    // <<< FIN DEL BLOQUE DE CÁLCULO DUAL >>>
-    
-    handleAutoZoom();
-}
-
-
-
-
-
-
-
-
-    
 
     
 // ===================================================================
@@ -7850,18 +8021,25 @@ function showReminderActionModal(reminderId) {
         closeHandler();
     });
 }   
-// ===================================================================
-// NOMBRE: handleAutoZoom (MODIFICADA - USA ESTADO DE MODO)
-// RESUMEN: Ajusta el zoom, pero solo si el modo 'auto' está activo.
-function handleAutoZoom() {
-    const currentAutoZoomMode = localStorage.getItem(AUTO_ZOOM_MODE_KEY) || 'off';
-    if (currentAutoZoomMode !== 'auto' || isManualZoomActive || !(isNavigating || isFreeDriveActive) || !navigationMapInstance) return;
 
-    if (isZoomedForManeuver) return;
+// ===================================================================
+// NOMBRE: handleAutoZoom (MODIFICADA - SOLO CALCULA, NO EJECUTA)
+// RESUMEN: Ajusta el zoom según la velocidad, devolviendo el nivel de zoom objetivo.
+function handleAutoZoom() {
+    // Si el modo 'auto' no está activo, o el usuario ha interactuado manualmente,
+    // o no estamos navegando, no hacemos nada.
+    const currentAutoZoomMode = localStorage.getItem(AUTO_ZOOM_MODE_KEY) || 'off';
+    if (currentAutoZoomMode !== 'auto' || isManualZoomActive || !(isNavigating || isFreeDriveActive) || !navigationMapInstance) {
+        return null;
+    }
+
+    // No debe interferir con el zoom de maniobras.
+    if (isZoomedForManeuver) return null;
 
     const speed = window.currentSpeedKmh || 0;
     let targetZoom;
 
+    // Lógica de niveles de zoom por velocidad.
     if (speed < 30) targetZoom = 19;
     else if (speed < 50) targetZoom = 18.5;
     else if (speed < 80) targetZoom = 18;
@@ -7869,12 +8047,15 @@ function handleAutoZoom() {
     else if (speed < 110) targetZoom = 17.1;
     else if (speed < 120) targetZoom = 16.6;
     else if (speed < 200) targetZoom = 16.3;
-    else return; 
+    else return null; // Si la velocidad es muy alta, no hacemos nada.
 
+    // Solo devolvemos un nuevo zoom si hay una diferencia significativa.
     if (Math.abs(navigationMapInstance.getZoom() - targetZoom) > 0.1) {
-        navigationMapInstance.easeTo({ zoom: targetZoom, duration: 3000 });
+        return targetZoom;
     }
-}
+
+    return null; // No se necesita cambio de zoom.
+}    
     
 // ===================================================================
 // NOMBRE: handleDragStartReorder
@@ -9629,7 +9810,7 @@ async function openNavigationMap() {
                     const globeSpinPromise = new Promise(resolve => {
                         const startCoords = { lat: 30.3715, lng: -97.1903 }; // Texas
                         const endCoords = { lat: 40.3748, lng: -3.7354 };   // Madrid
-                        const duration = 2500;
+                        const duration = 1800;
 
                         const directLngDiff = endCoords.lng - startCoords.lng;
                         const totalLngChange = -(360 - directLngDiff);
@@ -9692,7 +9873,7 @@ async function openNavigationMap() {
                             zoom: 17,
                             bearing: 0,
                             pitch: 50,
-                            duration: 2300
+                            duration: 1500
                         });
                     }
                     startGpsWatching();
@@ -10064,9 +10245,11 @@ function findNextValidStep(route, currentLeg, currentStep) {
     }
     return null;
 }
-// --- FIN: Funciones de Ayuda ---
 
-// <<< CAMBIO CLAVE AQUÍ: Se añade el nuevo argumento 'carDistanceAlongRouteForNavLogic' >>>
+// ===================================================================
+// NOMBRE: handleProgressiveManeuverZoom (VERSIÓN CON INCLINACIÓN ADAPTATIVA)
+// RESUMEN: Gestiona el zoom y la inclinación de forma diferente para modos 2D y 3D.
+// ===================================================================
 function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDistanceAlongRouteForNavLogic) {
     if (isManualZoomActive) return null;
 
@@ -10077,6 +10260,8 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
     
     const route = navigationCurrentRouteData?.routes?.[0];
     if (!route) return null;
+
+    let pitchBeforeManeuver = null;
 
     const maxZoomForMap = navigationMapInstance.getMaxZoom() || 19;
     const currentMapLayerName = (localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "satélite + calles").toLowerCase();
@@ -10094,28 +10279,50 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
 
     const distanceIntoCurrentStep = currentStep.distance - distanceToManeuver;
     let targetZoom = null;
+    let targetPitch = null;
 
     switch (progressiveZoomState) {
         case 'zooming-out':
             isZoomedForManeuver = true;
+            pitchBeforeManeuver = window.pitchBeforeManeuver !== null ? window.pitchBeforeManeuver : navigationMapInstance.getPitch();
+
             const nextStepAfterCurrent = findNextValidStep(route, currentLegIndexNav, currentStepIndexNav);
-            
-            // <<< CAMBIO CLAVE AQUÍ: Se usa el nuevo argumento >>>
             const distanceToNextStep = nextStepAfterCurrent ? calculateDistanceToEndOfStep(route, nextStepAfterCurrent.legIndex, nextStepAfterCurrent.stepIndex) - carDistanceAlongRouteForNavLogic : Infinity;
             
             if (nextStepAfterCurrent && distanceToNextStep < HOLD_ZOOM_THRESHOLD) {
                 targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
+                // Mantener inclinación máxima de la maniobra si hay otra cerca
+                if (mapViewMode === 'perspective') {
+                    targetPitch = pitchBeforeManeuver * 0.90;
+                } else {
+                    targetPitch = 45;
+                }
             } else {
                 if (distanceIntoCurrentStep > PROGRESSIVE_ZOOM_EXIT_END_DISTANCE || mapPreviousZoomLevelForProgressive === null) {
                     targetZoom = mapPreviousZoomLevelForProgressive;
+                    targetPitch = pitchBeforeManeuver; // Volver a la inclinación original
                     progressiveZoomState = 'none';
                     mapPreviousZoomLevelForProgressive = null;
+                    window.pitchBeforeManeuver = null;
                     isZoomedForManeuver = false;
                 } else if (distanceIntoCurrentStep >= PROGRESSIVE_ZOOM_EXIT_START_DISTANCE) {
                     const progress = (distanceIntoCurrentStep - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE) / (PROGRESSIVE_ZOOM_EXIT_END_DISTANCE - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE);
                     targetZoom = MANEUVER_PEAK_ZOOM_LEVEL - (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * Math.min(1, progress);
+                    // Lógica DUAL para recuperar inclinación
+                    if (mapViewMode === 'perspective') {
+                        const pitchReduction = pitchBeforeManeuver * 0.10;
+                        targetPitch = (pitchBeforeManeuver - pitchReduction) + (pitchReduction * progress);
+                    } else {
+                        targetPitch = 45 - (45 * progress);
+                    }
                 } else {
                     targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
+                    // Lógica DUAL para mantener inclinación
+                    if (mapViewMode === 'perspective') {
+                        targetPitch = pitchBeforeManeuver * 0.90;
+                    } else {
+                        targetPitch = 45;
+                    }
                 }
             }
             break;
@@ -10124,31 +10331,64 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
             if (distanceToManeuver <= PROGRESSIVE_ZOOM_START_DISTANCE && distanceToManeuver > PROGRESSIVE_ZOOM_PEAK_DISTANCE) {
                 if (progressiveZoomState !== 'zooming-in' && progressiveZoomState !== 'holding') {
                     mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
+                    window.pitchBeforeManeuver = navigationMapInstance.getPitch();
                 }
                 progressiveZoomState = 'zooming-in';
+                pitchBeforeManeuver = window.pitchBeforeManeuver;
+
                 let progress = (PROGRESSIVE_ZOOM_START_DISTANCE - distanceToManeuver) / (PROGRESSIVE_ZOOM_START_DISTANCE - PROGRESSIVE_ZOOM_PEAK_DISTANCE);
                 progress = easeInOutQuad(progress);
                 targetZoom = mapPreviousZoomLevelForProgressive + (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * progress;
+                
+                // <<< INICIO DE LA LÓGICA DE INCLINACIÓN DUAL >>>
+                if (mapViewMode === 'perspective') {
+                    const pitchReduction = pitchBeforeManeuver * 0.20;
+                    targetPitch = pitchBeforeManeuver - (pitchReduction * progress);
+                } else { // Modos 2D
+                    targetPitch = pitchBeforeManeuver + (45 * progress);
+                }
+                // <<< FIN DE LA LÓGICA DE INCLINACIÓN DUAL >>>
+                
                 isZoomedForManeuver = true;
+
             } else if (distanceToManeuver <= PROGRESSIVE_ZOOM_PEAK_DISTANCE) {
-                if (progressiveZoomState !== 'holding' && mapPreviousZoomLevelForProgressive === null) {
-                    mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
+                if (progressiveZoomState !== 'holding') {
+                    if(mapPreviousZoomLevelForProgressive === null) mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
+                    if(window.pitchBeforeManeuver === null) window.pitchBeforeManeuver = navigationMapInstance.getPitch();
                 }
                 progressiveZoomState = 'holding';
+                pitchBeforeManeuver = window.pitchBeforeManeuver;
                 targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
+                
+                // Mantener la inclinación máxima de la maniobra
+                if (mapViewMode === 'perspective') {
+                    targetPitch = pitchBeforeManeuver * 0.90;
+                } else {
+                    targetPitch = 45;
+                }
                 isZoomedForManeuver = true;
+
             } else {
                 if (progressiveZoomState !== 'none' && mapPreviousZoomLevelForProgressive !== null) {
                     targetZoom = mapPreviousZoomLevelForProgressive;
+                    targetPitch = window.pitchBeforeManeuver;
                 }
                 progressiveZoomState = 'none';
                 mapPreviousZoomLevelForProgressive = null;
+                window.pitchBeforeManeuver = null;
                 isZoomedForManeuver = false;
             }
             break;
     }
-    return targetZoom;
-}    
+
+    if (targetZoom !== null && targetPitch !== null) {
+        // Aseguramos que los valores de inclinación estén siempre dentro de los límites válidos
+        targetPitch = Math.max(0, Math.min(85, targetPitch));
+        return { zoom: targetZoom, pitch: targetPitch };
+    }
+    return null;
+}
+    
 // ===================================================================
 // NOMBRE: clearModalAutoCloseTimer
 // RESUMEN: Limpia un temporizador de autocierre de un modal.
@@ -22286,140 +22526,6 @@ async function handleStageSelectionFromDeviationModal(selectedWaypointId) {
         showToast("Error al recalcular la ruta hacia la etapa seleccionada.", "error");
     }
 }
-    
-
-// ===================================================================
-// NOMBRE: OFFFrecalculateAndDrawRoute (VERSIÓN DEFINITIVA CON GESTIÓN DE ESTADO ATÓMICA)
-// RESUMEN: Lógica de recálculo final que garantiza que todas las variables
-async function OFFrecalculateAndDrawRoute(preserveAccumulatedStats = false, isUserAction = false) {
-    const RETRY_CADENCE_MS = 3000;
-    const MAX_RETRIES = 5; // Límite para evitar bucles infinitos
-    let attempt = 1;
-
-    // Bucle de reintento para máxima robustez ante fallos de red o del servidor
-    while (attempt <= MAX_RETRIES) {
-        // Solo continuamos el bucle si el modal de desvío sigue activo, o si es el primer intento
-        if (!isDeviationModalActive && attempt > 1) break;
-        
-        console.log(`[RECALC] Intento #${attempt} de ${MAX_RETRIES}...`);
-        isRecalculatingRoute = true;
-        const wasNavigatingBeforeRecalc = isNavigating;
-
-        try {
-            const completedDistance = preserveAccumulatedStats ? totalDistanceTravelledForStats : 0;
-
-            let waypointsForAPI = [];
-            let currentHeading = null;
-            
-            // --- INICIO DE LA MODIFICACIÓN CLAVE: DIFERENCIAR PLANIFICACIÓN Y NAVEGACIÓN ---
-            
-            // Si NO estamos navegando (es decir, estamos en modo planificación),
-            // la ruta SIEMPRE debe calcularse desde el primer waypoint de la lista,
-            // ignorando la posición GPS actual. Esto corrige el bug al añadir múltiples etapas.
-            if (!isNavigating) {
-                console.log("[RECALC] Modo Planificación: Calculando ruta desde la lista de waypoints definida.");
-                waypointsForAPI = [...navigationWaypoints];
-                currentHeading = null; // No usamos el rumbo del coche para la planificación
-            } else { 
-                // La lógica original para cuando SÍ estamos navegando (recalculando por desvío)
-                console.log("[RECALC] Modo Navegación Activa: Recalculando desde la posición GPS actual.");
-                if (navigationCurrentLocation) {
-                    currentHeading = navigationCurrentLocation.heading;
-                    waypointsForAPI.push({ lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude, isRecalculatedStart: true });
-                    waypointsForAPI.push(...navigationWaypoints.filter(wp => !wp.visited));
-                } else {
-                    // Fallback si perdemos el GPS durante la navegación: usamos la lista tal cual
-                    waypointsForAPI = [...navigationWaypoints];
-                }
-            }
-            // --- FIN DE LA MODIFICACIÓN CLAVE ---
-
-            const validWaypoints = waypointsForAPI.filter(wp => wp && typeof wp.lat === 'number' && typeof wp.lng === 'number');
-            if (validWaypoints.length < 2) { 
-                isRecalculatingRoute = false; 
-                return; // No hay suficientes puntos para una ruta
-            };
-
-            const coordsString = validWaypoints.map(wp => `${wp.lng},${wp.lat}`).join(';');
-            
-            const result = await fetchRouteData(coordsString, currentHeading);
-            if (result.error) throw result.error;
-
-            const newRouteData = result.routeData;
-            const newRemainingRoute = newRouteData.routes[0];
-
-            // --- INICIO DE LA SOLUCIÓN: Guardia de Calidad Contextual v2 ---
-            // Comprueba si la ruta devuelta tiene una distancia sospechosamente corta.
-            if (newRemainingRoute && newRemainingRoute.distance < 10) { // Umbral de 10m por flexibilidad
-                
-                // ANTES de rechazarla, verificamos si es una llegada legítima.
-                const startPointOfRecalc = validWaypoints[0]; // Nuestra posición GPS actual
-                const endPointOfRecalc = validWaypoints[validWaypoints.length - 1]; // El destino de este cálculo
-                
-                // Calculamos la distancia física (en línea recta) al destino.
-                const physicalDistanceToDestination = calculateDistance(
-                    startPointOfRecalc.lat, 
-                    startPointOfRecalc.lng, 
-                    endPointOfRecalc.lat, 
-                    endPointOfRecalc.lng
-                );
-
-                // SOLO si la ruta es "cero" PERO estamos lejos del destino, es un error.
-                if (physicalDistanceToDestination > WAYPOINT_VISITED_THRESHOLD_METERS) { // 70 metros
-                    console.warn(`[GUARDIA DE CALIDAD] Ruta de distancia cero (${newRemainingRoute.distance.toFixed(1)}m) recibida, pero la distancia física al destino es de ${physicalDistanceToDestination.toFixed(1)}m. Forzando reintento.`);
-                    throw new Error("Ruta inválida (distancia cero) recibida del servidor.");
-                }
-                // Si no se cumple la condición, significa que la distancia es cero porque
-                // realmente hemos llegado, por lo que permitimos que la ruta continúe.
-            }
-            // --- FIN DE LA SOLUCIÓN ---
-
-            await drawRouteOnMap(newRemainingRoute);
-            
-            navigationCurrentRouteData = newRouteData;
-            
-            if (preserveAccumulatedStats) {
-                accumulatedDistanceBeforeCurrentSegment = completedDistance;
-            }
-
-            tripInitialOverallEtaTime = new Date(Date.now() + newRemainingRoute.duration * 1000);
-            if (newRemainingRoute.legs && newRemainingRoute.legs.length > 0) {
-                currentStageInitialExpectedEtaTime = new Date(Date.now() + newRemainingRoute.legs[0].duration * 1000);
-            } else {
-                currentStageInitialExpectedEtaTime = null;
-            }
-
-            renderWaypointMarkers();
-            updateNavigationProgressDisplay(newRemainingRoute, 0);
-            updateTurnByTurnDisplay(newRemainingRoute, 0);
-            showDestinationName();
-            toggleRadaresRuta(document.getElementById('radares-ruta-checkbox').checked);
-            toggleTareasRuta(document.getElementById('tareas-ruta-checkbox').checked);
-            updateStartNavigationButtonState();
-            updateNavigationButtonColor();
-
-            showToast("¡Ruta recalculada con éxito!", "success");
-            closeModalAndProceed();
-            return; // Salimos de la función con éxito
-            
-        } catch (error) {
-            console.error(`[RECALC] Fallo en intento #${attempt}:`, error);
-            if (attempt === MAX_RETRIES) {
-                showToast("Fallo al recalcular la ruta tras varios intentos. Comprueba tu conexión.", "error");
-                closeModalAndProceed(); // Cerrar el modal para no bloquear al usuario
-            } else {
-                showToast(`Error al recalcular (${attempt}/${MAX_RETRIES}). Reintentando...`, "warning");
-                await new Promise(resolve => setTimeout(resolve, RETRY_CADENCE_MS));
-            }
-        } finally {
-            isRecalculatingRoute = false; // Se resetea en cada intento
-            isNavigating = wasNavigatingBeforeRecalc;
-            attempt++;
-        }
-    }
-    console.log("[RECALC] Bucle de recálculo finalizado sin éxito.");
-}    
-
    
 // ===================================================================
 // NOMBRE: closeModalAndProceed (MODIFICADA)
@@ -22435,10 +22541,8 @@ function closeModalAndProceed() {
 
     if (wasSimulatingBeforeRecalc) {
         wasSimulatingBeforeRecalc = false; // Se resetea la bandera
-//      simulatedDistanceAlongRoute = 0; 
         showToast("Desvío recalculado. Reanudando simulación...", "info");
         setTimeout(() => {
-            // ¡CAMBIO CLAVE! Pasamos 'true' para indicar que es una reanudación.
             startAutomatedRouteSimulation(currentSimulationSpeedKmph, true); 
         }, 100);
     }
@@ -22597,7 +22701,6 @@ async function autoSaveFromMobile(primaryId, backupPassword) {
     if(toast) toast.remove();
     if (saveResult.status === 'success') {
         showToast('Cambios sincronizados con la nube.', 'success');
-        // Actualizamos el timestamp de la última sincronización para que no vuelva a guardar inmediatamente
         lastMobileSyncTimestamp = parseInt(localStorage.getItem('lastCacheUpdateTimestamp') || '0'); 
     } else {
         showToast(`Error al sincronizar: ${saveResult.message}`, 'error');
