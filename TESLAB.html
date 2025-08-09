@@ -1,4 +1,4 @@
-CHECK 34
+CHECK 35
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -19336,12 +19336,36 @@ async function addChargingPointToRoute(pointIndex) {
         }
         return totalDistance;
     }
-
 // ===================================================================
 // NOMBRE: plotRemindersOnNavigationMap (NUEVA VERSIÓN GEOJSON)
 // RESUMEN: Carga todos los recordatorios a una única fuente GeoJSON para un renderizado eficiente.
 function plotRemindersOnNavigationMap() {
-    if (!navigationMapInstance || !navigationMapInstance.getSource('reminders-geojson-source')) return;
+    if (!navigationMapInstance || !navigationMapInstance.isStyleLoaded()) return;
+
+    // --- INICIO DE LA CORRECCIÓN CLAVE: LIMPIEZA TOTAL PREVIA ---
+    // 1. Eliminar todos los marcadores HTML de recordatorios existentes.
+    // Esto es crucial para los iconos de radar/tarea que son elementos DOM.
+    reminderMapObjects.forEach(obj => {
+        if (obj.marker) {
+            try {
+                obj.marker.remove();
+            } catch (e) { /* Ignorar si ya fue removido */ }
+        }
+    });
+    reminderMapObjects = []; // Reseteamos el array de control
+
+    // 2. Eliminar capas y fuentes GeoJSON de recordatorios anteriores.
+    // Esto fuerza a Mapbox a un redibujado completo e inmediato.
+    const layersAndSourcesToRemove = ['reminders-icons-layer', 'reminders-circles-layer', 'reminders-speed-text-layer', 'reminders-radar-text-layer', 'reminders-geojson-source'];
+    layersAndSourcesToRemove.forEach(id => {
+        try {
+            if (navigationMapInstance.getLayer(id)) navigationMapInstance.removeLayer(id);
+            if (navigationMapInstance.getSource(id)) navigationMapInstance.removeSource(id);
+        } catch (e) {
+            console.warn(`Intento de eliminar capa/fuente inexistente '${id}', puede ignorarse.`);
+        }
+    });
+    // --- FIN DE LA CORRECCIÓN CLAVE ---
 
     const reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
     const remindersWithLocation = reminders.filter(r => r.isLocationEnabled && r.locationCoordinates?.latitude && r.locationCoordinates?.longitude && !r.isFromRuta);
@@ -19354,6 +19378,7 @@ function plotRemindersOnNavigationMap() {
             reminderId: reminder.id,
             isRadar: isRadar,
             isFromTarea: reminder.isFromTarea || false,
+            radius: reminder.radiusMeters || DEFAULT_LOCATION_RADIUS
         };
 
         if (speed !== null) {
@@ -19375,7 +19400,78 @@ function plotRemindersOnNavigationMap() {
         features: geojsonFeatures
     };
 
-    navigationMapInstance.getSource('reminders-geojson-source').setData(geojsonData);
+    // Volvemos a añadir la fuente y las capas con los datos actualizados
+    navigationMapInstance.addSource('reminders-geojson-source', {
+        type: 'geojson',
+        data: geojsonData,
+        cluster: false // Asegurarse que el clustering está deshabilitado si no se usa
+    });
+
+    // Capa para los círculos de radio
+    navigationMapInstance.addLayer({
+        id: 'reminders-circles-layer',
+        type: 'circle',
+        source: 'reminders-geojson-source',
+        paint: {
+            'circle-radius': [
+                'interpolate',
+                ['linear'],
+                ['zoom'],
+                8, ['/', ['get', 'radius'], 50],
+                18, ['/', ['get', 'radius'], 2]
+            ],
+            'circle-color': [
+                'case',
+                ['==', ['get', 'isRadar'], true], 'rgba(255, 200, 0, 0.3)', // Color para radares
+                '#c7eb7a' // Color para recordatorios normales
+            ],
+            'circle-opacity': 0.35,
+            'circle-stroke-width': 1,
+            'circle-stroke-color': [
+                'case',
+                ['==', ['get', 'isRadar'], true], 'orange',
+                'green'
+            ]
+        }
+    });
+
+    // Capa para los iconos de recordatorios normales
+    navigationMapInstance.addLayer({
+        id: 'reminders-icons-layer',
+        type: 'symbol',
+        source: 'reminders-geojson-source',
+        filter: ['==', ['get', 'isRadar'], false],
+        layout: {
+            'icon-image': 'reminder-icon',
+            'icon-size': ['interpolate', ['linear'], ['zoom'], 10, 0.4, 14, 0.6, 17, 0.8],
+            'icon-allow-overlap': true,
+            'icon-anchor': 'bottom'
+        }
+    });
+
+    // Ahora, creamos los marcadores HTML solo para los radares, ya que son más complejos
+    remindersWithLocation.forEach(reminder => {
+        if (reminder.text.toUpperCase().includes("RADAR") || reminder.excludeFromList) {
+            const speedLimit = extractSpeedFromRadarText(reminder.text);
+            const isFromPersonalTask = reminder.isFromTarea === true;
+            const markerElement = createRadarSpeedIcon(speedLimit, navigationMapInstance.getZoom(), isFromPersonalTask);
+            
+            const marker = new mapboxgl.Marker({ element: markerElement, anchor: 'center' })
+                .setLngLat([reminder.locationCoordinates.longitude, reminder.locationCoordinates.latitude])
+                .addTo(navigationMapInstance);
+            
+            marker.getElement().addEventListener('click', (e) => {
+                e.stopPropagation();
+                showReminderActionModal(reminder.id);
+            });
+
+            // Guardamos la referencia para poder limpiarla después
+            reminderMapObjects.push({
+                reminderId: reminder.id,
+                marker: marker
+            });
+        }
+    });
 }
 
 // ===================================================================
