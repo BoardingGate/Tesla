@@ -1,4 +1,4 @@
-S03 zoom central
+S04 zoom central
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -7393,12 +7393,15 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, isUserA
     console.log("[RECALC] Bucle de recálculo finalizado sin éxito.");
 }
 
+
 // ===================================================================
-// NOMBRE: updateInitialUserPosition (VERSIÓN CON ORQUESTACIÓN CENTRALIZADA)
-// RESUMEN: Es el único responsable de mover el mapa, combinando la posición del GPS
-//          con los cálculos de zoom de las funciones auxiliares.
+// NOMBRE: updateInitialUserPosition (VERSIÓN CON VALIDACIÓN DE DATOS ROBUSTA)
+// RESUMEN: Orquesta la actualización del mapa y previene errores validando todos los datos del GPS antes de usarlos.
+// ===================================================================
 function updateInitialUserPosition(coords, mapInstanceToUse) {
-    if (!mapInstanceToUse || !coords || typeof coords.latitude !== 'number' || typeof coords.longitude !== 'number') {
+    // Guardia inicial: si no hay mapa o coordenadas válidas, no hacemos nada.
+    if (!mapInstanceToUse || !coords || typeof coords.latitude !== 'number' || typeof coords.longitude !== 'number' || isNaN(coords.latitude) || isNaN(coords.longitude)) {
+        console.warn("[GPS] Datos de coordenadas inválidos recibidos. Omitiendo actualización.");
         return;
     }
     lastGpsUpdateTime = Date.now();
@@ -7407,19 +7410,31 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
     initialUserLocationMarkerLat = coords.latitude;
     initialUserLocationMarkerLng = coords.longitude;
 
-    let effectiveHeading = null;
-    if (coords.heading !== null && typeof coords.heading === 'number' && coords.heading >= 0) {
-        effectiveHeading = coords.heading;
-    } else if (window.lastPositionForSpeedCalc && typeof turf !== 'undefined') {
+    // --- INICIO DE LA CORRECCIÓN DE ROBUSTEZ (ANTI-ERROR) ---
+    // Este bloque garantiza que 'validatedHeading' sea SIEMPRE un número válido.
+    
+    let validatedHeading = null;
+
+    // 1. Prioridad máxima: El rumbo del dispositivo, si es un número válido.
+    if (coords.heading !== null && typeof coords.heading === 'number' && !isNaN(coords.heading) && coords.heading >= 0) {
+        validatedHeading = coords.heading;
+    } 
+    // 2. Si no, calcularlo a partir del movimiento, si es posible y significativo.
+    else if (window.lastPositionForSpeedCalc && typeof turf !== 'undefined') {
         const lastPoint = turf.point([window.lastPositionForSpeedCalc.longitude, window.lastPositionForSpeedCalc.latitude]);
         const currentPoint = turf.point([coords.longitude, coords.latitude]);
-        if (turf.distance(lastPoint, currentPoint, { units: 'meters' }) > 1) {
+        if (turf.distance(lastPoint, currentPoint, { units: 'meters' }) > 1) { // Solo si se ha movido más de 1 metro
             const bearing = turf.bearing(lastPoint, currentPoint);
-            effectiveHeading = (bearing < 0) ? bearing + 360 : bearing;
+            validatedHeading = (bearing < 0) ? bearing + 360 : bearing;
         }
     }
 
-    const currentHeading = (effectiveHeading !== null) ? effectiveHeading : (currentMapBearing || 0);
+    // 3. Si todo lo anterior falla, usamos el último rumbo conocido de la animación para evitar saltos.
+    if (validatedHeading === null) {
+        // La rotación del icono es heading - 90
+        validatedHeading = (markerAnimationState.currentIconRotation + 90 + 360) % 360; 
+    }
+    // --- FIN DE LA CORRECCIÓN DE ROBUSTEZ ---
 
     if (!initialUserLocationMarker) {
         const vehicleIconElement = document.createElement('div');
@@ -7437,13 +7452,15 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
     }
    
     markerAnimationState.targetLngLat = lngLat;
-    markerAnimationState.targetIconRotation = currentHeading - 90;
+    // Usamos el rumbo validado para la animación del icono
+    markerAnimationState.targetIconRotation = validatedHeading - 90; 
     if (!markerAnimationState.animationFrameId) {
         markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
     }
 
     if (compassAndModeControl) {
-        compassAndModeControl.updateOrientation(currentHeading);
+        // Usamos el rumbo validado para la brújula
+        compassAndModeControl.updateOrientation(validatedHeading);
         compassAndModeControl.updateAltitude(coords.altitude);
         if (window.lastPositionForSpeedCalc && typeof coords.speed === 'number' && coords.speed !== null) {
             const distM = calculateDistance(window.lastPositionForSpeedCalc.latitude, window.lastPositionForSpeedCalc.longitude, coords.latitude, coords.longitude);
@@ -7496,7 +7513,6 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
         compassAndModeControl.updateMaxSpeed(maxSpeedDuringTrip);
     }
 
-    // --- CÁLCULO DE PROGRESO EN RUTA (OPTIMIZADO) ---
     if(isNavigating && navigationCurrentRouteData && navigationCurrentRouteData.routes[0] && coords) {
         const route = navigationCurrentRouteData.routes[0];
         let carDistTurf = 0;
@@ -7508,7 +7524,6 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
             const searchStartLeg = Math.max(0, currentLegIndexNav);
             let stepsChecked = 0;
             const MAX_STEPS_TO_CHECK = 8;
-
             for (let l = searchStartLeg; l < route.legs.length && stepsChecked < MAX_STEPS_TO_CHECK; l++) {
                 const leg = route.legs[l];
                 const searchStartStep = (l === currentLegIndexNav) ? currentStepIndexNav : 0;
@@ -7524,7 +7539,6 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
                     stepsChecked++;
                 }
             }
-            
             if (bestMatch.legIndex !== -1) {
                 currentLegIndexNav = bestMatch.legIndex;
                 currentStepIndexNav = bestMatch.stepIndex;
@@ -7563,7 +7577,6 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
         } else if (carDistTurf > totalRouteLength + 500) {
             lastCarDistanceAlongRouteForNavLogic = totalRouteLength;
         }
-
         checkAndMarkWaypointsAsVisited(route, lastCarDistanceAlongRouteForNavLogic, coords);
         renderWaypointMarkers();
         updateTurnByTurnDisplay(route, lastCarDistanceAlongRouteForNavLogic);
@@ -7571,33 +7584,28 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
     } else if (isFreeDriveActive) {
         updateNavigationProgressDisplay(null, 0);
     }
-
-    // --- ORQUESTACIÓN CENTRALIZADA DEL MOVIMIENTO DEL MAPA ---
+    
     const shouldFollow = (shouldCenterOnUser || navigationFollowUser);
     if (!shouldFollow || isRecalculatingRoute || !navigationMapInstance) {
         return;
     }
 
-    // 1. Calcular el zoom prioritario (maniobra tiene prioridad)
     let targetZoom = handleProgressiveManeuverZoom(
         navigationCurrentRouteData?.routes?.[0]?.legs?.[currentLegIndexNav]?.steps?.[currentStepIndexNav],
         distanceToNextManeuverOSRM,
         lastCarDistanceAlongRouteForNavLogic
     );
 
-    // 2. Si no hay zoom de maniobra, calcular el zoom por velocidad
     if (targetZoom === null) {
         targetZoom = handleAutoZoom();
     }
     
-    // 3. Construir el objeto de opciones para la animación del mapa
     const viewOptions = {
         center: lngLat,
         duration: 1000,
         essential: true
     };
     
-    // 4. Añadir padding, bearing y pitch
     const mapHeight = navigationMapInstance.getCanvas().clientHeight;
     const mapWidth = navigationMapInstance.getCanvas().clientWidth;
     viewOptions.padding = {
@@ -7607,20 +7615,17 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
         right: mapOffsetX < 0 ? mapWidth * Math.abs(mapOffsetX / 100) : 0
     };
     if (mapViewMode === 'heading' || mapViewMode === 'perspective') {
-        viewOptions.bearing = currentHeading;
+        // Usamos el rumbo validado para el movimiento del mapa
+        viewOptions.bearing = validatedHeading; 
     }
     viewOptions.pitch = (mapViewMode === 'perspective') ? mapPitchValue : 0;
 
-    // 5. Añadir el zoom calculado solo si es necesario y no hay interacción manual
     if (targetZoom !== null && !isManualZoomActive) {
         viewOptions.zoom = targetZoom;
     }
 
-    // 6. Ejecutar la única llamada de movimiento
     navigationMapInstance.easeTo(viewOptions);
-}
-
-  
+}  
 
     
 // ===================================================================
