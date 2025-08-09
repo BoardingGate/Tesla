@@ -17279,11 +17279,11 @@ function initializeNavigationGraph() {
     updateNavigationGraphVisibilityAndMode();
 }
 
-
 // ===================================================================
-// NOMBRE: updateInitialUserPosition (VERSIÓN OPTIMIZADA CON BÚSQUEDA LOCALIZADA)
-// RESUMEN: Calcula el progreso a lo largo de la ruta de forma eficiente, buscando solo
-//          en el segmento actual del recorrido, y gestiona la lógica de zoom de forma consolidada.
+// NOMBRE: updateInitialUserPosition (VERSIÓN FINAL CON CORRECCIÓN DE ERRORES CRÍTICOS)
+// RESUMEN: Incluye la optimización de búsqueda localizada pero ahora con robustas
+//          comprobaciones de seguridad para evitar errores cuando los datos de la ruta
+//          no contienen una geometría para un paso específico.
 // ===================================================================
 function updateInitialUserPosition(coords, mapInstanceToUse) {
     if (!mapInstanceToUse || !coords || typeof coords.latitude !== 'number' || typeof coords.longitude !== 'number') {
@@ -17386,60 +17386,56 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
 
     const shouldFollow = (shouldCenterOnUser || navigationFollowUser);
     
-    // --- INICIO DEL BLOQUE DE NAVEGACIÓN OPTIMIZADO ---
+    // --- INICIO DEL BLOQUE DE NAVEGACIÓN OPTIMIZADO Y CORREGIDO ---
     if (isNavigating && navigationCurrentRouteData && navigationCurrentRouteData.routes[0] && coords) {
         const route = navigationCurrentRouteData.routes[0];
         
-        // --- 1. CÁLCULO DE PROGRESO EFICIENTE ---
-        let carDistOnRoute = 0;
+        let carDistOnRoute = lastCarDistanceAlongRouteForNavLogic; // Usamos el último valor conocido como fallback
+        
         if (route.legs[currentLegIndexNav] && route.legs[currentLegIndexNav].steps[currentStepIndexNav]) {
             const currentStep = route.legs[currentLegIndexNav].steps[currentStepIndexNav];
             
-            // Construimos una "ventana de búsqueda" con el paso actual y el siguiente
-            let searchWindowCoords = [...currentStep.geometry.coordinates];
-            const nextStep = findNextValidStep(route, currentLegIndexNav, currentStepIndexNav);
-            if(nextStep) {
-                searchWindowCoords.push(...nextStep.step.geometry.coordinates);
+            let searchWindowCoords = [];
+            
+            // <<< CORRECCIÓN 1: Comprobación de seguridad para el paso actual >>>
+            if (currentStep.geometry && Array.isArray(currentStep.geometry.coordinates)) {
+                searchWindowCoords.push(...currentStep.geometry.coordinates);
             }
 
-            const searchLine = turf.lineString(searchWindowCoords);
-            const carPoint = turf.point([coords.longitude, coords.latitude]);
-            const nearestPointOnSegment = turf.nearestPointOnLine(searchLine, carPoint, { units: 'meters' });
+            const nextStepData = findNextValidStep(route, currentLegIndexNav, currentStepIndexNav);
             
-            // Calculamos la distancia acumulada hasta el inicio del paso actual
-            const distanceToStartOfStep = calculateDistanceToEndOfStep(route, currentLegIndexNav, currentStepIndexNav - 1);
-            
-            // Calculamos el progreso DENTRO del segmento de búsqueda
-            const lineSliceToNearest = turf.lineSlice(turf.point(searchWindowCoords[0]), nearestPointOnSegment, searchLine);
-            const progressWithinSegment = turf.length(lineSliceToNearest, { units: 'meters' });
+            // <<< CORRECCIÓN 2: Comprobación de seguridad para el paso siguiente >>>
+            if (nextStepData && nextStepData.step.geometry && Array.isArray(nextStepData.step.geometry.coordinates)) {
+                searchWindowCoords.push(...nextStepData.step.geometry.coordinates);
+            }
 
-            // El progreso total es la suma
-            carDistOnRoute = distanceToStartOfStep + progressWithinSegment;
-
-        } else {
-            // Fallback al método antiguo si algo sale mal con los índices (muy improbable)
-            carDistOnRoute = lastCarDistanceAlongRouteForNavLogic; 
+            // <<< CORRECCIÓN 3: Asegurarse de que tenemos una línea válida para Turf >>>
+            if (searchWindowCoords.length >= 2) {
+                const searchLine = turf.lineString(searchWindowCoords);
+                const carPoint = turf.point([coords.longitude, coords.latitude]);
+                const nearestPointOnSegment = turf.nearestPointOnLine(searchLine, carPoint, { units: 'meters' });
+                const distanceToStartOfStep = calculateDistanceToEndOfStep(route, currentLegIndexNav, currentStepIndexNav - 1);
+                const lineSliceToNearest = turf.lineSlice(turf.point(searchWindowCoords[0]), nearestPointOnSegment, searchLine);
+                const progressWithinSegment = turf.length(lineSliceToNearest, { units: 'meters' });
+                carDistOnRoute = distanceToStartOfStep + progressWithinSegment;
+            }
         }
 
-        // --- 2. GESTIÓN DE AVANCE DE ETAPA/PASO ---
         const distanceToEndOfCurrentStep = calculateDistanceToEndOfStep(route, currentLegIndexNav, currentStepIndexNav);
-        if (carDistOnRoute > distanceToEndOfCurrentStep - 10) { // Umbral de 10m para avanzar
+        if (carDistOnRoute > distanceToEndOfCurrentStep - 10) { 
             currentStepIndexNav++;
             if (currentStepIndexNav >= route.legs[currentLegIndexNav].steps.length) {
                 currentStepIndexNav = 0;
                 currentLegIndexNav++;
                 if (currentLegIndexNav >= route.legs.length) {
-                    // Hemos llegado al final
                     currentLegIndexNav = route.legs.length - 1;
                     currentStepIndexNav = route.legs[currentLegIndexNav].steps.length - 1;
                 }
             }
         }
         
-        // Actualizamos la variable global con el valor preciso y eficiente
         lastCarDistanceAlongRouteForNavLogic = carDistOnRoute;
 
-        // --- 3. LLAMADAS A LAS FUNCIONES DE UI (SIN CAMBIOS) ---
         checkAndMarkWaypointsAsVisited(route, carDistOnRoute, coords);
         renderWaypointMarkers();
         updateTurnByTurnDisplay(route, carDistOnRoute);
@@ -17448,13 +17444,12 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
     } else if (isFreeDriveActive) {
         updateNavigationProgressDisplay(null, 0);
     }
-    // --- FIN DEL BLOQUE DE NAVEGACIÓN OPTIMIZADO ---
+    // --- FIN DEL BLOQUE DE NAVEGACIÓN OPTIMIZADO Y CORREGIDO ---
 
 
     if (shouldFollow && !isRecalculatingRoute && navigationMapInstance) {
         const animationDuration = 1000;
         
-        // --- Lógica de Zoom Consolidada (sin cambios) ---
         let targetZoom = handleProgressiveManeuverZoom(navigationCurrentRouteData?.routes?.[0]?.legs?.[currentLegIndexNav]?.steps?.[currentStepIndexNav], distanceToNextManeuverOSRM, lastCarDistanceAlongRouteForNavLogic);
         if (targetZoom === null) {
             targetZoom = handleAutoZoom();
@@ -17494,7 +17489,7 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
 
         navigationMapInstance.easeTo(viewOptions);
     }
-}    
+}
 
 // ===================================================================
 // NOMBRE: startAutomatedRouteSimulation (VERSIÓN FINAL CON REINICIO CORRECTO)
