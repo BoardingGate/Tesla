@@ -1,4 +1,4 @@
-S07
+S08
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -5159,6 +5159,149 @@ class CombinedMapControl {
 
 
 // ===================================================================
+// NOMBRE: handleProgressiveManeuverZoom (VERSIÓN CON INCLINACIÓN ADAPTATIVA)
+// RESUMEN: Gestiona el zoom y la inclinación de forma diferente para modos 2D y 3D.
+// ===================================================================
+function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDistanceAlongRouteForNavLogic) {
+    if (isManualZoomActive) return null;
+
+    if (!isNavigating || !navigationMapInstance || !currentStep) {
+        if (isZoomedForManeuver) isZoomedForManeuver = false;
+        return null;
+    }
+    
+    const route = navigationCurrentRouteData?.routes?.[0];
+    if (!route) return null;
+
+    let pitchBeforeManeuver = null;
+
+    const maxZoomForMap = navigationMapInstance.getMaxZoom() || 19;
+    const currentMapLayerName = (localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "satélite + calles").toLowerCase();
+    const isSatelliteWithLabels = currentMapLayerName.includes("satélite + calles");
+    const MANEUVER_PEAK_ZOOM_LEVEL = isSatelliteWithLabels ? Math.min(17.5, maxZoomForMap) : Math.min(18.5, maxZoomForMap);
+    const HOLD_ZOOM_THRESHOLD = 250;
+    
+    const currentStepIdentifier = `${currentLegIndexNav}_${currentStepIndexNav}`;
+    if (lastProcessedStepIdentifier !== null && lastProcessedStepIdentifier !== currentStepIdentifier) {
+        if (progressiveZoomState === 'zooming-in' || progressiveZoomState === 'holding') {
+            progressiveZoomState = 'zooming-out';
+        }
+    }
+    lastProcessedStepIdentifier = currentStepIdentifier;
+
+    const distanceIntoCurrentStep = currentStep.distance - distanceToManeuver;
+    let targetZoom = null;
+    let targetPitch = null;
+
+    switch (progressiveZoomState) {
+        case 'zooming-out':
+            isZoomedForManeuver = true;
+            pitchBeforeManeuver = window.pitchBeforeManeuver !== null ? window.pitchBeforeManeuver : navigationMapInstance.getPitch();
+
+            const nextStepAfterCurrent = findNextValidStep(route, currentLegIndexNav, currentStepIndexNav);
+            const distanceToNextStep = nextStepAfterCurrent ? calculateDistanceToEndOfStep(route, nextStepAfterCurrent.legIndex, nextStepAfterCurrent.stepIndex) - carDistanceAlongRouteForNavLogic : Infinity;
+            
+            if (nextStepAfterCurrent && distanceToNextStep < HOLD_ZOOM_THRESHOLD) {
+                targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
+                // Mantener inclinación máxima de la maniobra si hay otra cerca
+                if (mapViewMode === 'perspective') {
+                    targetPitch = pitchBeforeManeuver * 0.90;
+                } else {
+                    targetPitch = 45;
+                }
+            } else {
+                if (distanceIntoCurrentStep > PROGRESSIVE_ZOOM_EXIT_END_DISTANCE || mapPreviousZoomLevelForProgressive === null) {
+                    targetZoom = mapPreviousZoomLevelForProgressive;
+                    targetPitch = pitchBeforeManeuver; // Volver a la inclinación original
+                    progressiveZoomState = 'none';
+                    mapPreviousZoomLevelForProgressive = null;
+                    window.pitchBeforeManeuver = null;
+                    isZoomedForManeuver = false;
+                } else if (distanceIntoCurrentStep >= PROGRESSIVE_ZOOM_EXIT_START_DISTANCE) {
+                    const progress = (distanceIntoCurrentStep - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE) / (PROGRESSIVE_ZOOM_EXIT_END_DISTANCE - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE);
+                    targetZoom = MANEUVER_PEAK_ZOOM_LEVEL - (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * Math.min(1, progress);
+                    // Lógica DUAL para recuperar inclinación
+                    if (mapViewMode === 'perspective') {
+                        const pitchReduction = pitchBeforeManeuver * 0.10;
+                        targetPitch = (pitchBeforeManeuver - pitchReduction) + (pitchReduction * progress);
+                    } else {
+                        targetPitch = 45 - (45 * progress);
+                    }
+                } else {
+                    targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
+                    // Lógica DUAL para mantener inclinación
+                    if (mapViewMode === 'perspective') {
+                        targetPitch = pitchBeforeManeuver * 0.90;
+                    } else {
+                        targetPitch = 45;
+                    }
+                }
+            }
+            break;
+
+        default:
+            if (distanceToManeuver <= PROGRESSIVE_ZOOM_START_DISTANCE && distanceToManeuver > PROGRESSIVE_ZOOM_PEAK_DISTANCE) {
+                if (progressiveZoomState !== 'zooming-in' && progressiveZoomState !== 'holding') {
+                    mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
+                    window.pitchBeforeManeuver = navigationMapInstance.getPitch();
+                }
+                progressiveZoomState = 'zooming-in';
+                pitchBeforeManeuver = window.pitchBeforeManeuver;
+
+                let progress = (PROGRESSIVE_ZOOM_START_DISTANCE - distanceToManeuver) / (PROGRESSIVE_ZOOM_START_DISTANCE - PROGRESSIVE_ZOOM_PEAK_DISTANCE);
+                progress = easeInOutQuad(progress);
+                targetZoom = mapPreviousZoomLevelForProgressive + (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * progress;
+                
+                // <<< INICIO DE LA LÓGICA DE INCLINACIÓN DUAL >>>
+                if (mapViewMode === 'perspective') {
+                    const pitchReduction = pitchBeforeManeuver * 0.10;
+                    targetPitch = pitchBeforeManeuver - (pitchReduction * progress);
+                } else { // Modos 2D
+                    targetPitch = pitchBeforeManeuver + (45 * progress);
+                }
+                // <<< FIN DE LA LÓGICA DE INCLINACIÓN DUAL >>>
+                
+                isZoomedForManeuver = true;
+
+            } else if (distanceToManeuver <= PROGRESSIVE_ZOOM_PEAK_DISTANCE) {
+                if (progressiveZoomState !== 'holding') {
+                    if(mapPreviousZoomLevelForProgressive === null) mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
+                    if(window.pitchBeforeManeuver === null) window.pitchBeforeManeuver = navigationMapInstance.getPitch();
+                }
+                progressiveZoomState = 'holding';
+                pitchBeforeManeuver = window.pitchBeforeManeuver;
+                targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
+                
+                // Mantener la inclinación máxima de la maniobra
+                if (mapViewMode === 'perspective') {
+                    targetPitch = pitchBeforeManeuver * 0.90;
+                } else {
+                    targetPitch = 45;
+                }
+                isZoomedForManeuver = true;
+
+            } else {
+                if (progressiveZoomState !== 'none' && mapPreviousZoomLevelForProgressive !== null) {
+                    targetZoom = mapPreviousZoomLevelForProgressive;
+                    targetPitch = window.pitchBeforeManeuver;
+                }
+                progressiveZoomState = 'none';
+                mapPreviousZoomLevelForProgressive = null;
+                window.pitchBeforeManeuver = null;
+                isZoomedForManeuver = false;
+            }
+            break;
+    }
+
+    if (targetZoom !== null && targetPitch !== null) {
+        // Aseguramos que los valores de inclinación estén siempre dentro de los límites válidos
+        targetPitch = Math.max(0, Math.min(85, targetPitch));
+        return { zoom: targetZoom, pitch: targetPitch };
+    }
+    return null;
+}
+
+// ===================================================================
 // NOMBRE: updateInitialUserPosition (VERSIÓN FINAL CON BLINDAJE Y PITCH DINÁMICO)
 // RESUMEN: Orquesta el movimiento del mapa, aplicando el zoom y la inclinación calculados.
 // ===================================================================
@@ -5380,7 +5523,6 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
 
     navigationMapInstance.easeTo(viewOptions);
 }
-    
     
 // ===================================================================
 // NOMBRE: updateDynamicRadars (MODIFICADA - Lógica de Navegación vs. Radio)
@@ -10107,8 +10249,8 @@ function findNextValidStep(route, currentLeg, currentStep) {
 }
 
 // ===================================================================
-// NOMBRE: handleProgressiveManeuverZoom (VERSIÓN CON CÁLCULO DE PITCH CORREGIDO)
-// RESUMEN: Gestiona el zoom y la inclinación, guardando el estado REAL del mapa al iniciar.
+// NOMBRE: handleProgressiveManeuverZoom (VERSIÓN CON INCLINACIÓN ADAPTATIVA)
+// RESUMEN: Gestiona el zoom y la inclinación de forma diferente para modos 2D y 3D.
 // ===================================================================
 function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDistanceAlongRouteForNavLogic) {
     if (isManualZoomActive) return null;
@@ -10151,11 +10293,16 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
             
             if (nextStepAfterCurrent && distanceToNextStep < HOLD_ZOOM_THRESHOLD) {
                 targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
-                targetPitch = Math.min(85, pitchBeforeManeuver + 6);
+                // Mantener inclinación máxima de la maniobra si hay otra cerca
+                if (mapViewMode === 'perspective') {
+                    targetPitch = pitchBeforeManeuver * 0.90;
+                } else {
+                    targetPitch = 45;
+                }
             } else {
                 if (distanceIntoCurrentStep > PROGRESSIVE_ZOOM_EXIT_END_DISTANCE || mapPreviousZoomLevelForProgressive === null) {
                     targetZoom = mapPreviousZoomLevelForProgressive;
-                    targetPitch = pitchBeforeManeuver;
+                    targetPitch = pitchBeforeManeuver; // Volver a la inclinación original
                     progressiveZoomState = 'none';
                     mapPreviousZoomLevelForProgressive = null;
                     window.pitchBeforeManeuver = null;
@@ -10163,11 +10310,21 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
                 } else if (distanceIntoCurrentStep >= PROGRESSIVE_ZOOM_EXIT_START_DISTANCE) {
                     const progress = (distanceIntoCurrentStep - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE) / (PROGRESSIVE_ZOOM_EXIT_END_DISTANCE - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE);
                     targetZoom = MANEUVER_PEAK_ZOOM_LEVEL - (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * Math.min(1, progress);
-                    targetPitch = (pitchBeforeManeuver + 6) - (6 * progress);
-                    targetPitch = Math.max(0, targetPitch);
+                    // Lógica DUAL para recuperar inclinación
+                    if (mapViewMode === 'perspective') {
+                        const pitchReduction = pitchBeforeManeuver * 0.10;
+                        targetPitch = (pitchBeforeManeuver - pitchReduction) + (pitchReduction * progress);
+                    } else {
+                        targetPitch = 45 - (45 * progress);
+                    }
                 } else {
                     targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
-                    targetPitch = Math.min(85, pitchBeforeManeuver + 6);
+                    // Lógica DUAL para mantener inclinación
+                    if (mapViewMode === 'perspective') {
+                        targetPitch = pitchBeforeManeuver * 0.90;
+                    } else {
+                        targetPitch = 45;
+                    }
                 }
             }
             break;
@@ -10175,8 +10332,6 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
         default:
             if (distanceToManeuver <= PROGRESSIVE_ZOOM_START_DISTANCE && distanceToManeuver > PROGRESSIVE_ZOOM_PEAK_DISTANCE) {
                 if (progressiveZoomState !== 'zooming-in' && progressiveZoomState !== 'holding') {
-                    // <<< ¡AQUÍ ESTÁ LA CORRECCIÓN CLAVE! >>>
-                    // Guardamos el estado REAL del mapa en el instante que empieza la animación.
                     mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
                     window.pitchBeforeManeuver = navigationMapInstance.getPitch();
                 }
@@ -10186,9 +10341,16 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
                 let progress = (PROGRESSIVE_ZOOM_START_DISTANCE - distanceToManeuver) / (PROGRESSIVE_ZOOM_START_DISTANCE - PROGRESSIVE_ZOOM_PEAK_DISTANCE);
                 progress = easeInOutQuad(progress);
                 targetZoom = mapPreviousZoomLevelForProgressive + (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * progress;
-                // Aumentamos la inclinación progresivamente desde su valor real
-                targetPitch = pitchBeforeManeuver + (6 * progress);
-                targetPitch = Math.min(85, targetPitch);
+                
+                // <<< INICIO DE LA LÓGICA DE INCLINACIÓN DUAL >>>
+                if (mapViewMode === 'perspective') {
+                    const pitchReduction = pitchBeforeManeuver * 0.10;
+                    targetPitch = pitchBeforeManeuver - (pitchReduction * progress);
+                } else { // Modos 2D
+                    targetPitch = pitchBeforeManeuver + (45 * progress);
+                }
+                // <<< FIN DE LA LÓGICA DE INCLINACIÓN DUAL >>>
+                
                 isZoomedForManeuver = true;
 
             } else if (distanceToManeuver <= PROGRESSIVE_ZOOM_PEAK_DISTANCE) {
@@ -10199,8 +10361,13 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
                 progressiveZoomState = 'holding';
                 pitchBeforeManeuver = window.pitchBeforeManeuver;
                 targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
-                // Mantener la inclinación máxima
-                targetPitch = Math.min(85, pitchBeforeManeuver + 6);
+                
+                // Mantener la inclinación máxima de la maniobra
+                if (mapViewMode === 'perspective') {
+                    targetPitch = pitchBeforeManeuver * 0.90;
+                } else {
+                    targetPitch = 45;
+                }
                 isZoomedForManeuver = true;
 
             } else {
@@ -10217,11 +10384,13 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
     }
 
     if (targetZoom !== null && targetPitch !== null) {
+        // Aseguramos que los valores de inclinación estén siempre dentro de los límites válidos
+        targetPitch = Math.max(0, Math.min(85, targetPitch));
         return { zoom: targetZoom, pitch: targetPitch };
     }
     return null;
-}    
-
+}
+    
 // ===================================================================
 // NOMBRE: clearModalAutoCloseTimer
 // RESUMEN: Limpia un temporizador de autocierre de un modal.
