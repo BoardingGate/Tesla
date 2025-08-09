@@ -9595,11 +9595,59 @@ async function fetchAndRenderChatUsers() {
         usersListContainer.innerHTML = '<p class="chat-no-users">Error al cargar usuarios.</p>';
     }
 }
-     
 
 // ===================================================================
-// NOMBRE: handleProgressiveManeuverZoom (MODIFICADA - RESPETA ANULACIÓN MANUAL)
-// RESUMEN: Calcula el zoom progresivo, pero se detiene si el zoom manual está activo.
+// NOMBRE: handleProgressiveManeuverZoom (VERSIÓN MEJORADA CON EASING Y ANTI-YOYÓ)
+// RESUMEN: Calcula el zoom progresivo para maniobras con una curva de suavizado
+//          y evita el "efecto yoyó" en giros consecutivos cercanos.
+// ===================================================================
+
+// --- INICIO: Funciones de Ayuda para la lógica de zoom ---
+
+/**
+ * Función de suavizado (easing) para una aceleración y deceleración suave.
+ * @param {number} t - Progreso lineal de 0 a 1.
+ * @returns {number} Progreso suavizado de 0 a 1.
+ */
+const easeInOutQuad = t => t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+
+/**
+ * Busca el siguiente paso de maniobra "real" en la ruta, omitiendo puntos internos.
+ * @param {object} route - El objeto de ruta completo.
+ * @param {number} currentLeg - El índice del tramo actual.
+ * @param {number} currentStep - El índice del paso actual.
+ * @returns {object|null} El siguiente paso válido o null si no hay más.
+ */
+function findNextValidStep(route, currentLeg, currentStep) {
+    let legIndex = currentLeg;
+    let stepIndex = currentStep + 1;
+    const waypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal);
+
+    while (legIndex < route.legs.length) {
+        const leg = route.legs[legIndex];
+        if (stepIndex >= leg.steps.length) {
+            legIndex++;
+            stepIndex = 0;
+            continue;
+        }
+
+        const candidateStep = leg.steps[stepIndex];
+        const isArrival = candidateStep.maneuver.type === 'arrive';
+        const arrivalWaypoint = isArrival ? waypoints[legIndex + 1] : null;
+
+        if (isArrival && arrivalWaypoint && arrivalWaypoint.isInternal) {
+            stepIndex++;
+            continue; 
+        }
+
+        return { step: candidateStep, legIndex: legIndex, stepIndex: stepIndex };
+    }
+    return null; // No se encontraron más pasos válidos
+}
+
+// --- FIN: Funciones de Ayuda ---
+
+
 function handleProgressiveManeuverZoom(currentStep, distanceToManeuver) {
     if (isManualZoomActive) return null;
 
@@ -9607,43 +9655,67 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver) {
         if (isZoomedForManeuver) isZoomedForManeuver = false;
         return null;
     }
+    
+    const route = navigationCurrentRouteData?.routes?.[0];
+    if (!route) return null;
+
+    // --- Constantes de configuración del zoom ---
     const maxZoomForMap = navigationMapInstance.getMaxZoom() || 19;
     const currentMapLayerName = (localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "satélite + calles").toLowerCase();
     const isSatelliteWithLabels = currentMapLayerName.includes("satélite + calles");
-    const MANEUVER_PEAK_ZOOM_LEVEL = isSatelliteWithLabels 
-        ? Math.min(17.5, maxZoomForMap) 
-        : Math.min(18.5, maxZoomForMap);
+    const MANEUVER_PEAK_ZOOM_LEVEL = isSatelliteWithLabels ? Math.min(17.5, maxZoomForMap) : Math.min(18.5, maxZoomForMap);
+    const HOLD_ZOOM_THRESHOLD = 250; // Metros: si la siguiente maniobra está más cerca que esto, no nos alejamos.
+    
     const currentStepIdentifier = `${currentLegIndexNav}_${currentStepIndexNav}`;
+
+    // Lógica para detectar cuándo hemos pasado a un nuevo paso de la ruta
     if (lastProcessedStepIdentifier !== null && lastProcessedStepIdentifier !== currentStepIdentifier) {
         if (progressiveZoomState === 'zooming-in' || progressiveZoomState === 'holding') {
             progressiveZoomState = 'zooming-out';
         }
     }
     lastProcessedStepIdentifier = currentStepIdentifier;
+
     const distanceIntoCurrentStep = currentStep.distance - distanceToManeuver;
     let targetZoom = null;
+
     switch (progressiveZoomState) {
         case 'zooming-out':
             isZoomedForManeuver = true;
-            if (distanceIntoCurrentStep > PROGRESSIVE_ZOOM_EXIT_END_DISTANCE || mapPreviousZoomLevelForProgressive === null) {
-                targetZoom = mapPreviousZoomLevelForProgressive;
-                progressiveZoomState = 'none';
-                mapPreviousZoomLevelForProgressive = null;
-                isZoomedForManeuver = false;
-            } else if (distanceIntoCurrentStep >= PROGRESSIVE_ZOOM_EXIT_START_DISTANCE) {
-                const progress = (distanceIntoCurrentStep - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE) / (PROGRESSIVE_ZOOM_EXIT_END_DISTANCE - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE);
-                targetZoom = MANEUVER_PEAK_ZOOM_LEVEL - (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * Math.min(1, progress);
-            } else {
+            
+            // LÓGICA ANTI-YOYÓ: Miramos si la siguiente maniobra está muy cerca
+            const nextStepAfterCurrent = findNextValidStep(route, currentLegIndexNav, currentStepIndexNav);
+            const distanceToNextStep = nextStepAfterCurrent ? calculateDistanceToEndOfStep(route, nextStepAfterCurrent.legIndex, nextStepAfterCurrent.stepIndex) - carDistanceAlongRouteForNavLogic : Infinity;
+
+            if (nextStepAfterCurrent && distanceToNextStep < HOLD_ZOOM_THRESHOLD) {
+                // Si está cerca, forzamos el zoom máximo y no nos alejamos.
                 targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
+            } else {
+                // Si no, procedemos con el alejamiento normal
+                if (distanceIntoCurrentStep > PROGRESSIVE_ZOOM_EXIT_END_DISTANCE || mapPreviousZoomLevelForProgressive === null) {
+                    targetZoom = mapPreviousZoomLevelForProgressive;
+                    progressiveZoomState = 'none';
+                    mapPreviousZoomLevelForProgressive = null;
+                    isZoomedForManeuver = false;
+                } else if (distanceIntoCurrentStep >= PROGRESSIVE_ZOOM_EXIT_START_DISTANCE) {
+                    const progress = (distanceIntoCurrentStep - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE) / (PROGRESSIVE_ZOOM_EXIT_END_DISTANCE - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE);
+                    targetZoom = MANEUVER_PEAK_ZOOM_LEVEL - (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * Math.min(1, progress);
+                } else {
+                    targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
+                }
             }
             break;
-        default:
+
+        default: // Incluye los estados 'none', 'zooming-in', y 'holding'
             if (distanceToManeuver <= PROGRESSIVE_ZOOM_START_DISTANCE && distanceToManeuver > PROGRESSIVE_ZOOM_PEAK_DISTANCE) {
                 if (progressiveZoomState !== 'zooming-in' && progressiveZoomState !== 'holding') {
                     mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
                 }
                 progressiveZoomState = 'zooming-in';
-                const progress = (PROGRESSIVE_ZOOM_START_DISTANCE - distanceToManeuver) / (PROGRESSIVE_ZOOM_START_DISTANCE - PROGRESSIVE_ZOOM_PEAK_DISTANCE);
+                
+                let progress = (PROGRESSIVE_ZOOM_START_DISTANCE - distanceToManeuver) / (PROGRESSIVE_ZOOM_START_DISTANCE - PROGRESSIVE_ZOOM_PEAK_DISTANCE);
+                progress = easeInOutQuad(progress); // Aplicamos la curva de suavizado
+                
                 targetZoom = mapPreviousZoomLevelForProgressive + (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * progress;
                 isZoomedForManeuver = true;
             } else if (distanceToManeuver <= PROGRESSIVE_ZOOM_PEAK_DISTANCE) {
@@ -9664,7 +9736,7 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver) {
             break;
     }
     return targetZoom;
-}    
+}
     
 // ===================================================================
 // NOMBRE: clearModalAutoCloseTimer
