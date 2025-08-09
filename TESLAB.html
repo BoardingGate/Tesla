@@ -5656,13 +5656,18 @@ function rebuildProcessedRemindersCache() {
         processedRemindersCache = [];
     }
 }
+
 // ===================================================================
-// NOMBRE: startDeviationChecker (NUEVA FUNCIÓN)
-// RESUMEN: Inicia un temporizador dedicado para la comprobación de desvío de ruta.
+// NOMBRE: startDeviationChecker (VERSIÓN OPTIMIZADA)
+// RESUMEN: Inicia un temporizador que comprueba el desvío de ruta de forma eficiente,
+//          analizando solo un pequeño segmento de la ruta alrededor de la posición actual.
+// ===================================================================
 function startDeviationChecker() {
-    stopDeviationChecker(); // Asegura que no haya intervalos duplicados
-    console.log("[DESVÍO] Iniciando comprobador de desvío cada 5 segundos.");
+    stopDeviationChecker();
+    console.log("[DESVÍO] Iniciando comprobador de desvío optimizado (cada 5 segundos).");
+    
     deviationCheckIntervalId = setInterval(() => {
+        // Condiciones para no ejecutar la comprobación (sin cambios)
         if (!isNavigating || !navigationCurrentLocation || isRecalculatingRoute || isDeviationModalActive || isAddReminderAtLocationModeActive) {
             deviationStartTime = 0;
             return;
@@ -5670,36 +5675,82 @@ function startDeviationChecker() {
         if (Date.now() < deviationCheckGracePeriodUntil) {
             return;
         }
-        const currentCoords = navigationCurrentLocation;
-        const routeSource = navigationMapInstance?.getSource('route');
-        if (routeSource && routeSource._data && typeof turf !== 'undefined') {
-            try {
-                const routeGeoJSON = routeSource._data;
-                const routeLineString = turf.lineString(routeGeoJSON.geometry.coordinates);
-                const carPoint = turf.point([currentCoords.longitude, currentCoords.latitude]);
-                const distanceToRoute = turf.pointToLineDistance(carPoint, routeLineString, { units: 'meters' });
 
-                if (distanceToRoute > DEVIATION_THRESHOLD_METERS) {
-                    if (deviationStartTime === 0) {
-                        deviationStartTime = Date.now();
-                    } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
-                        showDeviationModal();
-                        deviationStartTime = 0;
+        const route = navigationCurrentRouteData?.routes?.[0];
+        // Comprobación de que la ruta y los datos necesarios existen
+        if (!route || !route.legs || !route.legs[currentLegIndexNav] || !route.legs[currentLegIndexNav].steps[currentStepIndexNav] || typeof turf === 'undefined') {
+            return;
+        }
+
+        try {
+            const carPoint = turf.point([navigationCurrentLocation.longitude, navigationCurrentLocation.latitude]);
+            
+            // --- INICIO DE LA OPTIMIZACIÓN ---
+            // 1. Construir la "mini-ruta" o "ventana de comprobación"
+            const searchWindowCoords = [];
+            const stepsToInclude = 5; // Revisamos el paso actual y los 4 siguientes
+
+            let legIdx = currentLegIndexNav;
+            let stepIdx = currentStepIndexNav;
+            
+            for (let i = 0; i < stepsToInclude && legIdx < route.legs.length; i++) {
+                const currentLeg = route.legs[legIdx];
+                if (stepIdx < currentLeg.steps.length) {
+                    const currentStep = currentLeg.steps[stepIdx];
+                    if (currentStep.geometry && currentStep.geometry.coordinates) {
+                        // Añadimos las coordenadas del paso, evitando duplicar el primer punto si no es el primer paso
+                        if (searchWindowCoords.length > 0) {
+                            searchWindowCoords.push(...currentStep.geometry.coordinates.slice(1));
+                        } else {
+                            searchWindowCoords.push(...currentStep.geometry.coordinates);
+                        }
                     }
+                    stepIdx++;
                 } else {
-                    deviationStartTime = 0;
+                    legIdx++;
+                    stepIdx = 0;
+                    // Saltamos el paso si pasamos a la siguiente pierna para evitar huecos en la geometría
+                    i--; 
                 }
-            } catch (e) {
-                // Error en turf, iniciar contador como fallback
-                if (deviationStartTime === 0) deviationStartTime = Date.now();
-                else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
+            }
+
+            // Si no tenemos suficientes coordenadas, la comprobación no es fiable, así que salimos.
+            if (searchWindowCoords.length < 2) {
+                deviationStartTime = 0; // Reseteamos el contador si no podemos comprobar
+                return;
+            }
+
+            // 2. Crear la línea de la ventana y calcular la distancia
+            const routeWindowLineString = turf.lineString(searchWindowCoords);
+            const distanceToRoute = turf.pointToLineDistance(carPoint, routeWindowLineString, { units: 'meters' });
+            // --- FIN DE LA OPTIMIZACIÓN ---
+
+            // 3. La lógica de detección de desvío es exactamente la misma que antes
+            if (distanceToRoute > DEVIATION_THRESHOLD_METERS) {
+                if (deviationStartTime === 0) {
+                    deviationStartTime = Date.now();
+                } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
                     showDeviationModal();
                     deviationStartTime = 0;
                 }
+            } else {
+                deviationStartTime = 0;
+            }
+        } catch (e) {
+            // En caso de error en Turf (muy improbable con geometrías pequeñas),
+            // se mantiene la lógica de seguridad original.
+            console.error("[DESVÍO] Error en el cálculo de distancia optimizado:", e);
+            if (deviationStartTime === 0) {
+                deviationStartTime = Date.now();
+            } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
+                showDeviationModal();
+                deviationStartTime = 0;
             }
         }
-    }, 5000); // Frecuencia de 5 segundos
+    }, 5000);
 }
+
+    
 
 // ===================================================================
 // NOMBRE: stopDeviationChecker (NUEVA FUNCIÓN)
