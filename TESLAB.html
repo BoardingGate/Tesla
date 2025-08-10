@@ -1,4 +1,4 @@
-DO 06
+DO 07
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -7726,46 +7726,41 @@ async function checkForAndExecuteCrashRecovery() {
         if (recoveryData && recoveryData.isActive && recoveryData.route) {
             showToast("Recuperando sesión de navegación anterior...", "info", 5000);
 
-            // Ocultamos la UI principal para ir directamente al mapa
             const mainContent = document.querySelector('main'); if (mainContent) mainContent.style.display = 'none';
             const footer = document.querySelector('footer'); if (footer) footer.style.display = 'none';
             const noticesContainer = document.querySelector('.notices-icon-container'); if (noticesContainer) noticesContainer.style.display = 'none';
             const sideControls = document.querySelectorAll('.toggle-image, .toggle-sign, .scroll-toggle-button'); sideControls.forEach(el => el.style.display = 'none');
             document.querySelectorAll('#config-button, #personal-button, #radar-button, #home-button, #reload-button, #keyword-assignment-button, #password-toggle-button, #versions-button, #info-button, #accident-alert-button').forEach(el => el.style.display = 'none');
             const gridFilter = document.getElementById('grid-filter-container'); if (gridFilter) gridFilter.style.display = 'none';
-
-            // Abrimos el mapa y esperamos a que esté listo
-            openNavigationMap();
             
-            // Esperamos a que la instancia del mapa esté disponible
-            await new Promise(resolve => {
-                const interval = setInterval(() => {
-                    if (navigationMapInstance && navigationMapInstance.isStyleLoaded()) {
-                        clearInterval(interval);
-                        resolve();
-                    }
-                }, 100);
-            });
+            try {
+                // Abrimos el mapa y esperamos a que esté completamente listo (mapa y GPS)
+                // openNavigationMap ahora resolverá incluso si el GPS falla, para no bloquear el flujo.
+                await openNavigationMap();
+                
+                // Cargamos la ruta y le indicamos que inicie la navegación inmediatamente.
+                // Esta función ahora es robusta contra la falta de GPS inicial.
+                await loadRouteFromObject(recoveryData.route, true, true);
 
-            // --- INICIO MODIFICACIÓN RECUPERACIÓN (CORRECCIÓN) ---
-            // Cargamos la ruta y le indicamos que inicie la navegación automáticamente Y de forma inmediata.
-            loadRouteFromObject(recoveryData.route, true, true);
-            // --- FIN MODIFICACIÓN RECUPERACIÓN (CORRECCIÓN) ---
-
-            return true; // Indicamos que la recuperación se ha manejado
+                return true; // La recuperación fue exitosa, detenemos la carga normal de la app.
+            
+            } catch (recoveryError) {
+                console.error("Fallo durante la ejecución de la recuperación automática:", recoveryError);
+                showToast("La recuperación automática falló. Cargando la app normalmente.", "error", 6000);
+                clearRecoveryFlag();
+                setTimeout(() => location.reload(), 2000);
+                return true; 
+            }
         }
     } catch (e) {
         console.error("Error al procesar los datos de recuperación. Limpiando bandera.", e);
-        localStorage.removeItem('boardinggate_nav_recovery_flag');
+        clearRecoveryFlag();
         return false;
     }
 
-    // Si los datos no son válidos pero la bandera existe, la limpiamos
-    localStorage.removeItem('boardinggate_nav_recovery_flag');
+    clearRecoveryFlag();
     return false;
 }
-            
-
     
 // ===================================================================
 // NOMBRE: clearRecoveryFlag (NUEVA FUNCIÓN)
@@ -10324,7 +10319,7 @@ async function openNavigationMap() {
 // NOMBRE: loadRouteFromObject (VERSIÓN FINAL Y ROBUSTA CONTRA MOVIMIENTO)
 // RESUMEN: "Salva" la ubicación GPS actual ANTES de limpiar, garantizando un recálculo fiable.
 async function loadRouteFromObject(routeObject, autoStartNavigation = false, forceImmediateStart = false) {
-    if (!routeObject || !routeObject.waypoints) {
+    if (!routeObject || !routeObject.waypoints || routeObject.waypoints.length === 0) {
         showToast("Error: El objeto de la ruta es inválido.", "error");
         return;
     }
@@ -10344,13 +10339,12 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
 
     currentRouteNameForSaving = routeObject.name;
     
-    // --- INICIO DE LA CORRECCIÓN CLAVE ---
-    // En lugar de copiar todos los waypoints, preparamos la lista para usar solo los destinos.
     const waypointsFromLoadedRoute = routeObject.waypoints;
-    // --- FIN DE LA CORRECCIÓN CLAVE ---
-
-    if (isNavigationMapActive && startLocation) {
-      
+    
+    // --- INICIO MODIFICACIÓN RECUPERACIÓN (CORRECCIÓN FINAL) ---
+    // Lógica robusta para manejar la falta de GPS inicial.
+    if (startLocation) {
+        // Si tenemos GPS, construimos la ruta desde la posición actual.
         const startPoint = {
             id: Date.now() - 1,
             lat: startLocation.latitude,
@@ -10361,64 +10355,26 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
             visited: true,
             isCriticalForRecalc: true,
             isInternal: false,
-            isRecalculatedStart: false };
-        
-        navigationWaypoints = [startPoint];
-        
-        // --- INICIO DE LA MODIFICACIÓN CLAVE ---
-        // Usamos .slice(1) para OMITIR el primer punto (el de partida original) de la ruta guardada.
-        waypointsFromLoadedRoute.slice(1).forEach(wpData => {
-            if (wpData) {
-                navigationWaypoints.push({
-                    id: wpData.id || Date.now() + Math.random(),
-                    lat: wpData.lat, lng: wpData.lng, type: '', label: '', marker: null,
-                    address: wpData.address || '', visited: false, isCriticalForRecalc: true,
-                    isInternal: false, isRecalculatedStart: false
-                });
-            }
-        });
-        // --- FIN DE LA MODIFICACIÓN CLAVE ---
-
+            isRecalculatedStart: false 
+        };
+        navigationWaypoints = [startPoint, ...sanitizeWaypointsForStorage(waypointsFromLoadedRoute.slice(1))];
     } else {
-        const isSingleDestinationRoute = routeObject.waypoints.length === 1;
-        
-        if (isSingleDestinationRoute && startLocation) {
-             const startPoint = {
-                id: Date.now() - 1, lat: startLocation.latitude, lng: startLocation.longitude,
-                type: 'S', marker: null, label: 'S', address: 'Posición Actual (GPS)', visited: true,
-                isCriticalForRecalc: true, isInternal: false, isRecalculatedStart: false
-            };
-            navigationWaypoints.push(startPoint);
-        }
-        
-        // --- INICIO DE LA MODIFICACIÓN CLAVE (PARA EL CASO 'ELSE') ---
-        const waypointsToAdd = isSingleDestinationRoute ? waypointsFromLoadedRoute : waypointsFromLoadedRoute.slice(1);
-        waypointsToAdd.forEach(wpData => {
-            if (wpData) {
-                navigationWaypoints.push({
-                    id: wpData.id || Date.now() + Math.random(),
-                    lat: wpData.lat,
-                    lng: wpData.lng,
-                    type: '', label: '', marker: null,
-                    address: wpData.address || '', visited: false, isCriticalForRecalc: true,
-                    isInternal: false, isRecalculatedStart: false
-                });
-            }
-        });
-        // --- FIN DE LA MODIFICACIÓN CLAVE ---
+        // Si NO tenemos GPS (caso del cuelgue en garaje), cargamos la ruta original completa.
+        // El sistema de desvío la recalculará automáticamente cuando el GPS se active.
+        showToast("Señal GPS no disponible. Cargando ruta original...", "warning");
+        navigationWaypoints = sanitizeWaypointsForStorage(waypointsFromLoadedRoute);
     }
+    // --- FIN MODIFICACIÓN RECUPERACIÓN (CORRECCIÓN FINAL) ---
 
     await updateWaypointTypesAndLabels();
     renderWaypointMarkers();
 
     if (navigationWaypoints.filter(wp => wp && !wp.isInternal).length >= 2) {
-        recalculateAndDrawRoute(false).then(() => {
+        return recalculateAndDrawRoute(false).then(() => {
             if (autoStartNavigation) {
-                // --- INICIO MODIFICACIÓN RECUPERACIÓN (CORRECCIÓN) ---
                 if (forceImmediateStart) {
-                    toggleNavigationState(); // Inicia la navegación directamente
+                    toggleNavigationState(); 
                 } else {
-                    // Muestra el modal de inicio con cuenta atrás (comportamiento normal)
                     if (navigationMapInstance && navigationMapInstance.getSource('route') && navigationMapInstance.getSource('route')._data) {
                         const routeGeoJSON = navigationMapInstance.getSource('route')._data;
                         if (routeGeoJSON.geometry && routeGeoJSON.geometry.coordinates.length > 1) {
@@ -10437,13 +10393,17 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
                     }
                     showAutoStartNavigationModal();
                 }
-                // --- FIN MODIFICACIÓN RECUPERACIÓN (CORRECCIÓN) ---
             }
+        }).catch(error => {
+            console.error("Fallo crítico al recalcular la ruta durante la carga:", error);
+            showToast("No se pudo recalcular la ruta. Comprueba la conexión.", "error");
+            clearRecoveryFlag();
+            throw new Error("Recalculation failed in loadRouteFromObject");
         });
     }
     updateStartNavigationButtonState();
     updateNavigationButtonColor();
-}                                
+}    
     
 // ===================================================================
 // NOMBRE: fetchAndRenderChatUsers (CON ESTADÍSTICAS COMPLETAS PARA ADMIN)
