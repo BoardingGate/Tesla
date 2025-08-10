@@ -3823,6 +3823,10 @@ body.mobile-view #locations-preview-modal { z-index: 11000 !important;}
                 <input type="checkbox" id="config-direct-to-nav" name="directToNav">
                 <label for="config-direct-to-nav">Entrar directamente al Navegador de rutas</label>
             </div>
+            <div class="checkbox-container">
+                <input type="checkbox" id="config-monitor-resources" name="monitorResources">
+                <label for="config-monitor-resources">CONSUMO RECURSOS DE LA NAVEGACIÓN (no dejar activo permanentemente)</label>
+            </div>
              <p id="config-pin-status" class="status-message"></p>
          </div>
          <div id="tab-content-radares" class="config-tab-content">
@@ -5130,7 +5134,7 @@ class CombinedMapControl {
     let isProgressBarLocked = false;
     let progressBarForceShowUntil = 0;
     let lastProcessedStepForLock = null;
-  
+
     const managedKeys = [ 'reminders','darkMode','toggleStates','zoomState','onOffState','noticesActive', 'footerVisible','teslaHtmlLastModified','teslaHtmlLastModifiedTimestamp', 'userData_userId','userData_teslaModel','userData_teslaYear','userData_teslaProvince', 'userData_allowDMs', 'customGridData', 'personalizationHelpShown', 'gridFilterValue',  'password_pin', 'password_active', 'lastUpdatesCheckDate', SAVED_LOCATIONS_KEY,  SHOW_EXCLUDED_REMINDERS_KEY, SAVED_ROUTES_KEY, RADARES_RUTA_CHECKED_KEY,  TAREAS_RUTA_CHECKED_KEY, ACTIVE_MAP_LAYER_KEY, DIRECT_TO_NAVIGATION_KEY, GRAPH_STATE_KEY, 'boardinggate_autoBackupOnLoad', 'userData_backupPassword', MAP_SEARCH_INPUT_KEY, 'mapViewMode_v1', MAP_FILTER_INPUT_KEY, PROGRESS_BAR_LOCKED_KEY,  MAP_VIEW_OFFSET_X_KEY,MAP_VIEW_OFFSET_Y_KEY,  MAP_VIEW_SHOW_MINIMAP_KEY, MAP_VIEW_PITCH_KEY  ];
     const managedDesc = managedKeys.map(k => {
             switch(k){
@@ -5156,6 +5160,349 @@ class CombinedMapControl {
         }).join(', ');
 
 
+// ===================================================================
+// NOMBRE: initializeApp (VERSIÓN FINAL CON LLAMADA A FUNCIÓN CORREGIDA)
+// RESUMEN: Llama a la nueva función `uploadDirtyCacheOnLoad_Car` y establece el timestamp inicial para la sincronización móvil.
+async function initializeApp() {
+    const recoveryExecuted = await checkForAndExecuteCrashRecovery();
+
+    loadCustomData();
+    loadSavedSettings();
+    applyMapVisualSettings();
+    // --- INICIO MODIFICACIÓN RECUPERACIÓN (CORRECCIÓN FINAL V4) ---
+    // La UI principal se renderiza SIEMPRE para evitar problemas de layout.
+    applyMainUISettings();
+    // --- FIN MODIFICACIÓN RECUPERACIÓN (CORRECCIÓN FINAL V4) ---
+
+    isMobileSession = parseUserId(localStorage.getItem('userData_userId')).isMobile; 
+    
+    if (isMobileSession) {
+        document.body.classList.add('mobile-view');
+        await restoreCacheForMobile();
+    } else {
+        await uploadDirtyCacheOnLoad_Car();
+    }
+
+    lastMobileSyncTimestamp = parseInt(localStorage.getItem('lastCacheUpdateTimestamp') || '0');
+    
+    checkForExcessiveRadars();
+    
+    const termsAccepted = localStorage.getItem('termsAccepted_v1') === 'true';
+    const shouldDirectToNav = JSON.parse(localStorage.getItem(DIRECT_TO_NAVIGATION_KEY)) || false;
+    const tempPreventDirectNav = sessionStorage.getItem(TEMP_PREVENT_DIRECT_NAV_KEY);
+    
+    if ((shouldDirectToNav && !tempPreventDirectNav && termsAccepted) || recoveryExecuted) {
+        if(!recoveryExecuted) sessionStorage.setItem('isInDirectToMapMode', 'true');
+        directToNavOnLoad = true;
+        const mainContent = document.querySelector('main'); if (mainContent) mainContent.style.display = 'none';
+        const footerContent = document.querySelector('footer'); if (footerContent) footerContent.style.display = 'none';
+        const noticesIconContainer = document.querySelector('.notices-icon-container'); if (noticesIconContainer) noticesIconContainer.style.display = 'none';
+        const sideControls = document.querySelectorAll('.toggle-image, .toggle-sign, .scroll-toggle-button'); sideControls.forEach(el => el.style.display = 'none');
+        document.querySelectorAll('#config-button, #personal-button, #radar-button, #home-button, #reload-button, #keyword-assignment-button, #password-toggle-button, #versions-button, #info-button').forEach(el => el.style.display = 'none');
+        document.getElementById('grid-filter-container').style.display = 'none';
+        
+        if (!recoveryExecuted) {
+            openNavigationMap();
+        }
+    } else {
+        sessionStorage.removeItem('isInDirectToMapMode');
+        directToNavOnLoad = false;
+        const mainContent = document.querySelector('main'); if (mainContent) mainContent.style.display = 'block';
+        const footerContent = document.querySelector('footer'); if (footerContent) footerContent.style.display = 'block';
+        const noticesIconContainer = document.querySelector('.notices-icon-container'); if (noticesIconContainer) noticesIconContainer.style.display = 'flex';
+        const sideControls = document.querySelectorAll('.toggle-image, .toggle-sign, .scroll-toggle-button'); sideControls.forEach(el => el.style.display = 'flex');
+        document.querySelectorAll('#config-button, #personal-button, #radar-button, #home-button, #reload-button, #keyword-assignment-button, #password-toggle-button, #versions-button, #info-button').forEach(el => el.style.display = 'block');
+        document.getElementById('grid-filter-container').style.display = 'flex';
+    }
+
+    initializeConfigModalListeners();
+    try { await updateVersion(); } catch (e) { }
+    try { await loadNotices(); startNoticeRotation(); } catch (e) { }
+    if (reminderCheckIntervalId) { clearInterval(reminderCheckIntervalId); }
+    
+    checkReminders(); 
+
+    currentCheckIntervalDuration = 3000;
+    reminderCheckIntervalId = setInterval(checkReminders, currentCheckIntervalDuration);
+    
+    if (!termsAccepted) {
+        showConfigModal();
+    }
+
+    const noticeToggleIcon = document.getElementById('notice-toggle-icon');
+    if (noticeToggleIcon) noticeToggleIcon.addEventListener('click', toggleNotices);
+    const countEl = document.getElementById('reminder-count-globe');
+    if (countEl) {
+         const openTable = (e) => {
+             if (isEditMode || isAssignmentMode || isKeywordAssignmentMode) return;
+             e.preventDefault(); e.stopPropagation();
+             showAllReminders();
+         };
+         countEl.addEventListener('click', openTable);
+         countEl.style.cursor = 'pointer';
+    }
+    const filterInput = document.getElementById('grid-filter-input');
+    const clearButton = document.getElementById('clear-filter-button');
+    if (filterInput) {
+        const savedFilter = localStorage.getItem('gridFilterValue');
+        if (savedFilter !== null) filterInput.value = savedFilter;
+        filterInput.addEventListener('input', () => {
+             localStorage.setItem('gridFilterValue', filterInput.value);
+             filterGridItems();
+             if(isKeywordAssignmentMode) applyInitialKeywordHighlights();
+        });
+    }
+    if (clearButton) {
+        clearButton.addEventListener('click', () => {
+             if (filterInput) filterInput.value = '';
+             localStorage.removeItem('gridFilterValue');
+             filterGridItems();
+             if(isKeywordAssignmentMode) applyInitialKeywordHighlights();
+        });
+    }
+    
+    const openChatArea = document.getElementById('open-chat-area');
+    if (openChatArea) {
+        openChatArea.addEventListener('click', openChatModal);
+    }
+    updateTotalMessageCount(); 
+    
+    const userCountGlobe = document.getElementById('user-count-globe');
+    if (userCountGlobe) {
+        userCountGlobe.addEventListener('click', () => {
+            showToast('Usuarios activos', 'info');
+        });
+        if (window.db && window.getDocs && window.collection) {
+            const usersCollectionRef = window.collection(window.db, "user_data");
+            window.getDocs(usersCollectionRef).then(snapshot => {
+                userCountGlobe.textContent = snapshot.size;
+            }).catch(error => {
+                userCountGlobe.textContent = 'X';
+            });
+        }
+    }
+
+    await checkVersionsIconOpacity();
+
+    document.body.addEventListener('click', function(event) {
+        const target = event.target;
+        const targetId = target.id || (target.closest('[id]') ? target.closest('[id]').id : null);
+        if (targetId === 'config-close-modal') {
+            const termsAcceptedForClose = localStorage.getItem('termsAccepted_v1') === 'true';
+            if (!termsAcceptedForClose) {
+                showToast('Debes aceptar las normas de uso para continuar.', 'warning');
+                return;
+            }
+            const modal = document.getElementById('config-modal');
+            if (modal && !modal.classList.contains('hidden')) {
+                clearModalAutoCloseTimer(modal, target, 'config-modal');
+                modal.classList.add('hidden');
+                 const mapWasOpenBeforeConfig = sessionStorage.getItem('boardinggate_map_should_reopen_after_config') === 'true';
+                 const mapContextToReopen = sessionStorage.getItem('mapContextToReopenAfterConfig');
+                 sessionStorage.removeItem('boardinggate_map_should_reopen_after_config');
+                 sessionStorage.removeItem('mapContextToReopenAfterConfig');
+                 if (mapWasOpenBeforeConfig && !document.getElementById('unified-reminder-window')?.classList.contains('visible') && !document.getElementById('reminders-location-map-modal')) {
+                    if (mapContextToReopen === 'navigation') {
+                        setTimeout(() => openNavigationMap(), 50);
+                    }
+                }
+            }
+        }
+        if (target.matches('.config-tab-button')) {
+            const modal = document.getElementById('config-modal');
+            if(modal && modal.classList.contains('hidden') === false) {
+                const tabTarget = target.dataset.tabTarget;
+                modal.querySelectorAll('.config-tab-button').forEach(btn => btn.classList.remove('active'));
+                modal.querySelectorAll('.config-tab-content').forEach(content => content.classList.remove('active'));
+                target.classList.add('active');
+                if (modal.querySelector(tabTarget)) {
+                    modal.querySelector(tabTarget).classList.add('active');
+                }
+            }
+        }
+        if (targetId === 'close-reminders-top' || targetId === 'close-reminders-bottom') {
+            const modalTable = document.querySelector('.reminder-table-modal');
+            if (modalTable) {
+                if (modalTable.autoCloseInterval) clearInterval(modalTable.autoCloseInterval);
+                modalTable.remove();
+                const mapShouldReopen = sessionStorage.getItem('boardinggate_map_was_open_before_table') === 'true';
+                const mapContext = sessionStorage.getItem('mapContext');
+                sessionStorage.removeItem('boardinggate_map_was_open_before_table');
+                sessionStorage.removeItem('mapContext');
+                if (fromReminderModal) {
+                    fromReminderModal = false;
+                    if (mapShouldReopen) {
+                        sessionStorage.setItem('boardinggate_map_should_reopen_after_form', 'true');
+                        sessionStorage.setItem('mapContext', mapContext);
+                    }
+                    showReminderModal();
+                } else if (mapShouldReopen) {
+                     if (mapContext === 'navigation') openNavigationMap();
+                }
+            }
+        }
+        if (targetId === 'view-all-locations-map') {
+            const modalTable = document.querySelector('.reminder-table-modal');
+             if (modalTable && modalTable.autoCloseInterval) clearInterval(modalTable.autoCloseInterval);
+             if (modalTable) modalTable.remove();
+            setTimeout(() => {
+                openLocationsPreviewMap();
+            }, 50);
+        }
+         if (targetId === 'close-locations-preview') {
+            const previewModal = document.getElementById('locations-preview-modal');
+            if (previewModal) {
+                if (locationsPreviewMap) {
+                    try { locationsPreviewMap.remove(); } catch (e) {}
+                    locationsPreviewMap = null;
+                }
+                if (mapLayersControlLocationsPreview) {
+                    try {mapLayersControlLocationsPreview.remove();} catch(e){}
+                    mapLayersControlLocationsPreview = null;
+                }
+                clearModalAutoCloseTimer(previewModal, target, 'locations-preview-modal');
+                previewModal.classList.add('hidden');
+            }
+        }
+        if (targetId === 'close-address-suggestions-modal') {
+            hideAddressSuggestionsModal();
+        }
+    });
+   const configModal = document.getElementById('config-modal');
+    if (configModal) {
+        configModal.addEventListener('click', function(event) {
+            const target = event.target;
+            if (target.matches('.config-tab-button')) {
+                const tabTarget = target.dataset.tabTarget;
+                configModal.querySelectorAll('.config-tab-button').forEach(btn => btn.classList.remove('active'));
+                configModal.querySelectorAll('.config-tab-content').forEach(content => content.classList.remove('active'));
+                target.classList.add('active');
+                if (configModal.querySelector(tabTarget)) {
+                    configModal.querySelector(tabTarget).classList.add('active');
+                }
+            }
+        });
+    }
+    const bookmarkGrid = document.getElementById('bookmark-grid');
+    if (bookmarkGrid) {
+        bookmarkGrid.addEventListener('click', function(event) {
+            const link = event.target.closest('a.bookmark-item');
+            if (link && link.href && link.href.startsWith("map-action:")) {
+                event.preventDefault();
+                const action = link.href.split(":")[1];
+                if (action === "openRemindersMapWithNoRadars") {
+                    closeOtherModals();
+                    setTimeout(() => {
+                        const existingPreviewModal = document.getElementById('locations-preview-modal');
+                        if (existingPreviewModal && !existingPreviewModal.classList.contains('hidden')) {
+                            showToast("El mapa de ubicaciones (sin radar) ya está abierto", "info");
+                        } else {
+                           openLocationsPreviewMap();
+                        }
+                    }, 50);
+                } else if (action === "openRemindersMap") {
+                    closeOtherModals();
+                    setTimeout(() => {
+                        const mapModalElement = document.getElementById('reminders-location-map-modal');
+                        if (mapModalElement && !mapModalElement.classList.contains('hidden')) {
+                            showToast("El mapa de navegación/ubicaciones ya está abierto", "info");
+                            if (navigationMapInstance) {
+                                requestAnimationFrame(() => {
+                                    requestAnimationFrame(() => {
+                                        if (navigationMapInstance) {
+                                            try {
+                                                 navigationMapInstance.resize();
+                                             } catch (e) {  }
+                                        }
+                                    });
+                                });
+                            }
+                        } else {
+                           openNavigationMap();
+                        }
+                    }, 50);
+                }
+            }
+        });
+    }
+    
+    const accidentAlertButton = document.getElementById('accident-alert-button');
+    if (accidentAlertButton) {
+        accidentAlertButton.addEventListener('click', () => {
+            if (isEditMode || isAssignmentMode || isKeywordAssignmentMode) return;
+            openAlertModal();
+        });
+    }
+
+     window.addEventListener('beforeunload', () => {
+         if (reminderCheckIntervalId) { clearInterval(reminderCheckIntervalId); }
+         if (locationWatchId !== null && navigator.geolocation) { navigator.geolocation.clearWatch(locationWatchId); locationWatchId = null; }
+         if (editingTargetElement) { editingTargetElement.classList.remove('editing-target'); editingTargetElement = null; }
+         const openReminderModal = document.querySelector('.reminder-modal');
+         if (openReminderModal && typeof openReminderModal.cleanUpModalTimers === 'function') { openReminderModal.cleanUpModalTimers(true); }
+         Object.keys(globalModalTimers).forEach(modalId => {
+            const timerData = globalModalTimers[modalId];
+            if (timerData) {
+                clearModalAutoCloseTimer(timerData.modalElement, timerData.closeButtonElement, modalId);
+            }
+         });
+         globalModalTimers = {};
+         const openTableModal = document.querySelector('.reminder-table-modal');
+         if(openTableModal && openTableModal.autoCloseInterval) { clearInterval(openTableModal.autoCloseInterval); }
+         const openPostponeModal = document.getElementById('postpone-options-modal');
+         if(openPostponeModal && openPostponeModal.autoPostponeInterval) { clearInterval(openPostponeModal.autoPostponeInterval); }
+         const openSavedLocationsModal = document.querySelector('.saved-locations-modal');
+         if (openSavedLocationsModal && locationPickerMap) { try { locationPickerMap.remove(); } catch(e){} locationPickerMap = null; locationPickerMarker = null; }
+         const simModalUnload = document.getElementById('simulation-modal');
+         if (simModalUnload && simulationModalTimer) clearTimeout(simulationModalTimer);
+         if (autoStartNavTimer) clearTimeout(autoStartNavTimer);
+         if (isNavigationMapActive || navigationMapInstance) {
+            closeNavigationMap(true);
+         }
+         if (locationsPreviewMap) {
+             try { locationsPreviewMap.remove(); } catch(e){}
+             locationsPreviewMap = null;
+         }
+         if (isAssignmentMode || isEditMode || isKeywordAssignmentMode) { saveCustomData(); }
+         const filterInput = document.getElementById('grid-filter-input');
+         if (filterInput && filterInput.value.trim()) {
+              localStorage.setItem('gridFilterValue', filterInput.value);
+         } else {
+              localStorage.removeItem('gridFilterValue');
+         }
+          saveSettings();
+          if (reminderModalMap) try {reminderModalMap.remove();} catch(e){}
+          Object.values(previewMaps).forEach(map => {try {map?.remove();} catch(e){}});
+          if (intersectionPreviewMap) try {intersectionPreviewMap.remove();} catch(e){}
+          if (navigationChart) navigationChart.destroy();
+          if (graphIntervalTimer) clearInterval(graphIntervalTimer);
+     });
+}    
+   
+// ===================================================================
+// NOMBRE: sanitizeWaypointsForStorage (NUEVA FUNCIÓN)
+// RESUMEN: Crea una copia "limpia" de un array de waypoints, eliminando propiedades
+//          no serializables como los marcadores del mapa para evitar errores de referencia circular.
+// ===================================================================
+function sanitizeWaypointsForStorage(waypoints) {
+    if (!Array.isArray(waypoints)) return [];
+    return waypoints.map(wp => {
+        if (!wp) return null;
+        // Se crea un objeto nuevo solo con las propiedades seguras para JSON.stringify
+        return {
+            id: wp.id,
+            lat: wp.lat,
+            lng: wp.lng,
+            address: wp.address,
+            type: wp.type,
+            label: wp.label,
+            visited: wp.visited,
+            isInternal: wp.isInternal,
+            isRecalculatedStart: wp.isRecalculatedStart,
+            isCriticalForRecalc: wp.isCriticalForRecalc
+        };
+    }).filter(Boolean); // Elimina cualquier posible nulo
+}
 // ===================================================================
 // NOMBRE: handleProgressiveManeuverZoom (VERSIÓN CON INCLINACIÓN ADAPTATIVA)
 // RESUMEN: Gestiona el zoom y la inclinación de forma diferente para modos 2D y 3D.
@@ -5625,6 +5972,21 @@ async function updateDynamicRadars(isInitialLoadCheck = false) {
         showToast(`Error al actualizar radares: ${error.message}`, "error");
     }
 }
+
+    
+// ===================================================================
+// NOMBRE: applyMainUISettings (NUEVA FUNCIÓN)
+// RESUMEN: Aplica todas las configuraciones visuales de la interfaz principal (toggles, filtros, etc.).
+//          Se usa tanto en la carga normal como en la recuperación para mantener la consistencia.
+// ===================================================================
+function applyMainUISettings() {
+    renderGrid();
+    createOtherButtons();
+    renderToggleButtons();
+    updateButtonStyles();
+    filterGridItems();
+    setTimeout(adjustButtonPositions, 100);
+}    
 // ===================================================================
 // NOMBRE: toggleRadaresRuta (VERSIÓN FINAL ANTI-DUPLICADOS Y CON CONTEO COMPLETO)
 // RESUMEN: Activa/desactiva la visualización de radares en la ruta, unificando dinámicos y manuales sin duplicados.
@@ -6129,7 +6491,6 @@ function stopDeviationChecker() {
     }
 }
 
-
 // ===================================================================
 // NOMBRE: toggleNavigationState (MODIFICADA - Inicia/Detiene el checker de desvío)
 // RESUMEN: Inicia/detiene la navegación y ahora también el comprobador de desvío.
@@ -6139,6 +6500,7 @@ async function toggleNavigationState(isRecalculationStop = false) {
     const mapContainer = document.getElementById('reminders-location-map-div');
     
     if (isNavigating) {
+        clearRecoveryFlag();
         if (isSimulatingGpsLocation) {
             stopAutomatedRouteSimulation();
         }
@@ -6170,8 +6532,29 @@ async function toggleNavigationState(isRecalculationStop = false) {
             const lastWpForName = waypointsForRecents[waypointsForRecents.length - 1];
             const isMultiStageForName = waypointsForRecents.length > 2;
             const suggestedName = await getSuggestedRouteName(lastWpForName.lat, lastWpForName.lng, isMultiStageForName, waypointsForRecents.length);
-            const routeForRecents = { name: currentRouteNameForSaving || suggestedName, waypoints: waypointsForRecents };
-            addRouteToRecents(routeForRecents);
+            
+            // --- INICIO MODIFICACIÓN RECUPERACIÓN (CORRECCIÓN FINAL V5) ---
+            let routeForStorage;
+            const finalWaypoint = waypointsForRecents[waypointsForRecents.length - 1];
+
+            if (currentRouteNameForSaving && currentRouteNameForSaving.startsWith("UBICACIÓN: ") && finalWaypoint) {
+                routeForStorage = {
+                    name: currentRouteNameForSaving,
+                    waypoints: sanitizeWaypointsForStorage([finalWaypoint]) // Sanitiza el waypoint único
+                };
+            } else {
+                routeForStorage = { 
+                    name: currentRouteNameForSaving || suggestedName, 
+                    waypoints: sanitizeWaypointsForStorage(waypointsForRecents) // Sanitiza todos los waypoints
+                };
+            }
+            addRouteToRecents(routeForStorage); // addRouteToRecents ahora recibe un objeto ya sanitizado
+
+            // Usamos el objeto ya sanitizado para la bandera de recuperación, eliminando el error.
+            const recoveryData = { isActive: true, route: routeForStorage };
+            localStorage.setItem('boardinggate_nav_recovery_flag', JSON.stringify(recoveryData));
+            // --- FIN MODIFICACIÓN RECUPERACIÓN (CORRECCIÓN FINAL V5) ---
+
             clearNavigationGraph();
             navigationWaypoints.forEach(wp => { if(wp) { if (wp.type === 'S' || wp.type === 'S_Recalc') { wp.visited = true; } else { wp.visited = false; } if (wp.marker) wp.marker.setDraggable(false); } });
             
@@ -6183,7 +6566,7 @@ async function toggleNavigationState(isRecalculationStop = false) {
             const loadingToast = document.getElementById("gps-init-toast"); if (loadingToast) loadingToast.remove(); activeToasts = activeToasts.filter(t => t.id !== "gps-init-toast");
             
             isNavigating = true;
-            startDeviationChecker(); // Inicia el comprobador de desvío
+            startDeviationChecker(); 
             mapHeaderButtonsVisible = false;
             toggleMapHeaderRowsVisibility(false);
             
@@ -6257,6 +6640,7 @@ async function toggleNavigationState(isRecalculationStop = false) {
     actualizarContadorTareas(tareasEnRutaActual.length);
 }
 
+    
 // ===================================================================
 // NOMBRE: saveCustomData (MODIFICADA - Llama a la nueva función de caché)
 // RESUMEN: Guarda la personalización y marca la caché de recordatorios como sucia.
@@ -7348,6 +7732,70 @@ function markReminderAsManaged(reminderId, managedState = true) {
      markRemindersCacheAsDirty(); } } } catch (e) { }
 }
 
+// ===================================================================
+// NOMBRE: checkForAndExecuteCrashRecovery (NUEVA FUNCIÓN)
+// RESUMEN: Se ejecuta al inicio para detectar si hubo un cuelgue durante la navegación.
+//          Si es así, restaura automáticamente la sesión de mapa y navegación.
+// ===================================================================
+async function checkForAndExecuteCrashRecovery() {
+    const recoveryFlagJSON = localStorage.getItem('boardinggate_nav_recovery_flag');
+    if (!recoveryFlagJSON) {
+        return false; // No hay nada que recuperar, carga normal.
+    }
+
+    try {
+        const recoveryData = JSON.parse(recoveryFlagJSON);
+        if (recoveryData && recoveryData.isActive && recoveryData.route) {
+            showToast("Recuperando sesión de navegación anterior...", "info", 5000);
+
+            // Ocultamos la UI principal para ir directamente al mapa
+            const mainContent = document.querySelector('main'); if (mainContent) mainContent.style.display = 'none';
+            const footer = document.querySelector('footer'); if (footer) footer.style.display = 'none';
+            const noticesContainer = document.querySelector('.notices-icon-container'); if (noticesContainer) noticesContainer.style.display = 'none';
+            const sideControls = document.querySelectorAll('.toggle-image, .toggle-sign, .scroll-toggle-button'); sideControls.forEach(el => el.style.display = 'none');
+            document.querySelectorAll('#config-button, #personal-button, #radar-button, #home-button, #reload-button, #keyword-assignment-button, #password-toggle-button, #versions-button, #info-button, #accident-alert-button').forEach(el => el.style.display = 'none');
+            const gridFilter = document.getElementById('grid-filter-container'); if (gridFilter) gridFilter.style.display = 'none';
+            
+            try {
+                // Abrimos el mapa y esperamos a que esté completamente listo (mapa y GPS)
+                // openNavigationMap ahora resolverá incluso si el GPS falla, para no bloquear el flujo.
+                await openNavigationMap();
+                
+                // Cargamos la ruta y le indicamos que inicie la navegación inmediatamente.
+                // Esta función ahora es robusta contra la falta de GPS inicial y fallos de red.
+                await loadRouteFromObject(recoveryData.route, true, true);
+
+                return true; // La recuperación fue exitosa, detenemos la carga normal de la app.
+            
+            } catch (recoveryError) {
+                // Si algo falla durante el proceso de apertura o carga de ruta
+                console.error("Fallo durante la ejecución de la recuperación automática:", recoveryError);
+                showToast("La recuperación automática falló. Cargando la app normalmente.", "error", 6000);
+                clearRecoveryFlag(); // Limpiamos la bandera para no reintentar
+                // Forzamos una recarga para volver a un estado limpio y conocido
+                setTimeout(() => location.reload(), 2000);
+                // Detenemos la ejecución aquí para que la recarga tenga efecto
+                return true; 
+            }
+        }
+    } catch (e) {
+        console.error("Error al procesar los datos de recuperación. Limpiando bandera.", e);
+        clearRecoveryFlag();
+        return false;
+    }
+
+    clearRecoveryFlag();
+    return false;
+}
+    
+// ===================================================================
+// NOMBRE: clearRecoveryFlag (NUEVA FUNCIÓN)
+// RESUMEN: Función centralizada para limpiar la bandera de recuperación de forma segura.
+// ===================================================================
+function clearRecoveryFlag() {
+    localStorage.removeItem('boardinggate_nav_recovery_flag');
+}
+    
     
 // ===================================================================
 // NOMBRE: addSlideButtonListeners (MODIFICADA - Llama a la nueva función de caché)
@@ -8526,10 +8974,13 @@ async function createAndLoadReturnTrip() {
 }
 
 // ===================================================================
-// NOMBRE: showarrivalstatsmodal (VERSIÓN CORREGIDA Y MEJORADA)
+// NOMBRE: showArrivalStatsModal (VERSIÓN CORREGIDA Y MEJORADA)
 // RESUMEN: Al cerrar, en lugar de borrar la ruta, ahora invoca el nuevo
 //          modal de acciones post-llegada (Vuelta / Borrar Ruta).
 function showArrivalStatsModal(freeDriveStatsData = null) {
+    // --- INICIO MODIFICACIÓN RECUPERACIÓN ---
+    clearRecoveryFlag();
+    // --- FIN MODIFICACIÓN RECUPERACIÓN ---
     closeOtherModals('arrival-stats-modal');
     document.body.classList.add('modal-open');
 
@@ -8749,7 +9200,7 @@ function showArrivalStatsModal(freeDriveStatsData = null) {
 
     acceptButton.addEventListener('click', closeHandler);
     addModalAutoCloseTimer(modal, acceptButton, 'arrival-stats-modal', 150000);
-}
+}    
 
 // ===================================================================
 // NOMBRE: drawRouteOnMap (REESCRITA - IMPLEMENTA EL SWAP SEGURO)
@@ -9573,352 +10024,328 @@ function preloadGpsLocation() {
     }
 }    
 
-
 // ===================================================================
 // NOMBRE: openNavigationMap (VERSIÓN CON ANIMACIÓN DE GIRO PERSONALIZADA)
 // RESUMEN: Al abrir, el mapa realiza un vuelo desde Texas hasta España antes de localizar al usuario.
-// ===================================================================
 async function openNavigationMap() {
-    const { primaryId: userId } = parseUserId(localStorage.getItem('userData_userId'));
-    if (userId && userId.toLowerCase() !== 'boardinggate') {
-        const toastId = "map-access-check";
-        try {
-            const adminDocRef = window.doc(window.db, "user_data", "boardinggate");
-            const userDocRef = window.doc(window.db, "user_data", userId);
-            
-            const [adminSnap, userSnap] = await Promise.all([window.getDoc(adminDocRef), window.getDoc(userDocRef)]);
-            
-            let maxSessions = Infinity;
-            if (adminSnap.exists() && typeof adminSnap.data().max_monthly_sessions === 'number') {
-                maxSessions = adminSnap.data().max_monthly_sessions;
-            }
-            
-            let userMonthlyCount = 0;
-            if (userSnap.exists()) {
-                const userData = userSnap.data();
-                const now = new Date();
-                const currentMonthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
-                if (userData.map_sessions_last_month === currentMonthStr) {
-                    userMonthlyCount = userData.map_sessions_month || 0;
+    // --- INICIO MODIFICACIÓN RECUPERACIÓN (CORRECCIÓN) ---
+    // La función ahora devuelve una Promesa que se resuelve cuando el mapa y el GPS están listos.
+    return new Promise(async (resolve, reject) => {
+    // --- FIN MODIFICACIÓN RECUPERACIÓN (CORRECCIÓN) ---
+        const { primaryId: userId } = parseUserId(localStorage.getItem('userData_userId'));
+        if (userId && userId.toLowerCase() !== 'boardinggate') {
+            const toastId = "map-access-check";
+            try {
+                const adminDocRef = window.doc(window.db, "user_data", "boardinggate");
+                const userDocRef = window.doc(window.db, "user_data", userId);
+                
+                const [adminSnap, userSnap] = await Promise.all([window.getDoc(adminDocRef), window.getDoc(userDocRef)]);
+                
+                let maxSessions = Infinity;
+                if (adminSnap.exists() && typeof adminSnap.data().max_monthly_sessions === 'number') {
+                    maxSessions = adminSnap.data().max_monthly_sessions;
                 }
-            }
+                
+                let userMonthlyCount = 0;
+                if (userSnap.exists()) {
+                    const userData = userSnap.data();
+                    const now = new Date();
+                    const currentMonthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+                    if (userData.map_sessions_last_month === currentMonthStr) {
+                        userMonthlyCount = userData.map_sessions_month || 0;
+                    }
+                }
 
-            const existingToast = document.getElementById(toastId);
-            if(existingToast) existingToast.remove();
-            
-            if (userMonthlyCount >= maxSessions) {
-                showToast("HA SUPERADO EL NÚMERO MÁXIMO DE SESIONES MENSUALES DE MAPA, consulte con el administrador", "error", 10000);
-                return; 
+                const existingToast = document.getElementById(toastId);
+                if(existingToast) existingToast.remove();
+                
+                if (userMonthlyCount >= maxSessions) {
+                    showToast("HA SUPERADO EL NÚMERO MÁXIMO DE SESIONES MENSUALES DE MAPA, consulte con el administrador", "error", 10000);
+                    reject(new Error("Límite de sesiones alcanzado")); // --- MODIFICACIÓN RECUPERACIÓN ---
+                    return; 
+                }
+            } catch (error) {
+                const existingToast = document.getElementById(toastId);
+                if(existingToast) existingToast.remove();
+                showToast("No se pudo verificar el límite de sesiones. Acceso permitido.", "warning");
             }
-        } catch (error) {
-            const existingToast = document.getElementById(toastId);
-            if(existingToast) existingToast.remove();
-            showToast("No se pudo verificar el límite de sesiones. Acceso permitido.", "warning");
         }
-    }
-                           
-    isGeolocated = false;
-    const mainContent = document.querySelector('main'); if (mainContent) mainContent.style.display = 'none';
-    const footer = document.querySelector('footer'); if (footer) footer.style.display = 'none';
-    const noticesContainer = document.querySelector('.notices-icon-container'); if (noticesContainer) noticesContainer.style.display = 'none';
-    const sideControls = document.querySelectorAll('.toggle-image, .toggle-sign, .scroll-toggle-button'); sideControls.forEach(el => el.style.display = 'none');
-    document.querySelectorAll('#config-button, #personal-button, #radar-button, #home-button, #reload-button, #keyword-assignment-button, #password-toggle-button, #versions-button, #info-button, #accident-alert-button').forEach(el => el.style.display = 'none');
-    const gridFilter = document.getElementById('grid-filter-container'); if (gridFilter) gridFilter.style.display = 'none';
+                               
+        isGeolocated = false;
+        const mainContent = document.querySelector('main'); if (mainContent) mainContent.style.display = 'none';
+        const footer = document.querySelector('footer'); if (footer) footer.style.display = 'none';
+        const noticesContainer = document.querySelector('.notices-icon-container'); if (noticesContainer) noticesContainer.style.display = 'none';
+        const sideControls = document.querySelectorAll('.toggle-image, .toggle-sign, .scroll-toggle-button'); sideControls.forEach(el => el.style.display = 'none');
+        document.querySelectorAll('#config-button, #personal-button, #radar-button, #home-button, #reload-button, #keyword-assignment-button, #password-toggle-button, #versions-button, #info-button, #accident-alert-button').forEach(el => el.style.display = 'none');
+        const gridFilter = document.getElementById('grid-filter-container'); if (gridFilter) gridFilter.style.display = 'none';
 
-    isNavigationMapActive = true;
-    sessionStorage.setItem('mapContext', 'navigation');
-    closeOtherModals('reminders-location-map-modal');
-    
-    const mapModal = document.getElementById('reminders-location-map-modal');
-    if (!mapModal) { console.error("Error crítico: El modal del mapa no se encuentra en el HTML."); isNavigationMapActive = false; return; }
-    
-    mapModal.classList.remove('map-modal-hidden');
-    const mapActualContainer = document.getElementById('mapbox-map-actual-container');
-    
-    if (navigationMapInstance) {
-        handleLoadOrDeleteRouteClick(null);
-        setNavigationMapClickHandler();
-        setTimeout(() => { if (navigationMapInstance) navigationMapInstance.resize(); }, 100);
+        isNavigationMapActive = true;
+        sessionStorage.setItem('mapContext', 'navigation');
+        closeOtherModals('reminders-location-map-modal');
         
-    } else {
-        try {
-            const savedLayerName = localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO";
-            const finalLayerName = MAP_LEGACY_NAME_MAP[savedLayerName] || savedLayerName;
-            const initialStyle = MAP_STYLES[finalLayerName] || MAP_STYLES["HÍBRIDO"];
-            showToast("INICIALIZANDO MAPA...", "info", 0, false, "map-init-toast");
-  
-            const startCoordsTexas = { lat: 30.3715, lng: -97.1903 };
-            navigationMapInstance = new mapboxgl.Map({
-                container: mapActualContainer,
-                style: initialStyle, 
-                center: [startCoordsTexas.lng, startCoordsTexas.lat],
-                zoom: 2.8,
-                pitch: 0,
-                bearing: 0,
-                attributionControl: false, 
-                accessToken: mapboxgl.accessToken
-            });
+        const mapModal = document.getElementById('reminders-location-map-modal');
+        if (!mapModal) { console.error("Error crítico: El modal del mapa no se encuentra en el HTML."); isNavigationMapActive = false; reject(new Error("Modal no encontrado")); return; }
+        
+        mapModal.classList.remove('map-modal-hidden');
+        const mapActualContainer = document.getElementById('mapbox-map-actual-container');
+        
+        if (navigationMapInstance) {
+            handleLoadOrDeleteRouteClick(null);
+            setNavigationMapClickHandler();
+            setTimeout(() => { if (navigationMapInstance) navigationMapInstance.resize(); }, 100);
+            resolve(); // Si el mapa ya existe, resolvemos inmediatamente.
             
-            setMapImmersiveMode(true);
-            
-            incrementMapSessionCount();
-            mapSessionStartTime = Date.now();
-            
-            const customControls = new CustomMapControlsGroup();
-            navigationMapInstance.addControl(customControls, 'bottom-right');
-            
-            compassAndModeControl = new CompassAndStatsControl();
-            navigationMapInstance.addControl(compassAndModeControl, 'bottom-left');
-            
-            // ===================================================================
-            // >>> INICIO DE LA CORRECCIÓN DEFINITIVA PARA PANTALLA TÁCTIL (v2) <<<
-            // ===================================================================
-            if (!navigationMapInstance._interactionListenersAttached) {
-                const mapCanvas = navigationMapInstance.getCanvasContainer();
-                let touchStartPos = null;
-                let hasMovedEnoughToDrag = false;
-                const DRAG_THRESHOLD = 10; // Píxeles de movimiento para considerarlo un arrastre
+        } else {
+            try {
+                const savedLayerName = localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO";
+                const finalLayerName = MAP_LEGACY_NAME_MAP[savedLayerName] || savedLayerName;
+                const initialStyle = MAP_STYLES[finalLayerName] || MAP_STYLES["HÍBRIDO"];
+                showToast("INICIALIZANDO MAPA...", "info", 0, false, "map-init-toast");
+      
+                const startCoordsTexas = { lat: 30.3715, lng: -97.1903 };
+                navigationMapInstance = new mapboxgl.Map({
+                    container: mapActualContainer,
+                    style: initialStyle, 
+                    center: [startCoordsTexas.lng, startCoordsTexas.lat],
+                    zoom: 2.8,
+                    pitch: 0,
+                    bearing: 0,
+                    attributionControl: false, 
+                    accessToken: mapboxgl.accessToken
+                });
+                
+                setMapImmersiveMode(true);
+                
+                incrementMapSessionCount();
+                mapSessionStartTime = Date.now();
+                
+                const customControls = new CustomMapControlsGroup();
+                navigationMapInstance.addControl(customControls, 'bottom-right');
+                
+                compassAndModeControl = new CompassAndStatsControl();
+                navigationMapInstance.addControl(compassAndModeControl, 'bottom-left');
+                
+                if (!navigationMapInstance._interactionListenersAttached) {
+                    const mapCanvas = navigationMapInstance.getCanvasContainer();
+                    let touchStartPos = null;
+                    let hasMovedEnoughToDrag = false;
+                    const DRAG_THRESHOLD = 10; // Píxeles de movimiento para considerarlo un arrastre
 
-                const onTouchStart = (e) => {
-                    // Si se coloca un segundo dedo, es un gesto de zoom/rotación.
-                    // Desactivamos el seguimiento inmediatamente.
-                    if (e.touches && e.touches.length > 1) {
-                        handleManualMapInteraction();
-                        return;
-                    }
-                    // Si es el primer dedo, solo registramos el inicio para un posible arrastre.
-                    const touch = e.touches ? e.touches[0] : e;
-                    touchStartPos = { x: touch.clientX, y: touch.clientY };
-                    hasMovedEnoughToDrag = false;
-                };
-
-                const onTouchMove = (e) => {
-                    // Si ya hemos desactivado el seguimiento en este gesto, o no hay un toque inicial, salimos.
-                    if (hasMovedEnoughToDrag || !touchStartPos || (e.touches && e.touches.length > 1)) return;
-                    
-                    const touch = e.touches ? e.touches[0] : e;
-                    const deltaX = Math.abs(touch.clientX - touchStartPos.x);
-                    const deltaY = Math.abs(touch.clientY - touchStartPos.y);
-
-                    // Si el dedo se ha movido lo suficiente, es un arrastre.
-                    if (deltaX > DRAG_THRESHOLD || deltaY > DRAG_THRESHOLD) {
-                        hasMovedEnoughToDrag = true;
-                        handleManualMapInteraction(); // Desactivamos el seguimiento.
-                    }
-                };
-
-                const onTouchEnd = () => {
-                    // Limpiamos el estado para el próximo toque.
-                    touchStartPos = null;
-                    hasMovedEnoughToDrag = false;
-                };
-
-                // Asignamos los listeners para el comportamiento táctil
-                mapCanvas.addEventListener('touchstart', onTouchStart, { passive: true });
-                mapCanvas.addEventListener('touchmove', onTouchMove, { passive: true });
-                mapCanvas.addEventListener('touchend', onTouchEnd, { passive: true });
-
-                // Mantenemos el listener de 'pitchend' para guardar la inclinación.
-                navigationMapInstance.on('pitchend', (e) => {
-                    if (e.originalEvent) { 
-                        const newPitch = navigationMapInstance.getPitch();
-                        if (Math.abs(newPitch - mapPitchValue) > 0.1) {
-                            mapPitchValue = newPitch;
-                            saveSettings();
+                    const onTouchStart = (e) => {
+                        if (e.touches && e.touches.length > 1) {
+                            handleManualMapInteraction();
+                            return;
                         }
+                        const touch = e.touches ? e.touches[0] : e;
+                        touchStartPos = { x: touch.clientX, y: touch.clientY };
+                        hasMovedEnoughToDrag = false;
+                    };
+
+                    const onTouchMove = (e) => {
+                        if (hasMovedEnoughToDrag || !touchStartPos || (e.touches && e.touches.length > 1)) return;
+                        
+                        const touch = e.touches ? e.touches[0] : e;
+                        const deltaX = Math.abs(touch.clientX - touchStartPos.x);
+                        const deltaY = Math.abs(touch.clientY - touchStartPos.y);
+
+                        if (deltaX > DRAG_THRESHOLD || deltaY > DRAG_THRESHOLD) {
+                            hasMovedEnoughToDrag = true;
+                            handleManualMapInteraction(); 
+                        }
+                    };
+
+                    const onTouchEnd = () => {
+                        touchStartPos = null;
+                        hasMovedEnoughToDrag = false;
+                    };
+
+                    mapCanvas.addEventListener('touchstart', onTouchStart, { passive: true });
+                    mapCanvas.addEventListener('touchmove', onTouchMove, { passive: true });
+                    mapCanvas.addEventListener('touchend', onTouchEnd, { passive: true });
+
+                    navigationMapInstance.on('pitchend', (e) => {
+                        if (e.originalEvent) { 
+                            const newPitch = navigationMapInstance.getPitch();
+                            if (Math.abs(newPitch - mapPitchValue) > 0.1) {
+                                mapPitchValue = newPitch;
+                                saveSettings();
+                            }
+                        }
+                    });
+                    navigationMapInstance._interactionListenersAttached = true; 
+                }
+
+                navigationMapInstance.on('error', (e) => {
+                    if (e.error && e.error.message.includes("Token")) {
+                        showToast("Error de Token de Mapbox. Revisa los permisos (scopes) en tu cuenta.", "error", 10000);
                     }
                 });
-                navigationMapInstance._interactionListenersAttached = true; 
-            }
+                
+                navigationMapInstance.on('load', async function() {
+                    try {
+                        const initToast = document.getElementById("map-init-toast");
+                        if (initToast) initToast.remove();
 
-            navigationMapInstance.on('error', (e) => {
-                if (e.error && e.error.message.includes("Token")) {
-                    showToast("Error de Token de Mapbox. Revisa los permisos (scopes) en tu cuenta.", "error", 10000);
-                }
-            });
-            
-            navigationMapInstance.on('load', async function() {
-                try {
-                    const initToast = document.getElementById("map-init-toast");
-                    if (initToast) initToast.remove();
-
-                    await loadAndAddMapImages(navigationMapInstance);
-                    reAddCustomMapLayersAndSources(navigationMapInstance);
-                    
-                    processTrafficAlerts();
-                    
-                    navigationMapInstance.on('pitch', updateLineWidthsOnPitchChange);
-                    
-                    mapPreviousZoomLevelForPDRs = navigationMapInstance.getZoom();
-                    navigationMapInstance.on('zoomend', updateAllIconSizes);
-                    navigationMapInstance.on('zoomend', updateTrafficAlertIconSizes);
-                    toggleMapHeaderRowsVisibility(mapHeaderButtonsVisible);
-
-                    navigationMapInstance.on('click', async (e) => {
-                        if (isAddReminderAtLocationModeActive) { handleMapClickToAddReminder(e); return; }
-                        if (isSimulatingGpsLocation) { handleSimulateGpsPositionClick(e); return; }
-                        if (isNavigating) { return; }
-
-                        const point = e.point;
-                        const lngLat = e.lngLat;
+                        await loadAndAddMapImages(navigationMapInstance);
+                        reAddCustomMapLayersAndSources(navigationMapInstance);
                         
-                        const pdrLayers = ['pdr-simple-circle-layer', 'pdr-cards-layer-bg'];
-                        const pdrFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: pdrLayers });
-                        if (pdrFeatures.length > 0) {
-                            const pdrIndex = pdrFeatures[0].properties.index;
-                            const fullPdrData = window.lastOcmApiResponse.find(p => p.ID === pdrFeatures[0].properties.ocmId);
-                            if (fullPdrData) {
-                                showChargingPointModal(fullPdrData, pdrIndex);
+                        processTrafficAlerts();
+                        
+                        navigationMapInstance.on('pitch', updateLineWidthsOnPitchChange);
+                        
+                        mapPreviousZoomLevelForPDRs = navigationMapInstance.getZoom();
+                        navigationMapInstance.on('zoomend', updateAllIconSizes);
+                        navigationMapInstance.on('zoomend', updateTrafficAlertIconSizes);
+                        toggleMapHeaderRowsVisibility(mapHeaderButtonsVisible);
+
+                        navigationMapInstance.on('click', async (e) => {
+                            if (isAddReminderAtLocationModeActive) { handleMapClickToAddReminder(e); return; }
+                            if (isSimulatingGpsLocation) { handleSimulateGpsPositionClick(e); return; }
+                            if (isNavigating) { return; }
+
+                            const point = e.point;
+                            const lngLat = e.lngLat;
+                            
+                            const pdrLayers = ['pdr-simple-circle-layer', 'pdr-cards-layer-bg'];
+                            const pdrFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: pdrLayers });
+                            if (pdrFeatures.length > 0) {
+                                const pdrIndex = pdrFeatures[0].properties.index;
+                                const fullPdrData = window.lastOcmApiResponse.find(p => p.ID === pdrFeatures[0].properties.ocmId);
+                                if (fullPdrData) {
+                                    showChargingPointModal(fullPdrData, pdrIndex);
+                                }
+                                return;
                             }
-                            return;
-                        }
 
-                        const reminderLayers = ['reminders-icons-layer'];
-                        const reminderFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: reminderLayers });
-                        if (reminderFeatures.length > 0) {
-                            const reminderId = reminderFeatures[0].properties.reminderId;
-                            showReminderActionModal(reminderId);
-                            return;
-                        }
+                            const reminderLayers = ['reminders-icons-layer'];
+                            const reminderFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: reminderLayers });
+                            if (reminderFeatures.length > 0) {
+                                const reminderId = reminderFeatures[0].properties.reminderId;
+                                showReminderActionModal(reminderId);
+                                return;
+                            }
 
-                        const mapboxPoiLayers = ['poi-label'];
-                        const features = navigationMapInstance.queryRenderedFeatures(point, { layers: mapboxPoiLayers });
-                        const validPoiFeature = features.find(f => {
-                             if (!f.properties) return false;
-                             const poiName = f.properties.name || f.properties.name_en || f.properties.text;
-                             return f.layer.id === 'poi-label' && poiName;
-                        });
+                            const mapboxPoiLayers = ['poi-label'];
+                            const features = navigationMapInstance.queryRenderedFeatures(point, { layers: mapboxPoiLayers });
+                            const validPoiFeature = features.find(f => {
+                                 if (!f.properties) return false;
+                                 const poiName = f.properties.name || f.properties.name_en || f.properties.text;
+                                 return f.layer.id === 'poi-label' && poiName;
+                            });
 
-                        if (validPoiFeature) {
-                            const properties = validPoiFeature.properties;
-                            const poiName = properties.name || properties.name_en || properties.text;
-                            let categories = [];
-                            if (properties.poi_category && Array.isArray(properties.poi_category)) { categories = properties.poi_category; } 
-                            else if (properties.category) { categories = properties.category.split(',').map(c => c.trim()); } 
-                            else if (properties.maki) { categories = [properties.maki]; }
-                            
-                            const featureForModal = { properties: { name: poiName, categories: categories }, geometry: validPoiFeature.geometry };
-                            showPoiInfoModal(featureForModal);
-                        } else {
-                            addWaypoint(lngLat);
-                        }
-                    });
-                    
-                    enablePoiInteractivity(navigationMapInstance);
-                    setNavigationMapClickHandler();
-                    
-                    const globeSpinPromise = new Promise(resolve => {
-                        const startCoords = { lat: 30.3715, lng: -97.1903 }; // Texas
-                        const endCoords = { lat: 40.3748, lng: -3.7354 };   // Madrid
-                        const duration = 1800;
-
-                        const directLngDiff = endCoords.lng - startCoords.lng;
-                        const totalLngChange = -(360 - directLngDiff);
-                        const totalLatChange = endCoords.lat - startCoords.lat;
-
-                        const startTimestamp = performance.now();
-
-                        function animateSpin(timestamp) {
-                            const elapsedTime = timestamp - startTimestamp;
-                            let progress = Math.min(elapsedTime / duration, 1);
-                            progress = 1 - Math.pow(1 - progress, 3);
-
-                            const currentLng = startCoords.lng + (totalLngChange * progress);
-                            const currentLat = startCoords.lat + (totalLatChange * progress);
-                            
-                            navigationMapInstance.setCenter([currentLng, currentLat]);
-
-                            if (progress < 1) {
-                                requestAnimationFrame(animateSpin);
+                            if (validPoiFeature) {
+                                const properties = validPoiFeature.properties;
+                                const poiName = properties.name || properties.name_en || properties.text;
+                                let categories = [];
+                                if (properties.poi_category && Array.isArray(properties.poi_category)) { categories = properties.poi_category; } 
+                                else if (properties.category) { categories = properties.category.split(',').map(c => c.trim()); } 
+                                else if (properties.maki) { categories = [properties.maki]; }
+                                
+                                const featureForModal = { properties: { name: poiName, categories: categories }, geometry: validPoiFeature.geometry };
+                                showPoiInfoModal(featureForModal);
                             } else {
-                                navigationMapInstance.setCenter([endCoords.lng, endCoords.lat]);
-                                resolve();
+                                addWaypoint(lngLat);
                             }
-                        }
-                        requestAnimationFrame(animateSpin);
-                    });
-
-                    await globeSpinPromise;
-
-                    async function getGpsWithRetries() {
-                        const toastId = "gps-locate-toast";
-                        showToast("LOCALIZANDO VEHÍCULO...", "info", 0, false, toastId);
-                        
-                        while (true) {
-                            try {
-                                const coords = await getCurrentLocationAsync();
-                                const loadingToast = document.getElementById(toastId);
-                                if (loadingToast) loadingToast.remove();
-                                return coords;
-                            } catch (error) {
-                                showToast(`No se pudo obtener la ubicación. Reintentando en 3 segundos...`, "warning", 0, false, toastId);
-                                await new Promise(resolve => setTimeout(resolve, 3000));
-                            }
-                        }
-                    }
-
-                    const currentPos = await getGpsWithRetries();
-                    
-                    setMapImmersiveMode(false);
-                    navigationFollowUser = true;
-                    shouldCenterOnUser = true;
-                    updateLocateMeButtonsUI();
-                    toggleMapControls(true);
-                    navigationCurrentLocation = currentPos;
-                    updateInitialUserPosition(currentPos, navigationMapInstance);
-                    
-                    if (navigationMapInstance) {
-                        navigationMapInstance.flyTo({
-                            center: [currentPos.longitude, currentPos.latitude],
-                            zoom: 17,
-                            bearing: 0,
-                            pitch: 50,
-                            duration: 1500
                         });
+                        
+                        enablePoiInteractivity(navigationMapInstance);
+                        setNavigationMapClickHandler();
+                        
+                        const globeSpinPromise = new Promise(resolve => {
+                            const startCoords = { lat: 30.3715, lng: -97.1903 }; // Texas
+                            const endCoords = { lat: 40.3748, lng: -3.7354 };   // Madrid
+                            const duration = 1800;
+
+                            const directLngDiff = endCoords.lng - startCoords.lng;
+                            const totalLngChange = -(360 - directLngDiff);
+                            const totalLatChange = endCoords.lat - startCoords.lat;
+
+                            const startTimestamp = performance.now();
+
+                            function animateSpin(timestamp) {
+                                const elapsedTime = timestamp - startTimestamp;
+                                let progress = Math.min(elapsedTime / duration, 1);
+                                progress = 1 - Math.pow(1 - progress, 3);
+
+                                const currentLng = startCoords.lng + (totalLngChange * progress);
+                                const currentLat = startCoords.lat + (totalLatChange * progress);
+                                
+                                navigationMapInstance.setCenter([currentLng, currentLat]);
+
+                                if (progress < 1) {
+                                    requestAnimationFrame(animateSpin);
+                                } else {
+                                    navigationMapInstance.setCenter([endCoords.lng, endCoords.lat]);
+                                    resolve();
+                                }
+                            }
+                            requestAnimationFrame(animateSpin);
+                        });
+
+                        await globeSpinPromise;
+
+                        async function getGpsWithRetries() {
+                            const toastId = "gps-locate-toast";
+                            showToast("LOCALIZANDO VEHÍCULO...", "info", 0, false, toastId);
+                            
+                            while (true) {
+                                try {
+                                    const coords = await getCurrentLocationAsync();
+                                    const loadingToast = document.getElementById(toastId);
+                                    if (loadingToast) loadingToast.remove();
+                                    return coords;
+                                } catch (error) {
+                                    showToast(`No se pudo obtener la ubicación. Reintentando en 3 segundos...`, "warning", 0, false, toastId);
+                                    await new Promise(resolve => setTimeout(resolve, 3000));
+                                }
+                            }
+                        }
+
+                        const currentPos = await getGpsWithRetries();
+                        
+                        setMapImmersiveMode(false);
+                        navigationFollowUser = true;
+                        shouldCenterOnUser = true;
+                        updateLocateMeButtonsUI();
+                        toggleMapControls(true);
+                        navigationCurrentLocation = currentPos;
+                        updateInitialUserPosition(currentPos, navigationMapInstance);
+                        
+                        if (navigationMapInstance) {
+                            navigationMapInstance.flyTo({
+                                center: [currentPos.longitude, currentPos.latitude],
+                                zoom: 17,
+                                bearing: 0,
+                                pitch: 50,
+                                duration: 1500
+                            });
+                        }
+                        startGpsWatching();
+
+                        // --- INICIO MODIFICACIÓN RECUPERACIÓN (CORRECCIÓN) ---
+                        // Resolvemos la promesa principal AHORA que todo está listo.
+                        resolve();
+                        // --- FIN MODIFICACIÓN RECUPERACIÓN (CORRECCIÓN) ---
+                        
+                    } catch (loadError) {
+                        showToast(`Error crítico al cargar los recursos del mapa: ${loadError.message}`, "error", 10000);
+                        reject(loadError); // --- MODIFICACIÓN RECUPERACIÓN ---
                     }
-                    startGpsWatching();
-                    
-                } catch (loadError) {
-                    showToast(`Error crítico al cargar los recursos del mapa: ${loadError.message}`, "error", 10000);
-                }
-            });
-        } catch (initError) {
-             if (mapActualContainer) mapActualContainer.innerHTML = `<div style="color:red; text-align:center; padding:20px; background: rgba(0,0,0,0.7); height:100%; display:flex; align-items:center; justify-content:center; flex-direction:column;"><h2>Error al cargar el mapa</h2><p>${initError.message}</p><p style="margin-top:10px; font-size:0.9rem;">Por favor, revisa tu token de Mapbox y sus permisos (scopes).</p></div>`;
-             isNavigationMapActive = false;
+                });
+            } catch (initError) {
+                 if (mapActualContainer) mapActualContainer.innerHTML = `<div style="color:red; text-align:center; padding:20px; background: rgba(0,0,0,0.7); height:100%; display:flex; align-items:center; justify-content:center; flex-direction:column;"><h2>Error al cargar el mapa</h2><p>${initError.message}</p><p style="margin-top:10px; font-size:0.9rem;">Por favor, revisa tu token de Mapbox y sus permisos (scopes).</p></div>`;
+                 isNavigationMapActive = false;
+                 reject(initError); // --- MODIFICACIÓN RECUPERACIÓN ---
+            }
         }
-    }
-    
-    assignMapButtonListeners();
-    const lockButton = document.getElementById('toggle-progress-bar-lock');
-    if (lockButton && !lockButton.dataset.listenerAttached) {
-        lockButton.addEventListener('click', handleProgressBarLockToggle);
-        lockButton.dataset.listenerAttached = 'true';
-    }
-    updateProgressBarLockIcon();
-    
-    const radaresCheckbox = document.getElementById('radares-ruta-checkbox');
-    if (radaresCheckbox) radaresCheckbox.checked = localStorage.getItem(RADARES_RUTA_CHECKED_KEY) === 'true';
-    const tareasCheckbox = document.getElementById('tareas-ruta-checkbox');
-    if (tareasCheckbox) tareasCheckbox.checked = localStorage.getItem(TAREAS_RUTA_CHECKED_KEY) === 'true';
-    const mapboxCheckbox = document.getElementById('mapbox-primary-checkbox');
-    if (mapboxCheckbox) mapboxCheckbox.checked = localStorage.getItem('boardinggate_useMapboxAsPrimary') === 'true';
-    currentGraphMode = localStorage.getItem(GRAPH_STATE_KEY) || 'Desviación ETA';
-    mapViewMode = localStorage.getItem(MAP_VIEW_MODE_KEY) || 'static';
-    isAutoZoomActive = localStorage.getItem(AUTO_ZOOM_ACTIVE_KEY) === 'true';
-    const autoBtn = document.getElementById('zoom-auto-button');
-    if (autoBtn) autoBtn.classList.toggle('active', isAutoZoomActive);
-    toggleMapHeaderRowsVisibility(mapHeaderButtonsVisible);
-    updateStartNavigationButtonState();
-    updateNavigationButtonColor();
-    toggleMapLocationSearchVisibility(!isNavigating);
+    }); // --- MODIFICACIÓN RECUPERACIÓN ---
 }
-    
 
 // ===================================================================
 // NOMBRE: loadRouteFromObject (VERSIÓN FINAL Y ROBUSTA CONTRA MOVIMIENTO)
 // RESUMEN: "Salva" la ubicación GPS actual ANTES de limpiar, garantizando un recálculo fiable.
-async function loadRouteFromObject(routeObject, autoStartNavigation = false) {
-    if (!routeObject || !routeObject.waypoints) {
+async function loadRouteFromObject(routeObject, autoStartNavigation = false, forceImmediateStart = false) {
+    if (!routeObject || !routeObject.waypoints || routeObject.waypoints.length === 0) {
         showToast("Error: El objeto de la ruta es inválido.", "error");
         return;
     }
@@ -9933,104 +10360,111 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false) {
     }
 
     const startLocation = navigationCurrentLocation ? { ...navigationCurrentLocation } : null;
-
     resetNavigationState();
-
     currentRouteNameForSaving = routeObject.name;
-    
-    // --- INICIO DE LA CORRECCIÓN CLAVE ---
-    // En lugar de copiar todos los waypoints, preparamos la lista para usar solo los destinos.
     const waypointsFromLoadedRoute = routeObject.waypoints;
-    // --- FIN DE LA CORRECCIÓN CLAVE ---
-
-    if (isNavigationMapActive && startLocation) {
-      
-        const startPoint = {
-            id: Date.now() - 1,
-            lat: startLocation.latitude,
-            lng: startLocation.longitude,
-            type: 'S', marker: null,
-            label: 'S',
-            address: 'Posición Actual (GPS)',
-            visited: true,
-            isCriticalForRecalc: true,
-            isInternal: false,
-            isRecalculatedStart: false };
-        
-        navigationWaypoints = [startPoint];
-        
-        // --- INICIO DE LA MODIFICACIÓN CLAVE ---
-        // Usamos .slice(1) para OMITIR el primer punto (el de partida original) de la ruta guardada.
-        waypointsFromLoadedRoute.slice(1).forEach(wpData => {
-            if (wpData) {
-                navigationWaypoints.push({
-                    id: wpData.id || Date.now() + Math.random(),
-                    lat: wpData.lat, lng: wpData.lng, type: '', label: '', marker: null,
-                    address: wpData.address || '', visited: false, isCriticalForRecalc: true,
-                    isInternal: false, isRecalculatedStart: false
-                });
-            }
-        });
-        // --- FIN DE LA MODIFICACIÓN CLAVE ---
-
-    } else {
-        const isSingleDestinationRoute = routeObject.waypoints.length === 1;
-        
-        if (isSingleDestinationRoute && startLocation) {
-             const startPoint = {
-                id: Date.now() - 1, lat: startLocation.latitude, lng: startLocation.longitude,
-                type: 'S', marker: null, label: 'S', address: 'Posición Actual (GPS)', visited: true,
-                isCriticalForRecalc: true, isInternal: false, isRecalculatedStart: false
+    
+    // --- INICIO MODIFICACIÓN RECUPERACIÓN (CORRECCIÓN FINAL V8) ---
+    // Lógica dual para manejar rutas completas y destinos únicos.
+    if (waypointsFromLoadedRoute.length === 1) {
+        // Caso: Se está cargando un destino único (1 waypoint).
+        if (startLocation) {
+            const startPoint = {
+                id: Date.now() - 1,
+                lat: startLocation.latitude,
+                lng: startLocation.longitude,
+                type: 'S', marker: null, label: 'S', address: 'Posición Actual (GPS)',
+                visited: true, isCriticalForRecalc: true, isInternal: false, isRecalculatedStart: false 
             };
-            navigationWaypoints.push(startPoint);
+            const destinationWp = sanitizeWaypointsForStorage(waypointsFromLoadedRoute)[0];
+            navigationWaypoints = [startPoint, destinationWp];
+        } else {
+            showToast("Señal GPS no disponible. No se puede iniciar ruta a un único destino.", "error");
+            return; // Abortamos la carga si no hay punto de partida.
         }
-        
-        // --- INICIO DE LA MODIFICACIÓN CLAVE (PARA EL CASO 'ELSE') ---
-        const waypointsToAdd = isSingleDestinationRoute ? waypointsFromLoadedRoute : waypointsFromLoadedRoute.slice(1);
-        waypointsToAdd.forEach(wpData => {
-            if (wpData) {
-                navigationWaypoints.push({
-                    id: wpData.id || Date.now() + Math.random(),
-                    lat: wpData.lat,
-                    lng: wpData.lng,
-                    type: '', label: '', marker: null,
-                    address: wpData.address || '', visited: false, isCriticalForRecalc: true,
-                    isInternal: false, isRecalculatedStart: false
-                });
-            }
-        });
-        // --- FIN DE LA MODIFICACIÓN CLAVE ---
+    } else {
+        // Caso: Se está cargando una ruta completa (2 o más waypoints).
+        if (startLocation) {
+            const startPoint = {
+                id: Date.now() - 1,
+                lat: startLocation.latitude,
+                lng: startLocation.longitude,
+                type: 'S', marker: null, label: 'S', address: 'Posición Actual (GPS)',
+                visited: true, isCriticalForRecalc: true, isInternal: false, isRecalculatedStart: false 
+            };
+            // Descartamos el punto de salida antiguo y usamos el resto.
+            navigationWaypoints = [startPoint, ...sanitizeWaypointsForStorage(waypointsFromLoadedRoute.slice(1))];
+        } else {
+            // Si no hay GPS, cargamos la ruta original tal cual.
+            showToast("Señal GPS no disponible. Cargando ruta original...", "warning");
+            navigationWaypoints = sanitizeWaypointsForStorage(waypointsFromLoadedRoute);
+        }
     }
-
+    // --- FIN MODIFICACIÓN RECUPERACIÓN (CORRECCIÓN FINAL V8) ---
+    
     await updateWaypointTypesAndLabels();
     renderWaypointMarkers();
 
     if (navigationWaypoints.filter(wp => wp && !wp.isInternal).length >= 2) {
-        recalculateAndDrawRoute(false).then(() => {
-            if (autoStartNavigation) {
-                if (navigationMapInstance && navigationMapInstance.getSource('route') && navigationMapInstance.getSource('route')._data) {
-                    const routeGeoJSON = navigationMapInstance.getSource('route')._data;
-                    if (routeGeoJSON.geometry && routeGeoJSON.geometry.coordinates.length > 1) {
-                        const coordinates = routeGeoJSON.geometry.coordinates;
-                        const bounds = new mapboxgl.LngLatBounds();
-                        coordinates.forEach(coord => bounds.extend(coord));
-                        if (!bounds.isEmpty()) {
-                            mapPreviousZoomLevel = navigationMapInstance.getZoom();
-                            navigationMapInstance.fitBounds(bounds, { padding: 80, animate: true, duration: 1500 });
+        return new Promise((resolve, reject) => {
+            navigationMapInstance.once('idle', async () => {
+                let recalculationSuccess = false;
+                let attempts = 0;
+                const MAX_RECALC_ATTEMPTS = 5;
+
+                while (!recalculationSuccess && attempts < MAX_RECALC_ATTEMPTS) {
+                    attempts++;
+                    try {
+                        await recalculateAndDrawRoute(false);
+                        recalculationSuccess = true;
+                    } catch (error) {
+                        console.error(`Intento de recálculo #${attempts} falló:`, error);
+                        if (attempts < MAX_RECALC_ATTEMPTS) {
+                            showToast(`Fallo al trazar la ruta (${attempts}/${MAX_RECALC_ATTEMPTS}). Reintentando...`, "warning");
+                            await new Promise(resolve => setTimeout(resolve, 3000));
                         }
                     }
                 }
-                const firstDestination = navigationWaypoints.find(wp => wp && !wp.isInternal && wp.type !== 'S' && !wp.visited);
-                if (firstDestination) {
-                    fetchAndDisplayAlternativeRoutes(firstDestination.id);
+
+                if (!recalculationSuccess) {
+                    showToast("No se pudo trazar la ruta. Comprueba la conexión. Inicia la navegación manualmente cuando sea posible.", "error", 8000);
+                    const fallbackCoords = navigationWaypoints.map(wp => [wp.lng, wp.lat]);
+                    await drawRouteOnMap({ geometry: { type: 'LineString', coordinates: fallbackCoords } });
+                    updateStartNavigationButtonState();
+                    updateNavigationButtonColor();
+                    reject(new Error("Recalculation failed after all retries"));
+                    return;
                 }
-                showAutoStartNavigationModal();
-            }
+
+                if (autoStartNavigation) {
+                    if (forceImmediateStart) {
+                        toggleNavigationState(); 
+                    } else {
+                        if (navigationMapInstance && navigationMapInstance.getSource('route') && navigationMapInstance.getSource('route')._data) {
+                            const routeGeoJSON = navigationMapInstance.getSource('route')._data;
+                            if (routeGeoJSON.geometry && routeGeoJSON.geometry.coordinates.length > 1) {
+                                const coordinates = routeGeoJSON.geometry.coordinates;
+                                const bounds = new mapboxgl.LngLatBounds();
+                                coordinates.forEach(coord => bounds.extend(coord));
+                                if (!bounds.isEmpty()) {
+                                    mapPreviousZoomLevel = navigationMapInstance.getZoom();
+                                    navigationMapInstance.fitBounds(bounds, { padding: 80, animate: true, duration: 1500 });
+                                }
+                            }
+                        }
+                        const firstDestination = navigationWaypoints.find(wp => wp && !wp.isInternal && wp.type !== 'S' && !wp.visited);
+                        if (firstDestination) { fetchAndDisplayAlternativeRoutes(firstDestination.id); }
+                        showAutoStartNavigationModal();
+                    }
+                }
+                resolve();
+            });
         });
     }
     updateStartNavigationButtonState();
     updateNavigationButtonColor();
 }
+    
     
 // ===================================================================
 // NOMBRE: fetchAndRenderChatUsers (CON ESTADÍSTICAS COMPLETAS PARA ADMIN)
@@ -13206,12 +13640,16 @@ function startFreeDrive(initialCoords) {
     currentGraphMode = localStorage.getItem(GRAPH_STATE_KEY) || 'Desviación ETA'; 
     initializeNavigationGraph();
 }
-    
+
 // ===================================================================
 // NOMBRE: stopFreeDrive
 // RESUMEN: Detiene el modo de conducción libre y muestra el modal de estadísticas.
 function stopFreeDrive() {
     if (!isFreeDriveActive) return;
+
+    // --- INICIO MODIFICACIÓN RECUPERACIÓN ---
+    clearRecoveryFlag();
+    // --- FIN MODIFICACIÓN RECUPERACIÓN ---
 
     const statsToSend = { ...freeDriveStats };
     showArrivalStatsModal(statsToSend);
@@ -13225,7 +13663,7 @@ function stopFreeDrive() {
     updateNavigationButtonColor();
     clearNavigationGraph();
     showMapInfoOverlay("Modo FREE DRIVE fin de viaje");
-}
+}    
 
 // ===================================================================
 // NOMBRE: updateNavigationProgressDisplay (VERSIÓN CON VISIBILIDAD CORREGIDA)
@@ -14018,10 +14456,8 @@ async function getSuggestedRouteName(lat, lng, isMultiStage = false, totalWaypoi
         return `  ${baseName}`;
     }
 }
-    
-// ===================================================================
-// NOMBRE: initializeConfigModalListeners
-// RESUMEN: Asigna los listeners a todos los elementos interactivos del modal de configuración.
+
+// Esta función NO cambia, es la misma de la respuesta anterior.
 function initializeConfigModalListeners() {
     document.getElementById('config-save-user-firebase')?.addEventListener('click', validateAndSaveUserToFirebase);
     document.getElementById('config-save-user-firebase-from-backup-tab')?.addEventListener('click', validateAndSaveUserToFirebase);
@@ -14082,7 +14518,21 @@ function initializeConfigModalListeners() {
         });
         autoBackupCheckbox.dataset.listenerAttached = "true";
     }
-}
+
+    const monitorResourcesCheckbox = document.getElementById('config-monitor-resources');
+    if (monitorResourcesCheckbox && !monitorResourcesCheckbox.dataset.listenerAttached) {
+        monitorResourcesCheckbox.addEventListener('change', () => {
+            if (monitorResourcesCheckbox.checked) {
+                startResourceMonitor();
+                showToast('Monitor de recursos ACTIVADO.', 'info');
+            } else {
+                stopResourceMonitor();
+                showToast('Monitor de recursos DESACTIVADO.', 'info');
+            }
+        });
+        monitorResourcesCheckbox.dataset.listenerAttached = "true";
+    }
+}    
     
     // ===================================================================
     // NOMBRE: parseUserId
@@ -14535,6 +14985,7 @@ function hideIntersectionPreviewMap() {
         intersectionPreviewTimer = null;
     }
 }
+
 // ===================================================================
 // NOMBRE: addRouteToRecents (MODIFICADA - LÍMITE DE 3)
 // RESUMEN: Añade una ruta o destino al historial, evitando duplicados por nombre
@@ -14551,24 +15002,35 @@ function addRouteToRecents(routeObject) {
         recentRoutes = [];
     }
 
-    const finalAddress = routeObject.waypoints[routeObject.waypoints.length - 1]?.address || 'destino desconocido';
-    const simplifiedRoute = {
-        name: routeObject.name || `Ruta a ${finalAddress}`,
-        waypoints: routeObject.waypoints.map(wp => ({
-            lat: wp.lat,
-            lng: wp.lng,
-            address: wp.address
-        })),
-        timestamp: new Date().toISOString()
-    };
+    // --- INICIO MODIFICACIÓN RECUPERACIÓN (CORRECCIÓN FINAL V7) ---
+    // Lógica inteligente para guardar solo el destino en recientes si es una ruta simple.
+    let simplifiedRoute;
+    const waypointsForCheck = routeObject.waypoints;
+    const isSingleDestination = waypointsForCheck.length === 1 || (waypointsForCheck.length === 2 && (waypointsForCheck[0].type === 'S' || waypointsForCheck[0].isRecalculatedStart));
 
+    if (isSingleDestination) {
+        const finalWaypoint = waypointsForCheck[waypointsForCheck.length - 1];
+        simplifiedRoute = {
+            name: routeObject.name,
+            waypoints: sanitizeWaypointsForStorage([finalWaypoint]), // Guardamos solo el destino
+            timestamp: new Date().toISOString()
+        };
+    } else {
+        simplifiedRoute = {
+            name: routeObject.name,
+            waypoints: sanitizeWaypointsForStorage(waypointsForCheck), // Guardamos la ruta completa
+            timestamp: new Date().toISOString()
+        };
+    }
+    // --- FIN MODIFICACIÓN RECUPERACIÓN (CORRECCIÓN FINAL V7) ---
+    
     const uniqueRecentRoutes = recentRoutes.filter(item => item.name !== simplifiedRoute.name);
     
     uniqueRecentRoutes.unshift(simplifiedRoute);
     const finalRecentRoutes = uniqueRecentRoutes.slice(0, MAX_RECENT_ROUTES);
     localStorage.setItem(RECENT_ROUTES_KEY, JSON.stringify(finalRecentRoutes));
-}    
-
+}
+    
 // ===================================================================
 // NOMBRE: addModalAutoCloseTimer
 // RESUMEN: Añade un temporizador de autocierre a un modal.
@@ -16015,9 +16477,10 @@ async function saveCurrentRoute() {
     const defaultRouteName = await getSuggestedRouteName(lastWp.lat, lastWp.lng, isMultiStage, actualWaypointsToSave.length);
     
     const onSaveCallback = (confirmedName) => {
-        let waypointsToSave = actualWaypointsToSave.map(wp => ({
-            id: wp.id, lat: wp.lat, lng: wp.lng, label: wp.label, type: wp.type, address: wp.address || '', visited: false, isCriticalForRecalc: true, isInternal: false, isRecalculatedStart: false
-        }));
+        // --- INICIO MODIFICACIÓN RECUPERACIÓN (CORRECCIÓN FINAL V7) ---
+        // Se restaura la lógica original: siempre se guardan TODOS los waypoints de la ruta activa en favoritos.
+        let waypointsToSave = sanitizeWaypointsForStorage(actualWaypointsToSave);
+        // --- FIN MODIFICACIÓN RECUPERACIÓN (CORRECCIÓN FINAL V7) ---
 
         const routeToSave = {
             name: confirmedName,
@@ -16048,7 +16511,7 @@ async function saveCurrentRoute() {
 
     showSaveRoutePromptModal(defaultRouteName, onSaveCallback);
 }
-
+    
 // ===================================================================
 // NOMBRE: showSaveRoutePromptModal (NUEVA FUNCIÓN REUTILIZABLE)
 // RESUMEN: Muestra un modal de guardado genérico con el nuevo diseño oscuro.
@@ -16121,7 +16584,7 @@ function showSaveRoutePromptModal(defaultName, onSaveCallback) {
     confirmButton.addEventListener('click', saveAction);
     cancelButton.addEventListener('click', closePrompt);
     addModalAutoCloseTimer(overlay, confirmButton, 'save-route-prompt-modal', 20000);
-}
+}    
     
     // ===================================================================
     // NOMBRE: formatVersionDate
@@ -18389,10 +18852,14 @@ function saveSettings() {
         }
     }
 }
+
 // ===================================================================
 // NOMBRE: handleLoadOrDeleteRouteClick (MODIFICADA - USA RESET CENTRAL)
 // RESUMEN: Llama a la función de reseteo completa antes de realizar otras acciones.
 function handleLoadOrDeleteRouteClick(button) {
+    // --- INICIO MODIFICACIÓN RECUPERACIÓN ---
+    clearRecoveryFlag();
+    // --- FIN MODIFICACIÓN RECUPERACIÓN ---
     clearAlternativeRoutesDisplay(); 
     resetNavigationState();
 
@@ -18417,7 +18884,8 @@ function handleLoadOrDeleteRouteClick(button) {
     
     updateStartNavigationButtonState();
     updateNavigationButtonColor();
-}
+}    
+
 // ===================================================================
 // NOMBRE: showLoadRouteModal (MODIFICADA - NUEVO DISEÑO CON RECIENTES)
 // RESUMEN: Muestra el modal de carga con una sección superior para rutas/destinos recientes,
@@ -18447,7 +18915,6 @@ function showLoadRouteModal() {
                 <button id="clear-filter-button" class="clear-input-btn" title="Limpiar filtro" style="display: none;">×</button>
             </div>
             
-            <!-- NUEVO: Sección de Recientes/Favoritos fuera de las pestañas -->
             <h3 class="routes-section-title">Recientes</h3>
             <div id="recents-container" class="route-scroll-container" style="max-height: 180px; flex-grow: 0; margin-bottom: 15px;">
                 <ul id="recent-items-list" class="route-list"></ul>
@@ -18587,14 +19054,18 @@ function showLoadRouteModal() {
         }
         
         const recentRouteNames = recentRoutes.map(r => r.name);
-
+        
         const savedDestinationsList = document.getElementById('saved-destinations-list');
         savedDestinationsList.innerHTML = '';
-        const savedDestinations = savedRoutes.filter(r => 
-            r.waypoints.length === 1 && 
-            !recentRouteNames.includes(r.name) && 
-            r.name.toUpperCase().includes(filterText)
-        );
+        
+        // --- INICIO MODIFICACIÓN RECUPERACIÓN (CORRECCIÓN FINAL V7) ---
+        // Lógica corregida para clasificar rutas simples en "Destinos".
+        const savedDestinations = savedRoutes.filter(r => {
+            const isSingleDestination = r.waypoints.length === 1 || (r.waypoints.length === 2 && (r.waypoints[0].type === 'S' || r.waypoints[0].isRecalculatedStart));
+            return isSingleDestination && !recentRouteNames.includes(r.name) && r.name.toUpperCase().includes(filterText);
+        });
+        // --- FIN MODIFICACIÓN RECUPERACIÓN (CORRECCIÓN FINAL V7) ---
+
         if (savedDestinations.length > 0) {
             savedDestinations.forEach(route => renderRouteListItem(route, savedDestinationsList, false));
         } else {
@@ -18603,11 +19074,15 @@ function showLoadRouteModal() {
 
         const savedRoutesList = document.getElementById('saved-routes-list');
         savedRoutesList.innerHTML = '';
-        const savedMultiStage = savedRoutes.filter(r => 
-            r.waypoints.length > 1 && 
-            !recentRouteNames.includes(r.name) && 
-            r.name.toUpperCase().includes(filterText)
-        );
+        
+        // --- INICIO MODIFICACIÓN RECUPERACIÓN (CORRECCIÓN FINAL V7) ---
+        // Lógica corregida para clasificar rutas multietapa en "Rutas".
+        const savedMultiStage = savedRoutes.filter(r => {
+            const isMultiStageRoute = r.waypoints.length > 2;
+            return isMultiStageRoute && !recentRouteNames.includes(r.name) && r.name.toUpperCase().includes(filterText);
+        });
+        // --- FIN MODIFICACIÓN RECUPERACIÓN (CORRECCIÓN FINAL V7) ---
+        
         if (savedMultiStage.length > 0) {
             savedMultiStage.forEach(route => renderRouteListItem(route, savedRoutesList, false));
         } else {
@@ -18619,13 +19094,15 @@ function showLoadRouteModal() {
     clearFilterBtn.addEventListener('click', () => { filterInput.value = ''; displayRoutes(); });
     displayRoutes();
 }
+    
 
 // ===================================================================
 // NOMBRE: closeNavigationMap (MODIFICADA - USA RESET CENTRAL)
 // RESUMEN: Llama a la función de reseteo al cerrar el mapa para asegurar limpieza.
 function closeNavigationMap(force = false) {
+    clearRecoveryFlag();
     hideAddressSuggestionsModal();
-    resetNavigationState(); // Llamada a la nueva función de reseteo
+    resetNavigationState(); 
     
     if (manualZoomTimeout) { clearTimeout(manualZoomTimeout); manualZoomTimeout = null; }
     isManualZoomActive = false;
@@ -18641,8 +19118,7 @@ function closeNavigationMap(force = false) {
         location.reload();
         return;
     }
-    directToNavOnLoad = false;
-    sessionStorage.removeItem('isInDirectToMapMode');
+    
     isNavigationMapActive = false;
     sessionStorage.removeItem('mapContext');
     if (locationWatchId !== null && navigator.geolocation) { navigator.geolocation.clearWatch(locationWatchId); locationWatchId = null; }
@@ -18666,20 +19142,24 @@ function closeNavigationMap(force = false) {
     sessionStorage.removeItem('boardinggate_map_should_reopen_after_form');
     hideUnifiedReminderWindow();
     
-    if (!directToNavOnLoad) {
-        const mainContent = document.querySelector('main'); if (mainContent) mainContent.style.display = 'block';
-        const footer = document.querySelector('footer'); if (footer) footer.style.display = 'block';
-        const noticesContainer = document.querySelector('.notices-icon-container'); if (noticesContainer) noticesContainer.style.display = 'flex';
-        const sideControls = document.querySelectorAll('.toggle-image, .toggle-sign, .scroll-toggle-button'); sideControls.forEach(el => el.style.display = 'flex');
-        document.querySelectorAll('#config-button, #personal-button, #radar-button, #home-button, #reload-button, #keyword-assignment-button, #password-toggle-button, #versions-button, #info-button').forEach(el => el.style.display = 'block');
-        const gridFilter = document.getElementById('grid-filter-container'); if (gridFilter) gridFilter.style.display = 'flex';
-        renderGrid();
-        renderToggleButtons();
-        updateButtonStyles();
-        filterGridItems();
-        setTimeout(adjustButtonPositions, 100);
+    // --- INICIO MODIFICACIÓN RECUPERACIÓN (CORRECCIÓN FINAL V4) ---
+    // Si la app se cargó directamente en el mapa, debemos forzar la carga y renderizado de la UI.
+    if (directToNavOnLoad) {
+        loadCustomData();
+        loadSavedSettings();
+        applyMainUISettings();
+        directToNavOnLoad = false;
     }
+    // --- FIN MODIFICACIÓN RECUPERACIÓN (CORRECCIÓN FINAL V4) ---
+
+    const mainContent = document.querySelector('main'); if (mainContent) mainContent.style.display = 'block';
+    const footer = document.querySelector('footer'); if (footer) footer.style.display = 'block';
+    const noticesContainer = document.querySelector('.notices-icon-container'); if (noticesContainer) noticesContainer.style.display = 'flex';
+    const sideControls = document.querySelectorAll('.toggle-image, .toggle-sign, .scroll-toggle-button'); sideControls.forEach(el => el.style.display = 'flex');
+    document.querySelectorAll('#config-button, #personal-button, #radar-button, #home-button, #reload-button, #keyword-assignment-button, #password-toggle-button, #versions-button, #info-button').forEach(el => el.style.display = 'block');
+    const gridFilter = document.getElementById('grid-filter-container'); if (gridFilter) gridFilter.style.display = 'flex';
 }
+    
 // ===================================================================
 // NOMBRE: updateStartNavigationButtonState (CORRECCIÓN FINAL: SIMULADOR SIEMPRE VISIBLE)
 // RESUMEN: Actualiza la visibilidad de los botones de navegación. Iniciar y Simular GPS ahora siempre están visibles.
@@ -22077,280 +22557,6 @@ function startGraphIntervalTimer() {
 }
 
 // ===================================================================
-// NOMBRE: initializeApp (VERSIÓN FINAL CON LLAMADA A FUNCIÓN CORREGIDA)
-// RESUMEN: Llama a la nueva función `uploadDirtyCacheOnLoad_Car` y establece el timestamp inicial para la sincronización móvil.
-async function initializeApp() {
-    loadCustomData();
-    loadSavedSettings();
-    applyMapVisualSettings();
-    isMobileSession = parseUserId(localStorage.getItem('userData_userId')).isMobile; // <-- AÑADE ESTA LÍNEA AQUÍ
-    
-    if (isMobileSession) {
-        document.body.classList.add('mobile-view');
-        await restoreCacheForMobile();
-    } else {
-        await uploadDirtyCacheOnLoad_Car();
-    }
-
-    // Establecemos el timestamp de la última sincronización al cargar la página.
-    lastMobileSyncTimestamp = parseInt(localStorage.getItem('lastCacheUpdateTimestamp') || '0');
-    
-    checkForExcessiveRadars();
-    
-    const termsAccepted = localStorage.getItem('termsAccepted_v1') === 'true';
-    const shouldDirectToNav = JSON.parse(localStorage.getItem(DIRECT_TO_NAVIGATION_KEY)) || false;
-    const tempPreventDirectNav = sessionStorage.getItem(TEMP_PREVENT_DIRECT_NAV_KEY);
-    
-    if (shouldDirectToNav && !tempPreventDirectNav && termsAccepted) {
-        sessionStorage.setItem('isInDirectToMapMode', 'true');
-        directToNavOnLoad = true;
-        const mainContent = document.querySelector('main'); if (mainContent) mainContent.style.display = 'none';
-        const footerContent = document.querySelector('footer'); if (footerContent) footerContent.style.display = 'none';
-        const noticesIconContainer = document.querySelector('.notices-icon-container'); if (noticesIconContainer) noticesIconContainer.style.display = 'none';
-        const sideControls = document.querySelectorAll('.toggle-image, .toggle-sign, .scroll-toggle-button'); sideControls.forEach(el => el.style.display = 'none');
-        document.querySelectorAll('#config-button, #personal-button, #radar-button, #home-button, #reload-button, #keyword-assignment-button, #password-toggle-button, #versions-button, #info-button').forEach(el => el.style.display = 'none');
-        document.getElementById('grid-filter-container').style.display = 'none';
-        createOtherButtons();
-        renderToggleButtons();
-        openNavigationMap();
-    } else {
-        sessionStorage.removeItem('isInDirectToMapMode');
-        directToNavOnLoad = false;
-        const mainContent = document.querySelector('main'); if (mainContent) mainContent.style.display = 'block';
-        const footerContent = document.querySelector('footer'); if (footerContent) footerContent.style.display = 'block';
-        const noticesIconContainer = document.querySelector('.notices-icon-container'); if (noticesIconContainer) noticesIconContainer.style.display = 'flex';
-        const sideControls = document.querySelectorAll('.toggle-image, .toggle-sign, .scroll-toggle-button'); sideControls.forEach(el => el.style.display = 'flex');
-        document.querySelectorAll('#config-button, #personal-button, #radar-button, #home-button, #reload-button, #keyword-assignment-button, #password-toggle-button, #versions-button, #info-button').forEach(el => el.style.display = 'block');
-        document.getElementById('grid-filter-container').style.display = 'flex';
-        renderGrid();
-        createOtherButtons();
-        renderToggleButtons();
-        updateButtonStyles();
-        filterGridItems();
-    }
-
-    initializeConfigModalListeners();
-    try { await updateVersion(); } catch (e) { }
-    try { await loadNotices(); startNoticeRotation(); } catch (e) { }
-    if (reminderCheckIntervalId) { clearInterval(reminderCheckIntervalId); }
-    
-    checkReminders(); 
-
-    currentCheckIntervalDuration = 3000;
-    reminderCheckIntervalId = setInterval(checkReminders, currentCheckIntervalDuration);
-    
-    if (!termsAccepted) {
-        showConfigModal();
-    }
-
-    const noticeToggleIcon = document.getElementById('notice-toggle-icon');
-    if (noticeToggleIcon) noticeToggleIcon.addEventListener('click', toggleNotices);
-    const countEl = document.getElementById('reminder-count-globe');
-    if (countEl) {
-         const openTable = (e) => {
-             if (isEditMode || isAssignmentMode || isKeywordAssignmentMode) return;
-             e.preventDefault(); e.stopPropagation();
-             showAllReminders();
-         };
-         countEl.addEventListener('click', openTable);
-         countEl.style.cursor = 'pointer';
-    }
-    const filterInput = document.getElementById('grid-filter-input');
-    const clearButton = document.getElementById('clear-filter-button');
-    if (filterInput) {
-        const savedFilter = localStorage.getItem('gridFilterValue');
-        if (savedFilter !== null) filterInput.value = savedFilter;
-        filterInput.addEventListener('input', () => {
-             localStorage.setItem('gridFilterValue', filterInput.value);
-             filterGridItems();
-             if(isKeywordAssignmentMode) applyInitialKeywordHighlights();
-        });
-    }
-    if (clearButton) {
-        clearButton.addEventListener('click', () => {
-             if (filterInput) filterInput.value = '';
-             localStorage.removeItem('gridFilterValue');
-             filterGridItems();
-             if(isKeywordAssignmentMode) applyInitialKeywordHighlights();
-        });
-    }
-    adjustButtonPositions();
-    window.addEventListener('resize', adjustButtonPositions);
-    
-    const openChatArea = document.getElementById('open-chat-area');
-    if (openChatArea) {
-        openChatArea.addEventListener('click', openChatModal);
-    }
-    updateTotalMessageCount(); 
-    
-    const userCountGlobe = document.getElementById('user-count-globe');
-    if (userCountGlobe) {
-        userCountGlobe.addEventListener('click', () => {
-            showToast('Usuarios activos', 'info');
-        });
-        if (window.db && window.getDocs && window.collection) {
-            const usersCollectionRef = window.collection(window.db, "user_data");
-            window.getDocs(usersCollectionRef).then(snapshot => {
-                userCountGlobe.textContent = snapshot.size;
-            }).catch(error => {
-                userCountGlobe.textContent = 'X';
-            });
-        }
-    }
-
-    await checkVersionsIconOpacity();
-
-    document.body.addEventListener('click', function(event) {
-        const target = event.target;
-        const targetId = target.id || (target.closest('[id]') ? target.closest('[id]').id : null);
-        if (targetId === 'config-close-modal') {
-            const termsAcceptedForClose = localStorage.getItem('termsAccepted_v1') === 'true';
-            if (!termsAcceptedForClose) {
-                showToast('Debes aceptar las normas de uso para continuar.', 'warning');
-                return;
-            }
-            const modal = document.getElementById('config-modal');
-            if (modal && !modal.classList.contains('hidden')) {
-                clearModalAutoCloseTimer(modal, target, 'config-modal');
-                modal.classList.add('hidden');
-                 const mapWasOpenBeforeConfig = sessionStorage.getItem('boardinggate_map_should_reopen_after_config') === 'true';
-                 const mapContextToReopen = sessionStorage.getItem('mapContextToReopenAfterConfig');
-                 sessionStorage.removeItem('boardinggate_map_should_reopen_after_config');
-                 sessionStorage.removeItem('mapContextToReopenAfterConfig');
-                 if (mapWasOpenBeforeConfig && !document.getElementById('unified-reminder-window')?.classList.contains('visible') && !document.getElementById('reminders-location-map-modal')) {
-                    if (mapContextToReopen === 'navigation') {
-                        setTimeout(() => openNavigationMap(), 50);
-                    }
-                }
-            }
-        }
-        if (target.matches('.config-tab-button')) {
-            const modal = document.getElementById('config-modal');
-            if(modal && modal.classList.contains('hidden') === false) {
-                const tabTarget = target.dataset.tabTarget;
-                modal.querySelectorAll('.config-tab-button').forEach(btn => btn.classList.remove('active'));
-                modal.querySelectorAll('.config-tab-content').forEach(content => content.classList.remove('active'));
-                target.classList.add('active');
-                if (modal.querySelector(tabTarget)) {
-                    modal.querySelector(tabTarget).classList.add('active');
-                }
-            }
-        }
-        if (targetId === 'close-reminders-top' || targetId === 'close-reminders-bottom') {
-            const modalTable = document.querySelector('.reminder-table-modal');
-            if (modalTable) {
-                if (modalTable.autoCloseInterval) clearInterval(modalTable.autoCloseInterval);
-                modalTable.remove();
-                const mapShouldReopen = sessionStorage.getItem('boardinggate_map_was_open_before_table') === 'true';
-                const mapContext = sessionStorage.getItem('mapContext');
-                sessionStorage.removeItem('boardinggate_map_was_open_before_table');
-                sessionStorage.removeItem('mapContext');
-                if (fromReminderModal) {
-                    fromReminderModal = false;
-                    if (mapShouldReopen) {
-                        sessionStorage.setItem('boardinggate_map_should_reopen_after_form', 'true');
-                        sessionStorage.setItem('mapContext', mapContext);
-                    }
-                    showReminderModal();
-                } else if (mapShouldReopen) {
-                     if (mapContext === 'navigation') openNavigationMap();
-                }
-            }
-        }
-        if (targetId === 'view-all-locations-map') {
-            const modalTable = document.querySelector('.reminder-table-modal');
-             if (modalTable && modalTable.autoCloseInterval) clearInterval(modalTable.autoCloseInterval);
-             if (modalTable) modalTable.remove();
-            setTimeout(() => {
-                openLocationsPreviewMap();
-            }, 50);
-        }
-         if (targetId === 'close-locations-preview') {
-            const previewModal = document.getElementById('locations-preview-modal');
-            if (previewModal) {
-                if (locationsPreviewMap) {
-                    try { locationsPreviewMap.remove(); } catch (e) {}
-                    locationsPreviewMap = null;
-                }
-                if (mapLayersControlLocationsPreview) {
-                    try {mapLayersControlLocationsPreview.remove();} catch(e){}
-                    mapLayersControlLocationsPreview = null;
-                }
-                clearModalAutoCloseTimer(previewModal, target, 'locations-preview-modal');
-                previewModal.classList.add('hidden');
-            }
-        }
-        if (targetId === 'close-address-suggestions-modal') {
-            hideAddressSuggestionsModal();
-        }
-    });
-    const configModal = document.getElementById('config-modal');
-    if (configModal) {
-        configModal.addEventListener('click', function(event) {
-            const target = event.target;
-            if (target.matches('.config-tab-button')) {
-                const tabTarget = target.dataset.tabTarget;
-                configModal.querySelectorAll('.config-tab-button').forEach(btn => btn.classList.remove('active'));
-                configModal.querySelectorAll('.config-tab-content').forEach(content => content.classList.remove('active'));
-                target.classList.add('active');
-                if (configModal.querySelector(tabTarget)) {
-                    configModal.querySelector(tabTarget).classList.add('active');
-                }
-            }
-        });
-    }
-    const bookmarkGrid = document.getElementById('bookmark-grid');
-    if (bookmarkGrid) {
-        bookmarkGrid.addEventListener('click', function(event) {
-            const link = event.target.closest('a.bookmark-item');
-            if (link && link.href && link.href.startsWith("map-action:")) {
-                event.preventDefault();
-                const action = link.href.split(":")[1];
-                if (action === "openRemindersMapWithNoRadars") {
-                    closeOtherModals();
-                    setTimeout(() => {
-                        const existingPreviewModal = document.getElementById('locations-preview-modal');
-                        if (existingPreviewModal && !existingPreviewModal.classList.contains('hidden')) {
-                            showToast("El mapa de ubicaciones (sin radar) ya está abierto", "info");
-                        } else {
-                           openLocationsPreviewMap();
-                        }
-                    }, 50);
-                } else if (action === "openRemindersMap") {
-                    closeOtherModals();
-                    setTimeout(() => {
-                        const mapModalElement = document.getElementById('reminders-location-map-modal');
-                        if (mapModalElement && !mapModalElement.classList.contains('hidden')) {
-                            showToast("El mapa de navegación/ubicaciones ya está abierto", "info");
-                            if (navigationMapInstance) {
-                                requestAnimationFrame(() => {
-                                    requestAnimationFrame(() => {
-                                        if (navigationMapInstance) {
-                                            try {
-                                                 navigationMapInstance.resize();
-                                             } catch (e) {  }
-                                        }
-                                    });
-                                });
-                            }
-                        } else {
-                           openNavigationMap();
-                        }
-                    }, 50);
-                }
-            }
-        });
-    }
-    
-    const accidentAlertButton = document.getElementById('accident-alert-button');
-    if (accidentAlertButton) {
-        accidentAlertButton.addEventListener('click', () => {
-            if (isEditMode || isAssignmentMode || isKeywordAssignmentMode) return;
-            openAlertModal();
-        });
-    }
-}
-// ===================================================================
 // NOMBRE: showDeviationModal (VERSIÓN FINAL CON LÓGICA DUAL Y TEMPORIZADOR)
 // RESUMEN: Muestra un modal diferente si la ruta es simple o multietapa.
 //          Para rutas multietapa, incluye un temporizador de 10s que
@@ -22706,6 +22912,116 @@ async function autoSaveFromMobile(primaryId, backupPassword) {
         showToast(`Error al sincronizar: ${saveResult.message}`, 'error');
     }
 }
+
+
+
+// ===================================================================
+// INICIO: LÓGICA DE MONITOREO DE RECURSOS (Versión simple y funcional)
+// ===================================================================
+let resourceMonitorInterval = null;
+let fpsCounter = {
+    frame: 0,
+    lastTime: performance.now(),
+    fps: 0
+};
+let isMonitoring = false;
+
+// Función para formatear bytes a un formato legible
+function formatBytes(bytes, decimals = 2) {
+    if (typeof bytes !== 'number' || isNaN(bytes) || bytes === 0) return '0 Bytes';
+    const k = 1024;
+    const dm = decimals < 0 ? 0 : decimals;
+    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+}
+
+// Función para actualizar el contador de FPS
+function updateFPS(timestamp) {
+    if (!isMonitoring) return;
+    fpsCounter.frame++;
+    const delta = timestamp - fpsCounter.lastTime;
+    if (delta >= 1000) {
+        fpsCounter.fps = (fpsCounter.frame / (delta / 1000)).toFixed(0);
+        fpsCounter.frame = 0;
+        fpsCounter.lastTime = timestamp;
+    }
+    requestAnimationFrame(updateFPS);
+}
+
+// Inicia el monitoreo de recursos
+function startResourceMonitor() {
+    if (isMonitoring) return;
+
+    if (typeof performance === 'undefined' || !performance.memory) {
+        showToast("El monitoreo de memoria no es compatible.", "warning");
+        const checkbox = document.getElementById('config-monitor-resources');
+        if (checkbox) checkbox.checked = false;
+        return;
+    }
+
+    isMonitoring = true;
+    requestAnimationFrame(updateFPS);
+
+    resourceMonitorInterval = setInterval(() => {
+        const memory = performance.memory;
+        
+        const used = formatBytes(memory.usedJSHeapSize);
+        const total = formatBytes(memory.totalJSHeapSize);
+        const limit = formatBytes(memory.jsHeapSizeLimit);
+        const fps = fpsCounter.fps;
+
+        // Formatea el texto para que se alinee usando una etiqueta <pre>
+        const messageContent = `<pre style="margin:0; padding:0; font-family:monospace; font-size:0.85rem;">` +
+            `MEMORIA EN USO:   ${used.padStart(12)}\n` +
+            `MEMORIA RESERVADA: ${total.padStart(12)}\n` +
+            `MEMORIA LÍMITE:   ${limit.padStart(12)}\n` +
+            `FPS:              ${String(fps).padStart(12)}` +
+            `</pre>`;
+            
+        const buttonHtml = `<button onclick="document.getElementById('config-monitor-resources').click()" style="width:100%; margin-top:8px; padding:4px 8px; font-size:0.9rem; font-weight:bold; background-color:#dc3545; color:white; border:none; border-radius:4px; cursor:pointer;">Cancelar</button>`;
+
+        // Usamos la función showToast existente, pero le pasamos el HTML completo
+        showToast(messageContent + buttonHtml, 'debug', 0, false, 'resource-monitor-toast');
+        
+        // Ajustamos el estilo de la tostada después de que se cree
+        const toast = document.getElementById('resource-monitor-toast');
+        if (toast) {
+            toast.style.top = '10px';
+            toast.style.right = '10px';
+            toast.style.bottom = 'auto';
+            toast.style.left = 'auto';
+            toast.style.transform = 'none';
+            toast.style.maxWidth = '300px';
+            toast.style.backgroundColor = 'rgba(40, 40, 40, 0.85)';
+            toast.style.backdropFilter = 'blur(5px)';
+            toast.style.border = '1px solid rgba(255, 255, 255, 0.2)';
+        }
+    }, 2000);
+}
+
+// Detiene el monitoreo de recursos
+function stopResourceMonitor() {
+    if (!isMonitoring) return;
+
+    isMonitoring = false;
+    if (resourceMonitorInterval) {
+        clearInterval(resourceMonitorInterval);
+        resourceMonitorInterval = null;
+    }
+
+    const toast = document.getElementById('resource-monitor-toast');
+    if (toast) {
+        toast.remove();
+        // Limpiamos del array de toasts activos para evitar problemas
+        activeToasts = activeToasts.filter(t => t.id !== 'resource-monitor-toast');
+    }
+}
+// ===================================================================
+// FIN: LÓGICA DE MONITOREO DE RECURSOS
+// ===================================================================
+
+    
 
 // ===================================================================
 // NOMBRE: DOMContentLoaded (MODIFICADO)
