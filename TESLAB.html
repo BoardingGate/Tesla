@@ -1,4 +1,4 @@
-DO 25
+HW01
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -5137,7 +5137,26 @@ class CombinedMapControl {
     let progressBarForceShowUntil = 0;
     let lastProcessedStepForLock = null;
 
-    const managedKeys = [ 'reminders','darkMode','toggleStates','zoomState','onOffState','noticesActive', 'footerVisible','teslaHtmlLastModified','teslaHtmlLastModifiedTimestamp', 'userData_userId','userData_teslaModel','userData_teslaYear','userData_teslaProvince', 'userData_allowDMs', 'customGridData', 'personalizationHelpShown', 'gridFilterValue',  'password_pin', 'password_active', 'lastUpdatesCheckDate', SAVED_LOCATIONS_KEY,  SHOW_EXCLUDED_REMINDERS_KEY, SAVED_ROUTES_KEY, RADARES_RUTA_CHECKED_KEY,  TAREAS_RUTA_CHECKED_KEY, ACTIVE_MAP_LAYER_KEY, DIRECT_TO_NAVIGATION_KEY, GRAPH_STATE_KEY, 'boardinggate_autoBackupOnLoad', 'userData_backupPassword', MAP_SEARCH_INPUT_KEY, 'mapViewMode_v1', MAP_FILTER_INPUT_KEY, PROGRESS_BAR_LOCKED_KEY,  MAP_VIEW_OFFSET_X_KEY,MAP_VIEW_OFFSET_Y_KEY,  MAP_VIEW_SHOW_MINIMAP_KEY, MAP_VIEW_PITCH_KEY  ];
+    const PERFORMANCE_RATIO_ROUTE_KEY = 'perf_ratio_route';
+    const PERFORMANCE_RATIO_ALERTS_KEY = 'perf_ratio_alerts';
+    const PERFORMANCE_RATIO_STATS_KEY = 'perf_ratio_stats';
+    const PERFORMANCE_RATIO_GRAPH_KEY = 'perf_ratio_graph';
+    
+    let performanceRatios = {
+        routeProgress: 6,
+        trafficAlerts: 15,
+        tripStats: 15,
+        performanceGraph: 20
+    };
+    
+    let gpsTickCounter = 0;
+    let gpsHzMonitor = {
+        ticks: 0,
+        interval: null
+    };
+
+
+    const managedKeys = [ 'reminders','darkMode','toggleStates','zoomState','onOffState','noticesActive', 'footerVisible','teslaHtmlLastModified','teslaHtmlLastModifiedTimestamp', 'userData_userId','userData_teslaModel','userData_teslaYear','userData_teslaProvince', 'userData_allowDMs', 'customGridData', 'personalizationHelpShown', 'gridFilterValue',  'password_pin', 'password_active', 'lastUpdatesCheckDate', SAVED_LOCATIONS_KEY,  SHOW_EXCLUDED_REMINDERS_KEY, SAVED_ROUTES_KEY, RADARES_RUTA_CHECKED_KEY,  TAREAS_RUTA_CHECKED_KEY, ACTIVE_MAP_LAYER_KEY, DIRECT_TO_NAVIGATION_KEY, GRAPH_STATE_KEY, 'boardinggate_autoBackupOnLoad', 'userData_backupPassword', MAP_SEARCH_INPUT_KEY, 'mapViewMode_v1', MAP_FILTER_INPUT_KEY, PROGRESS_BAR_LOCKED_KEY,  MAP_VIEW_OFFSET_X_KEY,MAP_VIEW_OFFSET_Y_KEY,  MAP_VIEW_SHOW_MINIMAP_KEY, MAP_VIEW_PITCH_KEY, 'perf_ratio_route', 'perf_ratio_alerts', 'perf_ratio_stats', 'perf_ratio_graph' ];
     const managedDesc = managedKeys.map(k => {
             switch(k){
                 case 'reminders':return 'Recordatorios'; case 'darkMode':return 'Modo Oscuro'; case 'toggleStates':return 'Visibilidad Secc.';
@@ -5480,6 +5499,730 @@ async function initializeApp() {
           if (graphIntervalTimer) clearInterval(graphIntervalTimer);
      });
 }    
+
+
+
+// ===================================================================
+// NOMBRE: updateInitialUserPosition (¡REFACTORIZADA Y OPTIMIZADA!)
+// RESUMEN: Orquestador principal que se ejecuta en cada tick del GPS.
+//          Distribuye las tareas a funciones especializadas según ratios
+//          de frecuencia configurables para un rendimiento óptimo.
+// ===================================================================
+function updateInitialUserPosition(coords, mapInstanceToUse) {
+    if (!mapInstanceToUse || !coords || typeof coords.latitude !== 'number' || typeof coords.longitude !== 'number' || isNaN(coords.latitude) || isNaN(coords.longitude)) {
+        console.warn("[GPS] Datos de coordenadas inválidos recibidos. Omitiendo actualización.");
+        return;
+    }
+
+    gpsTickCounter = (gpsTickCounter + 1) % 6000; // Se reinicia cada 100 minutos aprox. a 1Hz para seguridad.
+    
+    // --- NIVEL 1: CRÍTICO (Cada Tick) ---
+    // Tareas indispensables para la fluidez visual del movimiento.
+    updateVehicleMarker(coords, mapInstanceToUse);
+    updateMapCamera(coords, mapInstanceToUse);
+
+    // --- NIVEL 2: ALTA FRECUENCIA (Controlado por Ratio) ---
+    // Lógica principal de la navegación.
+    if (gpsTickCounter % performanceRatios.routeProgress === 0) {
+        if (isNavigating) {
+            processRouteProgress(coords, mapInstanceToUse);
+        }
+    }
+
+    // --- NIVEL 3: FRECUENCIA MEDIA (Controlado por Ratio) ---
+    // Alertas y estadísticas que no necesitan ser instantáneas.
+    if (gpsTickCounter % performanceRatios.trafficAlerts === 0) {
+        checkAlertsProximity();
+    }
+    
+    if (gpsTickCounter % performanceRatios.tripStats === 0) {
+        updateTripStatistics(coords);
+    }
+
+    // --- NIVEL 4: BAJA FRECUENCIA (Controlado por Ratio) ---
+    // Gráfica que muestra tendencias a lo largo del tiempo.
+    if (gpsTickCounter % performanceRatios.performanceGraph === 0) {
+        plotIntervalData();
+    }
+}
+
+// ===================================================================
+// NOMBRE: updateVehicleMarker (NUEVA FUNCIÓN AUXILIAR)
+// RESUMEN: Gestiona exclusivamente la posición y rotación del marcador del vehículo.
+// ===================================================================
+function updateVehicleMarker(coords, mapInstanceToUse) {
+    lastGpsUpdateTime = Date.now();
+    const lngLat = new mapboxgl.LngLat(coords.longitude, coords.latitude);
+    initialUserLocationMarkerLat = coords.latitude;
+    initialUserLocationMarkerLng = coords.longitude;
+
+    let validatedHeading = null;
+    if (coords.heading !== null && typeof coords.heading === 'number' && !isNaN(coords.heading) && coords.heading >= 0) {
+        validatedHeading = coords.heading;
+    } else if (window.lastPositionForSpeedCalc && typeof turf !== 'undefined') {
+        const lastPoint = turf.point([window.lastPositionForSpeedCalc.longitude, window.lastPositionForSpeedCalc.latitude]);
+        const currentPoint = turf.point([coords.longitude, coords.latitude]);
+        if (turf.distance(lastPoint, currentPoint, { units: 'meters' }) > 1) {
+            const bearing = turf.bearing(lastPoint, currentPoint);
+            validatedHeading = (bearing < 0) ? bearing + 360 : bearing;
+        }
+    }
+    if (validatedHeading === null) {
+        validatedHeading = (markerAnimationState.currentIconRotation + 90 + 360) % 360; 
+    }
+
+    if (!initialUserLocationMarker) {
+        const vehicleIconElement = document.createElement('div');
+        vehicleIconElement.style.width = '48px';
+        vehicleIconElement.style.height = '48px';
+        vehicleIconElement.innerHTML = `<img src="PNG/AVANCE.PNG" alt="Coche" style="width:100%; height:100%; object-fit:contain;">`;
+        initialUserLocationMarker = new mapboxgl.Marker({ element: vehicleIconElement, rotationAlignment: 'map', anchor: 'center' })
+            .setLngLat(lngLat)
+            .addTo(mapInstanceToUse);
+    }
+    
+    if (!markerAnimationState.currentLngLat) {
+        markerAnimationState.currentLngLat = lngLat;
+    }
+   
+    markerAnimationState.targetLngLat = lngLat;
+    markerAnimationState.targetIconRotation = validatedHeading - 90; 
+    
+    if (!markerAnimationState.animationFrameId) {
+        markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
+    }
+
+    if (compassAndModeControl) {
+        compassAndModeControl.updateOrientation(validatedHeading);
+    }
+}
+
+// ===================================================================
+// NOMBRE: updateMapCamera (NUEVA FUNCIÓN AUXILIAR)
+// RESUMEN: Gestiona exclusivamente el movimiento de la cámara del mapa.
+// ===================================================================
+function updateMapCamera(coords, mapInstanceToUse) {
+    const shouldFollow = (shouldCenterOnUser || navigationFollowUser);
+    if (!shouldFollow || isRecalculatingRoute || !mapInstanceToUse) {
+        return;
+    }
+    
+    const lngLat = new mapboxgl.LngLat(coords.longitude, coords.latitude);
+
+    const maneuverCameraAdjustments = handleProgressiveManeuverZoom(
+        navigationCurrentRouteData?.routes?.[0]?.legs?.[currentLegIndexNav]?.steps?.[currentStepIndexNav],
+        distanceToNextManeuverOSRM,
+        lastCarDistanceAlongRouteForNavLogic
+    );
+
+    let targetZoom = maneuverCameraAdjustments ? maneuverCameraAdjustments.zoom : null;
+    let targetPitch = maneuverCameraAdjustments ? maneuverCameraAdjustments.pitch : null;
+
+    if (targetZoom === null) {
+        targetZoom = handleAutoZoom();
+    }
+    
+    if (targetZoom !== null && (typeof targetZoom !== 'number' || isNaN(targetZoom))) {
+        console.error(`[VALIDACIÓN] Se ha detectado un valor de zoom inválido (${targetZoom}). Se anulará el cambio de zoom en este ciclo para prevenir un error.`);
+        targetZoom = null;
+    }
+    
+    const viewOptions = {
+        center: lngLat,
+        duration: 1000,
+        essential: true
+    };
+    
+    const mapHeight = mapInstanceToUse.getCanvas().clientHeight;
+    const mapWidth = mapInstanceToUse.getCanvas().clientWidth;
+    viewOptions.padding = {
+        top: mapOffsetY > 0 ? mapHeight * Math.abs(mapOffsetY / 100) : 0,
+        bottom: mapOffsetY < 0 ? mapHeight * Math.abs(mapOffsetY / 100) : 0,
+        left: mapOffsetX > 0 ? mapWidth * Math.abs(mapOffsetX / 100) : 0,
+        right: mapOffsetX < 0 ? mapWidth * Math.abs(mapOffsetX / 100) : 0
+    };
+    if (mapViewMode === 'heading' || mapViewMode === 'perspective') {
+        let validatedHeading = null;
+        if (coords.heading !== null && typeof coords.heading === 'number' && !isNaN(coords.heading) && coords.heading >= 0) {
+             validatedHeading = coords.heading;
+        } else if (window.lastPositionForSpeedCalc && typeof turf !== 'undefined') {
+            const lastPoint = turf.point([window.lastPositionForSpeedCalc.longitude, window.lastPositionForSpeedCalc.latitude]);
+            const currentPoint = turf.point([coords.longitude, coords.latitude]);
+            if (turf.distance(lastPoint, currentPoint, { units: 'meters' }) > 1) {
+                const bearing = turf.bearing(lastPoint, currentPoint);
+                validatedHeading = (bearing < 0) ? bearing + 360 : bearing;
+            }
+        }
+        if(validatedHeading !== null) {
+            viewOptions.bearing = validatedHeading; 
+        }
+    }
+
+    if (targetPitch !== null && typeof targetPitch === 'number' && !isNaN(targetPitch)) {
+        viewOptions.pitch = targetPitch;
+    } else {
+        viewOptions.pitch = (mapViewMode === 'perspective') ? mapPitchValue : 0;
+    }
+
+    if (targetZoom !== null && !isManualZoomActive) {
+        viewOptions.zoom = targetZoom;
+    }
+
+    mapInstanceToUse.easeTo(viewOptions);
+}
+
+// ===================================================================
+// NOMBRE: updateTripStatistics (NUEVA FUNCIÓN AUXILIAR)
+// RESUMEN: Gestiona los cálculos y la actualización de la UI de estadísticas de viaje.
+// ===================================================================
+function updateTripStatistics(coords) {
+    if (compassAndModeControl) {
+        compassAndModeControl.updateAltitude(coords.altitude);
+
+        if (window.lastPositionForSpeedCalc && typeof coords.speed === 'number' && coords.speed !== null) {
+            const distM = calculateDistance(window.lastPositionForSpeedCalc.latitude, window.lastPositionForSpeedCalc.longitude, coords.latitude, coords.longitude);
+            const timeS = (Date.now() - window.lastPositionForSpeedCalc.time) / 1000;
+            if (timeS > 0 && distM >= 0) {
+                let speedMs = coords.speed;
+                if (typeof speedMs !== 'number' || speedMs === null || speedMs < 0) { speedMs = distM / timeS; }
+                window.currentSpeedKmh = speedMs * 3.6;
+            } else { window.currentSpeedKmh = 0; }
+        } else {
+            if (typeof coords.speed === 'number' && coords.speed !== null && coords.speed >= 0) { window.currentSpeedKmh = coords.speed * 3.6; } else { window.currentSpeedKmh = 0; }
+        }
+        window.lastPositionForSpeedCalc = { latitude: coords.latitude, longitude: coords.longitude, time: Date.now() };
+
+        const isTripActive = isNavigating || isFreeDriveActive;
+        if (isTripActive) {
+             if (navigationStartTimeForStats === null && window.currentSpeedKmh > 1) {
+                navigationStartTimeForStats = new Date();
+             }
+             if (lastPositionForStats && navigationStartTimeForStats) {
+                const distanceMoved = calculateDistance(lastPositionForStats.latitude, lastPositionForStats.longitude, coords.latitude, coords.longitude);
+                totalDistanceTravelledForStats += distanceMoved;
+                const timeElapsedS = (Date.now() - navigationStartTimeForStats.getTime()) / 1000;
+                if (timeElapsedS > 0) {
+                    window.averageSpeedKmh = (totalDistanceTravelledForStats / timeElapsedS) * 3.6;
+                }
+             }
+            lastPositionForStats = { ...coords };
+            
+            if (window.currentSpeedKmh > maxSpeedDuringTrip) {
+                maxSpeedDuringTrip = window.currentSpeedKmh;
+                if (coords) { maxSpeedCoordinates = { lat: coords.latitude, lng: coords.longitude }; }
+            }
+            if (coords.altitude !== null && !isNaN(coords.altitude)) {
+                maxAltitudeDuringTrip = Math.max(maxAltitudeDuringTrip, coords.altitude);
+                minAltitudeDuringTrip = Math.min(minAltitudeDuringTrip, coords.altitude);
+            }
+            SPEED_MILESTONES.forEach(milestone => {
+                if (window.currentSpeedKmh > milestone && milestone > lastSpeedMilestone) {
+                    lastSpeedMilestone = milestone;
+                    const newMilestoneFeature = {
+                        type: 'Feature',
+                        geometry: { type: 'Point', coordinates: [coords.longitude, coords.latitude] },
+                        properties: { type: 'milestone', speedText: String(milestone) }
+                    };
+                    speedMarkerFeatures.push(newMilestoneFeature);
+                    if (navigationMapInstance && navigationMapInstance.getSource('speed-markers-source')) {
+                        navigationMapInstance.getSource('speed-markers-source').setData({ type: 'FeatureCollection', features: speedMarkerFeatures });
+                    }
+                }
+            });
+        }
+        compassAndModeControl.updateCurrentSpeed(window.currentSpeedKmh);
+        compassAndModeControl.updateAverageSpeed(window.averageSpeedKmh);
+        compassAndModeControl.updateMaxSpeed(maxSpeedDuringTrip);
+    }
+}
+
+// ===================================================================
+// NOMBRE: processRouteProgress (NUEVA FUNCIÓN AUXILIAR - OPTIMIZADA)
+// RESUMEN: Lógica de progreso en ruta con "búsqueda en ventana" para máxima eficiencia.
+// ===================================================================
+function processRouteProgress(coords, mapInstanceToUse) {
+    if(!isNavigating || !navigationCurrentRouteData || !navigationCurrentRouteData.routes[0] || !coords) return;
+
+    const route = navigationCurrentRouteData.routes[0];
+    let carDistTurf = 0;
+
+    // --- INICIO DE LA OPTIMIZACIÓN "BÚSQUEDA EN VENTANA" ---
+    try {
+        const carPoint = turf.point([coords.longitude, coords.latitude]);
+        const searchWindowCoords = [];
+        const stepsToIncludeInWindow = 5;
+        let legIdx = currentLegIndexNav;
+        let stepIdx = currentStepIndexNav;
+
+        for (let i = 0; i < stepsToIncludeInWindow && legIdx < route.legs.length; i++) {
+            const currentLeg = route.legs[legIdx];
+            if (stepIdx < currentLeg.steps.length) {
+                const currentStep = currentLeg.steps[stepIdx];
+                if (currentStep.geometry && currentStep.geometry.coordinates) {
+                    if (searchWindowCoords.length > 0) {
+                        searchWindowCoords.push(...currentStep.geometry.coordinates.slice(1));
+                    } else {
+                        searchWindowCoords.push(...currentStep.geometry.coordinates);
+                    }
+                }
+                stepIdx++;
+            } else {
+                legIdx++;
+                stepIdx = 0;
+                i--; 
+            }
+        }
+        
+        if (searchWindowCoords.length < 2) {
+             throw new Error("Ventana de búsqueda insuficiente. Usando fallback.");
+        }
+
+        const routeWindowLineString = turf.lineString(searchWindowCoords);
+        const nearestPointOnWindow = turf.nearestPointOnLine(routeWindowLineString, carPoint, { units: 'meters' });
+        
+        const bestStepInWindow = route.legs[currentLegIndexNav].steps[currentStepIndexNav];
+        const cumulativeDistance = bestStepInWindow.cumulativeDistance || 0;
+        
+        const startOfWindowPoint = turf.point(routeWindowLineString.geometry.coordinates[0]);
+        const sliceToPoint = turf.lineSlice(startOfWindowPoint, nearestPointOnWindow, routeWindowLineString);
+        const distanceAlongWindow = turf.length(sliceToPoint, { units: 'meters' });
+        
+        carDistTurf = cumulativeDistance + distanceAlongWindow;
+
+    } catch (e) {
+        // --- FALLBACK AL MÉTODO ORIGINAL (MENOS EFICIENTE) ---
+        if (!window.optimizationHasFailed) {
+            console.warn("[OPTIMIZATION FALLBACK] Error en búsqueda por ventana. Usando método original.", e);
+            window.optimizationHasFailed = true;
+        }
+        try {
+            const carPointTurf = turf.point([coords.longitude, coords.latitude]);
+            const routeGeoJSON = mapInstanceToUse.getSource('route')._data;
+            const routeLineStringTurf = turf.lineString(routeGeoJSON.geometry.coordinates);
+            const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
+            const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
+            carDistTurf = turf.length(lineSliceToNearestTurf, { units: 'meters' });
+        } catch (turfError) { /* Silenciar error de fallback */ }
+    }
+    // --- FIN DE LA OPTIMIZACIÓN ---
+
+    const totalRouteLength = route.distance;
+    if (carDistTurf >= 0 && carDistTurf <= totalRouteLength + 500) {
+        if (carDistTurf > lastCarDistanceAlongRouteForNavLogic - 100) {
+             lastCarDistanceAlongRouteForNavLogic = carDistTurf;
+        }
+    } else if (carDistTurf > totalRouteLength + 500) {
+        lastCarDistanceAlongRouteForNavLogic = totalRouteLength;
+    }
+
+    checkAndMarkWaypointsAsVisited(route, lastCarDistanceAlongRouteForNavLogic, coords);
+    renderWaypointMarkers();
+    updateTurnByTurnDisplay(route, lastCarDistanceAlongRouteForNavLogic);
+    updateNavigationProgressDisplay(route, lastCarDistanceAlongRouteForNavLogic);
+}
+
+// ===================================================================
+// NOMBRE: saveSettings (MODIFICADA)
+// RESUMEN: Añade el guardado de los nuevos ratios de rendimiento.
+// ===================================================================
+function saveSettings() {
+    localStorage.setItem('darkMode', JSON.stringify(isDarkMode));
+    const tS = {};
+    document.querySelectorAll('.range-toggle').forEach(t => {
+        const start = t.dataset.rangeStart;
+        if (start) tS[start] = t.dataset.state;
+    });
+    localStorage.setItem('toggleStates', JSON.stringify(tS));
+    const zoomButton = document.getElementById('zoom-button');
+    if (zoomButton) localStorage.setItem('zoomState', zoomButton.dataset.zoomState);
+    const onOffBtn = document.getElementById('on-off-toggle');
+    if (onOffBtn) localStorage.setItem('onOffState', onOffBtn.dataset.state);
+    localStorage.setItem('noticesActive', JSON.stringify(isActive));
+    localStorage.setItem('footerVisible', JSON.stringify(isFooterVisible));
+    localStorage.setItem('password_active', JSON.stringify(isPasswordActive));
+    localStorage.setItem('lastUpdatesCheckDate', lastUpdatesCheckDate);
+    localStorage.setItem(GRAPH_STATE_KEY, currentGraphMode);
+    localStorage.setItem(MAP_VIEW_OFFSET_X_KEY, mapOffsetX);
+    localStorage.setItem(MAP_VIEW_OFFSET_Y_KEY, mapOffsetY);
+    localStorage.setItem(MAP_VIEW_SHOW_MINIMAP_KEY, showMinimapPreference);
+    localStorage.setItem(MAP_VIEW_PITCH_KEY, mapPitchValue);
+    
+    // --- NUEVAS LÍNEAS PARA GUARDAR RATIOS DE RENDIMIENTO ---
+    localStorage.setItem(PERFORMANCE_RATIO_ROUTE_KEY, performanceRatios.routeProgress);
+    localStorage.setItem(PERFORMANCE_RATIO_ALERTS_KEY, performanceRatios.trafficAlerts);
+    localStorage.setItem(PERFORMANCE_RATIO_STATS_KEY, performanceRatios.tripStats);
+    localStorage.setItem(PERFORMANCE_RATIO_GRAPH_KEY, performanceRatios.performanceGraph);
+    
+    const radaresCheckboxElement = document.getElementById('radares-ruta-checkbox');
+    if (radaresCheckboxElement) {
+        localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresCheckboxElement.checked));
+    }
+    const tareasCheckboxElement = document.getElementById('tareas-ruta-checkbox');
+    if (tareasCheckboxElement) { 
+        localStorage.setItem(TAREAS_RUTA_CHECKED_KEY, String(tareasCheckboxElement.checked));
+    }
+    const mainSearchInputGrid = document.getElementById('main-search-input'); 
+    if (mainSearchInputGrid) {
+        localStorage.setItem('gridFilterValue', mainSearchInputGrid.value);
+    }
+    const mapFilterInput = document.getElementById('filter-input'); 
+    if (mapFilterInput) {
+        localStorage.setItem(MAP_FILTER_INPUT_KEY, mapFilterInput.value);
+    }
+    if (mapLayersControl && mapLayersControl._map && mapLayersControl._map._layers) {
+        const layersArray = Object.values(mapLayersControl._map._layers);
+        const baseLayerMapObject = layersArray.find(l => l._map && l.options && !l.options.pane && l.options.attribution);
+        if (baseLayerMapObject) {
+            const activeLayerEntry = mapLayersControl._layers.find(l => l.layer === baseLayerMapObject);
+            if (activeLayerEntry && activeLayerEntry.name) {
+                localStorage.setItem(ACTIVE_MAP_LAYER_KEY, activeLayerEntry.name);
+            }
+        }
+    }
+}
+
+// ===================================================================
+// NOMBRE: loadSavedSettings (MODIFICADA)
+// RESUMEN: Carga la configuración, incluyendo los nuevos ratios de rendimiento.
+// ===================================================================
+function loadSavedSettings() {
+    const savedDarkMode = localStorage.getItem('darkMode');
+    isDarkMode = savedDarkMode ? JSON.parse(savedDarkMode) : false;
+    if (isDarkMode) document.body.classList.add('dark-mode');
+    
+    mapOffsetX = parseInt(localStorage.getItem(MAP_VIEW_OFFSET_X_KEY)) || 0;
+    mapOffsetY = parseInt(localStorage.getItem(MAP_VIEW_OFFSET_Y_KEY)) || -30;
+    const savedMinimapPref = localStorage.getItem(MAP_VIEW_SHOW_MINIMAP_KEY);
+    showMinimapPreference = savedMinimapPref === null ? true : JSON.parse(savedMinimapPref);
+    mapPitchValue = parseInt(localStorage.getItem(MAP_VIEW_PITCH_KEY)) || 56;
+    
+    // --- NUEVAS LÍNEAS PARA CARGAR RATIOS DE RENDIMIENTO ---
+    performanceRatios.routeProgress = parseInt(localStorage.getItem(PERFORMANCE_RATIO_ROUTE_KEY)) || 6;
+    performanceRatios.trafficAlerts = parseInt(localStorage.getItem(PERFORMANCE_RATIO_ALERTS_KEY)) || 15;
+    performanceRatios.tripStats = parseInt(localStorage.getItem(PERFORMANCE_RATIO_STATS_KEY)) || 15;
+    performanceRatios.performanceGraph = parseInt(localStorage.getItem(PERFORMANCE_RATIO_GRAPH_KEY)) || 20;
+
+    const savedZoomState = localStorage.getItem('zoomState');
+    const zoomButtonElem = document.getElementById('zoom-button');
+    if (zoomButtonElem) {
+        zoomButtonElem.dataset.zoomState = savedZoomState || 'off';
+        applyZoom(zoomButtonElem.dataset.zoomState);
+    }
+    const savedPasswordActive = localStorage.getItem('password_active');
+    isPasswordActive = savedPasswordActive ? JSON.parse(savedPasswordActive) : false;
+    storedPin = localStorage.getItem('password_pin');
+    lastUpdatesCheckDate = localStorage.getItem('lastUpdatesCheckDate');
+    const savedNoticesActive = localStorage.getItem('noticesActive');
+    const savedFooterVisible = localStorage.getItem('footerVisible');
+    isActive = savedNoticesActive ? JSON.parse(savedNoticesActive) : true;
+    isFooterVisible = savedFooterVisible ? JSON.parse(savedFooterVisible) : true;
+    const noticeContainer = document.querySelector('.notices-container');
+    if (noticeContainer) noticeContainer.style.display = isActive ? 'flex' : 'none';
+    const footerElement = document.querySelector('footer');
+    if (footerElement) footerElement.classList.toggle('footer-hidden', !isFooterVisible);
+    const onOffBtn = document.getElementById('on-off-toggle');
+    if (onOffBtn) {
+        const savedOnOffState = localStorage.getItem('onOffState');
+        onOffBtn.dataset.state = savedOnOffState ? savedOnOffState : 'on';
+    }
+    const toggleStatesFromCache = JSON.parse(localStorage.getItem('toggleStates') || '{}');
+    document.querySelectorAll('.range-toggle').forEach(toggle => {
+        const start = parseInt(toggle.dataset.rangeStart);
+        const savedState = toggleStatesFromCache[start] || 'visible';
+        toggle.dataset.state = savedState;
+    });
+    const mainSearchInputGrid = document.getElementById('grid-filter-input');
+    if (mainSearchInputGrid) {
+        const savedMainFilter = localStorage.getItem('gridFilterValue');
+        if (savedMainFilter !== null) {
+            mainSearchInputGrid.value = savedMainFilter;
+        } else {
+            mainSearchInputGrid.value = '';
+        }
+    }
+    
+    const mapFilterInput = document.getElementById('filter-input'); 
+    if (mapFilterInput) {
+        mapFilterInput.value = localStorage.getItem(MAP_FILTER_INPUT_KEY) || 'España';
+    }
+    
+    const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+    if (radaresRutaCheckbox) {
+        const savedCheckState = localStorage.getItem(RADARES_RUTA_CHECKED_KEY);
+        radaresRutaCheckbox.checked = savedCheckState === 'true';
+    }
+    const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
+    if (tareasRutaCheckbox) {
+        const savedTareasCheckState = localStorage.getItem(TAREAS_RUTA_CHECKED_KEY);
+        tareasRutaCheckbox.checked = savedTareasCheckState === 'true';
+    }
+    currentGraphMode = localStorage.getItem(GRAPH_STATE_KEY) || 'Desviación ETA';
+    const userIdInput = document.getElementById('user-id');
+    const modelInput = document.getElementById('tesla-model');
+    const yearInput = document.getElementById('tesla-year');
+    const provinceInput = document.getElementById('tesla-province');
+    const dmsCheckbox = document.getElementById('allow-dms');
+    const autoBackupCheckbox = document.getElementById('config-auto-backup-on-load');
+    if (userIdInput) userIdInput.value = localStorage.getItem('userData_userId') || '';
+    if (modelInput) modelInput.value = localStorage.getItem('userData_teslaModel') || '';
+    if (yearInput) yearInput.value = localStorage.getItem('userData_teslaYear') || '';
+    if (provinceInput) provinceInput.value = localStorage.getItem('userData_teslaProvince') || '';
+   
+   const savedAllowDMs = localStorage.getItem('userData_allowDMs');
+   if (dmsCheckbox) {
+    dmsCheckbox.checked = savedAllowDMs === null ? true : JSON.parse(savedAllowDMs); 
+   } 
+    
+    if (autoBackupCheckbox) {
+        const savedAutoBackup = localStorage.getItem('boardinggate_autoBackupOnLoad');
+        autoBackupCheckbox.checked = savedAutoBackup === null ? true : JSON.parse(savedAutoBackup);
+    }
+    const savedLockState = localStorage.getItem(PROGRESS_BAR_LOCKED_KEY);
+    isProgressBarLocked = savedLockState === null ? true : JSON.parse(savedLockState);
+    actualizarContadorRadares(0);
+    actualizarContadorTareas(0);
+    updateUserIdDisplay();
+    updateReminderCount();
+}
+
+// ===================================================================
+// NOMBRE: showNavigationMapHelpModal (MODIFICADA)
+// RESUMEN: Incluye la nueva sección de configuración de rendimiento.
+// ===================================================================
+function showNavigationMapHelpModal() {
+    const existingHelpModal = document.getElementById('reminders-map-help-modal-instance');
+    if (existingHelpModal) {
+        clearModalAutoCloseTimer(existingHelpModal, existingHelpModal.querySelector('#close-reminders-map-help-instance'), 'reminders-map-help-modal-instance');
+        existingHelpModal.remove();
+    }
+
+    const helpModal = document.createElement('div');
+    helpModal.id = 'reminders-map-help-modal-instance';
+    helpModal.className = 'help-modal';
+    helpModal.setAttribute('aria-label', 'Ayuda Mapa de Navegación/Radares');
+    
+    helpModal.innerHTML = `
+        <style>
+            #reminders-map-help-modal-instance h3 { color: #87CEEB; margin-top: 1.2rem; margin-bottom: 0.5rem; border-bottom: 1px solid #444; padding-bottom: 4px;}
+            #reminders-map-help-modal-instance ul { list-style-position: inside; padding-left: 0.5rem; }
+            #reminders-map-help-modal-instance li { margin-bottom: 0.5rem; }
+            #reminders-map-help-modal-instance .icon-in-text { height: 1.4em; display: inline; vertical-align: middle; margin: 0 4px; padding: 2px; border-radius: 4px; background: rgba(255,255,255,0.1);}
+            #reminders-map-help-modal-instance .icon-in-text.circle { border-radius: 50%; }
+            .visual-settings-container { background-color: rgba(255,255,255,0.05); padding: 15px; border-radius: 8px; margin-top: 10px;}
+            .slider-control { display: flex; align-items: center; gap: 15px; margin-bottom: 10px; }
+            .slider-control label { flex-basis: 120px; text-align: right; font-weight: bold; color: #a0a0a0; }
+            .slider-control input[type="range"] { flex-grow: 1; accent-color: #87CEEB; }
+            .slider-control .value-display { flex-basis: 50px; font-weight: bold; color: #f0f0f0; }
+            .reset-visuals-btn { background-color: #555; color: white; padding: 4px 8px; border:none; border-radius: 5px; cursor: pointer; margin-top: 5px; }
+        </style>
+
+        <h2 class="text-xl font-bold mb-4">Ayuda del Mapa de Navegación</h2>
+        <div class="modal-top-buttons" style="justify-content: flex-end;">
+            <button type="button" id="close-reminders-map-help-instance" style="flex: 0 1 auto; min-width: 120px;">Entendido</button>
+        </div>
+        <div style="max-height: 70vh; overflow-y: auto; padding-right: 15px;">
+            
+            <h3><img src="https://boardinggate.github.io/Tesla/PNG/personal.png" class="icon-in-text"> Ajustes Visuales del Mapa</h3>
+            <div class="visual-settings-container">
+                <div class="slider-control">
+                    <label for="map-saturation-slider">Saturación:</label>
+                    <input type="range" id="map-saturation-slider" min="0.5" max="2" step="0.05">
+                    <span id="map-saturation-value" class="value-display">120%</span>
+                </div>
+                <div class="slider-control">
+                    <label for="map-contrast-slider">Contraste:</label>
+                    <input type="range" id="map-contrast-slider" min="0.5" max="2" step="0.05">
+                    <span id="map-contrast-value" class="value-display">110%</span>
+                </div>
+                <button id="map-visuals-reset-btn" class="reset-visuals-btn">Restaurar por defecto</button>
+            </div>
+
+            <h3><img src="https://boardinggate.github.io/Tesla/PNG/config.jpg" class="icon-in-text"> Ajuste de Rendimiento (Navegación)</h3>
+            <div class="visual-settings-container">
+                <p style="font-size: 0.9rem; margin-bottom: 15px;">Ajusta la frecuencia de actualización para optimizar el rendimiento. Un número más alto significa que la tarea se ejecuta con menos frecuencia (mejor rendimiento, menos actualizaciones). Un número más bajo es más "en tiempo real" pero consume más recursos.</p>
+                <div class="slider-control">
+                    <label for="gps-hz-display" style="color: #f0f0f0;">GPS Ticks/seg:</label>
+                    <span id="gps-hz-display" class="value-display" style="text-align: left;">Calculando...</span>
+                </div>
+                <div class="slider-control">
+                    <label for="ratio-route-progress-slider">Progreso Ruta:</label>
+                    <input type="range" id="ratio-route-progress-slider" min="1" max="100" step="1">
+                    <span id="ratio-route-progress-value" class="value-display"></span>
+                </div>
+                <div class="slider-control">
+                    <label for="ratio-traffic-alerts-slider">Alertas Tráfico:</label>
+                    <input type="range" id="ratio-traffic-alerts-slider" min="1" max="100" step="1">
+                    <span id="ratio-traffic-alerts-value" class="value-display"></span>
+                </div>
+                <div class="slider-control">
+                    <label for="ratio-trip-stats-slider">Estadísticas:</label>
+                    <input type="range" id="ratio-trip-stats-slider" min="1" max="100" step="1">
+                    <span id="ratio-trip-stats-value" class="value-display"></span>
+                </div>
+                <div class="slider-control">
+                    <label for="ratio-performance-graph-slider">Gráfica:</label>
+                    <input type="range" id="ratio-performance-graph-slider" min="1" max="100" step="1">
+                    <span id="ratio-performance-graph-value" class="value-display"></span>
+                </div>
+                <button id="perf-ratios-reset-btn" class="reset-visuals-btn">Restaurar por defecto</button>
+            </div>
+
+            <h3><img src="https://boardinggate.github.io/Tesla/PNG/config.jpg" class="icon-in-text"> Controles Principales</h3>
+            <ul class="list-disc space-y-2">
+                 <li><strong>Botón Flotante <img src="PNG/Coche_Sat.PNG" class="icon-in-text circle">:</strong> Es tu navaja suiza. Realiza diferentes acciones según el gesto:
+                    <ul style="padding-left: 20px; margin-top: 5px;">
+                        <li><strong>Clic Corto:</strong> Muestra u oculta la barra de botones superior.</li>
+                        <li><strong>Pulsación Larga (1 seg):</strong> Abre el menú para reportar <strong>Alertas de Tráfico</strong>.</li>
+                        <li><strong>Deslizar ARRIBA:</strong> Inicia <img src="PNG/INICIARNAVEGACION.PNG" class="icon-in-text"> o detiene <img src="PNG/TERMINARNAVEGACION.PNG" class="icon-in-text"> la navegación.</li>
+                        <li><strong>Deslizar a la IZQUIERDA:</strong> Activa/desactiva el modo inmersivo (pantalla completa).</li>
+                        <li><strong>Deslizar a la DERECHA / ABAJO:</strong> Carga y navega automáticamente a tus rutas guardadas "CASA" o "TRABAJO".</li>
+                    </ul>
+                </li>
+                <li><strong>Salir del Mapa <img src="PNG/SALIR.PNG" class="icon-in-text">:</strong> Cierra la vista de navegación y vuelve al lanzador principal.</li>
+                <li><strong>Localización <img src="PNG/ESTASAQUI.PNG" class="icon-in-text">:</strong> Centra el mapa en tu posición actual. Si lo pulsas de nuevo (<img src="PNG/DEJARSEGUIR.PNG" class="icon-in-text">), desactivas el seguimiento automático.</li>
+                <li><strong>Zoom <img src="PNG/ZOOM+.PNG" class="icon-in-text"> / <img src="PNG/ZOOM-.PNG" class="icon-in-text">:</strong> Alterna entre una vista general de toda la ruta y un zoom cercano a tu vehículo.</li>
+            </ul>
+
+            <h3><img src="./PNG/ANADIRPUNTO.PNG" class="icon-in-text"> Planificación de Ruta</h3>
+            <ul class="list-disc space-y-2">
+                <li><strong>Añadir Puntos:</strong> Simplemente <strong>pulsa en cualquier lugar del mapa</strong> para añadir una etapa. También puedes usar el <strong>buscador de texto</strong> para encontrar direcciones o lugares y añadirlos con el botón <img src="./PNG/ANADIRPUNTO.PNG" class="icon-in-text">.</li>
+                <li><strong>Eliminar Puntos:</strong> Pulsa la <strong>'X' roja</strong> sobre cualquier marcador de etapa.</li>
+                <li><strong>Reordenar Etapas <img src="./PNG/MOVER.PNG" class="icon-in-text">:</strong> Abre un menú para arrastrar y cambiar el orden de las etapas de tu ruta.</li>
+                <li><strong>Guardar y Cargar Rutas <img src="PNG/GUARDARRUTA.PNG" class="icon-in-text"> <img src="PNG/CARGARRUTA.PNG" class="icon-in-text">:</strong> Guarda la ruta actual para usarla en el futuro o carga una ya existente.</li>
+            </ul>
+
+            <h3><img src="https://boardinggate.github.io/Tesla/th.jpeg" class="icon-in-text circle"> Durante la Navegación</h3>
+            <ul class="list-disc space-y-2">
+                <li><strong>Rutas Alternativas:</strong>
+                    <ul>
+                        <li><strong>Pulsación Larga</strong> sobre un marcador de etapa (1, 2, F...) para ver al instante las rutas alternativas (Rápida, Corta, Alternativa) para ese tramo.</li>
+                        <li>También puedes hacer un <strong>clic corto</strong> en el marcador, y en la tarjeta que se abre, pulsar el botón <strong>"OTRAS RUTAS"</strong>.</li>
+                    </ul>
+                </li>
+                <li><strong>Puntos de Recarga (PDRs) <img src="PNG/pdrs.png" class="icon-in-text">:</strong>
+                    <ul>
+                        <li><strong>1ª Pulsación:</strong> Abre un modal para filtrar PDRs por potencia, distancia a la ruta y operadores.</li>
+                        <li><strong>2ª Pulsación:</strong> Muestra en el mapa solo el PDR más económico de cada rango de potencia (resaltado con un halo amarillo).</li>
+                        <li><strong>3ª Pulsación:</strong> Limpia todos los PDRs del mapa.</li>
+                    </ul>
+                </li>
+                 <li><strong>Radares y Tareas en Ruta:</strong> Activa los checkboxes <img src="https://i.imgur.com/r33g3oY.png" class="icon-in-text"> para ver en el mapa y en la barra de progreso los radares o tus tareas personales que se encuentren en el trazado actual.</li>
+                 <li><strong>Simulación <img src="./PNG/GPS.PNG" class="icon-in-text">:</strong> Activa este modo para que el coche recorra la ruta automáticamente o para fijar tu posición GPS manualmente haciendo clic en el mapa.</li>
+            </ul>
+        </div>
+    `;
+
+    const mapModal = document.getElementById('reminders-location-map-modal');
+    if (mapModal) {
+        mapModal.style.zIndex = 6400;
+    }
+
+    document.body.appendChild(helpModal); 
+    
+    // Lógica para los nuevos sliders de rendimiento
+    const setupRatioSlider = (sliderId, valueId, storageKey, defaultValue) => {
+        const slider = helpModal.querySelector(`#${sliderId}`);
+        const valueDisplay = helpModal.querySelector(`#${valueId}`);
+        if (!slider || !valueDisplay) return;
+
+        slider.value = localStorage.getItem(storageKey) || defaultValue;
+        valueDisplay.textContent = slider.value;
+        performanceRatios[storageKey.split('_').pop()] = parseInt(slider.value);
+
+        slider.addEventListener('input', () => {
+            const val = slider.value;
+            valueDisplay.textContent = val;
+            localStorage.setItem(storageKey, val);
+            performanceRatios[storageKey.split('_').pop()] = parseInt(val);
+        });
+    };
+
+    setupRatioSlider('ratio-route-progress-slider', 'ratio-route-progress-value', PERFORMANCE_RATIO_ROUTE_KEY, 6);
+    setupRatioSlider('ratio-traffic-alerts-slider', 'ratio-traffic-alerts-value', PERFORMANCE_RATIO_ALERTS_KEY, 15);
+    setupRatioSlider('ratio-trip-stats-slider', 'ratio-trip-stats-value', PERFORMANCE_RATIO_STATS_KEY, 15);
+    setupRatioSlider('ratio-performance-graph-slider', 'ratio-performance-graph-value', PERFORMANCE_RATIO_GRAPH_KEY, 20);
+
+    const perfResetBtn = helpModal.querySelector('#perf-ratios-reset-btn');
+    perfResetBtn.addEventListener('click', () => {
+        setupRatioSlider('ratio-route-progress-slider', 'ratio-route-progress-value', PERFORMANCE_RATIO_ROUTE_KEY, 6);
+        setupRatioSlider('ratio-traffic-alerts-slider', 'ratio-traffic-alerts-value', PERFORMANCE_RATIO_ALERTS_KEY, 15);
+        setupRatioSlider('ratio-trip-stats-slider', 'ratio-trip-stats-value', PERFORMANCE_RATIO_STATS_KEY, 15);
+        setupRatioSlider('ratio-performance-graph-slider', 'ratio-performance-graph-value', PERFORMANCE_RATIO_GRAPH_KEY, 20);
+        showToast('Ratios de rendimiento restaurados.', 'info');
+    });
+
+    // Monitor de FPS del GPS
+    const gpsHzDisplay = helpModal.querySelector('#gps-hz-display');
+    if (gpsHzDisplay) {
+        if (gpsHzMonitor.interval) clearInterval(gpsHzMonitor.interval);
+        gpsHzMonitor.ticks = 0;
+        gpsHzMonitor.interval = setInterval(() => {
+            if (document.body.contains(gpsHzDisplay)) {
+                gpsHzDisplay.textContent = `${gpsHzMonitor.ticks.toFixed(1)}`;
+                gpsHzMonitor.ticks = 0;
+            } else {
+                clearInterval(gpsHzMonitor.interval);
+                gpsHzMonitor.interval = null;
+            }
+        }, 1000);
+    }
+
+    const saturationSlider = helpModal.querySelector('#map-saturation-slider');
+    const contrastSlider = helpModal.querySelector('#map-contrast-slider');
+    const saturationValue = helpModal.querySelector('#map-saturation-value');
+    const contrastValue = helpModal.querySelector('#map-contrast-value');
+    const resetButton = helpModal.querySelector('#map-visuals-reset-btn');
+
+    const updateLabels = () => {
+        saturationValue.textContent = `${Math.round(saturationSlider.value * 100)}%`;
+        contrastValue.textContent = `${Math.round(contrastSlider.value * 100)}%`;
+    };
+
+    saturationSlider.value = getComputedStyle(document.documentElement).getPropertyValue('--map-saturation').trim() || '1.2';
+    contrastSlider.value = getComputedStyle(document.documentElement).getPropertyValue('--map-contrast').trim() || '1.1';
+    updateLabels();
+
+    saturationSlider.addEventListener('input', () => {
+        const val = saturationSlider.value;
+        document.documentElement.style.setProperty('--map-saturation', val);
+        localStorage.setItem('boardinggate_map_saturation', val);
+        updateLabels();
+    });
+
+    contrastSlider.addEventListener('input', () => {
+        const val = contrastSlider.value;
+        document.documentElement.style.setProperty('--map-contrast', val);
+        localStorage.setItem('boardinggate_map_contrast', val);
+        updateLabels();
+    });
+
+    resetButton.addEventListener('click', () => {
+        saturationSlider.value = '1.2';
+        contrastSlider.value = '1.1';
+        saturationSlider.dispatchEvent(new Event('input'));
+        contrastSlider.dispatchEvent(new Event('input'));
+        showToast('Ajustes visuales restaurados a los valores por defecto.', 'info');
+    });
+
+    const closeButtonHelp = helpModal.querySelector('#close-reminders-map-help-instance');
+    const closeHandlerHelp = () => { 
+        if(gpsHzMonitor.interval) clearInterval(gpsHzMonitor.interval);
+        gpsHzMonitor.interval = null;
+        clearModalAutoCloseTimer(helpModal, closeButtonHelp, 'reminders-map-help-modal-instance'); 
+        if (helpModal.parentNode) {
+            helpModal.parentNode.removeChild(helpModal); 
+        }
+        if (mapModal) {
+            mapModal.style.zIndex = '';
+        }
+    };
+    
+    closeButtonHelp.addEventListener('click', closeHandlerHelp); 
+    addModalAutoCloseTimer(helpModal, closeButtonHelp, 'reminders-map-help-modal-instance', 90000);
+}
+
+
+    
    
 // ===================================================================
 // NOMBRE: sanitizeWaypointsForStorage (NUEVA FUNCIÓN)
@@ -5648,228 +6391,6 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
     return null;
 }
 
-// ===================================================================
-// NOMBRE: updateInitialUserPosition (VERSIÓN FINAL CON BLINDAJE Y PITCH DINÁMICO)
-// RESUMEN: Orquesta el movimiento del mapa, aplicando el zoom y la inclinación calculados.
-// ===================================================================
-function updateInitialUserPosition(coords, mapInstanceToUse) {
-    if (!mapInstanceToUse || !coords || typeof coords.latitude !== 'number' || typeof coords.longitude !== 'number' || isNaN(coords.latitude) || isNaN(coords.longitude)) {
-        console.warn("[GPS] Datos de coordenadas inválidos recibidos. Omitiendo actualización.");
-        return;
-    }
-    lastGpsUpdateTime = Date.now();
-
-    const lngLat = new mapboxgl.LngLat(coords.longitude, coords.latitude);
-    initialUserLocationMarkerLat = coords.latitude;
-    initialUserLocationMarkerLng = coords.longitude;
-
-    let validatedHeading = null;
-    if (coords.heading !== null && typeof coords.heading === 'number' && !isNaN(coords.heading) && coords.heading >= 0) {
-        validatedHeading = coords.heading;
-    } else if (window.lastPositionForSpeedCalc && typeof turf !== 'undefined') {
-        const lastPoint = turf.point([window.lastPositionForSpeedCalc.longitude, window.lastPositionForSpeedCalc.latitude]);
-        const currentPoint = turf.point([coords.longitude, coords.latitude]);
-        if (turf.distance(lastPoint, currentPoint, { units: 'meters' }) > 1) {
-            const bearing = turf.bearing(lastPoint, currentPoint);
-            validatedHeading = (bearing < 0) ? bearing + 360 : bearing;
-        }
-    }
-    if (validatedHeading === null) {
-        validatedHeading = (markerAnimationState.currentIconRotation + 90 + 360) % 360; 
-    }
-
-    if (!initialUserLocationMarker) {
-        const vehicleIconElement = document.createElement('div');
-        vehicleIconElement.style.width = '48px';
-        vehicleIconElement.style.height = '48px';
-        vehicleIconElement.innerHTML = `<img src="PNG/AVANCE.PNG" alt="Coche" style="width:100%; height:100%; object-fit:contain;">`;
-        initialUserLocationMarker = new mapboxgl.Marker({ element: vehicleIconElement, rotationAlignment: 'map', anchor: 'center' })
-            .setLngLat(lngLat)
-            .addTo(mapInstanceToUse);
-    }
-
-    if (!markerAnimationState.currentLngLat) {
-        markerAnimationState.currentLngLat = lngLat;
-    }
-   
-    markerAnimationState.targetLngLat = lngLat;
-    markerAnimationState.targetIconRotation = validatedHeading - 90; 
-    if (!markerAnimationState.animationFrameId) {
-        markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
-    }
-
-    if (compassAndModeControl) {
-        compassAndModeControl.updateOrientation(validatedHeading);
-        compassAndModeControl.updateAltitude(coords.altitude);
-        if (window.lastPositionForSpeedCalc && typeof coords.speed === 'number' && coords.speed !== null) {
-            const distM = calculateDistance(window.lastPositionForSpeedCalc.latitude, window.lastPositionForSpeedCalc.longitude, coords.latitude, coords.longitude);
-            const timeS = (Date.now() - window.lastPositionForSpeedCalc.time) / 1000;
-            if (timeS > 0 && distM >= 0) {
-                let speedMs = coords.speed;
-                if (typeof speedMs !== 'number' || speedMs === null || speedMs < 0) { speedMs = distM / timeS; }
-                window.currentSpeedKmh = speedMs * 3.6;
-            } else { window.currentSpeedKmh = 0; }
-        } else {
-            if (typeof coords.speed === 'number' && coords.speed !== null && coords.speed >= 0) { window.currentSpeedKmh = coords.speed * 3.6; } else { window.currentSpeedKmh = 0; }
-        }
-        window.lastPositionForSpeedCalc = { latitude: coords.latitude, longitude: coords.longitude, time: Date.now() };
-        const isTripActive = isNavigating || isFreeDriveActive;
-        if (isTripActive) {
-            if (window.currentSpeedKmh > maxSpeedDuringTrip) {
-                maxSpeedDuringTrip = window.currentSpeedKmh;
-                if (coords) { maxSpeedCoordinates = { lat: coords.latitude, lng: coords.longitude }; }
-            }
-            if (coords.altitude !== null && !isNaN(coords.altitude)) {
-                maxAltitudeDuringTrip = Math.max(maxAltitudeDuringTrip, coords.altitude);
-                minAltitudeDuringTrip = Math.min(minAltitudeDuringTrip, coords.altitude);
-            }
-            SPEED_MILESTONES.forEach(milestone => {
-                if (window.currentSpeedKmh > milestone && milestone > lastSpeedMilestone) {
-                    lastSpeedMilestone = milestone;
-                    const newMilestoneFeature = {
-                        type: 'Feature',
-                        geometry: {
-                            type: 'Point',
-                            coordinates: [coords.longitude, coords.latitude]
-                        },
-                        properties: { type: 'milestone', speedText: String(milestone) }
-                    };
-                    speedMarkerFeatures.push(newMilestoneFeature);
-                    if (navigationMapInstance.getSource('speed-markers-source')) {
-                        navigationMapInstance.getSource('speed-markers-source').setData({ type: 'FeatureCollection', features: speedMarkerFeatures });
-                    }
-                }
-            });
-        }
-        compassAndModeControl.updateCurrentSpeed(window.currentSpeedKmh);
-        compassAndModeControl.updateAverageSpeed(window.averageSpeedKmh);
-        compassAndModeControl.updateMaxSpeed(maxSpeedDuringTrip);
-    }
-
-    if(isNavigating && navigationCurrentRouteData && navigationCurrentRouteData.routes[0] && coords) {
-        const route = navigationCurrentRouteData.routes[0];
-        let carDistTurf = 0;
-        const hasPrecalculatedData = route.totalPrecalculatedDistance !== undefined;
-        if (hasPrecalculatedData) {
-            const carPoint = turf.point([coords.longitude, coords.latitude]);
-            let bestMatch = { distance: Infinity, legIndex: -1, stepIndex: -1 };
-            const searchStartLeg = Math.max(0, currentLegIndexNav);
-            let stepsChecked = 0;
-            const MAX_STEPS_TO_CHECK = 8;
-            for (let l = searchStartLeg; l < route.legs.length && stepsChecked < MAX_STEPS_TO_CHECK; l++) {
-                const leg = route.legs[l];
-                const searchStartStep = (l === currentLegIndexNav) ? currentStepIndexNav : 0;
-                for (let s = searchStartStep; s < leg.steps.length && stepsChecked < MAX_STEPS_TO_CHECK; s++) {
-                    const step = leg.steps[s];
-                    if (step.geometry && step.geometry.coordinates) {
-                        const stepLine = turf.lineString(step.geometry.coordinates);
-                        const distToLine = turf.pointToLineDistance(carPoint, stepLine, { units: 'meters' });
-                        if (distToLine < bestMatch.distance) {
-                            bestMatch = { distance: distToLine, legIndex: l, stepIndex: s };
-                        }
-                    }
-                    stepsChecked++;
-                }
-            }
-            if (bestMatch.legIndex !== -1) {
-                currentLegIndexNav = bestMatch.legIndex;
-                currentStepIndexNav = bestMatch.stepIndex;
-                const bestStep = route.legs[currentLegIndexNav].steps[currentStepIndexNav];
-                const cumulativeDistance = bestStep.cumulativeDistance || 0;
-                let distanceAlongStep = 0;
-                try {
-                    const stepLine = turf.lineString(bestStep.geometry.coordinates);
-                    const nearestPoint = turf.nearestPointOnLine(stepLine, carPoint, { units: 'meters' });
-                    const startOfStepPoint = turf.point(bestStep.geometry.coordinates[0]);
-                    const sliceToPoint = turf.lineSlice(startOfStepPoint, nearestPoint, stepLine);
-                    distanceAlongStep = turf.length(sliceToPoint, { units: 'meters' });
-                } catch (e) { distanceAlongStep = 0; }
-                carDistTurf = cumulativeDistance + distanceAlongStep;
-            }
-        } else {
-            if (!window.optimizationHasFailed) {
-                console.warn("[OPTIMIZATION FALLBACK] La ruta actual no tiene datos pre-calculados. Usando método de cálculo de distancia original (menos eficiente).");
-                window.optimizationHasFailed = true;
-            }
-            try {
-                const carPointTurf = turf.point([coords.longitude, coords.latitude]);
-                const routeGeoJSON = navigationMapInstance.getSource('route')._data;
-                const routeLineStringTurf = turf.lineString(routeGeoJSON.geometry.coordinates);
-                const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
-                const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
-                carDistTurf = turf.length(lineSliceToNearestTurf, { units: 'meters' });
-            } catch (e) {}
-        }
-        
-        const totalRouteLength = route.distance;
-        if (carDistTurf >= 0 && carDistTurf <= totalRouteLength + 500) {
-            if (carDistTurf > lastCarDistanceAlongRouteForNavLogic - 100) {
-                 lastCarDistanceAlongRouteForNavLogic = carDistTurf;
-            }
-        } else if (carDistTurf > totalRouteLength + 500) {
-            lastCarDistanceAlongRouteForNavLogic = totalRouteLength;
-        }
-        checkAndMarkWaypointsAsVisited(route, lastCarDistanceAlongRouteForNavLogic, coords);
-        renderWaypointMarkers();
-        updateTurnByTurnDisplay(route, lastCarDistanceAlongRouteForNavLogic);
-        updateNavigationProgressDisplay(route, lastCarDistanceAlongRouteForNavLogic);
-    } else if (isFreeDriveActive) {
-        updateNavigationProgressDisplay(null, 0);
-    }
-    
-    const shouldFollow = (shouldCenterOnUser || navigationFollowUser);
-    if (!shouldFollow || isRecalculatingRoute || !navigationMapInstance) {
-        return;
-    }
-
-    const maneuverCameraAdjustments = handleProgressiveManeuverZoom(
-        navigationCurrentRouteData?.routes?.[0]?.legs?.[currentLegIndexNav]?.steps?.[currentStepIndexNav],
-        distanceToNextManeuverOSRM,
-        lastCarDistanceAlongRouteForNavLogic
-    );
-
-    let targetZoom = maneuverCameraAdjustments ? maneuverCameraAdjustments.zoom : null;
-    let targetPitch = maneuverCameraAdjustments ? maneuverCameraAdjustments.pitch : null;
-
-    if (targetZoom === null) {
-        targetZoom = handleAutoZoom();
-    }
-    
-    if (targetZoom !== null && (typeof targetZoom !== 'number' || isNaN(targetZoom))) {
-        console.error(`[VALIDACIÓN] Se ha detectado un valor de zoom inválido (${targetZoom}). Se anulará el cambio de zoom en este ciclo para prevenir un error.`);
-        targetZoom = null;
-    }
-    
-    const viewOptions = {
-        center: lngLat,
-        duration: 1000,
-        essential: true
-    };
-    
-    const mapHeight = navigationMapInstance.getCanvas().clientHeight;
-    const mapWidth = navigationMapInstance.getCanvas().clientWidth;
-    viewOptions.padding = {
-        top: mapOffsetY > 0 ? mapHeight * Math.abs(mapOffsetY / 100) : 0,
-        bottom: mapOffsetY < 0 ? mapHeight * Math.abs(mapOffsetY / 100) : 0,
-        left: mapOffsetX > 0 ? mapWidth * Math.abs(mapOffsetX / 100) : 0,
-        right: mapOffsetX < 0 ? mapWidth * Math.abs(mapOffsetX / 100) : 0
-    };
-    if (mapViewMode === 'heading' || mapViewMode === 'perspective') {
-        viewOptions.bearing = validatedHeading; 
-    }
-
-    if (targetPitch !== null && typeof targetPitch === 'number' && !isNaN(targetPitch)) {
-        viewOptions.pitch = targetPitch;
-    } else {
-        viewOptions.pitch = (mapViewMode === 'perspective') ? mapPitchValue : 0;
-    }
-
-    if (targetZoom !== null && !isManualZoomActive) {
-        viewOptions.zoom = targetZoom;
-    }
-
-    navigationMapInstance.easeTo(viewOptions);
-}
     
 // ===================================================================
 // NOMBRE: updateDynamicRadars (MODIFICADA - Lógica de Navegación vs. Radio)
@@ -8606,6 +9127,7 @@ function startGpsWatching() {
     }
     locationWatchId = navigator.geolocation.watchPosition(
         (position) => {
+            gpsHzMonitor.ticks++;
             if (isSimulatingGpsLocation) return;
             const attemptToast = document.getElementById("gps-attempt-toast");
             if (attemptToast) attemptToast.remove();
@@ -9725,103 +10247,6 @@ function handleMapClickToAddReminder(e) {
     }, { onTopOfMap: true });
 }
 
-// ===================================================================
-// NOMBRE: loadSavedSettings (MODIFICADA - CARGA EL PITCH)
-// RESUMEN: Carga la configuración, incluyendo el valor de pitch guardado.
-function loadSavedSettings() {
-    const savedDarkMode = localStorage.getItem('darkMode');
-    isDarkMode = savedDarkMode ? JSON.parse(savedDarkMode) : false;
-    if (isDarkMode) document.body.classList.add('dark-mode');
-    
-    mapOffsetX = parseInt(localStorage.getItem(MAP_VIEW_OFFSET_X_KEY)) || 0;
-    mapOffsetY = parseInt(localStorage.getItem(MAP_VIEW_OFFSET_Y_KEY)) || -30;
-    const savedMinimapPref = localStorage.getItem(MAP_VIEW_SHOW_MINIMAP_KEY);
-    showMinimapPreference = savedMinimapPref === null ? true : JSON.parse(savedMinimapPref);
-    // --- LÍNEA MODIFICADA: Carga el pitch guardado ---
-    mapPitchValue = parseInt(localStorage.getItem(MAP_VIEW_PITCH_KEY)) || 56;
-
-    const savedZoomState = localStorage.getItem('zoomState');
-    const zoomButtonElem = document.getElementById('zoom-button');
-    if (zoomButtonElem) {
-        zoomButtonElem.dataset.zoomState = savedZoomState || 'off';
-        applyZoom(zoomButtonElem.dataset.zoomState);
-    }
-    const savedPasswordActive = localStorage.getItem('password_active');
-    isPasswordActive = savedPasswordActive ? JSON.parse(savedPasswordActive) : false;
-    storedPin = localStorage.getItem('password_pin');
-    lastUpdatesCheckDate = localStorage.getItem('lastUpdatesCheckDate');
-    const savedNoticesActive = localStorage.getItem('noticesActive');
-    const savedFooterVisible = localStorage.getItem('footerVisible');
-    isActive = savedNoticesActive ? JSON.parse(savedNoticesActive) : true;
-    isFooterVisible = savedFooterVisible ? JSON.parse(savedFooterVisible) : true;
-    const noticeContainer = document.querySelector('.notices-container');
-    if (noticeContainer) noticeContainer.style.display = isActive ? 'flex' : 'none';
-    const footerElement = document.querySelector('footer');
-    if (footerElement) footerElement.classList.toggle('footer-hidden', !isFooterVisible);
-    const onOffBtn = document.getElementById('on-off-toggle');
-    if (onOffBtn) {
-        const savedOnOffState = localStorage.getItem('onOffState');
-        onOffBtn.dataset.state = savedOnOffState ? savedOnOffState : 'on';
-    }
-    const toggleStatesFromCache = JSON.parse(localStorage.getItem('toggleStates') || '{}');
-    document.querySelectorAll('.range-toggle').forEach(toggle => {
-        const start = parseInt(toggle.dataset.rangeStart);
-        const savedState = toggleStatesFromCache[start] || 'visible';
-        toggle.dataset.state = savedState;
-    });
-    const mainSearchInputGrid = document.getElementById('grid-filter-input');
-    if (mainSearchInputGrid) {
-        const savedMainFilter = localStorage.getItem('gridFilterValue');
-        if (savedMainFilter !== null) {
-            mainSearchInputGrid.value = savedMainFilter;
-        } else {
-            mainSearchInputGrid.value = '';
-        }
-    }
-    
-    const mapFilterInput = document.getElementById('filter-input'); 
-    if (mapFilterInput) {
-        mapFilterInput.value = localStorage.getItem(MAP_FILTER_INPUT_KEY) || 'España';
-    }
-    
-    const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
-    if (radaresRutaCheckbox) {
-        const savedCheckState = localStorage.getItem(RADARES_RUTA_CHECKED_KEY);
-        radaresRutaCheckbox.checked = savedCheckState === 'true';
-    }
-    const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
-    if (tareasRutaCheckbox) {
-        const savedTareasCheckState = localStorage.getItem(TAREAS_RUTA_CHECKED_KEY);
-        tareasRutaCheckbox.checked = savedTareasCheckState === 'true';
-    }
-    currentGraphMode = localStorage.getItem(GRAPH_STATE_KEY) || 'Desviación ETA';
-    const userIdInput = document.getElementById('user-id');
-    const modelInput = document.getElementById('tesla-model');
-    const yearInput = document.getElementById('tesla-year');
-    const provinceInput = document.getElementById('tesla-province');
-    const dmsCheckbox = document.getElementById('allow-dms');
-    const autoBackupCheckbox = document.getElementById('config-auto-backup-on-load');
-    if (userIdInput) userIdInput.value = localStorage.getItem('userData_userId') || '';
-    if (modelInput) modelInput.value = localStorage.getItem('userData_teslaModel') || '';
-    if (yearInput) yearInput.value = localStorage.getItem('userData_teslaYear') || '';
-    if (provinceInput) provinceInput.value = localStorage.getItem('userData_teslaProvince') || '';
-   
-   const savedAllowDMs = localStorage.getItem('userData_allowDMs');
-   if (dmsCheckbox) {
-    dmsCheckbox.checked = savedAllowDMs === null ? true : JSON.parse(savedAllowDMs); 
-   } 
-    
-    if (autoBackupCheckbox) {
-        const savedAutoBackup = localStorage.getItem('boardinggate_autoBackupOnLoad');
-        autoBackupCheckbox.checked = savedAutoBackup === null ? true : JSON.parse(savedAutoBackup);
-    }
-    const savedLockState = localStorage.getItem(PROGRESS_BAR_LOCKED_KEY);
-    isProgressBarLocked = savedLockState === null ? true : JSON.parse(savedLockState);
-    actualizarContadorRadares(0);
-    actualizarContadorTareas(0);
-    updateUserIdDisplay();
-    updateReminderCount();
-}
     
 // ===================================================================
 // NOMBRE: showReorderStagesModal (VERSIÓN FINAL CON CORRECCIÓN DE ID)
@@ -18802,58 +19227,6 @@ function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = fa
     }
 }    
     
-// ===================================================================
-// NOMBRE: saveSettings (MODIFICADA - GUARDA NUEVOS AJUSTES)
-// RESUMEN: Guarda la configuración, incluyendo los nuevos ajustes de offset y minimapa.
-function saveSettings() {
-    localStorage.setItem('darkMode', JSON.stringify(isDarkMode));
-    const tS = {};
-    document.querySelectorAll('.range-toggle').forEach(t => {
-        const start = t.dataset.rangeStart;
-        if (start) tS[start] = t.dataset.state;
-    });
-    localStorage.setItem('toggleStates', JSON.stringify(tS));
-    const zoomButton = document.getElementById('zoom-button');
-    if (zoomButton) localStorage.setItem('zoomState', zoomButton.dataset.zoomState);
-    const onOffBtn = document.getElementById('on-off-toggle');
-    if (onOffBtn) localStorage.setItem('onOffState', onOffBtn.dataset.state);
-    localStorage.setItem('noticesActive', JSON.stringify(isActive));
-    localStorage.setItem('footerVisible', JSON.stringify(isFooterVisible));
-    localStorage.setItem('password_active', JSON.stringify(isPasswordActive));
-    localStorage.setItem('lastUpdatesCheckDate', lastUpdatesCheckDate);
-    localStorage.setItem(GRAPH_STATE_KEY, currentGraphMode);
-    localStorage.setItem(MAP_VIEW_OFFSET_X_KEY, mapOffsetX);
-    localStorage.setItem(MAP_VIEW_OFFSET_Y_KEY, mapOffsetY);
-    localStorage.setItem(MAP_VIEW_SHOW_MINIMAP_KEY, showMinimapPreference);
-    // --- LÍNEA AÑADIDA: Guarda el pitch ---
-    localStorage.setItem(MAP_VIEW_PITCH_KEY, mapPitchValue);
-    const radaresCheckboxElement = document.getElementById('radares-ruta-checkbox');
-    if (radaresCheckboxElement) {
-        localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresCheckboxElement.checked));
-    }
-    const tareasCheckboxElement = document.getElementById('tareas-ruta-checkbox');
-    if (tareasCheckboxElement) { 
-        localStorage.setItem(TAREAS_RUTA_CHECKED_KEY, String(tareasCheckboxElement.checked));
-    }
-    const mainSearchInputGrid = document.getElementById('main-search-input'); 
-    if (mainSearchInputGrid) {
-        localStorage.setItem('gridFilterValue', mainSearchInputGrid.value);
-    }
-    const mapFilterInput = document.getElementById('filter-input'); 
-    if (mapFilterInput) {
-        localStorage.setItem(MAP_FILTER_INPUT_KEY, mapFilterInput.value);
-    }
-    if (mapLayersControl && mapLayersControl._map && mapLayersControl._map._layers) {
-        const layersArray = Object.values(mapLayersControl._map._layers);
-        const baseLayerMapObject = layersArray.find(l => l._map && l.options && !l.options.pane && l.options.attribution);
-        if (baseLayerMapObject) {
-            const activeLayerEntry = mapLayersControl._layers.find(l => l.layer === baseLayerMapObject);
-            if (activeLayerEntry && activeLayerEntry.name) {
-                localStorage.setItem(ACTIVE_MAP_LAYER_KEY, activeLayerEntry.name);
-            }
-        }
-    }
-}
 
 // ===================================================================
 // NOMBRE: handleLoadOrDeleteRouteClick (MODIFICADA - USA RESET CENTRAL)
@@ -20993,161 +21366,6 @@ function handleProgressBarLockToggle() {
             updateTurnByTurnDisplay(navigationCurrentRouteData.routes[0], lastCarDistanceAlongRouteForNavLogic);
         }
     }
-}
-// ===================================================================
-// NOMBRE: showNavigationMapHelpModal (VERSIÓN FINAL Y MEJORADA)
-// RESUMEN: Muestra un modal de ayuda completo y detallado para el mapa de navegación.
-function showNavigationMapHelpModal() {
-    const existingHelpModal = document.getElementById('reminders-map-help-modal-instance');
-    if (existingHelpModal) {
-        clearModalAutoCloseTimer(existingHelpModal, existingHelpModal.querySelector('#close-reminders-map-help-instance'), 'reminders-map-help-modal-instance');
-        existingHelpModal.remove();
-    }
-
-    const helpModal = document.createElement('div');
-    helpModal.id = 'reminders-map-help-modal-instance';
-    helpModal.className = 'help-modal';
-    helpModal.setAttribute('aria-label', 'Ayuda Mapa de Navegación/Radares');
-    
-    helpModal.innerHTML = `
-        <style>
-            #reminders-map-help-modal-instance h3 { color: #87CEEB; margin-top: 1.2rem; margin-bottom: 0.5rem; border-bottom: 1px solid #444; padding-bottom: 4px;}
-            #reminders-map-help-modal-instance ul { list-style-position: inside; padding-left: 0.5rem; }
-            #reminders-map-help-modal-instance li { margin-bottom: 0.5rem; }
-            #reminders-map-help-modal-instance .icon-in-text { height: 1.4em; display: inline; vertical-align: middle; margin: 0 4px; padding: 2px; border-radius: 4px; background: rgba(255,255,255,0.1);}
-            #reminders-map-help-modal-instance .icon-in-text.circle { border-radius: 50%; }
-            /* Estilos para los sliders (CORREGIDOS) */
-            .visual-settings-container { background-color: rgba(255,255,255,0.05); padding: 15px; border-radius: 8px; margin-top: 10px;}
-            .slider-control { display: flex; align-items: center; gap: 15px; margin-bottom: 10px; }
-            .slider-control label { flex-basis: 120px; text-align: right; font-weight: bold; color: #a0a0a0; } /* Color de etiqueta mejorado */
-            .slider-control input[type="range"] { flex-grow: 1; accent-color: #87CEEB; }
-            .slider-control .value-display { flex-basis: 50px; font-weight: bold; color: #f0f0f0; } /* Color de valor mejorado */
-            .reset-visuals-btn { background-color: #ox2bc7; color: black; padding: 4px 4px; border:none; border-radius: 5px; cursor: pointer; margin-top: 5px; }
-        </style>
-
-        <h2 class="text-xl font-bold mb-4">Ayuda del Mapa de Navegación</h2>
-        <div class="modal-top-buttons" style="justify-content: flex-end;">
-            <button type="button" id="close-reminders-map-help-instance" style="flex: 0 1 auto; min-width: 120px;">Entendido</button>
-        </div>
-        <div style="max-height: 70vh; overflow-y: auto; padding-right: 15px;">
-            
-            <h3><img src="https://boardinggate.github.io/Tesla/PNG/personal.png" class="icon-in-text"> Ajustes Visuales del Mapa</h3>
-            <div class="visual-settings-container">
-                <div class="slider-control">
-                    <label for="map-saturation-slider">Saturación:</label>
-                    <input type="range" id="map-saturation-slider" min="0.5" max="2" step="0.05">
-                    <span id="map-saturation-value" class="value-display">120%</span>
-                </div>
-                <div class="slider-control">
-                    <label for="map-contrast-slider">Contraste:</label>
-                    <input type="range" id="map-contrast-slider" min="0.5" max="2" step="0.05">
-                    <span id="map-contrast-value" class="value-display">110%</span>
-                </div>
-                <button id="map-visuals-reset-btn" class="reset-visuals-btn">Restaurar por defecto</button>
-            </div>
-
-            <h3><img src="https://boardinggate.github.io/Tesla/PNG/config.jpg" class="icon-in-text"> Controles Principales</h3>
-            <ul class="list-disc space-y-2">
-                <li><strong>Botón Flotante <img src="PNG/Coche_Sat.PNG" class="icon-in-text circle">:</strong> Es tu navaja suiza. Realiza diferentes acciones según el gesto:
-                    <ul style="padding-left: 20px; margin-top: 5px;">
-                        <li><strong>Clic Corto:</strong> Muestra u oculta la barra de botones superior.</li>
-                        <li><strong>Pulsación Larga (1 seg):</strong> Abre el menú para reportar <strong>Alertas de Tráfico</strong>.</li>
-                        <li><strong>Deslizar ARRIBA:</strong> Inicia <img src="PNG/INICIARNAVEGACION.PNG" class="icon-in-text"> o detiene <img src="PNG/TERMINARNAVEGACION.PNG" class="icon-in-text"> la navegación.</li>
-                        <li><strong>Deslizar a la IZQUIERDA:</strong> Activa/desactiva el modo inmersivo (pantalla completa).</li>
-                        <li><strong>Deslizar a la DERECHA / ABAJO:</strong> Carga y navega automáticamente a tus rutas guardadas "CASA" o "TRABAJO".</li>
-                    </ul>
-                </li>
-                <li><strong>Salir del Mapa <img src="PNG/SALIR.PNG" class="icon-in-text">:</strong> Cierra la vista de navegación y vuelve al lanzador principal.</li>
-                <li><strong>Localización <img src="PNG/ESTASAQUI.PNG" class="icon-in-text">:</strong> Centra el mapa en tu posición actual. Si lo pulsas de nuevo (<img src="PNG/DEJARSEGUIR.PNG" class="icon-in-text">), desactivas el seguimiento automático.</li>
-                <li><strong>Zoom <img src="PNG/ZOOM+.PNG" class="icon-in-text"> / <img src="PNG/ZOOM-.PNG" class="icon-in-text">:</strong> Alterna entre una vista general de toda la ruta y un zoom cercano a tu vehículo.</li>
-            </ul>
-
-            <h3><img src="./PNG/ANADIRPUNTO.PNG" class="icon-in-text"> Planificación de Ruta</h3>
-            <ul class="list-disc space-y-2">
-                <li><strong>Añadir Puntos:</strong> Simplemente <strong>pulsa en cualquier lugar del mapa</strong> para añadir una etapa. También puedes usar el <strong>buscador de texto</strong> para encontrar direcciones o lugares y añadirlos con el botón <img src="./PNG/ANADIRPUNTO.PNG" class="icon-in-text">.</li>
-                <li><strong>Eliminar Puntos:</strong> Pulsa la <strong>'X' roja</strong> sobre cualquier marcador de etapa.</li>
-                <li><strong>Reordenar Etapas <img src="./PNG/MOVER.PNG" class="icon-in-text">:</strong> Abre un menú para arrastrar y cambiar el orden de las etapas de tu ruta.</li>
-                <li><strong>Guardar y Cargar Rutas <img src="PNG/GUARDARRUTA.PNG" class="icon-in-text"> <img src="PNG/CARGARRUTA.PNG" class="icon-in-text">:</strong> Guarda la ruta actual para usarla en el futuro o carga una ya existente.</li>
-            </ul>
-
-            <h3><img src="https://boardinggate.github.io/Tesla/th.jpeg" class="icon-in-text circle"> Durante la Navegación</h3>
-            <ul class="list-disc space-y-2">
-                <li><strong>Rutas Alternativas:</strong>
-                    <ul>
-                        <li><strong>Pulsación Larga</strong> sobre un marcador de etapa (1, 2, F...) para ver al instante las rutas alternativas (Rápida, Corta, Alternativa) para ese tramo.</li>
-                        <li>También puedes hacer un <strong>clic corto</strong> en el marcador, y en la tarjeta que se abre, pulsar el botón <strong>"OTRAS RUTAS"</strong>.</li>
-                    </ul>
-                </li>
-                <li><strong>Puntos de Recarga (PDRs) <img src="PNG/pdrs.png" class="icon-in-text">:</strong>
-                    <ul>
-                        <li><strong>1ª Pulsación:</strong> Abre un modal para filtrar PDRs por potencia, distancia a la ruta y operadores.</li>
-                        <li><strong>2ª Pulsación:</strong> Muestra en el mapa solo el PDR más económico de cada rango de potencia (resaltado con un halo amarillo).</li>
-                        <li><strong>3ª Pulsación:</strong> Limpia todos los PDRs del mapa.</li>
-                    </ul>
-                </li>
-                 <li><strong>Radares y Tareas en Ruta:</strong> Activa los checkboxes <img src="https://i.imgur.com/r33g3oY.png" class="icon-in-text"> para ver en el mapa y en la barra de progreso los radares o tus tareas personales que se encuentren en el trazado actual.</li>
-                 <li><strong>Simulación <img src="./PNG/GPS.PNG" class="icon-in-text">:</strong> Activa este modo para que el coche recorra la ruta automáticamente o para fijar tu posición GPS manualmente haciendo clic en el mapa.</li>
-            </ul>
-        </div>
-    `;
-
-    const mapModal = document.getElementById('reminders-location-map-modal');
-    if (mapModal) {
-        mapModal.style.zIndex = 6400;
-    }
-
-    document.body.appendChild(helpModal); 
-    
-    const saturationSlider = helpModal.querySelector('#map-saturation-slider');
-    const contrastSlider = helpModal.querySelector('#map-contrast-slider');
-    const saturationValue = helpModal.querySelector('#map-saturation-value');
-    const contrastValue = helpModal.querySelector('#map-contrast-value');
-    const resetButton = helpModal.querySelector('#map-visuals-reset-btn');
-
-    const updateLabels = () => {
-        saturationValue.textContent = `${Math.round(saturationSlider.value * 100)}%`;
-        contrastValue.textContent = `${Math.round(contrastSlider.value * 100)}%`;
-    };
-
-    saturationSlider.value = getComputedStyle(document.documentElement).getPropertyValue('--map-saturation').trim() || '1.2';
-    contrastSlider.value = getComputedStyle(document.documentElement).getPropertyValue('--map-contrast').trim() || '1.1';
-    updateLabels();
-    saturationSlider.addEventListener('input', () => {
-        const val = saturationSlider.value;
-        document.documentElement.style.setProperty('--map-saturation', val);
-        localStorage.setItem('boardinggate_map_saturation', val);
-        updateLabels();
-    });
-
-    contrastSlider.addEventListener('input', () => {
-        const val = contrastSlider.value;
-        document.documentElement.style.setProperty('--map-contrast', val);
-        localStorage.setItem('boardinggate_map_contrast', val);
-        updateLabels();
-    });
-
-    resetButton.addEventListener('click', () => {
-        saturationSlider.value = '1.2';
-        contrastSlider.value = '1.1';
-        saturationSlider.dispatchEvent(new Event('input'));
-        contrastSlider.dispatchEvent(new Event('input'));
-        showToast('Ajustes visuales restaurados a los valores por defecto.', 'info');
-    });
-
-    const closeButtonHelp = helpModal.querySelector('#close-reminders-map-help-instance');
-    
-    const closeHandlerHelp = () => { 
-        clearModalAutoCloseTimer(helpModal, closeButtonHelp, 'reminders-map-help-modal-instance'); 
-        if (helpModal.parentNode) {
-            helpModal.parentNode.removeChild(helpModal); 
-        }
-        if (mapModal) {
-            mapModal.style.zIndex = '';
-        }
-    };
-    
-    closeButtonHelp.addEventListener('click', closeHandlerHelp); 
-    addModalAutoCloseTimer(helpModal, closeButtonHelp, 'reminders-map-help-modal-instance', 90000);
 }
     
     // ===================================================================
