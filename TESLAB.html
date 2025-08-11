@@ -516,12 +516,11 @@ V14
 
     
 <script>
-
 // ===================================================================
-// NOMBRE: handleProgressiveManeuverZoom (VERSIÓN CON DESCENTRADO DINÁMICO)
-// RESUMEN: Gestiona el zoom, inclinación y ahora también el descentrado (offset)
-//          de la cámara al acercarse a una maniobra. Analiza la ruta futura para
-//          desplazar horizontalmente la cámara y anticipar giros cerrados.
+// NOMBRE: handleProgressiveManeuverZoom (VERSIÓN 2.0 - DESCENTRADO PREDICTIVO CORREGIDO)
+// RESUMEN: Lógica de cámara completamente reescrita. Ahora analiza la geometría
+//          del giro (ángulo de entrada vs. salida) para anticipar giros cerrados
+//          y desplazar la cámara horizontalmente, mientras centra la vista verticalmente.
 // ===================================================================
 function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDistanceAlongRouteForNavLogic) {
     if (isManualZoomActive) return null;
@@ -553,39 +552,37 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
     const distanceIntoCurrentStep = currentStep.distance - distanceToManeuver;
     let targetZoom = null;
     let targetPitch = null;
-    let targetOffsetX = mapOffsetX; // Partimos del offset actual
-    let targetOffsetY = mapOffsetY; // Partimos del offset actual
+    let targetOffsetX = mapOffsetX;
+    let targetOffsetY = mapOffsetY;
 
-    // --- INICIO: LÓGICA DE DESCENTRADO PREDICTIVO ---
+    // --- INICIO: NUEVA LÓGICA DE DESCENTRADO PREDICTIVO (CORREGIDA) ---
     let predictiveOffsetX = 0;
-    if (distanceToManeuver < PROGRESSIVE_ZOOM_START_DISTANCE + 50) { // Empezamos a calcular un poco antes
-        try {
-            const routeLineString = turf.lineString(route.geometry.coordinates);
-            const carPointOnLine = turf.along(routeLineString, carDistanceAlongRouteForNavLogic / 1000, { units: 'kilometers' });
-            
-            // Miramos 150m hacia adelante en la ruta
-            const lookAheadPoint = turf.along(routeLineString, (carDistanceAlongRouteForNavLogic + 150) / 1000, { units: 'kilometers' });
+    try {
+        const routeLineString = turf.lineString(route.geometry.coordinates);
+        const maneuverPoint = turf.point(currentStep.maneuver.location);
+        const pointOnLine = turf.nearestPointOnLine(routeLineString, maneuverPoint, { units: 'meters' });
+        
+        // Punto 50 metros ANTES de la maniobra
+        const pointBefore = turf.along(routeLineString, Math.max(0, pointOnLine.properties.location - 0.05), { units: 'kilometers' });
+        // Punto 50 metros DESPUÉS de la maniobra
+        const pointAfter = turf.along(routeLineString, pointOnLine.properties.location + 0.05, { units: 'kilometers' });
 
-            // Bearing (dirección) actual del coche
-            const currentBearing = navigationCurrentLocation.heading || 0;
-            
-            // Bearing hacia el punto futuro en la ruta
-            const bearingToLookAhead = turf.bearing(carPointOnLine, lookAheadPoint);
-            
-            // Diferencia de ángulo
-            let angleDiff = bearingToLookAhead - currentBearing;
-            if (angleDiff > 180) angleDiff -= 360;
-            if (angleDiff < -180) angleDiff += 360;
-            
-            // Si el giro es significativo (más de 30 grados), aplicamos un offset
-            if (Math.abs(angleDiff) > 30) {
-                // Si el ángulo es positivo (giro a la derecha), el offset es negativo (cámara a la izquierda)
-                // Si el ángulo es negativo (giro a la izquierda), el offset es positivo (cámara a la derecha)
-                predictiveOffsetX = angleDiff > 0 ? -30 : 30;
-            }
-        } catch(e) { /* Fallo silencioso si Turf falla */ }
-    }
-    // --- FIN: LÓGICA DE DESCENTRADO PREDICTIVO ---
+        // Dirección de entrada y salida de la maniobra
+        const bearingIn = turf.bearing(pointBefore, pointOnLine);
+        const bearingOut = turf.bearing(pointOnLine, pointAfter);
+
+        let angleDiff = bearingOut - bearingIn;
+        if (angleDiff > 180) angleDiff -= 360;
+        if (angleDiff < -180) angleDiff += 360;
+
+        // Si el giro es "cerrado" (más de 40 grados), calculamos el offset
+        if (Math.abs(angleDiff) > 40) {
+            // Giro a la derecha (ángulo positivo) -> offset negativo (cámara a la izquierda)
+            // Giro a la izquierda (ángulo negativo) -> offset positivo (cámara a la derecha)
+            predictiveOffsetX = angleDiff > 0 ? -30 : 30;
+        }
+    } catch(e) { /* Fallo silencioso si Turf no puede calcular */ }
+    // --- FIN: NUEVA LÓGICA DE DESCENTRADO PREDICTIVO ---
 
 
     switch (progressiveZoomState) {
@@ -603,7 +600,6 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
                 } else {
                     targetPitch = 45;
                 }
-                // Mantenemos el offset predictivo si hay otra maniobra cerca
                 targetOffsetX = predictiveOffsetX;
                 targetOffsetY = 0;
 
@@ -611,8 +607,8 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
                 if (distanceIntoCurrentStep > PROGRESSIVE_ZOOM_EXIT_END_DISTANCE || mapPreviousZoomLevelForProgressive === null) {
                     targetZoom = mapPreviousZoomLevelForProgressive;
                     targetPitch = pitchBeforeManeuver;
-                    targetOffsetX = mapOffsetX; // Volver al offset original del usuario
-                    targetOffsetY = mapOffsetY; // Volver al offset original del usuario
+                    targetOffsetX = mapOffsetX;
+                    targetOffsetY = mapOffsetY;
                     progressiveZoomState = 'none';
                     mapPreviousZoomLevelForProgressive = null;
                     window.pitchBeforeManeuver = null;
@@ -626,9 +622,8 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
                     } else {
                         targetPitch = 45 - (45 * progress);
                     }
-                    // Transición suave de vuelta al offset original del usuario
-                    targetOffsetX = predictiveOffsetX - (predictiveOffsetX - mapOffsetX) * progress;
-                    targetOffsetY = 0 - (0 - mapOffsetY) * progress;
+                    targetOffsetX = predictiveOffsetX + (mapOffsetX - predictiveOffsetX) * progress;
+                    targetOffsetY = 0 + (mapOffsetY - 0) * progress;
                 } else {
                     targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
                     if (mapViewMode === 'perspective') {
@@ -636,7 +631,6 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
                     } else {
                         targetPitch = 45;
                     }
-                    // Mantenemos el offset predictivo
                     targetOffsetX = predictiveOffsetX;
                     targetOffsetY = 0;
                 }
@@ -663,9 +657,8 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
                     targetPitch = pitchBeforeManeuver + (45 * progress);
                 }
                 
-                // Transición suave hacia el offset de la maniobra
-                targetOffsetX = mapOffsetX - (mapOffsetX - predictiveOffsetX) * progress;
-                targetOffsetY = mapOffsetY - (mapOffsetY - 0) * progress;
+                targetOffsetX = mapOffsetX + (predictiveOffsetX - mapOffsetX) * progress;
+                targetOffsetY = mapOffsetY * (1 - progress);
 
                 isZoomedForManeuver = true;
 
@@ -683,7 +676,6 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
                 } else {
                     targetPitch = 45;
                 }
-                // Offset completo de la maniobra
                 targetOffsetX = predictiveOffsetX;
                 targetOffsetY = 0;
                 isZoomedForManeuver = true;
@@ -693,7 +685,6 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
                     targetZoom = mapPreviousZoomLevelForProgressive;
                     targetPitch = window.pitchBeforeManeuver;
                 }
-                // Si no hay maniobra, el offset es el del usuario
                 targetOffsetX = mapOffsetX;
                 targetOffsetY = mapOffsetY;
                 progressiveZoomState = 'none';
@@ -708,7 +699,6 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
         targetPitch = Math.max(0, Math.min(85, targetPitch));
         return { zoom: targetZoom, pitch: targetPitch, offsetX: targetOffsetX, offsetY: targetOffsetY };
     }
-    // Si no hay zoom/pitch de maniobra, devolvemos null para que la cámara no haga nada especial
     return null;
 }
 
@@ -790,6 +780,62 @@ function updateMapCamera(coords, mapInstanceToUse) {
     }
 
     mapInstanceToUse.easeTo(viewOptions);
+}    
+
+// ===================================================================
+// NOMBRE: triggerManualMapInteraction (VERSIÓN FINAL CORREGIDA)
+// RESUMEN: Desactiva el seguimiento y reinicia el temporizador de 30s.
+//          Si el modo era 'RUTA', lo cambia a 'OFF'.
+// ===================================================================
+function triggerManualMapInteraction() {
+    if (isInitialMapLoadAnimationActive) return;
+
+    isManualZoomActive = true;
+    navigationFollowUser = false;
+    shouldCenterOnUser = false;
+
+    clearLocateMeReactivationTimer();
+
+    const currentAutoZoomMode = localStorage.getItem(AUTO_ZOOM_MODE_KEY) || 'off';
+    const autoBtn = document.getElementById('zoom-auto-button');
+
+    if (currentAutoZoomMode === 'route') {
+        localStorage.setItem(AUTO_ZOOM_MODE_KEY, 'off');
+        showToast("Modo 'Ruta' desactivado por interacción manual.", "info");
+
+        if (autoBtn) {
+            autoBtn.textContent = 'AUTO';
+            autoBtn.classList.remove('active', 'route-mode');
+            autoBtn.title = 'Zoom automático (Desactivado)';
+        }
+    }
+  
+    startLocateMeReactivationTimer();
+    updateLocateMeButtonsUI();
+}
+
+// ===================================================================
+// NOMBRE: handleManualMapInteraction (VERSIÓN CORREGIDA Y SIMPLIFICADA)
+// RESUMEN: Desactiva el seguimiento al detectar un gesto de arrastre y
+//          siempre reinicia el temporizador de reactivación.
+// ===================================================================
+function handleManualMapInteraction() {
+    if (isInitialMapLoadAnimationActive) return;
+
+    // Si el seguimiento ya está desactivado, simplemente reiniciamos el temporizador.
+    if (!navigationFollowUser) {
+        startLocateMeReactivationTimer();
+        return;
+    }
+
+    // Si el seguimiento estaba activo, lo desactivamos y luego iniciamos el temporizador.
+    isManualZoomActive = true;
+    navigationFollowUser = false;
+    shouldCenterOnUser = false;
+    mapPreviousZoomLevel = navigationMapInstance.getZoom();
+    
+    updateLocateMeButtonsUI();
+    startLocateMeReactivationTimer();
 }    
 
 </script>
