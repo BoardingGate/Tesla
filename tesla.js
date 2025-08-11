@@ -889,7 +889,7 @@ class CombinedMapControl {
     const MAP_VIEW_SHOW_MINIMAP_KEY = 'mapView_showMinimap';
     let mapOffsetX = 0;
     let mapOffsetY = 30;
-    let showMinimapPreference = true;
+  //  let showMinimapPreference = true;
     const MAP_VIEW_PITCH_KEY = 'mapView_pitch';
     let mapPitchValue = 56;
 
