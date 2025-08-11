@@ -889,7 +889,7 @@ class CombinedMapControl {
     const MAP_VIEW_SHOW_MINIMAP_KEY = 'mapView_showMinimap';
     let mapOffsetX = 0;
     let mapOffsetY = 30;
-  //  let showMinimapPreference = true;
+    let showMinimapPreference = true;
     const MAP_VIEW_PITCH_KEY = 'mapView_pitch';
     let mapPitchValue = 56;
 
@@ -1132,7 +1132,6 @@ class CombinedMapControl {
     const PERFORMANCE_RATIO_ALERTS_KEY = 'perf_ratio_alerts';
     const PERFORMANCE_RATIO_STATS_KEY = 'perf_ratio_stats';
     const PERFORMANCE_RATIO_GRAPH_KEY = 'perf_ratio_graph';
-    let showMinimapPreference = true;
     
     let performanceRatios = {
         routeProgress: 6,
