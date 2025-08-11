@@ -1542,9 +1542,6 @@ function triggerArrivalSequence() {
     if (isArrivalSequenceStarted) return; // Doble chequeo por seguridad
     isArrivalSequenceStarted = true;
     
-    console.log("[LLEGADA] Umbral de 20m alcanzado. Iniciando secuencia de llegada.");
-    
-    // Muestra el modal de estadísticas de fin de viaje
     showArrivalStatsModal();
 }
 
