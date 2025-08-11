@@ -1127,8 +1127,7 @@ class CombinedMapControl {
     let progressBarForceShowUntil = 0;
     let lastProcessedStepForLock = null;
     const ARRIVAL_MODAL_THRESHOLD_METERS = 20
-    let isInitialMapLoadAnimationActive = false;
-
+    
     const PERFORMANCE_RATIO_ROUTE_KEY = 'perf_ratio_route';
     const PERFORMANCE_RATIO_ALERTS_KEY = 'perf_ratio_alerts';
     const PERFORMANCE_RATIO_STATS_KEY = 'perf_ratio_stats';
