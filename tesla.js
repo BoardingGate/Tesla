@@ -2812,10 +2812,6 @@ function saveCustomData() {
     }
 }
 
-// ===================================================================
-// VARIABLE FALTANTE - AÑADIR JUNTO CON LA FUNCIÓN
-// ===================================================================
-let showMinimapPreference = true;
 
 // ===================================================================
 // NOMBRE: showIntersectionPreviewMap (VERSIÓN 8 - CORRECCIÓN DE VARIABLE Y ANTI-FLICKER)
