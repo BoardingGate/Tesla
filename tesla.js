@@ -855,7 +855,7 @@ class CombinedMapControl {
         "Satélite Puro": "SATÉLITE",
         "Mapa Normal": "CALLES"
     };
-    const MAP_VIEW_MODES = {
+    const MAP_VIEW_MODES = { 
         'NORTE': {pitch: 0, bearing: 0, mode: 'static'},
         'AVANCE': {pitch: 0, bearing: null, mode: 'heading'},
         '3D': {pitch: 62, bearing: null, mode: 'perspective'}
