@@ -5961,149 +5961,6 @@ function sanitizeWaypointsForStorage(waypoints) {
         };
     }).filter(Boolean); // Elimina cualquier posible nulo
 }
-// ===================================================================
-// NOMBRE: handleProgressiveManeuverZoom (VERSIÓN CON INCLINACIÓN ADAPTATIVA)
-// RESUMEN: Gestiona el zoom y la inclinación de forma diferente para modos 2D y 3D.
-// ===================================================================
-function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDistanceAlongRouteForNavLogic) {
-    if (isManualZoomActive) return null;
-
-    if (!isNavigating || !navigationMapInstance || !currentStep) {
-        if (isZoomedForManeuver) isZoomedForManeuver = false;
-        return null;
-    }
-    
-    const route = navigationCurrentRouteData?.routes?.[0];
-    if (!route) return null;
-
-    let pitchBeforeManeuver = null;
-
-    const maxZoomForMap = navigationMapInstance.getMaxZoom() || 19;
-    const currentMapLayerName = (localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "satélite + calles").toLowerCase();
-    const isSatelliteWithLabels = currentMapLayerName.includes("satélite + calles");
-    const MANEUVER_PEAK_ZOOM_LEVEL = isSatelliteWithLabels ? Math.min(17.5, maxZoomForMap) : Math.min(18.5, maxZoomForMap);
-    const HOLD_ZOOM_THRESHOLD = 250;
-    
-    const currentStepIdentifier = `${currentLegIndexNav}_${currentStepIndexNav}`;
-    if (lastProcessedStepIdentifier !== null && lastProcessedStepIdentifier !== currentStepIdentifier) {
-        if (progressiveZoomState === 'zooming-in' || progressiveZoomState === 'holding') {
-            progressiveZoomState = 'zooming-out';
-        }
-    }
-    lastProcessedStepIdentifier = currentStepIdentifier;
-
-    const distanceIntoCurrentStep = currentStep.distance - distanceToManeuver;
-    let targetZoom = null;
-    let targetPitch = null;
-
-    switch (progressiveZoomState) {
-        case 'zooming-out':
-            isZoomedForManeuver = true;
-            pitchBeforeManeuver = window.pitchBeforeManeuver !== null ? window.pitchBeforeManeuver : navigationMapInstance.getPitch();
-
-            const nextStepAfterCurrent = findNextValidStep(route, currentLegIndexNav, currentStepIndexNav);
-            const distanceToNextStep = nextStepAfterCurrent ? calculateDistanceToEndOfStep(route, nextStepAfterCurrent.legIndex, nextStepAfterCurrent.stepIndex) - carDistanceAlongRouteForNavLogic : Infinity;
-            
-            if (nextStepAfterCurrent && distanceToNextStep < HOLD_ZOOM_THRESHOLD) {
-                targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
-                // Mantener inclinación máxima de la maniobra si hay otra cerca
-                if (mapViewMode === 'perspective') {
-                    targetPitch = pitchBeforeManeuver * 0.90;
-                } else {
-                    targetPitch = 45;
-                }
-            } else {
-                if (distanceIntoCurrentStep > PROGRESSIVE_ZOOM_EXIT_END_DISTANCE || mapPreviousZoomLevelForProgressive === null) {
-                    targetZoom = mapPreviousZoomLevelForProgressive;
-                    targetPitch = pitchBeforeManeuver; // Volver a la inclinación original
-                    progressiveZoomState = 'none';
-                    mapPreviousZoomLevelForProgressive = null;
-                    window.pitchBeforeManeuver = null;
-                    isZoomedForManeuver = false;
-                } else if (distanceIntoCurrentStep >= PROGRESSIVE_ZOOM_EXIT_START_DISTANCE) {
-                    const progress = (distanceIntoCurrentStep - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE) / (PROGRESSIVE_ZOOM_EXIT_END_DISTANCE - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE);
-                    targetZoom = MANEUVER_PEAK_ZOOM_LEVEL - (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * Math.min(1, progress);
-                    // Lógica DUAL para recuperar inclinación
-                    if (mapViewMode === 'perspective') {
-                        const pitchReduction = pitchBeforeManeuver * 0.10;
-                        targetPitch = (pitchBeforeManeuver - pitchReduction) + (pitchReduction * progress);
-                    } else {
-                        targetPitch = 45 - (45 * progress);
-                    }
-                } else {
-                    targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
-                    // Lógica DUAL para mantener inclinación
-                    if (mapViewMode === 'perspective') {
-                        targetPitch = pitchBeforeManeuver * 0.90;
-                    } else {
-                        targetPitch = 45;
-                    }
-                }
-            }
-            break;
-
-        default:
-            if (distanceToManeuver <= PROGRESSIVE_ZOOM_START_DISTANCE && distanceToManeuver > PROGRESSIVE_ZOOM_PEAK_DISTANCE) {
-                if (progressiveZoomState !== 'zooming-in' && progressiveZoomState !== 'holding') {
-                    mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
-                    window.pitchBeforeManeuver = navigationMapInstance.getPitch();
-                }
-                progressiveZoomState = 'zooming-in';
-                pitchBeforeManeuver = window.pitchBeforeManeuver;
-
-                let progress = (PROGRESSIVE_ZOOM_START_DISTANCE - distanceToManeuver) / (PROGRESSIVE_ZOOM_START_DISTANCE - PROGRESSIVE_ZOOM_PEAK_DISTANCE);
-                progress = easeInOutQuad(progress);
-                targetZoom = mapPreviousZoomLevelForProgressive + (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * progress;
-                
-                // <<< INICIO DE LA LÓGICA DE INCLINACIÓN DUAL >>>
-                if (mapViewMode === 'perspective') {
-                    const pitchReduction = pitchBeforeManeuver * 0.10;
-                    targetPitch = pitchBeforeManeuver - (pitchReduction * progress);
-                } else { // Modos 2D
-                    targetPitch = pitchBeforeManeuver + (45 * progress);
-                }
-                // <<< FIN DE LA LÓGICA DE INCLINACIÓN DUAL >>>
-                
-                isZoomedForManeuver = true;
-
-            } else if (distanceToManeuver <= PROGRESSIVE_ZOOM_PEAK_DISTANCE) {
-                if (progressiveZoomState !== 'holding') {
-                    if(mapPreviousZoomLevelForProgressive === null) mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
-                    if(window.pitchBeforeManeuver === null) window.pitchBeforeManeuver = navigationMapInstance.getPitch();
-                }
-                progressiveZoomState = 'holding';
-                pitchBeforeManeuver = window.pitchBeforeManeuver;
-                targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
-                
-                // Mantener la inclinación máxima de la maniobra
-                if (mapViewMode === 'perspective') {
-                    targetPitch = pitchBeforeManeuver * 0.90;
-                } else {
-                    targetPitch = 45;
-                }
-                isZoomedForManeuver = true;
-
-            } else {
-                if (progressiveZoomState !== 'none' && mapPreviousZoomLevelForProgressive !== null) {
-                    targetZoom = mapPreviousZoomLevelForProgressive;
-                    targetPitch = window.pitchBeforeManeuver;
-                }
-                progressiveZoomState = 'none';
-                mapPreviousZoomLevelForProgressive = null;
-                window.pitchBeforeManeuver = null;
-                isZoomedForManeuver = false;
-            }
-            break;
-    }
-
-    if (targetZoom !== null && targetPitch !== null) {
-        // Aseguramos que los valores de inclinación estén siempre dentro de los límites válidos
-        targetPitch = Math.max(0, Math.min(85, targetPitch));
-        return { zoom: targetZoom, pitch: targetPitch };
-    }
-    return null;
-}
-
     
 // ===================================================================
 // NOMBRE: updateDynamicRadars (MODIFICADA - Lógica de Navegación vs. Radio)
@@ -6389,9 +6246,6 @@ async function checkReminders() {
     // TAREA 4: Gestión de la Caché
     if (isCacheDirty) {
         rebuildProcessedRemindersCache();
-        // >>> ¡CORRECCIÓN CLAVE! <<<
-        // Forzamos la salida del bucle actual. La próxima ejecución de checkReminders
-        // (en el siguiente intervalo) ya trabajará con la caché limpia y actualizada.
         return; 
     }
     
@@ -6494,7 +6348,7 @@ async function checkReminders() {
 }
 
 // ===================================================================
-// NOMBRE: toggleTareasRuta (VERSIÓN OPTIMIZADA Y CORREGIDA PARA MAPBOX)
+// NOMBRE:  (VERSIÓN OPTIMIZADA Y CORREGIDA PARA MAPBOX)
 // RESUMEN: Muestra tareas en la ruta. Optimizado para evitar recalculos innecesarios.
 async function toggleTareasRuta(activo) {
     const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
@@ -6567,14 +6421,7 @@ async function toggleTareasRuta(activo) {
     if (tareasRutaCheckbox) {
         tareasRutaCheckbox.checked = activo;
     }
-}
-
-
-
-
-
-    
-    
+}   
     
 // ===================================================================
 // NOMBRE: markRemindersCacheAsDirty (NUEVA FUNCIÓN)
@@ -7971,8 +7818,6 @@ function markReminderAsManaged(reminderId, managedState = true) {
     
 // ===================================================================
 // NOMBRE: clearRecoveryFlag (NUEVA FUNCIÓN)
-// RESUMEN: Función centralizada para limpiar la bandera de recuperación de forma segura.
-// ===================================================================
 function clearRecoveryFlag() {
     localStorage.removeItem('boardinggate_nav_recovery_flag');
 }
@@ -8387,8 +8232,6 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, isUserA
     console.log("[RECALC] Bucle de recálculo finalizado sin éxito.");
 }
 
-
-
     
 // ===================================================================
 // NOMBRE: checkAndIncrementPoiCount (VERSIÓN CORREGIDA PARA CLIENTE)
@@ -8419,7 +8262,6 @@ async function checkAndIncrementPoiCount() {
         let dataToUpdate = {};
 
         if (!userDocSnap.exists()) {
-            // Si el usuario no existe en la BD, se crea con el primer clic
             dataToUpdate = {
                 poi_clicks_last_month: monthStr,
                 poi_clicks_month: 1
@@ -8437,7 +8279,6 @@ async function checkAndIncrementPoiCount() {
             };
         }
 
-        // Realizamos la escritura en la base de datos
         await window.setDoc(userDocRef, dataToUpdate, { merge: true });
 
         return true; // Permitir la llamada a la API
@@ -8455,11 +8296,9 @@ async function checkAndIncrementPoiCount() {
 function createRadarSpeedIcon(speed, currentZoomLevel = null, isFromTarea = false) {
     const container = document.createElement('div');
     
-    // UMBRALES DE ZOOM
     const ZOOM_PEQUENO = 11.5;  // Por debajo de este zoom, el tamaño es mínimo
     const ZOOM_GRANDE = 16.5;   // Por encima de este zoom, el tamaño es máximo
 
-    // TAMAÑOS DEL ICONO EN PÍXELES
     const TAMANO_MINIMO = 18;
     const TAMANO_MAXIMO = 48; // Puedes ajustar este valor si lo quieres más grande
 
@@ -8470,7 +8309,6 @@ function createRadarSpeedIcon(speed, currentZoomLevel = null, isFromTarea = fals
         } else if (currentZoomLevel >= ZOOM_GRANDE) {
             finalSize = TAMANO_MAXIMO;
         } else {
-            // Interpolar linealmente entre los dos umbrales
             const progress = (currentZoomLevel - ZOOM_PEQUENO) / (ZOOM_GRANDE - ZOOM_PEQUENO);
             finalSize = TAMANO_MINIMO + (TAMANO_MAXIMO - TAMANO_MINIMO) * progress;
         }
@@ -8547,7 +8385,6 @@ function initializeLocationPickerMap(mapContainerId, slotIndex) {
                 tempSavedLocations[activeSlotIndex].lng = pos.lng;
             });
 
-            // El listener de 'click' también necesita el slot activo.
             locationPickerMap.on('click', (e) => {
                 const activeSlotIndex = locationPickerMap.activeSlotIndex;
                 if (typeof activeSlotIndex !== 'number') return;
@@ -8655,20 +8492,16 @@ function showReminderActionModal(reminderId) {
 // NOMBRE: handleAutoZoom (MODIFICADA - SOLO CALCULA, NO EJECUTA)
 // RESUMEN: Ajusta el zoom según la velocidad, devolviendo el nivel de zoom objetivo.
 function handleAutoZoom() {
-    // Si el modo 'auto' no está activo, o el usuario ha interactuado manualmente,
-    // o no estamos navegando, no hacemos nada.
     const currentAutoZoomMode = localStorage.getItem(AUTO_ZOOM_MODE_KEY) || 'off';
     if (currentAutoZoomMode !== 'auto' || isManualZoomActive || !(isNavigating || isFreeDriveActive) || !navigationMapInstance) {
         return null;
     }
 
-    // No debe interferir con el zoom de maniobras.
     if (isZoomedForManeuver) return null;
 
     const speed = window.currentSpeedKmh || 0;
     let targetZoom;
 
-    // Lógica de niveles de zoom por velocidad.
     if (speed < 30) targetZoom = 19;
     else if (speed < 50) targetZoom = 18.5;
     else if (speed < 80) targetZoom = 18;
@@ -8678,7 +8511,6 @@ function handleAutoZoom() {
     else if (speed < 200) targetZoom = 16.3;
     else return null; // Si la velocidad es muy alta, no hacemos nada.
 
-    // Solo devolvemos un nuevo zoom si hay una diferencia significativa.
     if (Math.abs(navigationMapInstance.getZoom() - targetZoom) > 0.1) {
         return targetZoom;
     }
@@ -8802,7 +8634,6 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
 // ===================================================================
 // NOMBRE: updateVehicleMarker (NUEVA FUNCIÓN AUXILIAR)
 // RESUMEN: Gestiona exclusivamente la posición y rotación del marcador del vehículo.
-// ===================================================================
 function updateVehicleMarker(coords, mapInstanceToUse) {
     lastGpsUpdateTime = Date.now();
     const lngLat = new mapboxgl.LngLat(coords.longitude, coords.latitude);
@@ -8853,7 +8684,6 @@ function updateVehicleMarker(coords, mapInstanceToUse) {
 // ===================================================================
 // NOMBRE: updateMapCamera (NUEVA FUNCIÓN AUXILIAR)
 // RESUMEN: Gestiona exclusivamente el movimiento de la cámara del mapa.
-// ===================================================================
 function updateMapCamera(coords, mapInstanceToUse) {
     const shouldFollow = (shouldCenterOnUser || navigationFollowUser);
     if (!shouldFollow || isRecalculatingRoute || !mapInstanceToUse) {
@@ -8992,7 +8822,6 @@ function updateTripStatistics(coords) {
 // ===================================================================
 // NOMBRE: processRouteProgress (NUEVA FUNCIÓN AUXILIAR - CORREGIDA)
 // RESUMEN: Lógica de progreso en ruta que CALCULA y LUEGO LLAMA a las funciones de UI.
-// ===================================================================
 function processRouteProgress(coords, mapInstanceToUse) {
     if(!isNavigating || !navigationCurrentRouteData || !navigationCurrentRouteData.routes[0] || !coords) return;
 
@@ -9065,7 +8894,6 @@ function processRouteProgress(coords, mapInstanceToUse) {
         lastCarDistanceAlongRouteForNavLogic = totalRouteLength;
     }
 
-    // --- CORRECCIÓN CLAVE: Se llama a las funciones de UI DESDE AQUÍ ---
     checkAndMarkWaypointsAsVisited(route, lastCarDistanceAlongRouteForNavLogic, coords);
     renderWaypointMarkers(); // Necesario para actualizar el color de los visitados
     updateTurnByTurnDisplay(route, lastCarDistanceAlongRouteForNavLogic);
@@ -9168,8 +8996,6 @@ function startGpsWatching() {
 // ===================================================================
 // NOMBRE: processSimulatedGpsPosition (VERSIÓN FINAL Y CORRECTA)
 // RESUMEN: Procesa la posición GPS simulada, actualiza las estadísticas
-//          de viaje y delega toda la lógica de UI al orquestador.
-// ===================================================================
 function processSimulatedGpsPosition(forceExactPosition = false) {
     if (!isSimulatingGpsLocation || !simulatedGpsLocation) return;
     navigationCurrentLocation = { ...simulatedGpsLocation };
@@ -9314,7 +9140,6 @@ function showPostArrivalActionModal() {
     const modal = document.createElement('div');
     modal.id = 'post-arrival-action-modal';
     
-    // <<< MODIFICACIÓN: Se añade el tercer botón "Salir" al innerHTML >>>
     modal.innerHTML = `
         <p class="post-arrival-title">Viaje finalizado</p>
         <div class="post-arrival-buttons">
@@ -9336,7 +9161,6 @@ function showPostArrivalActionModal() {
         hidePostArrivalActionModal();
     });
 
-    // <<< NUEVO: Se añade el event listener para el botón "Salir" >>>
     document.getElementById('post-arrival-exit-button').addEventListener('click', () => {
         hidePostArrivalActionModal();
     });
@@ -9394,9 +9218,7 @@ async function createAndLoadReturnTrip() {
 // RESUMEN: Al cerrar, en lugar de borrar la ruta, ahora invoca el nuevo
 //          modal de acciones post-llegada (Vuelta / Borrar Ruta).
 function showArrivalStatsModal(freeDriveStatsData = null) {
-    // --- INICIO MODIFICACIÓN RECUPERACIÓN ---
     clearRecoveryFlag();
-    // --- FIN MODIFICACIÓN RECUPERACIÓN ---
     closeOtherModals('arrival-stats-modal');
     document.body.classList.add('modal-open');
 
@@ -9674,8 +9496,7 @@ async function drawRouteOnMap(route) {
         }
     });
 }
-
-    
+  
 // ===================================================================
 // NOMBRE: handleAddRadarHereClick
 // RESUMEN: Inicia el proceso para añadir un radar, mostrando el modal de selección de velocidad.
@@ -9750,7 +9571,6 @@ async function proceedWithRecalculation(action) {
         return;
     }
     if (action === 'skip_one') {
-        // --- CORRECCIÓN APLICADA AQUÍ: Se añade '&& wp.type !== 'F'' para no omitir nunca el destino final ---
         const nextUnvisitedStageIndex = navigationWaypoints.findIndex(wp => wp && !wp.isInternal && !wp.isRecalculatedStart && !wp.visited && wp.type !== 'S' && wp.type !== 'S_Recalc' && wp.type !== 'F');
         if (nextUnvisitedStageIndex !== -1) {
             navigationWaypoints[nextUnvisitedStageIndex].visited = true;
@@ -9762,7 +9582,6 @@ async function proceedWithRecalculation(action) {
         const stagesToSkip = [];
         const currentHeading = navigationCurrentLocation.heading;
         navigationWaypoints.forEach(wp => {
-            // Esta condición ya era correcta, pero la dejamos para asegurar que el destino final NUNCA se omita.
             if (wp.visited || wp.type === 'S' || wp.type === 'S_Recalc' || wp.type === 'F') return;
             const bearingToWp = turf.bearing(
                 turf.point([navigationCurrentLocation.longitude, navigationCurrentLocation.latitude]),
@@ -9786,9 +9605,6 @@ async function proceedWithRecalculation(action) {
 // ===================================================================
 // NOMBRE: checkAndMarkWaypointsAsVisited (VERSIÓN CON LÓGICA DE ACUMULACIÓN CORREGIDA)
 // RESUMEN: Corrige el error lógico "off-by-one" que marcaba la primera etapa
-//          como visitada. La distancia de cada tramo ahora se usa para evaluar la
-//          llegada a la etapa correcta.
-// ===================================================================
 function checkAndMarkWaypointsAsVisited(route, carDistanceAlongRoute, currentCoords) {
     if (!route || !route.legs || !currentCoords) return;
 
@@ -9804,19 +9620,15 @@ function checkAndMarkWaypointsAsVisited(route, carDistanceAlongRoute, currentCoo
             } else if (isIntermediate && (index - 1) < route.legs.length) {
                 const leg = route.legs[index - 1];
                 if (leg) {
-                    // <<< CORRECCIÓN CLAVE >>>
-                    // Se calcula la distancia hasta el final de ESTA etapa antes de hacer nada más.
                     const distanceToEndOfThisLeg = cumulativeDistance + (leg.distance || 0);
 
                     const tripHasPhysicallyStarted = isNavigating && navigationStartTimeForStats;
                     const hasClearedStartBuffer = carDistanceAlongRoute > 20;
 
-                    // La comprobación ahora usa la distancia correcta para esta etapa.
                     if (tripHasPhysicallyStarted && hasClearedStartBuffer && carDistanceAlongRoute >= distanceToEndOfThisLeg - WAYPOINT_VISITED_THRESHOLD_METERS) {
                         wp.visited = true;
                     }
                     
-                    // Solo DESPUÉS de la comprobación, se actualiza la distancia acumulada para la SIGUIENTE etapa.
                     cumulativeDistance = distanceToEndOfThisLeg;
                 }
             } else if (isFinal) {
@@ -10368,7 +10180,6 @@ async function getGpsWithRetries() {
         }
     }
 
-    // Si todos los reintentos fallan
     const loadingToast = document.getElementById(toastId);
     if (loadingToast) loadingToast.remove();
     showToast("Fallo al obtener la ubicación tras varios intentos. Revise los permisos.", "error");
@@ -10748,8 +10559,7 @@ async function openNavigationMap(isRecovery = false) {
         }
     }); 
 }
-
-    
+   
 // ===================================================================
 // NOMBRE: loadRouteFromObject (VERSIÓN FINAL Y ROBUSTA CONTRA MOVIMIENTO)
 // RESUMEN: "Salva" la ubicación GPS actual ANTES de limpiar, garantizando un recálculo fiable.
@@ -10773,8 +10583,6 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
     currentRouteNameForSaving = routeObject.name;
     const waypointsFromLoadedRoute = routeObject.waypoints;
     
-    // --- INICIO MODIFICACIÓN RECUPERACIÓN (CORRECCIÓN FINAL V8) ---
-    // Lógica dual para manejar rutas completas y destinos únicos.
     if (waypointsFromLoadedRoute.length === 1) {
         // Caso: Se está cargando un destino único (1 waypoint).
         if (startLocation) {
@@ -10801,15 +10609,12 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
                 type: 'S', marker: null, label: 'S', address: 'Posición Actual (GPS)',
                 visited: true, isCriticalForRecalc: true, isInternal: false, isRecalculatedStart: false 
             };
-            // Descartamos el punto de salida antiguo y usamos el resto.
             navigationWaypoints = [startPoint, ...sanitizeWaypointsForStorage(waypointsFromLoadedRoute.slice(1))];
         } else {
-            // Si no hay GPS, cargamos la ruta original tal cual.
             showToast("Señal GPS no disponible. Cargando ruta original...", "warning");
             navigationWaypoints = sanitizeWaypointsForStorage(waypointsFromLoadedRoute);
         }
     }
-    // --- FIN MODIFICACIÓN RECUPERACIÓN (CORRECCIÓN FINAL V8) ---
     
     await updateWaypointTypesAndLabels();
     renderWaypointMarkers();
