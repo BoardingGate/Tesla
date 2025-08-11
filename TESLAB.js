@@ -1058,7 +1058,7 @@ class CombinedMapControl {
     let simulatedDistanceAlongRoute = 0;
     let simulationSpeedKmph = 85;
     let currentSimulationSpeedKmph = 85; 
-    const SIMULATION_TICK_INTERVAL_MS = 175;
+    const SIMULATION_TICK_INTERVAL_MS = 110;
     const AUTO_ZOOM_ACTIVE_KEY = 'boardinggate_autoZoomActive';
     let completedSegmentsGeoJSON = { type: 'FeatureCollection', features: [] }; 
     let maxSpeedMarkerObjects = []; 
