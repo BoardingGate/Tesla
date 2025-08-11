@@ -1534,6 +1534,22 @@ function checkAndMarkWaypointsAsVisited(route, carDistanceAlongRoute, currentCoo
 }
 
 // ===================================================================
+// NOMBRE: triggerArrivalSequence (NUEVA FUNCIÓN - CORRECCIÓN CRÍTICA)
+// RESUMEN: Inicia la secuencia de llegada, estableciendo el flag de control
+//          y mostrando el modal de estadísticas. Esta función faltaba.
+// ===================================================================
+function triggerArrivalSequence() {
+    if (isArrivalSequenceStarted) return; // Doble chequeo por seguridad
+    isArrivalSequenceStarted = true;
+    
+    console.log("[LLEGADA] Umbral de 20m alcanzado. Iniciando secuencia de llegada.");
+    
+    // Muestra el modal de estadísticas de fin de viaje
+    showArrivalStatsModal();
+}
+
+
+// ===================================================================
 // NOMBRE: saveSettings (MODIFICADA)
 // RESUMEN: Añade el guardado de los nuevos ratios de rendimiento.
 // ===================================================================
