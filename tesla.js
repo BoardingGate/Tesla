@@ -16723,12 +16723,12 @@ function startLocateMeReactivationTimer() {
 }
 
 // ===================================================================
-// NOMBRE: triggerManualMapInteraction (VERSIÓN FINAL CON LÓGICA DE MODOS Y PERIODO DE GRACIA)
-// RESUMEN: Desactiva temporalmente el seguimiento. Si el modo es 'RUTA', lo cambia a 'OFF'.
-//          Ignora la interacción si la animación de carga inicial está activa.
+// NOMBRE: triggerManualMapInteraction (VERSIÓN FINAL CORREGIDA)
+// RESUMEN: Desactiva el seguimiento y reinicia el temporizador de 30s.
+//          Si el modo era 'RUTA', lo cambia a 'OFF'.
 // ===================================================================
 function triggerManualMapInteraction() {
-    if (isInitialMapLoadAnimationActive) return; // <-- AÑADIDO: Ignora si la animación inicial está en curso
+    if (isInitialMapLoadAnimationActive) return;
 
     isManualZoomActive = true;
     navigationFollowUser = false;
@@ -16755,18 +16755,20 @@ function triggerManualMapInteraction() {
 }
 
 // ===================================================================
-// NOMBRE: handleManualMapInteraction (VERSIÓN CON PERIODO DE GRACIA)
-// RESUMEN: Desactiva el seguimiento SOLO cuando detecta un gesto de arrastre
-//          e ignora la interacción si la animación de carga inicial está activa.
+// NOMBRE: handleManualMapInteraction (VERSIÓN CORREGIDA Y SIMPLIFICADA)
+// RESUMEN: Desactiva el seguimiento al detectar un gesto de arrastre y
+//          siempre reinicia el temporizador de reactivación.
 // ===================================================================
 function handleManualMapInteraction() {
-    if (isInitialMapLoadAnimationActive) return; // <-- AÑADIDO: Ignora si la animación inicial está en curso
+    if (isInitialMapLoadAnimationActive) return;
 
+    // Si el seguimiento ya está desactivado, simplemente reiniciamos el temporizador.
     if (!navigationFollowUser) {
         startLocateMeReactivationTimer();
         return;
     }
 
+    // Si el seguimiento estaba activo, lo desactivamos y luego iniciamos el temporizador.
     isManualZoomActive = true;
     navigationFollowUser = false;
     shouldCenterOnUser = false;
@@ -16774,7 +16776,8 @@ function handleManualMapInteraction() {
     
     updateLocateMeButtonsUI();
     startLocateMeReactivationTimer();
-}    
+}
+
  // ===================================================================
 // NOMBRE: assignMapButtonListeners (VERSIÓN FINAL CON REASIGNACIÓN SEGURA)
 // RESUMEN: Asigna listeners a los botones del modal. Clona y reemplaza elementos clave como el input de búsqueda para eliminar listeners antiguos y añadir los nuevos, garantizando la interactividad al reabrir el mapa.
