@@ -1132,6 +1132,7 @@ class CombinedMapControl {
     const PERFORMANCE_RATIO_ALERTS_KEY = 'perf_ratio_alerts';
     const PERFORMANCE_RATIO_STATS_KEY = 'perf_ratio_stats';
     const PERFORMANCE_RATIO_GRAPH_KEY = 'perf_ratio_graph';
+    const PERFORMANCE_RATIO_CRITICAL_KEY = 'perf_ratio_critical'; 
     
     let performanceRatios = {
         routeProgress: 6,
