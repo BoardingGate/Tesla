@@ -1127,6 +1127,7 @@ class CombinedMapControl {
     let progressBarForceShowUntil = 0;
     let lastProcessedStepForLock = null;
     const ARRIVAL_MODAL_THRESHOLD_METERS = 20
+    let isInitialMapLoadAnimationActive = false;
 
     const PERFORMANCE_RATIO_ROUTE_KEY = 'perf_ratio_route';
     const PERFORMANCE_RATIO_ALERTS_KEY = 'perf_ratio_alerts';
@@ -6418,11 +6419,10 @@ async function checkForAndExecuteCrashRecovery() {
     return false;
 }
 
-
 // ===================================================================
-// NOMBRE: openNavigationMap (VERSIÓN CORREGIDA - ASIGNA LISTENERS DE TARJETA Y CANDADO)
-// RESUMEN: Abre el mapa y asigna correctamente los listeners de clic al
-//          botón del candado y a la tarjeta superior de maniobras.
+// NOMBRE: openNavigationMap (VERSIÓN CORREGIDA - CON PERIODO DE GRACIA)
+// RESUMEN: Añade un flag para evitar que la interacción manual durante
+//          la animación inicial desactive el seguimiento automático.
 // ===================================================================
 async function openNavigationMap(isRecovery = false) {
     return new Promise(async (resolve, reject) => {
@@ -6592,8 +6592,6 @@ async function openNavigationMap(isRecovery = false) {
                 
                 navigationMapInstance.on('load', async function() {
                     try {
-                        // --- INICIO DE LA CORRECCIÓN ---
-                        // 1. Asignar listener al candado
                         const lockButton = document.getElementById('toggle-progress-bar-lock');
                         if (lockButton && !lockButton.dataset.listenerAttached) {
                             lockButton.addEventListener('click', (e) => {
@@ -6604,7 +6602,6 @@ async function openNavigationMap(isRecovery = false) {
                         }
                         updateProgressBarLockIcon();
                         
-                        // 2. Asignar listener a la tarjeta de maniobra
                         const topInfoBar = document.getElementById('navigation-top-info-bar');
                         if (topInfoBar && !topInfoBar.dataset.listenerAttached) {
                             topInfoBar.addEventListener('click', (e) => {
@@ -6613,8 +6610,8 @@ async function openNavigationMap(isRecovery = false) {
                                     showIntersectionPreviewMap(
                                         nextManeuverStepForPreview, 
                                         navigationCurrentRouteData.routes[0], 
-                                        true, // Es un clic manual
-                                        10000 // Autocierre en 10s
+                                        true,
+                                        10000
                                     );
                                 } else {
                                     showToast("No hay una próxima maniobra que mostrar.", "info");
@@ -6622,7 +6619,6 @@ async function openNavigationMap(isRecovery = false) {
                             });
                             topInfoBar.dataset.listenerAttached = 'true';
                         }
-                        // --- FIN DE LA CORRECCIÓN ---
                         
                         const initToast = document.getElementById("map-init-toast");
                         if (initToast) initToast.remove();
@@ -6737,14 +6733,18 @@ async function openNavigationMap(isRecovery = false) {
                         updateInitialUserPosition(currentPos, navigationMapInstance);
                         
                         if (navigationMapInstance) {
+                            // --- INICIO DE LA CORRECCIÓN CLAVE ---
+                            isInitialMapLoadAnimationActive = true; // 1. Activar el periodo de gracia
                             navigationMapInstance.flyTo({
                                 center: [currentPos.longitude, currentPos.latitude],
                                 zoom: 17,
                                 bearing: 0,
                                 pitch: 50,
                                 duration: 1500
+                            }).once('end', () => {
+                                isInitialMapLoadAnimationActive = false; // 2. Desactivar cuando la animación termine
                             });
-                        }
+                          }
                         startGpsWatching();
                         
                         resolve();
@@ -6762,7 +6762,7 @@ async function openNavigationMap(isRecovery = false) {
         }
     }); 
 }
-
+//======================================================
 function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     const topInfoBar = document.getElementById('navigation-top-info-bar');
     const intersectionPreviewWindow = document.getElementById('intersection-preview-map-window');
@@ -16721,11 +16721,15 @@ function startLocateMeReactivationTimer() {
         }
     }, 1000);
 }
+
 // ===================================================================
-// NOMBRE: triggerManualMapInteraction (VERSIÓN FINAL CON LÓGICA DE MODOS)
+// NOMBRE: triggerManualMapInteraction (VERSIÓN FINAL CON LÓGICA DE MODOS Y PERIODO DE GRACIA)
 // RESUMEN: Desactiva temporalmente el seguimiento. Si el modo es 'RUTA', lo cambia a 'OFF'.
-//          Si el modo es 'AUTO', solo lo anula temporalmente sin cambiar el estado.
+//          Ignora la interacción si la animación de carga inicial está activa.
+// ===================================================================
 function triggerManualMapInteraction() {
+    if (isInitialMapLoadAnimationActive) return; // <-- AÑADIDO: Ignora si la animación inicial está en curso
+
     isManualZoomActive = true;
     navigationFollowUser = false;
     shouldCenterOnUser = false;
@@ -16751,9 +16755,13 @@ function triggerManualMapInteraction() {
 }
 
 // ===================================================================
-// NOMBRE: handleManualMapInteraction (VERSIÓN CON DETECCIÓN DE INTENCIÓN)
-// RESUMEN: Desactiva el seguimiento SOLO cuando detecta un gesto de arrastre o
+// NOMBRE: handleManualMapInteraction (VERSIÓN CON PERIODO DE GRACIA)
+// RESUMEN: Desactiva el seguimiento SOLO cuando detecta un gesto de arrastre
+//          e ignora la interacción si la animación de carga inicial está activa.
+// ===================================================================
 function handleManualMapInteraction() {
+    if (isInitialMapLoadAnimationActive) return; // <-- AÑADIDO: Ignora si la animación inicial está en curso
+
     if (!navigationFollowUser) {
         startLocateMeReactivationTimer();
         return;
@@ -16766,8 +16774,7 @@ function handleManualMapInteraction() {
     
     updateLocateMeButtonsUI();
     startLocateMeReactivationTimer();
-}
-    
+}    
  // ===================================================================
 // NOMBRE: assignMapButtonListeners (VERSIÓN FINAL CON REASIGNACIÓN SEGURA)
 // RESUMEN: Asigna listeners a los botones del modal. Clona y reemplaza elementos clave como el input de búsqueda para eliminar listeners antiguos y añadir los nuevos, garantizando la interactividad al reabrir el mapa.
