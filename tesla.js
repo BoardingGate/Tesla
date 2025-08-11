@@ -1559,6 +1559,7 @@ function saveSettings() {
     localStorage.setItem(MAP_VIEW_PITCH_KEY, mapPitchValue);
     
     // --- NUEVAS LÍNEAS PARA GUARDAR RATIOS DE RENDIMIENTO ---
+    localStorage.setItem(PERFORMANCE_RATIO_CRITICAL_KEY, performanceRatios.criticalUpdate); // <-- NUEVA LÍNEA AÑADIDA
     localStorage.setItem(PERFORMANCE_RATIO_ROUTE_KEY, performanceRatios.routeProgress);
     localStorage.setItem(PERFORMANCE_RATIO_ALERTS_KEY, performanceRatios.trafficAlerts);
     localStorage.setItem(PERFORMANCE_RATIO_STATS_KEY, performanceRatios.tripStats);
@@ -1608,6 +1609,7 @@ function loadSavedSettings() {
     mapPitchValue = parseInt(localStorage.getItem(MAP_VIEW_PITCH_KEY)) || 56;
     
     // --- NUEVAS LÍNEAS PARA CARGAR RATIOS DE RENDIMIENTO ---
+    performanceRatios.criticalUpdate = parseInt(localStorage.getItem(PERFORMANCE_RATIO_CRITICAL_KEY)) || 1; // <-- NUEVA LÍNEA AÑADIDA (default 1)
     performanceRatios.routeProgress = parseInt(localStorage.getItem(PERFORMANCE_RATIO_ROUTE_KEY)) || 6;
     performanceRatios.trafficAlerts = parseInt(localStorage.getItem(PERFORMANCE_RATIO_ALERTS_KEY)) || 15;
     performanceRatios.tripStats = parseInt(localStorage.getItem(PERFORMANCE_RATIO_STATS_KEY)) || 15;
@@ -1695,9 +1697,113 @@ function loadSavedSettings() {
     updateUserIdDisplay();
     updateReminderCount();
 }
+// ===================================================================
+// NOMBRE: loadSavedSettings (MODIFICADA)
+// RESUMEN: Carga la configuración, incluyendo los nuevos ratios de rendimiento.
+// ===================================================================
+function loadSavedSettings() {
+    const savedDarkMode = localStorage.getItem('darkMode');
+    isDarkMode = savedDarkMode ? JSON.parse(savedDarkMode) : false;
+    if (isDarkMode) document.body.classList.add('dark-mode');
+    
+    mapOffsetX = parseInt(localStorage.getItem(MAP_VIEW_OFFSET_X_KEY)) || 0;
+    mapOffsetY = parseInt(localStorage.getItem(MAP_VIEW_OFFSET_Y_KEY)) || -30;
+    const savedMinimapPref = localStorage.getItem(MAP_VIEW_SHOW_MINIMAP_KEY);
+    showMinimapPreference = savedMinimapPref === null ? true : JSON.parse(savedMinimapPref);
+    mapPitchValue = parseInt(localStorage.getItem(MAP_VIEW_PITCH_KEY)) || 56;
+    
+    // --- NUEVAS LÍNEAS PARA CARGAR RATIOS DE RENDIMIENTO CON NUEVOS VALORES POR DEFECTO ---
+    performanceRatios.criticalUpdate = parseInt(localStorage.getItem(PERFORMANCE_RATIO_CRITICAL_KEY)) || 1;
+    performanceRatios.routeProgress = parseInt(localStorage.getItem(PERFORMANCE_RATIO_ROUTE_KEY)) || 8;
+    performanceRatios.trafficAlerts = parseInt(localStorage.getItem(PERFORMANCE_RATIO_ALERTS_KEY)) || 50;
+    performanceRatios.tripStats = parseInt(localStorage.getItem(PERFORMANCE_RATIO_STATS_KEY)) || 20;
+    performanceRatios.performanceGraph = parseInt(localStorage.getItem(PERFORMANCE_RATIO_GRAPH_KEY)) || 20;
+
+    const savedZoomState = localStorage.getItem('zoomState');
+    const zoomButtonElem = document.getElementById('zoom-button');
+    if (zoomButtonElem) {
+        zoomButtonElem.dataset.zoomState = savedZoomState || 'off';
+        applyZoom(zoomButtonElem.dataset.zoomState);
+    }
+    const savedPasswordActive = localStorage.getItem('password_active');
+    isPasswordActive = savedPasswordActive ? JSON.parse(savedPasswordActive) : false;
+    storedPin = localStorage.getItem('password_pin');
+    lastUpdatesCheckDate = localStorage.getItem('lastUpdatesCheckDate');
+    const savedNoticesActive = localStorage.getItem('noticesActive');
+    const savedFooterVisible = localStorage.getItem('footerVisible');
+    isActive = savedNoticesActive ? JSON.parse(savedNoticesActive) : true;
+    isFooterVisible = savedFooterVisible ? JSON.parse(savedFooterVisible) : true;
+    const noticeContainer = document.querySelector('.notices-container');
+    if (noticeContainer) noticeContainer.style.display = isActive ? 'flex' : 'none';
+    const footerElement = document.querySelector('footer');
+    if (footerElement) footerElement.classList.toggle('footer-hidden', !isFooterVisible);
+    const onOffBtn = document.getElementById('on-off-toggle');
+    if (onOffBtn) {
+        const savedOnOffState = localStorage.getItem('onOffState');
+        onOffBtn.dataset.state = savedOnOffState ? savedOnOffState : 'on';
+    }
+    const toggleStatesFromCache = JSON.parse(localStorage.getItem('toggleStates') || '{}');
+    document.querySelectorAll('.range-toggle').forEach(toggle => {
+        const start = parseInt(toggle.dataset.rangeStart);
+        const savedState = toggleStatesFromCache[start] || 'visible';
+        toggle.dataset.state = savedState;
+    });
+    const mainSearchInputGrid = document.getElementById('grid-filter-input');
+    if (mainSearchInputGrid) {
+        const savedMainFilter = localStorage.getItem('gridFilterValue');
+        if (savedMainFilter !== null) {
+            mainSearchInputGrid.value = savedMainFilter;
+        } else {
+            mainSearchInputGrid.value = '';
+        }
+    }
+    
+    const mapFilterInput = document.getElementById('filter-input'); 
+    if (mapFilterInput) {
+        mapFilterInput.value = localStorage.getItem(MAP_FILTER_INPUT_KEY) || 'España';
+    }
+    
+    const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+    if (radaresRutaCheckbox) {
+        const savedCheckState = localStorage.getItem(RADARES_RUTA_CHECKED_KEY);
+        radaresRutaCheckbox.checked = savedCheckState === 'true';
+    }
+    const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
+    if (tareasRutaCheckbox) {
+        const savedTareasCheckState = localStorage.getItem(TAREAS_RUTA_CHECKED_KEY);
+        tareasRutaCheckbox.checked = savedTareasCheckState === 'true';
+    }
+    currentGraphMode = localStorage.getItem(GRAPH_STATE_KEY) || 'Desviación ETA';
+    const userIdInput = document.getElementById('user-id');
+    const modelInput = document.getElementById('tesla-model');
+    const yearInput = document.getElementById('tesla-year');
+    const provinceInput = document.getElementById('tesla-province');
+    const dmsCheckbox = document.getElementById('allow-dms');
+    const autoBackupCheckbox = document.getElementById('config-auto-backup-on-load');
+    if (userIdInput) userIdInput.value = localStorage.getItem('userData_userId') || '';
+    if (modelInput) modelInput.value = localStorage.getItem('userData_teslaModel') || '';
+    if (yearInput) yearInput.value = localStorage.getItem('userData_teslaYear') || '';
+    if (provinceInput) provinceInput.value = localStorage.getItem('userData_teslaProvince') || '';
+   
+   const savedAllowDMs = localStorage.getItem('userData_allowDMs');
+   if (dmsCheckbox) {
+    dmsCheckbox.checked = savedAllowDMs === null ? true : JSON.parse(savedAllowDMs); 
+   } 
+    
+    if (autoBackupCheckbox) {
+        const savedAutoBackup = localStorage.getItem('boardinggate_autoBackupOnLoad');
+        autoBackupCheckbox.checked = savedAutoBackup === null ? true : JSON.parse(savedAutoBackup);
+    }
+    const savedLockState = localStorage.getItem(PROGRESS_BAR_LOCKED_KEY);
+    isProgressBarLocked = savedLockState === null ? true : JSON.parse(savedLockState);
+    actualizarContadorRadares(0);
+    actualizarContadorTareas(0);
+    updateUserIdDisplay();
+    updateReminderCount();
+}
 
 // ===================================================================
-// NOMBRE: showNavigationMapHelpModal (VERSIÓN FINAL CON INTERVALOS EN MS)
+// NOMBRE: showNavigationMapHelpModal (VERSIÓN FINAL CON INTERVALOS EN MS Y NUEVOS VALORES POR DEFECTO)
 // RESUMEN: Muestra un modal de ayuda completo, incluyendo la frecuencia de
 //          actualización en milisegundos para cada ratio de rendimiento.
 // ===================================================================
@@ -1724,7 +1830,6 @@ function showNavigationMapHelpModal() {
             .slider-control { display: flex; align-items: center; gap: 15px; margin-bottom: 10px; }
             .slider-control label { flex-basis: 120px; text-align: right; font-weight: bold; color: #a0a0a0; }
             .slider-control input[type="range"] { flex-grow: 1; accent-color: #87CEEB; }
-            /* --- MODIFICADO: Más ancho para el texto del intervalo --- */
             .slider-control .value-display { flex-basis: 120px; font-weight: bold; color: #f0f0f0; text-align: left; }
             .reset-visuals-btn { background-color: #555; color: white; padding: 4px 8px; border:none; border-radius: 5px; cursor: pointer; margin-top: 5px; }
         </style>
@@ -1756,6 +1861,11 @@ function showNavigationMapHelpModal() {
                 <div class="slider-control">
                     <label for="gps-hz-display" style="color: #f0f0f0;">GPS Ticks/seg:</label>
                     <span id="gps-hz-display" class="value-display" style="text-align: left;">Calculando...</span>
+                </div>
+                <div class="slider-control">
+                    <label for="ratio-critical-update-slider">Procesos Críticos:</label>
+                    <input type="range" id="ratio-critical-update-slider" min="1" max="100" step="1">
+                    <span id="ratio-critical-update-value" class="value-display"></span>
                 </div>
                 <div class="slider-control">
                     <label for="ratio-route-progress-slider">Progreso Ruta:</label>
@@ -1837,10 +1947,11 @@ function showNavigationMapHelpModal() {
     let baseFrequency = 0;
 
     const sliders = [
-        { id: 'ratio-route-progress-slider', valueId: 'ratio-route-progress-value', key: PERFORMANCE_RATIO_ROUTE_KEY, default: 2, name: 'routeProgress' },
-        { id: 'ratio-traffic-alerts-slider', valueId: 'ratio-traffic-alerts-value', key: PERFORMANCE_RATIO_ALERTS_KEY, default: 10, name: 'trafficAlerts' },
-        { id: 'ratio-trip-stats-slider', valueId: 'ratio-trip-stats-value', key: PERFORMANCE_RATIO_STATS_KEY, default: 6, name: 'tripStats' },
-        { id: 'ratio-performance-graph-slider', valueId: 'ratio-performance-graph-value', key: PERFORMANCE_RATIO_GRAPH_KEY, default: 6, name: 'performanceGraph' }
+        { id: 'ratio-critical-update-slider', valueId: 'ratio-critical-update-value', key: PERFORMANCE_RATIO_CRITICAL_KEY, default: 1, name: 'criticalUpdate' },
+        { id: 'ratio-route-progress-slider', valueId: 'ratio-route-progress-value', key: PERFORMANCE_RATIO_ROUTE_KEY, default: 8, name: 'routeProgress' },
+        { id: 'ratio-traffic-alerts-slider', valueId: 'ratio-traffic-alerts-value', key: PERFORMANCE_RATIO_ALERTS_KEY, default: 50, name: 'trafficAlerts' },
+        { id: 'ratio-trip-stats-slider', valueId: 'ratio-trip-stats-value', key: PERFORMANCE_RATIO_STATS_KEY, default: 20, name: 'tripStats' },
+        { id: 'ratio-performance-graph-slider', valueId: 'ratio-performance-graph-value', key: PERFORMANCE_RATIO_GRAPH_KEY, default: 20, name: 'performanceGraph' }
     ];
 
     const updateAllIntervalDisplays = () => {
@@ -1969,7 +2080,7 @@ function showNavigationMapHelpModal() {
     closeButtonHelp.addEventListener('click', closeHandlerHelp); 
     addModalAutoCloseTimer(helpModal, closeButtonHelp, 'reminders-map-help-modal-instance', 90000);
 }
-    
+
 // ===================================================================
 // NOMBRE: sanitizeWaypointsForStorage (NUEVA FUNCIÓN)
 // RESUMEN: Crea una copia "limpia" de un array de waypoints, eliminando propiedades
@@ -4791,9 +4902,11 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
     gpsTickCounter = (gpsTickCounter + 1) % 60000;
     navigationCurrentLocation = { ...coords }; 
     
-    // --- NIVEL 1: CRÍTICO (Cada Tick) ---
-    updateVehicleMarker(coords, mapInstanceToUse);
-    updateMapCamera(coords, mapInstanceToUse);
+    // --- NIVEL 1: CRÍTICO (Controlado por Ratio) ---
+    if (gpsTickCounter % performanceRatios.criticalUpdate === 0) { // <-- CAMBIO APLICADO AQUÍ
+        updateVehicleMarker(coords, mapInstanceToUse);
+        updateMapCamera(coords, mapInstanceToUse);
+    }
 
     // --- NIVEL 2: ALTA FRECUENCIA (Controlado por Ratio) ---
     if (gpsTickCounter % performanceRatios.routeProgress === 0) {
@@ -4816,6 +4929,7 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
         plotIntervalData();
     }
 }
+
 
 // ===================================================================
 // NOMBRE: updateVehicleMarker (NUEVA FUNCIÓN AUXILIAR)
