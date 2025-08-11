@@ -1,4 +1,4 @@
-V13
+V14
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -516,6 +516,281 @@ V13
 
     
 <script>
+
+// ===================================================================
+// NOMBRE: handleProgressiveManeuverZoom (VERSIÓN CON DESCENTRADO DINÁMICO)
+// RESUMEN: Gestiona el zoom, inclinación y ahora también el descentrado (offset)
+//          de la cámara al acercarse a una maniobra. Analiza la ruta futura para
+//          desplazar horizontalmente la cámara y anticipar giros cerrados.
+// ===================================================================
+function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDistanceAlongRouteForNavLogic) {
+    if (isManualZoomActive) return null;
+
+    if (!isNavigating || !navigationMapInstance || !currentStep) {
+        if (isZoomedForManeuver) isZoomedForManeuver = false;
+        return null;
+    }
+    
+    const route = navigationCurrentRouteData?.routes?.[0];
+    if (!route) return null;
+
+    let pitchBeforeManeuver = null;
+
+    const maxZoomForMap = navigationMapInstance.getMaxZoom() || 19;
+    const currentMapLayerName = (localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "satélite + calles").toLowerCase();
+    const isSatelliteWithLabels = currentMapLayerName.includes("satélite + calles");
+    const MANEUVER_PEAK_ZOOM_LEVEL = isSatelliteWithLabels ? Math.min(17.5, maxZoomForMap) : Math.min(18.5, maxZoomForMap);
+    const HOLD_ZOOM_THRESHOLD = 250;
+    
+    const currentStepIdentifier = `${currentLegIndexNav}_${currentStepIndexNav}`;
+    if (lastProcessedStepIdentifier !== null && lastProcessedStepIdentifier !== currentStepIdentifier) {
+        if (progressiveZoomState === 'zooming-in' || progressiveZoomState === 'holding') {
+            progressiveZoomState = 'zooming-out';
+        }
+    }
+    lastProcessedStepIdentifier = currentStepIdentifier;
+
+    const distanceIntoCurrentStep = currentStep.distance - distanceToManeuver;
+    let targetZoom = null;
+    let targetPitch = null;
+    let targetOffsetX = mapOffsetX; // Partimos del offset actual
+    let targetOffsetY = mapOffsetY; // Partimos del offset actual
+
+    // --- INICIO: LÓGICA DE DESCENTRADO PREDICTIVO ---
+    let predictiveOffsetX = 0;
+    if (distanceToManeuver < PROGRESSIVE_ZOOM_START_DISTANCE + 50) { // Empezamos a calcular un poco antes
+        try {
+            const routeLineString = turf.lineString(route.geometry.coordinates);
+            const carPointOnLine = turf.along(routeLineString, carDistanceAlongRouteForNavLogic / 1000, { units: 'kilometers' });
+            
+            // Miramos 150m hacia adelante en la ruta
+            const lookAheadPoint = turf.along(routeLineString, (carDistanceAlongRouteForNavLogic + 150) / 1000, { units: 'kilometers' });
+
+            // Bearing (dirección) actual del coche
+            const currentBearing = navigationCurrentLocation.heading || 0;
+            
+            // Bearing hacia el punto futuro en la ruta
+            const bearingToLookAhead = turf.bearing(carPointOnLine, lookAheadPoint);
+            
+            // Diferencia de ángulo
+            let angleDiff = bearingToLookAhead - currentBearing;
+            if (angleDiff > 180) angleDiff -= 360;
+            if (angleDiff < -180) angleDiff += 360;
+            
+            // Si el giro es significativo (más de 30 grados), aplicamos un offset
+            if (Math.abs(angleDiff) > 30) {
+                // Si el ángulo es positivo (giro a la derecha), el offset es negativo (cámara a la izquierda)
+                // Si el ángulo es negativo (giro a la izquierda), el offset es positivo (cámara a la derecha)
+                predictiveOffsetX = angleDiff > 0 ? -30 : 30;
+            }
+        } catch(e) { /* Fallo silencioso si Turf falla */ }
+    }
+    // --- FIN: LÓGICA DE DESCENTRADO PREDICTIVO ---
+
+
+    switch (progressiveZoomState) {
+        case 'zooming-out':
+            isZoomedForManeuver = true;
+            pitchBeforeManeuver = window.pitchBeforeManeuver !== null ? window.pitchBeforeManeuver : navigationMapInstance.getPitch();
+
+            const nextStepAfterCurrent = findNextValidStep(route, currentLegIndexNav, currentStepIndexNav);
+            const distanceToNextStep = nextStepAfterCurrent ? calculateDistanceToEndOfStep(route, nextStepAfterCurrent.legIndex, nextStepAfterCurrent.stepIndex) - carDistanceAlongRouteForNavLogic : Infinity;
+            
+            if (nextStepAfterCurrent && distanceToNextStep < HOLD_ZOOM_THRESHOLD) {
+                targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
+                if (mapViewMode === 'perspective') {
+                    targetPitch = pitchBeforeManeuver * 0.90;
+                } else {
+                    targetPitch = 45;
+                }
+                // Mantenemos el offset predictivo si hay otra maniobra cerca
+                targetOffsetX = predictiveOffsetX;
+                targetOffsetY = 0;
+
+            } else {
+                if (distanceIntoCurrentStep > PROGRESSIVE_ZOOM_EXIT_END_DISTANCE || mapPreviousZoomLevelForProgressive === null) {
+                    targetZoom = mapPreviousZoomLevelForProgressive;
+                    targetPitch = pitchBeforeManeuver;
+                    targetOffsetX = mapOffsetX; // Volver al offset original del usuario
+                    targetOffsetY = mapOffsetY; // Volver al offset original del usuario
+                    progressiveZoomState = 'none';
+                    mapPreviousZoomLevelForProgressive = null;
+                    window.pitchBeforeManeuver = null;
+                    isZoomedForManeuver = false;
+                } else if (distanceIntoCurrentStep >= PROGRESSIVE_ZOOM_EXIT_START_DISTANCE) {
+                    const progress = (distanceIntoCurrentStep - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE) / (PROGRESSIVE_ZOOM_EXIT_END_DISTANCE - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE);
+                    targetZoom = MANEUVER_PEAK_ZOOM_LEVEL - (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * Math.min(1, progress);
+                    if (mapViewMode === 'perspective') {
+                        const pitchReduction = pitchBeforeManeuver * 0.25;
+                        targetPitch = (pitchBeforeManeuver - pitchReduction) + (pitchReduction * progress);
+                    } else {
+                        targetPitch = 45 - (45 * progress);
+                    }
+                    // Transición suave de vuelta al offset original del usuario
+                    targetOffsetX = predictiveOffsetX - (predictiveOffsetX - mapOffsetX) * progress;
+                    targetOffsetY = 0 - (0 - mapOffsetY) * progress;
+                } else {
+                    targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
+                    if (mapViewMode === 'perspective') {
+                        targetPitch = pitchBeforeManeuver * 0.90;
+                    } else {
+                        targetPitch = 45;
+                    }
+                    // Mantenemos el offset predictivo
+                    targetOffsetX = predictiveOffsetX;
+                    targetOffsetY = 0;
+                }
+            }
+            break;
+
+        default:
+            if (distanceToManeuver <= PROGRESSIVE_ZOOM_START_DISTANCE && distanceToManeuver > PROGRESSIVE_ZOOM_PEAK_DISTANCE) {
+                if (progressiveZoomState !== 'zooming-in' && progressiveZoomState !== 'holding') {
+                    mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
+                    window.pitchBeforeManeuver = navigationMapInstance.getPitch();
+                }
+                progressiveZoomState = 'zooming-in';
+                pitchBeforeManeuver = window.pitchBeforeManeuver;
+
+                let progress = (PROGRESSIVE_ZOOM_START_DISTANCE - distanceToManeuver) / (PROGRESSIVE_ZOOM_START_DISTANCE - PROGRESSIVE_ZOOM_PEAK_DISTANCE);
+                progress = easeInOutQuad(progress);
+                targetZoom = mapPreviousZoomLevelForProgressive + (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * progress;
+                
+                if (mapViewMode === 'perspective') {
+                    const pitchReduction = pitchBeforeManeuver * 0.20;
+                    targetPitch = pitchBeforeManeuver - (pitchReduction * progress);
+                } else {
+                    targetPitch = pitchBeforeManeuver + (45 * progress);
+                }
+                
+                // Transición suave hacia el offset de la maniobra
+                targetOffsetX = mapOffsetX - (mapOffsetX - predictiveOffsetX) * progress;
+                targetOffsetY = mapOffsetY - (mapOffsetY - 0) * progress;
+
+                isZoomedForManeuver = true;
+
+            } else if (distanceToManeuver <= PROGRESSIVE_ZOOM_PEAK_DISTANCE) {
+                if (progressiveZoomState !== 'holding') {
+                    if(mapPreviousZoomLevelForProgressive === null) mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
+                    if(window.pitchBeforeManeuver === null) window.pitchBeforeManeuver = navigationMapInstance.getPitch();
+                }
+                progressiveZoomState = 'holding';
+                pitchBeforeManeuver = window.pitchBeforeManeuver;
+                targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
+                
+                if (mapViewMode === 'perspective') {
+                    targetPitch = pitchBeforeManeuver * 0.90;
+                } else {
+                    targetPitch = 45;
+                }
+                // Offset completo de la maniobra
+                targetOffsetX = predictiveOffsetX;
+                targetOffsetY = 0;
+                isZoomedForManeuver = true;
+
+            } else {
+                if (progressiveZoomState !== 'none' && mapPreviousZoomLevelForProgressive !== null) {
+                    targetZoom = mapPreviousZoomLevelForProgressive;
+                    targetPitch = window.pitchBeforeManeuver;
+                }
+                // Si no hay maniobra, el offset es el del usuario
+                targetOffsetX = mapOffsetX;
+                targetOffsetY = mapOffsetY;
+                progressiveZoomState = 'none';
+                mapPreviousZoomLevelForProgressive = null;
+                window.pitchBeforeManeuver = null;
+                isZoomedForManeuver = false;
+            }
+            break;
+    }
+
+    if (targetZoom !== null && targetPitch !== null) {
+        targetPitch = Math.max(0, Math.min(85, targetPitch));
+        return { zoom: targetZoom, pitch: targetPitch, offsetX: targetOffsetX, offsetY: targetOffsetY };
+    }
+    // Si no hay zoom/pitch de maniobra, devolvemos null para que la cámara no haga nada especial
+    return null;
+}
+
+// ===================================================================
+// NOMBRE: updateMapCamera (NUEVA FUNCIÓN AUXILIAR - CON OFFSET DINÁMICO)
+// RESUMEN: Gestiona el movimiento de la cámara, aplicando ahora los
+//          offsets dinámicos calculados por handleProgressiveManeuverZoom.
+// ===================================================================
+function updateMapCamera(coords, mapInstanceToUse) {
+    const shouldFollow = (shouldCenterOnUser || navigationFollowUser);
+    if (!shouldFollow || isRecalculatingRoute || !mapInstanceToUse) {
+        return;
+    }
+    
+    const lngLat = new mapboxgl.LngLat(coords.longitude, coords.latitude);
+
+    const maneuverCameraAdjustments = handleProgressiveManeuverZoom(
+        navigationCurrentRouteData?.routes?.[0]?.legs?.[currentLegIndexNav]?.steps?.[currentStepIndexNav],
+        distanceToNextManeuverOSRM,
+        lastCarDistanceAlongRouteForNavLogic
+    );
+
+    let targetZoom = maneuverCameraAdjustments ? maneuverCameraAdjustments.zoom : null;
+    let targetPitch = maneuverCameraAdjustments ? maneuverCameraAdjustments.pitch : null;
+    // --- NUEVO: Obtener los offsets de la maniobra o usar los del usuario ---
+    let finalOffsetX = maneuverCameraAdjustments ? maneuverCameraAdjustments.offsetX : mapOffsetX;
+    let finalOffsetY = maneuverCameraAdjustments ? maneuverCameraAdjustments.offsetY : mapOffsetY;
+
+    if (targetZoom === null) {
+        targetZoom = handleAutoZoom();
+    }
+    
+    if (targetZoom !== null && (typeof targetZoom !== 'number' || isNaN(targetZoom))) {
+        console.error(`[VALIDACIÓN] Se ha detectado un valor de zoom inválido (${targetZoom}). Se anulará el cambio de zoom en este ciclo para prevenir un error.`);
+        targetZoom = null;
+    }
+    
+    const viewOptions = {
+        center: lngLat,
+        duration: 1000,
+        essential: true
+    };
+    
+    const mapHeight = mapInstanceToUse.getCanvas().clientHeight;
+    const mapWidth = mapInstanceToUse.getCanvas().clientWidth;
+    // --- NUEVO: Usar los offsets finales (de maniobra o de usuario) para el padding ---
+    viewOptions.padding = {
+        top: finalOffsetY > 0 ? mapHeight * Math.abs(finalOffsetY / 100) : 0,
+        bottom: finalOffsetY < 0 ? mapHeight * Math.abs(finalOffsetY / 100) : 0,
+        left: finalOffsetX > 0 ? mapWidth * Math.abs(finalOffsetX / 100) : 0,
+        right: finalOffsetX < 0 ? mapWidth * Math.abs(finalOffsetX / 100) : 0
+    };
+    
+    if (mapViewMode === 'heading' || mapViewMode === 'perspective') {
+        let validatedHeading = null;
+        if (coords.heading !== null && typeof coords.heading === 'number' && !isNaN(coords.heading) && coords.heading >= 0) {
+             validatedHeading = coords.heading;
+        } else if (window.lastPositionForSpeedCalc && typeof turf !== 'undefined') {
+            const lastPoint = turf.point([window.lastPositionForSpeedCalc.longitude, window.lastPositionForSpeedCalc.latitude]);
+            const currentPoint = turf.point([coords.longitude, coords.latitude]);
+            if (turf.distance(lastPoint, currentPoint, { units: 'meters' }) > 1) {
+                const bearing = turf.bearing(lastPoint, currentPoint);
+                validatedHeading = (bearing < 0) ? bearing + 360 : bearing;
+            }
+        }
+        if(validatedHeading !== null) {
+            viewOptions.bearing = validatedHeading; 
+        }
+    }
+
+    if (targetPitch !== null && typeof targetPitch === 'number' && !isNaN(targetPitch)) {
+        viewOptions.pitch = targetPitch;
+    } else {
+        viewOptions.pitch = (mapViewMode === 'perspective') ? mapPitchValue : 0;
+    }
+
+    if (targetZoom !== null && !isManualZoomActive) {
+        viewOptions.zoom = targetZoom;
+    }
+
+    mapInstanceToUse.easeTo(viewOptions);
+}    
 
 </script>
 
