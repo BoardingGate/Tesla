@@ -1,4 +1,4 @@
-M11
+M12
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -8317,8 +8317,9 @@ function findNextValidStep(route, currentLeg, currentStep) {
 }
 
 // ===================================================================
-// NOMBRE: handleProgressiveManeuverZoom (VERSIÓN CORREGIDA Y COMPLETA)
-// RESUMEN: Incluye la constante faltante y la lógica de análisis de rotondas.
+// NOMBRE: handleProgressiveManeuverZoom (VERSIÓN CON ANÁLISIS GEOMÉTRICO DE RUTA)
+// RESUMEN: Utiliza Turf.js para analizar la forma real de la ruta antes y después
+//          de una maniobra, calculando el ángulo de giro real para un offset siempre correcto.
 // ===================================================================
 function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDistanceAlongRouteForNavLogic) {
     if (isManualZoomActive) return null;
@@ -8329,15 +8330,16 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
     }
     
     const route = navigationCurrentRouteData?.routes?.[0];
-    if (!route) return null;
+    if (!route || !route.geometry || !route.geometry.coordinates || route.geometry.coordinates.length < 2) {
+        return null;
+    }
     
-    // Constantes de control de la animación
     const ANIMATION_START_DISTANCE = 200;
     const OFFSET_PEAK_DISTANCE = 120;
     const ZOOM_PEAK_DISTANCE = 50;
     const PROGRESSIVE_ZOOM_EXIT_START_DISTANCE = 60;
     const PROGRESSIVE_ZOOM_EXIT_END_DISTANCE = 150;
-    const HOLD_ZOOM_THRESHOLD = 250; // <-- CONSTANTE AÑADIDA
+    const HOLD_ZOOM_THRESHOLD = 250;
 
     const maxZoomForMap = navigationMapInstance.getMaxZoom() || 19;
     const currentMapLayerName = (localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO").toLowerCase();
@@ -8403,46 +8405,48 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
                     window.offsetYBeforeManeuver = mapOffsetY;
                     
                     let dynamicHorizontalTarget = 0;
-                    const maneuver = currentStep.maneuver;
                     
-                    if (maneuver) {
-                        const isRoundabout = maneuver.type.includes('roundabout') || maneuver.type.includes('rotary');
+                    // <<< INICIO DE LA NUEVA LÓGICA GEOMÉTRICA >>>
+                    try {
+                        // 1. Crear una línea Turf a partir de la geometría de la ruta completa.
+                        const routeLine = turf.lineString(route.geometry.coordinates);
+                        const totalRouteDistance = turf.length(routeLine, {units: 'meters'});
 
-                        if (isRoundabout && typeof maneuver.exit === 'number' && currentStep.intersections && currentStep.intersections[0]) {
-                            const intersection = currentStep.intersections[0];
-                            const bearingIn = intersection.in !== undefined ? intersection.bearings[intersection.in] : maneuver.bearing_before;
-                            const bearingOut = intersection.out !== undefined ? intersection.bearings[intersection.out] : maneuver.bearing_after;
-                            
-                            let angleChange = bearingOut - bearingIn;
-                            angleChange = (angleChange + 540) % 360 - 180;
+                        // 2. Calcular la distancia exacta desde el inicio de la ruta hasta el punto de la maniobra actual.
+                        const maneuverDistance = calculateDistanceToEndOfStep(route, currentLegIndexNav, currentStepIndexNav);
 
-                            if (angleChange > 45) {
-                                dynamicHorizontalTarget = 40;
-                            } else if (angleChange < -45) {
-                                dynamicHorizontalTarget = -40;
-                            } else {
-                                dynamicHorizontalTarget = 0;
-                            }
-                        } else if (!isRoundabout && typeof maneuver.bearing_before === 'number' && typeof maneuver.bearing_after === 'number') {
-                            let angleChange = maneuver.bearing_after - maneuver.bearing_before;
-                            angleChange = (angleChange + 540) % 360 - 180;
+                        // 3. Definir los puntos de muestreo: 50m antes y 50m después de la maniobra.
+                        const lookBehindDistance = 50;
+                        const lookAheadDistance = 50;
+                        
+                        // Aseguramos no salirnos de los límites de la ruta.
+                        const pointA_distance = Math.max(0, maneuverDistance - lookBehindDistance);
+                        const pointC_distance = Math.min(totalRouteDistance, maneuverDistance + lookAheadDistance);
 
-                            const isSharpRightTurn = angleChange > 160 && angleChange <= 175;
-                            const isSharpLeftTurn = angleChange < -160 && angleChange >= -175;
-                            const isNormalRightTurn = angleChange >= 25 && angleChange <= 160;
-                            const isNormalLeftTurn = angleChange <= -25 && angleChange >= -160;
-                            
-                            if (isSharpRightTurn) {
-                                dynamicHorizontalTarget = 55;
-                            } else if (isSharpLeftTurn) {
-                                dynamicHorizontalTarget = -55;
-                            } else if (isNormalRightTurn) {
-                                dynamicHorizontalTarget = 40;
-                            } else if (isNormalLeftTurn) {
-                                dynamicHorizontalTarget = -40;
-                            }
-                        }
+                        // 4. Obtener las coordenadas de los puntos A (antes), B (maniobra) y C (después).
+                        const pointA = turf.along(routeLine, pointA_distance, {units: 'meters'});
+                        const pointB = turf.point(currentStep.maneuver.location);
+                        const pointC = turf.along(routeLine, pointC_distance, {units: 'meters'});
+
+                        // 5. Calcular la orientación del segmento de entrada (A->B) y de salida (B->C).
+                        const bearingIn = turf.bearing(pointA, pointB);
+                        const bearingOut = turf.bearing(pointB, pointC);
+
+                        // 6. Calcular el cambio de ángulo real y normalizarlo (-180 a 180).
+                        let geometricAngleChange = bearingOut - bearingIn;
+                        geometricAngleChange = (geometricAngleChange + 540) % 360 - 180;
+                        
+                        // 7. Aplicar la lógica de desplazamiento basada en el ángulo geométrico.
+                        if (geometricAngleChange > 160) { dynamicHorizontalTarget = 55; }
+                        else if (geometricAngleChange < -160) { dynamicHorizontalTarget = -55; }
+                        else if (geometricAngleChange > 25) { dynamicHorizontalTarget = 40; }
+                        else if (geometricAngleChange < -25) { dynamicHorizontalTarget = -40; }
+                        
+                    } catch (e) {
+                        console.error("Error en el cálculo geométrico del giro, no se aplicará offset.", e);
+                        dynamicHorizontalTarget = 0;
                     }
+                    // <<< FIN DE LA NUEVA LÓGICA GEOMÉTRICA >>>
                     
                     window.maneuverHorizontalTarget = dynamicHorizontalTarget;
                     progressiveZoomState = 'zooming-in';
@@ -8498,7 +8502,8 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
         };
     }
     return null;
-}    
+}
+
     
 // ===================================================================
 // NOMBRE: eliminarTareasDeBarraProgreso (MODIFICADA - PARA MAPBOX)
