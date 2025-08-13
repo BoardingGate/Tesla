@@ -1,4 +1,4 @@
-M26
+M27
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -153,7 +153,7 @@ M26
                 <div class="mapbox-control">
                     <input type="checkbox" id="mapbox-primary-checkbox">
                     <div class="mapbox-label-container">
-                        <label for="mapbox-primary-checkbox">Rutas<br>Mapbox</label>
+                        <label for="mapbox-primary-checkbox">Rutas<br>OSMR</label>
                     </div>
                 </div>
                 <button id="add-reminder-at-location-button" class="reminders-map-button-action" title="Añadir recordatorio en punto del mapa">
@@ -3136,7 +3136,89 @@ function startDeviationChecker() {
     }, 5000);
 }
 
+// ===================================================================
+// NOMBRE: startDeviationChecker (VERSIÓN CON PERÍODO DE GRACIA)
+// RESUMEN: Inicia un temporizador que comprueba el desvío, pero ignora la
+//          comprobación durante unos segundos después de un recálculo exitoso.
+// ===================================================================
+function startDeviationChecker() {
+    stopDeviationChecker();
+    console.log("[DESVÍO] Iniciando comprobador de desvío optimizado (cada 5 segundos).");
     
+    deviationCheckIntervalId = setInterval(() => {
+        // --- INICIO CORRECCIÓN CLAVE ---
+        // Si estamos dentro del período de gracia, salimos inmediatamente.
+        if (Date.now() < deviationCheckGracePeriodUntil) {
+            return;
+        }
+        // --- FIN CORRECCIÓN CLAVE ---
+
+        if (!isNavigating || !navigationCurrentLocation || isRecalculatingRoute || isDeviationModalActive || isAddReminderAtLocationModeActive) {
+            deviationStartTime = 0;
+            return;
+        }
+
+        const route = navigationCurrentRouteData?.routes?.[0];
+        if (!route || !route.legs || !route.legs[currentLegIndexNav] || !route.legs[currentLegIndexNav].steps[currentStepIndexNav] || typeof turf === 'undefined') {
+            return;
+        }
+
+        try {
+            const carPoint = turf.point([navigationCurrentLocation.longitude, navigationCurrentLocation.latitude]);
+            
+            const searchWindowCoords = [];
+            const stepsToInclude = 5;
+            let legIdx = currentLegIndexNav;
+            let stepIdx = currentStepIndexNav;
+            
+            for (let i = 0; i < stepsToInclude && legIdx < route.legs.length; i++) {
+                const currentLeg = route.legs[legIdx];
+                if (stepIdx < currentLeg.steps.length) {
+                    const currentStep = currentLeg.steps[stepIdx];
+                    if (currentStep.geometry && currentStep.geometry.coordinates) {
+                        if (searchWindowCoords.length > 0) {
+                            searchWindowCoords.push(...currentStep.geometry.coordinates.slice(1));
+                        } else {
+                            searchWindowCoords.push(...currentStep.geometry.coordinates);
+                        }
+                    }
+                    stepIdx++;
+                } else {
+                    legIdx++;
+                    stepIdx = 0;
+                    i--; 
+                }
+            }
+
+            if (searchWindowCoords.length < 2) {
+                deviationStartTime = 0;
+                return;
+            }
+
+            const routeWindowLineString = turf.lineString(searchWindowCoords);
+            const distanceToRoute = turf.pointToLineDistance(carPoint, routeWindowLineString, { units: 'meters' });
+
+            if (distanceToRoute > DEVIATION_THRESHOLD_METERS) {
+                if (deviationStartTime === 0) {
+                    deviationStartTime = Date.now();
+                } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
+                    showDeviationModal();
+                    deviationStartTime = 0;
+                }
+            } else {
+                deviationStartTime = 0;
+            }
+        } catch (e) {
+            console.error("[DESVÍO] Error en el cálculo de distancia optimizado:", e);
+            if (deviationStartTime === 0) {
+                deviationStartTime = Date.now();
+            } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
+                showDeviationModal();
+                deviationStartTime = 0;
+            }
+        }
+    }, 5000);
+}    
 
 // ===================================================================
 // NOMBRE: stopDeviationChecker (NUEVA FUNCIÓN)
@@ -4971,16 +5053,26 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, isUserA
 }
 
 // ===================================================================
-// NOMBRE: recalculateAndDrawRoute (VERSIÓN CON PRE-CÁLCULO Y BUCLE DE REINTENTO CORREGIDO)
-// RESUMEN: Lógica de recálculo que ahora reintenta de forma fiable y pre-procesa la ruta obtenida.
+// NOMBRE: recalculateAndDrawRoute (VERSIÓN FINAL CON LÓGICA DE CONTEXTO DUAL)
+// RESUMEN: Lógica de recálculo que usa dos `if` para controlar el flujo de reintentos
+//          y un período de gracia para evitar bucles de desvío.
 // ===================================================================
-async function recalculateAndDrawRoute(preserveAccumulatedStats = false, isUserAction = false) {
+async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
     const RETRY_CADENCE_MS = 3000;
     const MAX_RETRIES = 5;
     let attempt = 1;
 
     while (attempt <= MAX_RETRIES) {
+        // Condición para MODO PLANIFICACIÓN: Si no hay modal de desvío, permite hasta MAX_RETRIES.
+        // Se usa MAX_RETRIES en lugar de un número fijo para que sea dinámico.
+        if (!isDeviationModalActive && attempt > MAX_RETRIES) break;
         
+        // Condición para MODO DESVÍO: Si el modal de desvío está activo, solo permite 1 intento.
+        if (isDeviationModalActive && attempt > 1) {
+            console.log("[RECALC] Desvío: Saliendo después del primer intento fallido para evitar quedarse atascado.");
+            break;
+        }
+     
         console.log(`[RECALC] Intento #${attempt} de ${MAX_RETRIES}...`);
         isRecalculatingRoute = true;
         const wasNavigatingBeforeRecalc = isNavigating;
@@ -4991,11 +5083,9 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, isUserA
             let currentHeading = null;
             
             if (!isNavigating) {
-                console.log("[RECALC] Modo Planificación: Calculando ruta desde la lista de waypoints definida.");
                 waypointsForAPI = [...navigationWaypoints];
                 currentHeading = null;
             } else { 
-                console.log("[RECALC] Modo Navegación Activa: Recalculando desde la posición GPS actual.");
                 if (navigationCurrentLocation) {
                     currentHeading = navigationCurrentLocation.heading;
                     waypointsForAPI.push({ lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude, isRecalculatedStart: true });
@@ -5012,7 +5102,6 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, isUserA
             };
 
             const coordsString = validWaypoints.map(wp => `${wp.lng},${wp.lat}`).join(';');
-            
             const result = await fetchRouteData(coordsString, currentHeading);
             if (result.error) throw result.error;
 
@@ -5022,29 +5111,29 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, isUserA
             if (newRemainingRoute && newRemainingRoute.distance < 10) { 
                 const startPointOfRecalc = validWaypoints[0];
                 const endPointOfRecalc = validWaypoints[validWaypoints.length - 1];
-                const physicalDistanceToDestination = calculateDistance(
-                    startPointOfRecalc.lat, 
-                    startPointOfRecalc.lng, 
-                    endPointOfRecalc.lat, 
-                    endPointOfRecalc.lng
-                );
+                const physicalDistanceToDestination = calculateDistance(startPointOfRecalc.lat, startPointOfRecalc.lng, endPointOfRecalc.lat, endPointOfRecalc.lng);
                 if (physicalDistanceToDestination > WAYPOINT_VISITED_THRESHOLD_METERS) {
-                    console.warn(`[GUARDIA DE CALIDAD] Ruta de distancia cero (${newRemainingRoute.distance.toFixed(1)}m) recibida, pero la distancia física al destino es de ${physicalDistanceToDestination.toFixed(1)}m. Forzando reintento.`);
                     throw new Error("Ruta inválida (distancia cero) recibida del servidor.");
                 }
             }
             
             precalculateRouteStepDistances(newRouteData);
-            
             await drawRouteOnMap(newRemainingRoute);
             
             navigationCurrentRouteData = newRouteData;
-            
             if (preserveAccumulatedStats) {
                 accumulatedDistanceBeforeCurrentSegment = completedDistance;
             } else {
                 accumulatedDistanceBeforeCurrentSegment = 0;
             }
+
+            // --- INICIO PERÍODO DE GRACIA ---
+            // Si el recálculo tuvo éxito y el modal de desvío ESTABA activo, activamos la gracia.
+            if (isDeviationModalActive) {
+                deviationCheckGracePeriodUntil = Date.now() + 5000; // 5 segundos
+                console.log("[DESVÍO] Período de gracia activado hasta:", new Date(deviationCheckGracePeriodUntil).toLocaleTimeString());
+            }
+            // --- FIN PERÍODO DE GRACIA ---
 
             currentLegIndexNav = 0;
             currentStepIndexNav = 0;
@@ -5068,8 +5157,9 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, isUserA
             updateStartNavigationButtonState();
             updateNavigationButtonColor();
 
+            showToast("¡Ruta recalculada con éxito!", "success");
             closeModalAndProceed();
-            return; 
+            return;
             
         } catch (error) {
             console.error(`[RECALC] Fallo en intento #${attempt}:`, error);
@@ -5087,7 +5177,8 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, isUserA
             attempt++;
         }
     }
-   }
+    console.log("[RECALC] Bucle de recálculo finalizado sin éxito.");
+}    
     
     
 // ===================================================================
@@ -7944,6 +8035,7 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
             navigationMapInstance.once('idle', async () => {
                 try {
                     await recalculateAndDrawRoute(false);
+                    
                     if (autoStartNavigation) {
                         if (forceImmediateStart) {
                             toggleNavigationState(); 
@@ -7979,8 +8071,7 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
     }
     updateStartNavigationButtonState();
     updateNavigationButtonColor();
-}
-    
+}    
     
 // ===================================================================
 // NOMBRE: fetchAndRenderChatUsers (CON ESTADÍSTICAS COMPLETAS PARA ADMIN)
@@ -16900,8 +16991,103 @@ async function fetchRouteData(coordsString, startHeading = null) {
         }
     }
 }  
+// ===================================================================
+// NOMBRE: fetchRouteData (VERSIÓN FINAL CON MAPBOX PRIMARIO Y CHECKBOX OSRM)
+// RESUMEN: Usa Mapbox por defecto. Si el checkbox "Rutas OSRM" está marcado, usa OSRM como primario.
+// ===================================================================
+async function fetchRouteData(coordsString, startHeading = null) {
+    const OSRM_PRIMARY_KEY = 'boardinggate_useOsrmAsPrimary';
+    const useOsrmAsPrimary = localStorage.getItem(OSRM_PRIMARY_KEY) === 'true';
+  
+    const osrmService = {
+        name: 'OSRM',
+        buildUrl: (coords) => {
+            return `${OSRM_SERVICE_URL}/driving/${coords}?overview=full&geometries=geojson&steps=true&alternatives=false&annotations=true`;
+        },
+        processResponse: async (response) => {
+            if (!response.ok) {
+                let errorData = { message: `OSRM HTTP error ${response.status}` };
+                try { errorData = await response.json(); } catch (e) {}
+                throw new Error(errorData.code || errorData.message || response.statusText);
+            }
+            const data = await response.json();
+            if (data.code !== 'Ok' || !data.routes || data.routes.length === 0) {
+                throw new Error(data.message || "No se encontraron rutas en OSRM.");
+            }
+            return { routeData: data, serviceUsed: 'OSRM' };
+        }
+    };
 
+    const mapboxService = {
+        name: 'Mapbox',
+        buildUrl: (coords) => {
+            return `https://api.mapbox.com/directions/v5/mapbox/driving/${coords}?alternatives=false&geometries=geojson&overview=full&steps=true&access_token=${MAPBOX_ACCESS_TOKEN}`;
+        },
+        processResponse: async (response) => {
+            if (!response.ok) {
+                let errorData = { message: `Mapbox HTTP error ${response.status}` };
+                try { errorData = await response.json(); } catch (e) {}
+                throw new Error(errorData.message || response.statusText);
+            }
+            const data = await response.json();
+            if (data.code !== 'Ok' || !data.routes || data.routes.length === 0) {
+                throw new Error(data.message || "No se encontraron rutas en Mapbox.");
+            }
+            const adaptedRoute = adaptMapboxRouteToOSRMFormat(data.routes[0]);
+            const adaptedWaypoints = data.waypoints.map(wp => ({
+                distance: wp.distance,
+                hint: wp.hint,
+                location: wp.location,
+                name: wp.name,
+            }));
+            const finalData = {
+                code: 'Ok',
+                routes: [adaptedRoute],
+                waypoints: adaptedWaypoints
+            };
+            return { routeData: finalData, serviceUsed: 'Mapbox' };
+        }
+    };
 
+    const buildUrlWithCorrectBearings = (service, coords) => {
+        let baseUrl = service.buildUrl(coords).split('?')[0];
+        let params = new URLSearchParams(service.buildUrl(coords).split('?')[1] || '');
+
+        if (startHeading !== null && !isNaN(startHeading)) {
+            const waypointCount = (coords.match(/;/g) || []).length + 1;
+            let bearingsString = `${Math.round(startHeading)},45`;
+            if (waypointCount > 1) {
+                bearingsString += ';'.repeat(waypointCount - 1);
+            }
+            params.set('bearings', bearingsString);
+        } else {
+            params.delete('bearings'); 
+        }
+        
+        return `${baseUrl}?${params.toString()}`;
+    };
+
+    const primaryService = useOsrmAsPrimary ? osrmService : mapboxService;
+    const fallbackService = useOsrmAsPrimary ? mapboxService : osrmService;
+
+    try {
+        const primaryUrl = buildUrlWithCorrectBearings(primaryService, coordsString);
+        const primaryResponse = await fetch(primaryUrl);
+        return await primaryService.processResponse(primaryResponse);
+    } catch (primaryError) {
+        showToast(`Servicio principal (${primaryService.name}) falló. Intentando con respaldo (${fallbackService.name})...`, "warning", 4000);
+        
+        try {
+            const fallbackUrl = buildUrlWithCorrectBearings(fallbackService, coordsString);
+            const fallbackResponse = await fetch(fallbackUrl);
+            const fallbackData = await fallbackService.processResponse(fallbackResponse);
+            fallbackData.serviceUsed += ' (Respaldo)';
+            return fallbackData;
+        } catch (fallbackError) {
+            return { error: fallbackError, failedServices: `${primaryService.name} (Fallo), ${fallbackService.name} (Fallo)` };
+        }
+    }
+}
 
     
 // ===================================================================
@@ -17750,15 +17936,16 @@ function assignMapButtonListeners() {
         toggleTareasRuta(e.target.checked);
     });
     
-    
     const mapboxCheckbox = reassignElement(document.getElementById('mapbox-primary-checkbox'));
     mapboxCheckbox.addEventListener('change', (e) => {
-        localStorage.setItem('boardinggate_useMapboxAsPrimary', e.target.checked);
+        const OSRM_PRIMARY_KEY = 'boardinggate_useOsrmAsPrimary'; // Usamos una nueva clave más clara
+        localStorage.setItem(OSRM_PRIMARY_KEY, e.target.checked);
         markCacheAsDirty();
-        const serviceName = e.target.checked ? 'Mapbox' : 'OSRM';
+        const serviceName = e.target.checked ? 'OSRM' : 'Mapbox'; // La lógica del toast ahora es correcta
         showToast(`Servicio primario cambiado a ${serviceName}. Recalculando ruta...`, 'success');
-        if (navigationWaypoints.length >= 2) { recalculateAndDrawRoute(true); }
+        if (navigationWaypoints.length >= 2) { recalculateAndDrawRoute(false); } // Llamamos a la versión sin parámetros extra
     });
+
     
     newMapLocationSearchInput.value = '';
     newMapFilterInput.value = localStorage.getItem(MAP_FILTER_INPUT_KEY) || 'España';
