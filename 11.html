@@ -1,4 +1,4 @@
-JS13
+S01
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -864,10 +864,13 @@ JS13
             default:return k;
         }
     }).join(', ');   
+
+    
+
 // ===================================================================
-// NOMBRE: MapLayerAndViewController (VERSIÓN FINAL CON ACTUALIZACIÓN ROBUSTA)
-// RESUMEN: Gestiona el cambio de estilo de mapa y se asegura de que todas las capas y datos se recarguen.
-// ===================================================================
+// NOMBRE: MapLayerAndViewController (VERSIÓN CORREGIDA Y DEFINITIVA)
+// RESUMEN: Gestiona el cambio de estilo de mapa y se asegura de que todas las capas,
+//          fuentes e imágenes personalizadas se recarguen y redibujen correctamente.
 class MapLayerAndViewController {
     onAdd(map) {
         this._map = map;
@@ -898,6 +901,7 @@ class MapLayerAndViewController {
             savedLayerName = legacyNameMap[savedLayerName];
             localStorage.setItem(ACTIVE_MAP_LAYER_KEY, savedLayerName);
             markCacheAsDirty(); 
+        
         }
 
         if (!savedLayerName || !baseMaps[savedLayerName]) {
@@ -918,17 +922,12 @@ class MapLayerAndViewController {
                 localStorage.setItem(ACTIVE_MAP_LAYER_KEY, name);
                 markCacheAsDirty(); 
                       
-                this._map.once('style.load', async () => {
-                    console.log("[MAP RENDER] Estilo de mapa cambiado. Recreando todo...");
-                    
-                    await reAddCustomMapLayersAndSources(this._map);
-                    
-                    updateAllMapLayersData();
-                    
-                    if (navigationCurrentRouteData && navigationCurrentRouteData.routes[0]) {
-                        drawRouteOnMap(navigationCurrentRouteData.routes[0]);
-                    }
-                    
+                this._map.once('style.load', () => {
+                    reAddCustomMapLayersAndSources(this._map).then(() => {
+                        plotRemindersOnNavigationMap();
+                        displayChargingPointsOnMap();
+                        renderWaypointMarkers();
+                    });
                     updateRouteAndCarIconStyle();
                 });
               };
@@ -971,9 +970,9 @@ class MapLayerAndViewController {
 
                     const easeOptions = { };
                     if (modeName === '3D') {
-                        easeOptions.pitch = mapPitchValue;
+                        easeOptions.pitch = mapPitchValue; // Usar el valor persistente
                     } else {
-                        easeOptions.pitch = modeDetails.pitch;
+                        easeOptions.pitch = modeDetails.pitch; // Usar 0 para NORTE y AVANCE
                     }
 
                     if (modeDetails.bearing !== null) {
@@ -1005,8 +1004,7 @@ class MapLayerAndViewController {
         }
         this._map = undefined;
     }
-}
-   
+}    
 // ===================================================================
 // NOMBRE: CompassAndStatsControl
 // RESUMEN: Control que muestra brújula, altitud y velocidades.
@@ -1646,7 +1644,9 @@ class MapSettingsPanel {
                 localStorage.setItem(ACTIVE_MAP_LAYER_KEY, name);
                 this._map.once('style.load', () => {
                     reAddCustomMapLayersAndSources(this._map).then(() => {
-                        updateAllMapLayersData()
+                        plotRemindersOnNavigationMap();
+                        displayChargingPointsOnMap();
+                        renderWaypointMarkers();
                     });
                     updateRouteAndCarIconStyle();
                 });
@@ -1697,77 +1697,6 @@ class MapSettingsPanel {
         fragment.appendChild(viewSelector);
 
         return fragment;
-    }
-}
-
-// ===================================================================
-// NOMBRE: updateAllMapLayersData (NUEVA FUNCIÓN RENDERIZADORA CENTRAL)
-// RESUMEN: Única función responsable de actualizar TODAS las fuentes de datos del mapa.
-// ===================================================================
-function updateAllMapLayersData() {
-    if (!navigationMapInstance || !navigationMapInstance.isStyleLoaded()) return;
-    console.log("[MAP DATA] Actualizando todas las fuentes de datos GeoJSON...");
-
-    // --- 1. WAYPOINTS ---
-    const waypointsSource = navigationMapInstance.getSource('waypoints-source');
-    if (waypointsSource) {
-        const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
-        const waypointFeatures = actualWaypoints.map(wp => {
-            if (!wp || typeof wp.lat !== 'number' || typeof wp.lng !== 'number') return null;
-            return {
-                type: 'Feature',
-                geometry: { type: 'Point', coordinates: [wp.lng, wp.lat] },
-                properties: { id: Number(wp.id), label: String(wp.label), type: String(wp.type), visited: !!wp.visited }
-            };
-        }).filter(Boolean);
-        waypointsSource.setData({ type: 'FeatureCollection', features: waypointFeatures });
-    }
-
-    // --- 2. RECORDATORIOS Y RADARES ---
-    const remindersSource = navigationMapInstance.getSource('reminders-radars-source');
-    if (remindersSource) {
-        const reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
-        const remindersWithLocation = reminders.filter(r => r.isLocationEnabled && r.locationCoordinates?.latitude && r.locationCoordinates?.longitude && !r.isFromRuta);
-        const reminderFeatures = remindersWithLocation.map(reminder => {
-            const isRadar = reminder.text.toUpperCase().includes("RADAR") || reminder.excludeFromList;
-            const speed = isRadar ? extractSpeedFromRadarText(reminder.text) : null;
-            const properties = { reminderId: Number(reminder.id), isRadar: !!isRadar, isFromTarea: !!reminder.isFromTarea };
-            if (speed !== null) properties.speed = String(speed);
-            return {
-                type: 'Feature',
-                geometry: { type: 'Point', coordinates: [reminder.locationCoordinates.longitude, reminder.locationCoordinates.latitude] },
-                properties: properties
-            };
-        });
-        remindersSource.setData({ type: 'FeatureCollection', features: reminderFeatures });
-    }
-
-    // --- 3. PUNTOS DE RECARGA (PDRs) ---
-    const pdrsSource = navigationMapInstance.getSource('pdrs-geojson-source');
-    if (pdrsSource) {
-        const pdrFeatures = lastPdrSearchResults.map((point, index) => {
-            const operatorText = point.operator.length > 15 ? point.operator.substring(0, 14) + '...' : point.operator;
-            return {
-                type: 'Feature',
-                geometry: { type: 'Point', coordinates: [point.lon, point.lat] },
-                properties: { ocmId: Number(point.ocmId), index: index, bgColor: getChargingPointColorByPower(parseFloat(point.power)), isCheapest: !!point.isCheapest, power: String(point.power), operator: operatorText, price: String(point.price), availability: String(point.availabilityText) }
-            };
-        });
-        pdrsSource.setData({ type: 'FeatureCollection', features: pdrFeatures });
-    }
-    
-    // --- 4. ALERTAS DE TRÁFICO ---
-    const alertsSource = navigationMapInstance.getSource('traffic-alerts-source');
-    if (alertsSource) {
-        const alertFeatures = trafficAlertsCache.map(alert => {
-            if (alert.code === 9) return null;
-            return {
-                type: 'Feature',
-                geometry: { type: 'Point', coordinates: [alert.coordinates.lon, alert.coordinates.lat] },
-                properties: { id: alert.id, code: alert.code }
-            };
-        }).filter(Boolean);
-        alertsSource.setData({ type: 'FeatureCollection', features: alertFeatures });
     }
 }
 
@@ -2089,73 +2018,6 @@ async function initializeApp() {
      });
 }    
 
-
-// ===================================================================
-// NOMBRE: reAddCustomMapLayersAndSources (VERSIÓN FINAL CON ORDEN DEFINITIVO)
-// RESUMEN: Define y añade todas las fuentes y capas de forma robusta, usando beforeId para garantizar el orden.
-// ===================================================================
-async function reAddCustomMapLayersAndSources(mapInstance) {
-    if (!mapInstance || !mapInstance.isStyleLoaded()) return;
-    console.log("[MAP RENDER] Iniciando reAddCustomMapLayersAndSources (versión hitbox)...");
-
-    await loadAndAddMapImages(mapInstance);
-
-    const emptyGeoJson = { type: 'FeatureCollection', features: [] };
-    const style = mapInstance.getStyle();
-    
-    // Lista exhaustiva de todas las posibles capas y fuentes que creamos
-    const layersAndSourcesToRemove = ['waypoints-labels', 'waypoints-circles', 'waypoints-hitbox', 'reminders-icons-layer', 'radars-circle-layer', 'radars-text-layer', 'radars-generic-icon-layer', 'reminders-radars-hitbox', 'traffic-alerts-layer', 'traffic-alerts-hitbox', 'waypoints-source', 'reminders-radars-source', 'traffic-alerts-source', 'route', 'speed-markers-source', 'pdrs-geojson-source', 'speed-markers-text', 'speed-markers-circle-bg', 'pdr-cards-layer-availability', 'pdr-cards-layer-price', 'pdr-cards-layer-operator', 'pdr-cards-layer-power', 'pdr-cards-layer-bg-halo', 'pdr-cards-layer-bg', 'pdr-simple-text-layer', 'pdr-simple-circle-layer', 'pdrs-hitbox', 'completed-segments-layer', ...alternativeRouteLayers.map(alt => alt.layerId), ...alternativeRouteLayers.map(alt => alt.sourceId)];
-    layersAndSourcesToRemove.forEach(id => {
-        try { if (mapInstance.getLayer(id)) mapInstance.removeLayer(id); } catch (e) { console.warn(`Warn: No se pudo quitar la capa ${id} (puede que ya no existiera)`); }
-        try { if (mapInstance.getSource(id)) mapInstance.removeSource(id); } catch (e) { console.warn(`Warn: No se pudo quitar la fuente ${id}`); }
-    });
-
-    // Añadir Fuentes
-    mapInstance.addSource('route', { type: 'geojson', data: emptyGeoJson });
-    mapInstance.addSource('pdrs-geojson-source', { type: 'geojson', data: emptyGeoJson });
-    mapInstance.addSource('reminders-radars-source', { type: 'geojson', data: emptyGeoJson });
-    mapInstance.addSource('traffic-alerts-source', { type: 'geojson', data: emptyGeoJson });
-    mapInstance.addSource('waypoints-source', { type: 'geojson', data: emptyGeoJson });
-    mapInstance.addSource('speed-markers-source', { type: 'geojson', data: emptyGeoJson });
-
-    // Encontrar el punto de inserción para nuestras capas (debajo de las etiquetas de texto del mapa)
-    const firstSymbolId = style.layers.find(l => l.type === 'symbol')?.id;
-
-    // --- AÑADIR CAPAS EN ORDEN DE APILAMIENTO ---
-    
-    // Nivel 1: Línea de Ruta (Lo más abajo)
-    mapInstance.addLayer({ id: 'route', type: 'line', source: 'route', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: getRouteStyleProperties() }, firstSymbolId);
-
-    // Nivel 2: Capas VISIBLES de PDRs, Recordatorios, Radares, Alertas
-    mapInstance.addLayer({ id: 'pdr-cards-layer-bg-halo', type: 'circle', source: 'pdrs-geojson-source', filter: ['all', ['>', ['zoom'], 14], ['==', ['get', 'isCheapest'], true]], paint: { 'circle-radius': 48, 'circle-color': '#FFD700', 'circle-opacity': 0.8, 'circle-blur': 1 } }, 'route');
-    mapInstance.addLayer({ id: 'pdr-simple-circle-layer', type: 'circle', source: 'pdrs-geojson-source', filter: ['<=', ['zoom'], 14], paint: { 'circle-radius': 18, 'circle-color': ['get', 'bgColor'], 'circle-opacity': 1, 'circle-stroke-width': ['case', ['==', ['get', 'isCheapest'], true], 3.5, 2], 'circle-stroke-color': ['case', ['==', ['get', 'isCheapest'], true], '#FFD700', 'white'] } }, 'route');
-    mapInstance.addLayer({ id: 'pdr-cards-layer-bg', type: 'circle', source: 'pdrs-geojson-source', filter: ['>', ['zoom'], 14], paint: { 'circle-radius': 45, 'circle-color': ['get', 'bgColor'], 'circle-opacity': 1, 'circle-stroke-width': 3, 'circle-stroke-color': 'white' } }, 'route');
-    mapInstance.addLayer({ id: 'reminders-icons-layer', type: 'symbol', source: 'reminders-radars-source', filter: ['==', 'isRadar', false], layout: { 'icon-image': 'reminder-icon', 'icon-size': 0.6, 'icon-allow-overlap': true, 'icon-anchor': 'bottom' } }, 'route');
-    mapInstance.addLayer({ id: 'radars-circle-layer', type: 'circle', source: 'reminders-radars-source', filter: ['all', ['==', 'isRadar', true], ['has', 'speed']], paint: { 'circle-radius': ['interpolate', ['linear'], ['zoom'], 11.5, 9, 16.5, 24], 'circle-color': 'red', 'circle-stroke-width': ['interpolate', ['linear'], ['zoom'], 11.5, 1, 16.5, 2.5], 'circle-stroke-color': ['case', ['==', ['get', 'isFromTarea'], true], '#00FF00', 'white'] } }, 'route');
-    mapInstance.addLayer({ id: 'radars-generic-icon-layer', type: 'symbol', source: 'reminders-radars-source', filter: ['all', ['==', 'isRadar', true], ['!', ['has', 'speed']]], layout: { 'icon-image': 'radar-generic-icon', 'icon-size': ['interpolate', ['linear'], ['zoom'], 11.5, 0.3, 16.5, 0.7], 'icon-allow-overlap': true } }, 'route');
-    mapInstance.addLayer({ id: 'traffic-alerts-layer', type: 'symbol', source: 'traffic-alerts-source', layout: { 'icon-image': ['match', ['get', 'code'], 1, 'alert-icon-1', 2, 'alert-icon-2', 3, 'alert-icon-3', 4, 'alert-icon-4', 5, 'alert-icon-5', 6, 'alert-icon-6', 7, 'alert-icon-7', 8, 'alert-icon-8', 'alert-icon-5'], 'icon-size': ['interpolate', ['linear'], ['zoom'], 10, 0.3, 14.5, 0.4, 18, 1], 'icon-allow-overlap': true } }, 'route');
-    mapInstance.addLayer({ id: 'speed-markers-circle-bg', type: 'circle', source: 'speed-markers-source', paint: { 'circle-radius': 30, 'circle-color': '#FF2E08', 'circle-stroke-width': 2, 'circle-stroke-color': 'white' } }, 'route');
-    mapInstance.addLayer({ id: 'waypoints-circles', type: 'circle', source: 'waypoints-source', paint: { 'circle-radius': 22, 'circle-color': ['case', ['==', ['get', 'visited'], true], 'rgba(85, 85, 85, 0.8)', ['==', ['get', 'type'], 'S'], 'rgba(0, 128, 0, 0.8)', ['==', ['get', 'type'], 'F'], 'rgba(0, 0, 255, 0.8)', 'rgba(230, 140, 0, 0.8)'], 'circle-stroke-width': 2, 'circle-stroke-color': 'white', 'circle-opacity': ['case', ['==', ['get', 'visited'], true], 0.7, 1] } });
-
-    // Nivel 3: Capas INVISIBLES de HITBOX (para clics fiables)
-    mapInstance.addLayer({ id: 'pdrs-hitbox', type: 'circle', source: 'pdrs-geojson-source', paint: { 'circle-radius': 25, 'circle-color': 'rgba(0,0,0,0)' } });
-    mapInstance.addLayer({ id: 'reminders-radars-hitbox', type: 'circle', source: 'reminders-radars-source', paint: { 'circle-radius': 25, 'circle-color': 'rgba(0,0,0,0)' } });
-    mapInstance.addLayer({ id: 'traffic-alerts-hitbox', type: 'circle', source: 'traffic-alerts-source', paint: { 'circle-radius': 25, 'circle-color': 'rgba(0,0,0,0)' } });
-    mapInstance.addLayer({ id: 'waypoints-hitbox', type: 'circle', source: 'waypoints-source', paint: { 'circle-radius': 25, 'circle-color': 'rgba(0,0,0,0)' } });
-
-    // Nivel 4: Texto (Encima de todo)
-    mapInstance.addLayer({ id: 'pdr-simple-text-layer', type: 'symbol', source: 'pdrs-geojson-source', filter: ['<=', ['zoom'], 14], layout: { 'text-field': ['concat', ['get', 'power'], 'kW'], 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': 9, 'text-allow-overlap': true }, paint: { 'text-color': 'white', 'text-opacity': 1, 'text-halo-color': '#000', 'text-halo-width': 1 } });
-    mapInstance.addLayer({ id: 'pdr-cards-layer-power', type: 'symbol', source: 'pdrs-geojson-source', filter: ['>', ['zoom'], 14], layout: { 'text-field': ['concat', ['get', 'power'], ' kW'], 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': 14, 'text-offset': [0, -1.5], 'text-allow-overlap': true }, paint: { 'text-color': '#ffd700', 'text-opacity': 1, 'text-halo-color': '#000', 'text-halo-width': 1 } });
-    mapInstance.addLayer({ id: 'pdr-cards-layer-operator', type: 'symbol', source: 'pdrs-geojson-source', filter: ['>', ['zoom'], 14], layout: { 'text-field': ['get', 'operator'], 'text-font': ['Open Sans Semibold', 'Arial Unicode MS Bold'], 'text-size': 11, 'text-offset': [0, -0.3], 'text-allow-overlap': true, 'text-max-width': 10 }, paint: { 'text-color': 'white', 'text-opacity': 1, 'text-halo-color': '#000', 'text-halo-width': 1 } });
-    mapInstance.addLayer({ id: 'pdr-cards-layer-price', type: 'symbol', source: 'pdrs-geojson-source', filter: ['>', ['zoom'], 14], layout: { 'text-field': ['get', 'price'], 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': 13, 'text-offset': [0, 1.0], 'text-allow-overlap': true }, paint: { 'text-color': '#90ee90', 'text-opacity': 1, 'text-halo-color': '#000', 'text-halo-width': 1 } });
-    mapInstance.addLayer({ id: 'pdr-cards-layer-availability', type: 'symbol', source: 'pdrs-geojson-source', filter: ['>', ['zoom'], 14], layout: { 'text-field': ['get', 'availability'], 'text-font': ['Open Sans Semibold', 'Arial Unicode MS Bold'], 'text-size': 10, 'text-offset': [0, 2.8], 'text-allow-overlap': true }, paint: { 'text-color': '#e0e0e0', 'text-opacity': 1, 'text-halo-color': '#000', 'text-halo-width': 1 } });
-    mapInstance.addLayer({ id: 'radars-text-layer', type: 'symbol', source: 'reminders-radars-source', filter: ['all', ['==', 'isRadar', true], ['has', 'speed']], layout: { 'text-field': ['get', 'speed'], 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': ['interpolate', ['linear'], ['zoom'], 11.5, 8, 16.5, 21.5], 'text-allow-overlap': true }, paint: { 'text-color': 'yellow' } });
-    mapInstance.addLayer({ id: 'waypoints-labels', type: 'symbol', source: 'waypoints-source', layout: { 'text-field': ['get', 'label'], 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': ['interpolate', ['linear'], ['zoom'], 12, 15, 17, 19], 'text-allow-overlap': true }, paint: { 'text-color': 'white' } });
-    mapInstance.addLayer({ id: 'speed-markers-text', type: 'symbol', source: 'speed-markers-source', layout: { 'text-field': ['get', 'speedText'], 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': 20, 'text-allow-overlap': true }, paint: { 'text-color': 'white' } });
-
-    console.log("[MAP RENDER] reAddCustomMapLayersAndSources finalizado.");
-}
-    
 // ===================================================================
 // NOMBRE: checkAndMarkWaypointsAsVisited (VERSIÓN FINAL Y REFINADA)
 // RESUMEN: Marca la etapa como visitada a 70m y muestra el modal de llegada solo a 20m.
@@ -2360,37 +2222,6 @@ function loadSavedSettings() {
     updateReminderCount();
 } 
 
-// ===================================================================
-// NOMBRE: updateLineWidthsOnPitchChange (NUEVA FUNCIÓN AUXILIAR)
-// RESUMEN: Ajusta el grosor de las líneas de ruta según la inclinación.
-// ===================================================================
-function updateLineWidthsOnPitchChange() {
-    if (!navigationMapInstance || !navigationMapInstance.isStyleLoaded()) return;
-
-    const isPitched = navigationMapInstance.getPitch() > 20;
-    const mainWidth = isPitched ? 16 : 12;
-    const altWidth = isPitched ? 12 : 8;
-    const completedWidth = isPitched ? 10 : 6;
-
-    try {
-        if (navigationMapInstance.getLayer('route')) {
-            navigationMapInstance.setPaintProperty('route', 'line-width', mainWidth);
-        }
-        if (navigationMapInstance.getLayer('completed-segments-layer')) {
-            navigationMapInstance.setPaintProperty('completed-segments-layer', 'line-width', completedWidth);
-        }
-        alternativeRouteLayers.forEach(alt => {
-            if (navigationMapInstance.getLayer(alt.layerId)) {
-                navigationMapInstance.setPaintProperty(alt.layerId, 'line-width', altWidth);
-            }
-        });
-    } catch (e) { 
-        // Es seguro ignorar errores aquí, ya que una capa puede no existir 
-        // en el momento en que se llama a la función (ej. si no hay rutas alternativas).
-    }
-}
-
-    
 // ===================================================================
 // NOMBRE: showNavigationMapHelpModal (VERSIÓN FINAL CON INTERVALOS EN MS Y NUEVOS VALORES POR DEFECTO)
 // RESUMEN: Muestra un modal de ayuda completo, incluyendo la frecuencia de
@@ -2856,7 +2687,7 @@ async function updateDynamicRadars(isInitialLoadCheck = false) {
         markRemindersCacheAsDirty();
         
         if (isNavigationMapActive) {
-            updateAllMapLayersData();
+            plotRemindersOnNavigationMap();
         }
         updateReminderCount();
         updateButtonStyles();
@@ -3870,7 +3701,7 @@ function setupReminderTableListeners(modalTable) {
                     if (needsSave) {
                         localStorage.setItem('reminders', JSON.stringify(rems)); 
                         markRemindersCacheAsDirty();
-                        if (isNavigationMapActive) { updateAllMapLayersData(); } // <-- CORRECCIÓN
+                        if (isNavigationMapActive) { plotRemindersOnNavigationMap(); } // <-- CORRECCIÓN
                     }
                     const tbody = modalTable.querySelector('#reminder-table-body');
                     if (tbody && tbody.rows.length === 0) {
@@ -3924,7 +3755,7 @@ function setupReminderTableListeners(modalTable) {
                     if (rems.length < initialLength) {
                        localStorage.setItem('reminders', JSON.stringify(rems)); 
                        markRemindersCacheAsDirty();
-                       if (isNavigationMapActive) { updateAllMapLayersData(); } // <-- CORRECCIÓN
+                       if (isNavigationMapActive) { plotRemindersOnNavigationMap(); } // <-- CORRECCIÓN
                        showToast('Ciclo de recordatorio anulado permanentemente', 'success');
                     } else {
                         showToast('Error: No se encontró el ciclo para anular', 'warning');
@@ -4429,7 +4260,7 @@ function showReminderModal(reminder = null, options = {}) {
                     localStorage.setItem('reminders', JSON.stringify(reminders));
                     markRemindersCacheAsDirty();
                     if (isNavigationMapActive) {
-                        updateAllMapLayersData();
+                        plotRemindersOnNavigationMap();
                     }
                 } else { 
                     showToast('Recordatorio no encontrado para borrar.', 'warning');
@@ -5135,7 +4966,7 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
                 currentStageInitialExpectedEtaTime = null;
             }
             
-            updateAllMapLayersData()
+            renderWaypointMarkers();
             updateNavigationProgressDisplay(newRemainingRoute, 0); // Llama a la versión ligera
             drawStaticMarkersOnProgressBar();
             updateTurnByTurnDisplay(newRemainingRoute, 0);
@@ -5802,7 +5633,7 @@ function processRouteProgress(coords, mapInstanceToUse) {
     }
 
     checkAndMarkWaypointsAsVisited(route, lastCarDistanceAlongRouteForNavLogic, coords);
-    updateAllMapLayersData() // Necesario para actualizar el color de los visitados
+    renderWaypointMarkers(); // Necesario para actualizar el color de los visitados
     updateTurnByTurnDisplay(route, lastCarDistanceAlongRouteForNavLogic);
     updateNavigationProgressDisplay(route, lastCarDistanceAlongRouteForNavLogic);
 }
@@ -5944,8 +5775,9 @@ function redrawAllHTMLMarkers() {
     });
     reminderMapObjects = [];
 
-    updateAllMapLayersData()
-    }
+    renderWaypointMarkers();
+    plotRemindersOnNavigationMap();
+}
  
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 // NOMBRE: updateAllIconSizes (VERSIÓN FINAL CON LÓGICA DE RECREACIÓN)
@@ -5978,7 +5810,7 @@ function updateAllIconSizes() {
     const crossedThresholdDown = mapPreviousZoomLevelForPDRs > PDR_ZOOM_THRESHOLD && currentZoomLevel <= PDR_ZOOM_THRESHOLD;
 
     if (crossedThresholdUp || crossedThresholdDown) {
-        updateAllMapLayersData();
+        displayChargingPointsOnMap();
     }
     
     mapPreviousZoomLevelForPDRs = currentZoomLevel;
@@ -6627,7 +6459,7 @@ async function findChargingPointsOnRoute(powerFilters, searchConfig) {
         const existingToast = document.getElementById("pdrs-search");
         if (existingToast) existingToast.remove();
         showToast(`${currentChargingPointsOnRoute.length} PDRs encontrados.`, "success");
-        updateAllMapLayersData();
+        displayChargingPointsOnMap();
 
         pdrSearchState = 'results_shown';
 
@@ -6915,7 +6747,7 @@ function showReorderStagesModal() {
             const safeFinalWaypoints = navigationWaypoints.map(wp => ({ id: wp.id, address: wp.address, type: wp.type, label: wp.label, isInternal: wp.isInternal }));
             
             await updateWaypointTypesAndLabels();
-            updateAllMapLayersData()
+            renderWaypointMarkers();
             
             await recalculateAndDrawRoute();
 
@@ -6932,7 +6764,7 @@ function showReorderStagesModal() {
         showToast("Reordenación cancelada.", "info");
         closeReorderModal();
         if (navigationWaypoints.length >= 2) {
-            updateAllMapLayersData()
+            renderWaypointMarkers();
             recalculateAndDrawRoute().catch(() => {});
         } else {
             handleLoadOrDeleteRouteClick(null);
@@ -7095,9 +6927,10 @@ async function checkForAndExecuteCrashRecovery() {
     return false;
 }
 
+
 // ===================================================================
-// NOMBRE: openNavigationMap (VERSIÓN FINAL CON SETUP DIRECTO Y SIN HITBOX)
-// RESUMEN: Inicializa el mapa y añade la interactividad directamente a las capas visibles.
+// NOMBRE: openNavigationMap (VERSIÓN FINAL CON LÓGICA DE CLIC CENTRALIZADA)
+// RESUMEN: Centraliza toda la lógica de clics en un único listener para evitar conflictos.
 // ===================================================================
 async function openNavigationMap(isRecovery = false) {
     return new Promise(async (resolve, reject) => {
@@ -7107,18 +6940,27 @@ async function openNavigationMap(isRecovery = false) {
             try {
                 const adminDocRef = window.doc(window.db, "user_data", "boardinggate");
                 const userDocRef = window.doc(window.db, "user_data", userId);
+                
                 const [adminSnap, userSnap] = await Promise.all([window.getDoc(adminDocRef), window.getDoc(userDocRef)]);
+                
                 let maxSessions = Infinity;
-                if (adminSnap.exists() && typeof adminSnap.data().max_monthly_sessions === 'number') { maxSessions = adminSnap.data().max_monthly_sessions; }
+                if (adminSnap.exists() && typeof adminSnap.data().max_monthly_sessions === 'number') {
+                    maxSessions = adminSnap.data().max_monthly_sessions;
+                }
+                
                 let userMonthlyCount = 0;
                 if (userSnap.exists()) {
                     const userData = userSnap.data();
                     const now = new Date();
                     const currentMonthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
-                    if (userData.map_sessions_last_month === currentMonthStr) { userMonthlyCount = userData.map_sessions_month || 0; }
+                    if (userData.map_sessions_last_month === currentMonthStr) {
+                        userMonthlyCount = userData.map_sessions_month || 0;
+                    }
                 }
+
                 const existingToast = document.getElementById(toastId);
                 if(existingToast) existingToast.remove();
+                
                 if (userMonthlyCount >= maxSessions) {
                     showToast("HA SUPERADO EL NÚMERO MÁXIMO DE SESIONES MENSUALES DE MAPA, consulte con el administrador", "error", 10000);
                     reject(new Error("Límite de sesiones alcanzado")); 
@@ -7138,151 +6980,264 @@ async function openNavigationMap(isRecovery = false) {
         const sideControls = document.querySelectorAll('.toggle-image, .toggle-sign, .scroll-toggle-button'); sideControls.forEach(el => el.style.display = 'none');
         document.querySelectorAll('#config-button, #personal-button, #radar-button, #home-button, #reload-button, #keyword-assignment-button, #password-toggle-button, #versions-button, #info-button, #accident-alert-button').forEach(el => el.style.display = 'none');
         const gridFilter = document.getElementById('grid-filter-container'); if (gridFilter) gridFilter.style.display = 'none';
+
         isNavigationMapActive = true;
         sessionStorage.setItem('mapContext', 'navigation');
         closeOtherModals('reminders-location-map-modal');
+        
         const mapModal = document.getElementById('reminders-location-map-modal');
         if (!mapModal) { console.error("Error crítico: El modal del mapa no se encuentra en el HTML."); isNavigationMapActive = false; reject(new Error("Modal no encontrado")); return; }
+        
         mapModal.classList.remove('map-modal-hidden');
         const mapActualContainer = document.getElementById('mapbox-map-actual-container');
+        
         const radaresCheckbox = document.getElementById('radares-ruta-checkbox');
-        if (radaresCheckbox) { radaresCheckbox.checked = localStorage.getItem(RADARES_RUTA_CHECKED_KEY) === 'true'; }
+        if (radaresCheckbox) {
+            radaresCheckbox.checked = localStorage.getItem(RADARES_RUTA_CHECKED_KEY) === 'true';
+        }
         const tareasCheckbox = document.getElementById('tareas-ruta-checkbox');
-        if (tareasCheckbox) { tareasCheckbox.checked = localStorage.getItem(TAREAS_RUTA_CHECKED_KEY) === 'true'; }
+        if (tareasCheckbox) {
+            tareasCheckbox.checked = localStorage.getItem(TAREAS_RUTA_CHECKED_KEY) === 'true';
+        }
         const mapboxCheckbox = document.getElementById('mapbox-primary-checkbox');
-        if (mapboxCheckbox) { mapboxCheckbox.checked = localStorage.getItem('boardinggate_useMapboxAsPrimary') === 'true'; }
+        if (mapboxCheckbox) {
+            mapboxCheckbox.checked = localStorage.getItem('boardinggate_useMapboxAsPrimary') === 'true';
+        }
         
         if (navigationMapInstance) {
             handleLoadOrDeleteRouteClick(null);
             setNavigationMapClickHandler();
             setTimeout(() => { if (navigationMapInstance) navigationMapInstance.resize(); }, 100);
             resolve(); 
+            
         } else {
             try {
                 const savedLayerName = localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO";
                 const finalLayerName = MAP_LEGACY_NAME_MAP[savedLayerName] || savedLayerName;
                 const initialStyle = MAP_STYLES[finalLayerName] || MAP_STYLES["HÍBRIDO"];
                 showToast("INICIALIZANDO MAPA...", "info", 0, false, "map-init-toast");
+      
                 const startCoordsTexas = { lat: 30.3715, lng: -97.1903 };
                 navigationMapInstance = new mapboxgl.Map({
-                    container: mapActualContainer, style: initialStyle, center: [startCoordsTexas.lng, startCoordsTexas.lat],
-                    zoom: 2.8, pitch: 0, bearing: 0, attributionControl: false, accessToken: mapboxgl.accessToken
+                    container: mapActualContainer,
+                    style: initialStyle, 
+                    center: [startCoordsTexas.lng, startCoordsTexas.lat],
+                    zoom: 2.8,
+                    pitch: 0,
+                    bearing: 0,
+                    attributionControl: false, 
+                    accessToken: mapboxgl.accessToken
                 });
-                if (!isRecovery) { setMapImmersiveMode(true); }
+                
+                if (!isRecovery) {
+                    setMapImmersiveMode(true);
+                }
+                
                 incrementMapSessionCount();
                 mapSessionStartTime = Date.now();
+                
                 const customControls = new CustomMapControlsGroup();
                 window.mapCustomControlsInstance = customControls; 
                 navigationMapInstance.addControl(customControls, 'bottom-right');
+                
                 compassAndModeControl = new CompassAndStatsControl();
                 navigationMapInstance.addControl(compassAndModeControl, 'bottom-left');
+                
                 if (!navigationMapInstance._interactionListenersAttached) {
                     const mapCanvas = navigationMapInstance.getCanvasContainer();
                     let touchStartPos = null;
                     let hasMovedEnoughToDrag = false;
                     const DRAG_THRESHOLD = 10; 
-                    const onTouchStart = (e) => { if (e.touches && e.touches.length > 1) { handleManualMapInteraction(); return; } const touch = e.touches ? e.touches[0] : e; touchStartPos = { x: touch.clientX, y: touch.clientY }; hasMovedEnoughToDrag = false; };
-                    const onTouchMove = (e) => { if (hasMovedEnoughToDrag || !touchStartPos || (e.touches && e.touches.length > 1)) return; const touch = e.touches ? e.touches[0] : e; const deltaX = Math.abs(touch.clientX - touchStartPos.x); const deltaY = Math.abs(touch.clientY - touchStartPos.y); if (deltaX > DRAG_THRESHOLD || deltaY > DRAG_THRESHOLD) { hasMovedEnoughToDrag = true; handleManualMapInteraction(); } };
-                    const onTouchEnd = () => { touchStartPos = null; hasMovedEnoughToDrag = false; };
+
+                    const onTouchStart = (e) => {
+                        if (e.touches && e.touches.length > 1) {
+                            handleManualMapInteraction();
+                            return;
+                        }
+                        const touch = e.touches ? e.touches[0] : e;
+                        touchStartPos = { x: touch.clientX, y: touch.clientY };
+                        hasMovedEnoughToDrag = false;
+                    };
+
+                    const onTouchMove = (e) => {
+                        if (hasMovedEnoughToDrag || !touchStartPos || (e.touches && e.touches.length > 1)) return;
+                        
+                        const touch = e.touches ? e.touches[0] : e;
+                        const deltaX = Math.abs(touch.clientX - touchStartPos.x);
+                        const deltaY = Math.abs(touch.clientY - touchStartPos.y);
+
+                        if (deltaX > DRAG_THRESHOLD || deltaY > DRAG_THRESHOLD) {
+                            hasMovedEnoughToDrag = true;
+                            handleManualMapInteraction(); 
+                        }
+                    };
+
+                    const onTouchEnd = () => {
+                        touchStartPos = null;
+                        hasMovedEnoughToDrag = false;
+                    };
+
                     mapCanvas.addEventListener('touchstart', onTouchStart, { passive: true });
                     mapCanvas.addEventListener('touchmove', onTouchMove, { passive: true });
                     mapCanvas.addEventListener('touchend', onTouchEnd, { passive: true });
-                    navigationMapInstance.on('pitchend', (e) => { if (e.originalEvent) { const newPitch = navigationMapInstance.getPitch(); if (Math.abs(newPitch - mapPitchValue) > 0.1) { mapPitchValue = newPitch; saveSettings(); } } });
+
+                    navigationMapInstance.on('pitchend', (e) => {
+                        if (e.originalEvent) { 
+                            const newPitch = navigationMapInstance.getPitch();
+                            if (Math.abs(newPitch - mapPitchValue) > 0.1) {
+                                mapPitchValue = newPitch;
+                                saveSettings();
+                            }
+                        }
+                    });
                     navigationMapInstance._interactionListenersAttached = true; 
                 }
-                navigationMapInstance.on('error', (e) => { if (e.error && e.error.message.includes("Token")) { showToast("Error de Token de Mapbox. Revisa los permisos (scopes) en tu cuenta.", "error", 10000); } });
+
+                navigationMapInstance.on('error', (e) => {
+                    if (e.error && e.error.message.includes("Token")) {
+                        showToast("Error de Token de Mapbox. Revisa los permisos (scopes) en tu cuenta.", "error", 10000);
+                    }
+                });
                 
                 navigationMapInstance.on('load', async function() {
-                    console.log("[MAP EVENT] Evento 'load' disparado.");
                     try {
+                        const lockButton = document.getElementById('toggle-progress-bar-lock');
+                        if (lockButton && !lockButton.dataset.listenerAttached) {
+                            lockButton.addEventListener('click', (e) => {
+                                e.stopPropagation();
+                                handleProgressBarLockToggle();
+                            });
+                            lockButton.dataset.listenerAttached = 'true';
+                        }
+                        updateProgressBarLockIcon();
+                        
+                        const topInfoBar = document.getElementById('navigation-top-info-bar');
+                        if (topInfoBar && !topInfoBar.dataset.listenerAttached) {
+                            topInfoBar.addEventListener('click', (e) => {
+                                e.stopPropagation();
+                                if (nextManeuverStepForPreview && navigationCurrentRouteData?.routes?.[0]) {
+                                    showIntersectionPreviewMap(
+                                        nextManeuverStepForPreview, 
+                                        navigationCurrentRouteData.routes[0], 
+                                        true, 
+                                        10000 
+                                    );
+                                } else {
+                                    showToast("No hay una próxima maniobra que mostrar.", "info");
+                                }
+                            });
+                            topInfoBar.dataset.listenerAttached = 'true';
+                        }
+                        
                         const initToast = document.getElementById("map-init-toast");
                         if (initToast) initToast.remove();
 
-                        await reAddCustomMapLayersAndSources(navigationMapInstance);
-                        
-                        if (!navigationMapInstance._interactivitySetup) {
-                            console.log("[MAP INTERACTIVITY] Configurando listeners por primera vez.");
-                            const INTERACTIVE_LAYERS = ['pdrs-hitbox', 'waypoints-hitbox', 'reminders-radars-hitbox', 'traffic-alerts-hitbox'];
-                            
-                            let draggedWaypointId = null;
-                            const onMove = (e) => { if (!draggedWaypointId) return; const coords = e.lngLat; const source = navigationMapInstance.getSource('waypoints-source'); if (source && source._data) { const geojsonData = source._data; const featureIndex = geojsonData.features.findIndex(f => f.properties.id === draggedWaypointId); if (featureIndex > -1) { geojsonData.features[featureIndex].geometry.coordinates = [coords.lng, coords.lat]; source.setData(geojsonData); } } };
-                            const onUp = async () => { if (!draggedWaypointId) return; navigationMapInstance.getCanvas().style.cursor = ''; navigationMapInstance.off('mousemove', onMove); navigationMapInstance.off('touchmove', onMove); document.removeEventListener('mouseup', onUp); document.removeEventListener('touchend', onUp); const waypointIndex = navigationWaypoints.findIndex(w => w.id === draggedWaypointId); if (waypointIndex > -1) { const source = navigationMapInstance.getSource('waypoints-source'); const feature = source._data.features.find(f => f.properties.id === draggedWaypointId); const finalCoords = feature.geometry.coordinates; navigationWaypoints[waypointIndex].lat = finalCoords[1]; navigationWaypoints[waypointIndex].lng = finalCoords[0]; navigationWaypoints[waypointIndex].address = await getAddressForWaypoint(finalCoords[1], finalCoords[0]); await recalculateAndDrawRoute(false); updateAllMapLayersData(); } draggedWaypointId = null; };
-
-                            navigationMapInstance.on('mousedown', 'waypoints-hitbox', (e) => { if (isNavigating || e.features.length === 0) return; e.preventDefault(); draggedWaypointId = e.features[0].properties.id; console.log(`[DRAG] Start drag on waypoint ID: ${draggedWaypointId}`); navigationMapInstance.getCanvas().style.cursor = 'grabbing'; navigationMapInstance.on('mousemove', onMove); document.addEventListener('mouseup', onUp, { once: true }); });
-                            navigationMapInstance.on('touchstart', 'waypoints-hitbox', (e) => { if (isNavigating || e.features.length === 0) return; e.preventDefault(); draggedWaypointId = e.features[0].properties.id; console.log(`[DRAG] Start touch-drag on waypoint ID: ${draggedWaypointId}`); navigationMapInstance.on('touchmove', onMove); document.addEventListener('touchend', onUp, { once: true }); });
-                            
-                            navigationMapInstance.on('click', (e) => {
-                                console.log("[MAP CLICK] Clic detectado en el mapa.");
-                                if (draggedWaypointId) { console.log("[MAP CLICK] Clic ignorado porque se estaba arrastrando."); draggedWaypointId = null; return; }
-                                if (isAddReminderAtLocationModeActive) { handleMapClickToAddReminder(e); return; }
-                                if (isSimulatingGpsLocation) { handleSimulateGpsPositionClick(e); return; }
-                                if (isNavigating) { return; }
-                                const features = navigationMapInstance.queryRenderedFeatures(e.point, { layers: [...INTERACTIVE_LAYERS, 'poi-label'] });
-                                console.log(`[MAP CLICK] Features encontrados en hitbox/poi: ${features.length}`, features.map(f => `${f.layer.id} (ID: ${f.properties.id || f.properties.reminderId || f.properties.ocmId})`));
-                                if (features.length > 0) {
-                                    const feature = features[0];
-                                    const layerId = feature.layer.id;
-                                    if (layerId === 'pdrs-hitbox') {
-                                        const fullPdrData = window.lastOcmApiResponse.find(p => p.ID === feature.properties.ocmId);
-                                        if (fullPdrData) showChargingPointModal(fullPdrData, feature.properties.index);
-                                        return;
-                                    }
-                                    if (layerId === 'waypoints-hitbox') {
-                                        showWaypointActionModal(feature.properties.id);
-                                        return;
-                                    }
-                                    if (layerId === 'reminders-radars-hitbox') {
-                                        showReminderActionModal(feature.properties.reminderId);
-                                        return;
-                                    }
-                                    if (layerId === 'traffic-alerts-hitbox') {
-                                        const alertDetailsMap = {1: 'Accidente', 2: 'Averiado', 3: 'Control/Radar', 4: 'Atasco', 5: 'Peligro', 6: 'Mal Estado', 7: 'Obras', 8: 'Cerrada'};
-                                        showToast(alertDetailsMap[feature.properties.code] || 'Alerta de tráfico', 'warning', 4000);
-                                        return;
-                                    }
-                                    if (layerId === 'poi-label') {
-                                        const validPoiFeature = features.find(f => f.properties.name || f.properties.name_en || f.properties.text);
-                                        if (validPoiFeature) {
-                                            const properties = validPoiFeature.properties;
-                                            const poiName = properties.name || properties.name_en || properties.text;
-                                            let categories = [];
-                                            if (properties.poi_category && Array.isArray(properties.poi_category)) { categories = properties.poi_category; } 
-                                            else if (properties.category) { categories = properties.category.split(',').map(c => c.trim()); } 
-                                            else if (properties.maki) { categories = [properties.maki]; }
-                                            const featureForModal = { properties: { name: poiName, categories: categories }, geometry: validPoiFeature.geometry };
-                                            showPoiInfoModal(featureForModal);
-                                        }
-                                        return;
-                                    }
-                                }
-                                console.log("[MAP CLICK] Ningún feature interactivo encontrado. Añadiendo waypoint.");
-                                addWaypoint(e.lngLat);
-                            });
-                            navigationMapInstance.on('mouseenter', INTERACTIVE_LAYERS, () => { if(navigationMapInstance) navigationMapInstance.getCanvas().style.cursor = 'pointer'; });
-                            navigationMapInstance.on('mouseleave', INTERACTIVE_LAYERS, () => { if(navigationMapInstance) navigationMapInstance.getCanvas().style.cursor = ''; });
-                            navigationMapInstance._interactivitySetup = true;
-                        }
+                        await loadAndAddMapImages(navigationMapInstance);
+                        reAddCustomMapLayersAndSources(navigationMapInstance);
                         
                         processTrafficAlerts();
+                        
                         navigationMapInstance.on('pitch', updateLineWidthsOnPitchChange);
+                        
+                        mapPreviousZoomLevelForPDRs = navigationMapInstance.getZoom();
                         navigationMapInstance.on('zoomend', updateAllIconSizes);
+                        navigationMapInstance.on('zoomend', updateTrafficAlertIconSizes);
+                        toggleMapHeaderRowsVisibility(mapHeaderButtonsVisible);
+
+                        // =================== INICIO DEL LISTENER DE CLIC CORREGIDO ===================
+                        navigationMapInstance.on('click', async (e) => {
+                            if (isAddReminderAtLocationModeActive) { handleMapClickToAddReminder(e); return; }
+                            if (isSimulatingGpsLocation) { handleSimulateGpsPositionClick(e); return; }
+                            if (isNavigating) { return; }
+
+                            const point = e.point;
+                            const lngLat = e.lngLat;
+                            
+                            // Comprobación 1: PDRs (Máxima prioridad)
+                            const pdrLayers = ['pdr-simple-circle-layer', 'pdr-cards-layer-bg'];
+                            const pdrFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: pdrLayers });
+                            if (pdrFeatures.length > 0) {
+                                const fullPdrData = window.lastOcmApiResponse.find(p => p.ID === pdrFeatures[0].properties.ocmId);
+                                if (fullPdrData) {
+                                    showChargingPointModal(fullPdrData, pdrFeatures[0].properties.index);
+                                }
+                                return; // Detiene la ejecución
+                            }
+
+                            // Comprobación 2: Alertas de Tráfico
+                            const alertLayers = ['traffic-alerts-layer'];
+                            const alertFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: alertLayers });
+                            if (alertFeatures.length > 0) {
+                                const alertCode = alertFeatures[0].properties.code;
+                                const alertDetailsMap = {
+                                    1: 'Accidente de tráfico', 2: 'Coche averiado', 3: 'Control de tráfico / Radar',
+                                    4: 'Atasco', 5: 'Peligro indeterminado', 6: 'Carretera en mal estado',
+                                    7: 'Obras', 8: 'Vía / Carretera cerrada'
+                                };
+                                const alertText = alertDetailsMap[alertCode] || 'Alerta de tráfico';
+                                showToast(alertText, 'warning', 4000);
+                                return; // Detiene la ejecución
+                            }
+
+                            // Comprobación 3: Radares y Recordatorios (Tareas)
+                            const reminderLayers = ['reminders-icons-layer', 'radar-circles-layer', 'radar-speed-text-layer', 'radar-generic-icon-layer'];
+                            const reminderFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: reminderLayers });
+                            if (reminderFeatures.length > 0) {
+                                const reminderId = reminderFeatures[0].properties.reminderId;
+                                showReminderActionModal(reminderId);
+                                return; // Detiene la ejecución
+                            }
+
+                            // Comprobación 4: POIs de Mapbox
+                            const mapboxPoiLayers = ['poi-label'];
+                            const features = navigationMapInstance.queryRenderedFeatures(point, { layers: mapboxPoiLayers });
+                            const validPoiFeature = features.find(f => {
+                                 if (!f.properties) return false;
+                                 const poiName = f.properties.name || f.properties.name_en || f.properties.text;
+                                 return f.layer.id === 'poi-label' && poiName;
+                            });
+
+                            if (validPoiFeature) {
+                                const properties = validPoiFeature.properties;
+                                const poiName = properties.name || properties.name_en || properties.text;
+                                let categories = [];
+                                if (properties.poi_category && Array.isArray(properties.poi_category)) { categories = properties.poi_category; } 
+                                else if (properties.category) { categories = properties.category.split(',').map(c => c.trim()); } 
+                                else if (properties.maki) { categories = [properties.maki]; }
+                                
+                                const featureForModal = { properties: { name: poiName, categories: categories }, geometry: validPoiFeature.geometry };
+                                showPoiInfoModal(featureForModal);
+                            } else {
+                                // Fallback: Si no se ha clicado en nada, añadir waypoint
+                                addWaypoint(lngLat);
+                            }
+                        });
+                        // =================== FIN DEL LISTENER DE CLIC CORREGIDO ===================
+                        
+                        enablePoiInteractivity(navigationMapInstance);
                         setNavigationMapClickHandler();
+                        
                         if (!isRecovery) {
                             const globeSpinPromise = new Promise(resolve => {
                                 const startCoords = { lat: 30.3715, lng: -97.1903 }; 
                                 const endCoords = { lat: 40.3748, lng: -3.7354 };   
                                 const duration = 1800;
+
                                 const directLngDiff = endCoords.lng - startCoords.lng;
                                 const totalLngChange = -(360 - directLngDiff);
                                 const totalLatChange = endCoords.lat - startCoords.lat;
                                 const startTimestamp = performance.now();
+
                                 function animateSpin(timestamp) {
                                     const elapsedTime = timestamp - startTimestamp;
                                     let progress = Math.min(elapsedTime / duration, 1);
                                     progress = 1 - Math.pow(1 - progress, 3);
+
                                     const currentLng = startCoords.lng + (totalLngChange * progress);
                                     const currentLat = startCoords.lat + (totalLatChange * progress);
+                                    
                                     navigationMapInstance.setCenter([currentLng, currentLat]);
+
                                     if (progress < 1) {
                                         requestAnimationFrame(animateSpin);
                                     } else {
@@ -7292,30 +7247,86 @@ async function openNavigationMap(isRecovery = false) {
                                 }
                                 requestAnimationFrame(animateSpin);
                             });
+                            
                             await globeSpinPromise;
                         }
-                        let currentPos = await getInitialGpsPositionForMap();
+               
+                        // --- INICIO DE LA MODIFICACIÓN ---
+                        let currentPos;
+
+                        // Se utiliza la ubicación GPS precargada si existe (camino rápido).
+                        if (preloadedGpsPosition) {
+                            console.log("Usando la ubicación GPS precargada para abrir el mapa.");
+                            currentPos = preloadedGpsPosition;
+                            preloadedGpsPosition = null; // Se consume para no volver a usarla.
+                        } else {
+                            // Si no, se busca activamente mostrando un mensaje (camino de respaldo).
+                            console.log("La ubicación GPS no fue precargada. Buscando activamente...");
+                            try {
+                                showToast("LOCALIZANDO VEHÍCULO...", "info", 0, false, "gps-locate-toast");
+                                currentPos = await getCurrentLocationAsync();
+                                const loadingToast = document.getElementById("gps-locate-toast");
+                                if (loadingToast) loadingToast.remove();
+                            } catch (error) {
+                                const loadingToast = document.getElementById("gps-locate-toast");
+                                if (loadingToast) loadingToast.remove();
+                                showToast(`No se pudo obtener la ubicación para abrir el mapa. Se centrará en la vista por defecto.`, "error");
+                                // Si todo falla, se usa una ubicación por defecto para que el mapa se abra.
+                                currentPos = { latitude: 40.416775, longitude: -3.703790, heading: 0, speed: 0, altitude: 0, accuracy: 0 };
+                            }
+                        }
+                        
                         setMapImmersiveMode(false);
-                        navigationFollowUser = true; shouldCenterOnUser = true;
+                        
+                        // Se activa el seguimiento por defecto.
+                        navigationFollowUser = true;
+                        shouldCenterOnUser = true;
                         updateLocateMeButtonsUI();
                         toggleMapControls(true);
                         navigationCurrentLocation = currentPos;
-                        const initialViewOptions = { center: [currentPos.longitude, currentPos.latitude], zoom: 16, essential: true };
+                        
+                        const initialViewOptions = {
+                            center: [currentPos.longitude, currentPos.latitude],
+                            zoom: 16, // Zoom fijo a 16.
+                            essential: true
+                        };
+
+                        // Se respeta la configuración de vista del usuario (Norte, Avance o 3D).
                         const mode = mapViewMode || 'static';
-                        if (mode === 'heading' || mode === 'perspective') { initialViewOptions.bearing = currentPos.heading || 0; }
-                        if (mode === 'perspective') { initialViewOptions.pitch = mapPitchValue; } else { initialViewOptions.pitch = 0; }
-                        try { navigationMapInstance.jumpTo(initialViewOptions); } catch (e) { console.error("Fallo en jumpTo, usando fallback:", e); navigationMapInstance.setCenter(initialViewOptions.center); navigationMapInstance.setZoom(initialViewOptions.zoom); navigationMapInstance.setPitch(initialViewOptions.pitch); navigationMapInstance.setBearing(initialViewOptions.bearing); }
+                        if (mode === 'heading' || mode === 'perspective') {
+                            initialViewOptions.bearing = currentPos.heading || 0;
+                        }
+                        if (mode === 'perspective') {
+                            initialViewOptions.pitch = mapPitchValue; // Inclinación guardada.
+                        } else {
+                            initialViewOptions.pitch = 0;
+                        }
+                        
+                        // El "salto" instantáneo que evita la condición de carrera.
+                        try {
+                            navigationMapInstance.jumpTo(initialViewOptions);
+                        } catch (e) {
+                            console.error("Fallo en jumpTo, usando fallback:", e);
+                            navigationMapInstance.setCenter(initialViewOptions.center);
+                            navigationMapInstance.setZoom(initialViewOptions.zoom);
+                            navigationMapInstance.setPitch(initialViewOptions.pitch);
+                            navigationMapInstance.setBearing(initialViewOptions.bearing);
+                        }
+
+                        // Se coloca el marcador y se inicia la lógica de actualización.
                         updateInitialUserPosition(currentPos, navigationMapInstance);
+                        // --- FIN DE LA MODIFICACIÓN ---
+                        
                         startGpsWatching();
+                        
                         resolve();
+                        
                     } catch (loadError) {
-                       console.error("Error en el bloque 'load' del mapa:", loadError);
-                       showToast(`Error crítico al cargar los recursos del mapa: ${loadError.message}`, "error", 10000);
-                       reject(loadError); 
+                        showToast(`Error crítico al cargar los recursos del mapa: ${loadError.message}`, "error", 10000);
+                        reject(loadError); 
                     }
                 });
             } catch (initError) {
-                 console.error("Error al inicializar el mapa:", initError);
                  if (mapActualContainer) mapActualContainer.innerHTML = `<div style="color:red; text-align:center; padding:20px; background: rgba(0,0,0,0.7); height:100%; display:flex; align-items:center; justify-content:center; flex-direction:column;"><h2>Error al cargar el mapa</h2><p>${initError.message}</p><p style="margin-top:10px; font-size:0.9rem;">Por favor, revisa tu token de Mapbox y sus permisos (scopes).</p></div>`;
                  isNavigationMapActive = false;
                  reject(initError); 
@@ -7323,6 +7334,8 @@ async function openNavigationMap(isRecovery = false) {
         }
     }); 
 }
+                                                                                                                                                      
+
     
 //========================================================
 //========================================================    
@@ -7681,7 +7694,7 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
     }
     
     await updateWaypointTypesAndLabels();
-    updateAllMapLayersData()
+    renderWaypointMarkers();
 
     if (navigationWaypoints.filter(wp => wp && !wp.isInternal).length >= 2) {
         return new Promise((resolve, reject) => {
@@ -9434,108 +9447,183 @@ async function getGlobalMapSessionStats() {
     return { totalMonth, totalHistoric };
 }
 
+
+
 // ===================================================================
-// NOMBRE: updateTrafficAlertIconSizes (NUEVA FUNCIÓN)
-// RESUMEN: Redimensiona todos los iconos de alerta de tráfico en el mapa según el nivel de zoom actual.
-function updateTrafficAlertIconSizes() {
-    if (!navigationMapInstance || !trafficAlertsMarkers || trafficAlertsMarkers.length === 0) {
+// NOMBRE: displayAlertsOnMap (MODIFICADA - AÑADE LISTENER DE CLIC)
+// RESUMEN: Dibuja las alertas y añade un listener de clic a cada marcador para que sean interactivos.
+// ===================================================================
+function displayAlertsOnMap() {
+    if (!navigationMapInstance || !navigationMapInstance.isStyleLoaded()) {
         return;
     }
 
-    const currentZoom = navigationMapInstance.getZoom();
-    const ZOOM_THRESHOLD = 14.5;
-    const isSmall = currentZoom < ZOOM_THRESHOLD;
-    const finalSize = isSmall ? '25px' : '60px';
+    // === REFACTORIZADO (INICIO): Lógica completamente nueva con GeoJSON ===
+    // 1. Limpia los marcadores HTML antiguos (si los hubiera)
+    if (trafficAlertsMarkers && trafficAlertsMarkers.length > 0) {
+        trafficAlertsMarkers.forEach(marker => marker.remove());
+    }
+    trafficAlertsMarkers = [];
 
-    trafficAlertsMarkers.forEach(marker => {
-        const markerElement = marker.getElement();
-        if (markerElement) {
-            markerElement.style.width = finalSize;
-            markerElement.style.height = finalSize;
-        }
-    });
+    // 2. Prepara los datos GeoJSON
+    const alertFeatures = trafficAlertsCache.map(alert => {
+        if (alert.code === 9) return null;
+        return {
+            type: 'Feature',
+            geometry: {
+                type: 'Point',
+                coordinates: [alert.coordinates.lon, alert.coordinates.lat]
+            },
+            properties: {
+                code: alert.code,
+                id: alert.id
+            }
+        };
+    }).filter(Boolean); // Filtra los nulos
+
+    const geojsonData = {
+        type: 'FeatureCollection',
+        features: alertFeatures
+    };
+
+    // 3. Actualiza la fuente de datos (o la crea si no existe)
+    const sourceId = 'traffic-alerts-source';
+    const source = navigationMapInstance.getSource(sourceId);
+    if (source) {
+        source.setData(geojsonData);
+    } else {
+        navigationMapInstance.addSource(sourceId, {
+            type: 'geojson',
+            data: geojsonData
+        });
+    }
+
+    // 4. Crea la capa de símbolos si no existe
+    const layerId = 'traffic-alerts-layer';
+    if (!navigationMapInstance.getLayer(layerId)) {
+        navigationMapInstance.addLayer({
+            id: layerId,
+            type: 'symbol',
+            source: sourceId,
+            layout: {
+                'icon-image': [
+                    'match',
+                    ['get', 'code'],
+                    1, 'alert-1',
+                    2, 'alert-2',
+                    3, 'alert-3',
+                    4, 'alert-4',
+                    5, 'alert-5',
+                    6, 'alert-6',
+                    7, 'alert-7',
+                    8, 'alert-8',
+                    'alert-5' // Icono por defecto (peligro)
+                ],
+                'icon-size': ['interpolate', ['linear'], ['zoom'], 10, 0.4, 14.5, 0.5, 18, 1.0],
+                'icon-allow-overlap': true,
+                'icon-anchor': 'center'
+            }
+        });
+
+        // 5. Añade interactividad (cambio de cursor)
+        navigationMapInstance.on('mouseenter', layerId, () => { if(navigationMapInstance) navigationMapInstance.getCanvas().style.cursor = 'pointer'; });
+        navigationMapInstance.on('mouseleave', layerId, () => { if(navigationMapInstance) navigationMapInstance.getCanvas().style.cursor = ''; });
+    }
+    // El click se gestiona en el listener central de openNavigationMap
+    // === REFACTORIZADO (FIN): Lógica completamente nueva con GeoJSON ===
 }
+    
+// ===================================================================
+// NOMBRE: reAddCustomMapLayersAndSources (VERSIÓN CORREGIDA SIN CAPA DE ALERTAS)
+// RESUMEN: Ya no crea la fuente ni la capa para 'traffic-alerts-source', ya que se gestionan como marcadores HTML.
+// ===================================================================
+async function reAddCustomMapLayersAndSources(mapInstance) {
+    if (!mapInstance) return;
 
-// ===================================================================
-// NOMBRE: setupMapLayersAndInteractivity (NUEVA FUNCIÓN CENTRAL)
-// RESUMEN: Crea todas las capas y registra todos los listeners de forma segura.
-// ===================================================================
-async function setupMapLayersAndInteractivity(mapInstance) {
-    console.log("[MAP SETUP] Iniciando configuración de capas e interactividad...");
-    
     await loadAndAddMapImages(mapInstance);
-    const emptyGeoJson = { type: 'FeatureCollection', features: [] };
-    
-    // --- 1. AÑADIR FUENTES ---
-    const sources = ['route', 'pdrs-geojson-source', 'reminders-radars-source', 'traffic-alerts-source', 'waypoints-source', 'speed-markers-source'];
-    sources.forEach(id => {
-        if (!mapInstance.getSource(id)) {
-            mapInstance.addSource(id, { type: 'geojson', data: emptyGeoJson });
+
+    const routeGeojsonData = (navigationCurrentRouteData?.routes?.[0]?.geometry)
+        ? { type: 'Feature', properties: {}, geometry: navigationCurrentRouteData.routes[0].geometry }
+        : { type: 'FeatureCollection', features: [] };
+
+    const pdrFeatures = lastPdrSearchResults.map((point, index) => ({
+        type: 'Feature',
+        geometry: {
+            type: 'Point',
+            coordinates: [point.lon, point.lat]
+        },
+        properties: {
+            ocmId: point.ocmId,
+            index: index,
+            bgColor: getChargingPointColorByPower(parseFloat(point.power)),
+            isCheapest: point.isCheapest || false,
+            power: point.power,
+            operator: point.operator.substring(0, 14),
+            price: point.price,
+            availability: point.availabilityText
         }
+    }));
+    const pdrsGeojsonData = {
+        type: 'FeatureCollection',
+        features: pdrFeatures
+    };
+    
+    const sourcesAndLayersToRemove = [
+        'speed-markers-text', 'speed-markers-circle-bg',
+        'pdr-cards-layer-availability', 'pdr-cards-layer-price', 'pdr-cards-layer-operator', 'pdr-cards-layer-power', 'pdr-cards-layer-bg-halo', 'pdr-cards-layer-bg',
+        'pdr-simple-text-layer', 'pdr-simple-circle-layer', 'route',
+        'speed-markers-source', 'pdrs-geojson-source', 'route'
+    ];
+    sourcesAndLayersToRemove.forEach(id => {
+        try { if (mapInstance.getLayer(id)) mapInstance.removeLayer(id); if (mapInstance.getSource(id)) mapInstance.removeSource(id); } catch (e) {}
     });
 
-    // --- 2. AÑADIR CAPAS EN ORDEN CORRECTO ---
-    const firstSymbolId = mapInstance.getStyle().layers.find(l => l.type === 'symbol')?.id;
-
-    // CAPAS VISUALES
+    mapInstance.addSource('route', { type: 'geojson', data: routeGeojsonData });
+    mapInstance.addSource('speed-markers-source', {  type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
+    mapInstance.addSource('pdrs-geojson-source', { type: 'geojson', data: pdrsGeojsonData });
+ 
     mapInstance.addLayer({ id: 'route', type: 'line', source: 'route', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: getRouteStyleProperties() });
-    mapInstance.addLayer({ id: 'pdr-cards-layer-bg-halo', type: 'circle', source: 'pdrs-geojson-source', filter: ['all', ['>', ['zoom'], 14], ['==', ['get', 'isCheapest'], true]], paint: { 'circle-radius': 48, 'circle-color': '#FFD700', 'circle-opacity': 0.8, 'circle-blur': 1 } });
-    mapInstance.addLayer({ id: 'pdr-simple-circle-layer', type: 'circle', source: 'pdrs-geojson-source', filter: ['<=', ['zoom'], 14], paint: { 'circle-radius': 18, 'circle-color': ['get', 'bgColor'], 'circle-opacity': 1, 'circle-stroke-width': ['case', ['==', ['get', 'isCheapest'], true], 3.5, 2], 'circle-stroke-color': ['case', ['==', ['get', 'isCheapest'], true], '#FFD700', 'white'] } });
-    mapInstance.addLayer({ id: 'pdr-cards-layer-bg', type: 'circle', source: 'pdrs-geojson-source', filter: ['>', ['zoom'], 14], paint: { 'circle-radius': 45, 'circle-color': ['get', 'bgColor'], 'circle-opacity': 1, 'circle-stroke-width': 3, 'circle-stroke-color': 'white' } });
-    mapInstance.addLayer({ id: 'reminders-icons-layer', type: 'symbol', source: 'reminders-radars-source', filter: ['==', 'isRadar', false], layout: { 'icon-image': 'reminder-icon', 'icon-size': 0.6, 'icon-allow-overlap': true, 'icon-anchor': 'bottom' } });
-    mapInstance.addLayer({ id: 'radars-circle-layer', type: 'circle', source: 'reminders-radars-source', filter: ['all', ['==', 'isRadar', true], ['has', 'speed']], paint: { 'circle-radius': ['interpolate', ['linear'], ['zoom'], 11.5, 9, 16.5, 24], 'circle-color': 'red', 'circle-stroke-width': ['interpolate', ['linear'], ['zoom'], 11.5, 1, 16.5, 2.5], 'circle-stroke-color': ['case', ['==', ['get', 'isFromTarea'], true], '#00FF00', 'white'] } });
-    mapInstance.addLayer({ id: 'radars-generic-icon-layer', type: 'symbol', source: 'reminders-radars-source', filter: ['all', ['==', 'isRadar', true], ['!', ['has', 'speed']]], layout: { 'icon-image': 'radar-generic-icon', 'icon-size': ['interpolate', ['linear'], ['zoom'], 11.5, 0.3, 16.5, 0.7], 'icon-allow-overlap': true } });
-    mapInstance.addLayer({ id: 'traffic-alerts-layer', type: 'symbol', source: 'traffic-alerts-source', layout: { 'icon-image': ['match', ['get', 'code'], 1, 'alert-icon-1', 2, 'alert-icon-2', 3, 'alert-icon-3', 4, 'alert-icon-4', 5, 'alert-icon-5', 6, 'alert-icon-6', 7, 'alert-icon-7', 8, 'alert-icon-8', 'alert-icon-5'], 'icon-size': ['interpolate', ['linear'], ['zoom'], 10, 0.3, 14.5, 0.4, 18, 1], 'icon-allow-overlap': true } });
-    mapInstance.addLayer({ id: 'waypoints-circles', type: 'circle', source: 'waypoints-source', paint: { 'circle-radius': 22, 'circle-color': ['case', ['==', ['get', 'visited'], true], 'rgba(85, 85, 85, 0.8)', ['==', ['get', 'type'], 'S'], 'rgba(0, 128, 0, 0.8)', ['==', ['get', 'type'], 'F'], 'rgba(0, 0, 255, 0.8)', 'rgba(230, 140, 0, 0.8)'], 'circle-stroke-width': 2, 'circle-stroke-color': 'white', 'circle-opacity': ['case', ['==', ['get', 'visited'], true], 0.7, 1] } }, firstSymbolId);
     
-    // TEXTO (encima de sus fondos)
+    mapInstance.addLayer({ id: 'speed-markers-circle-bg', type: 'circle', source: 'speed-markers-source', paint: { 'circle-radius': 30, 'circle-color': '#FF2E08', 'circle-stroke-width': 2, 'circle-stroke-color': 'white' } });
+    mapInstance.addLayer({ id: 'speed-markers-text', type: 'symbol', source: 'speed-markers-source', layout: { 'text-field': ['get', 'speedText'], 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': 20, 'text-allow-overlap': true }, paint: { 'text-color': 'white' } });
+
+    mapInstance.addLayer({ id: 'pdr-simple-circle-layer', type: 'circle', source: 'pdrs-geojson-source', filter: ['<=', ['zoom'], 14], paint: { 'circle-radius': 18, 'circle-color': ['get', 'bgColor'], 'circle-opacity': 1, 'circle-stroke-width': ['case', ['==', ['get', 'isCheapest'], true], 3.5, 2], 'circle-stroke-color': ['case', ['==', ['get', 'isCheapest'], true], '#FFD700', 'white'] } });
     mapInstance.addLayer({ id: 'pdr-simple-text-layer', type: 'symbol', source: 'pdrs-geojson-source', filter: ['<=', ['zoom'], 14], layout: { 'text-field': ['concat', ['get', 'power'], 'kW'], 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': 9, 'text-allow-overlap': true }, paint: { 'text-color': 'white', 'text-opacity': 1, 'text-halo-color': '#000', 'text-halo-width': 1 } });
+    mapInstance.addLayer({ id: 'pdr-cards-layer-bg-halo', type: 'circle', source: 'pdrs-geojson-source', filter: ['all', ['>', ['zoom'], 14], ['==', ['get', 'isCheapest'], true]], paint: { 'circle-radius': 48, 'circle-color': '#FFD700', 'circle-opacity': 0.8, 'circle-blur': 1 } });
+    mapInstance.addLayer({ id: 'pdr-cards-layer-bg', type: 'circle', source: 'pdrs-geojson-source', filter: ['>', ['zoom'], 14], paint: { 'circle-radius': 45, 'circle-color': ['get', 'bgColor'], 'circle-opacity': 1, 'circle-stroke-width': 3, 'circle-stroke-color': 'white' } });
     mapInstance.addLayer({ id: 'pdr-cards-layer-power', type: 'symbol', source: 'pdrs-geojson-source', filter: ['>', ['zoom'], 14], layout: { 'text-field': ['concat', ['get', 'power'], ' kW'], 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': 14, 'text-offset': [0, -1.5], 'text-allow-overlap': true }, paint: { 'text-color': '#ffd700', 'text-opacity': 1, 'text-halo-color': '#000', 'text-halo-width': 1 } });
     mapInstance.addLayer({ id: 'pdr-cards-layer-operator', type: 'symbol', source: 'pdrs-geojson-source', filter: ['>', ['zoom'], 14], layout: { 'text-field': ['get', 'operator'], 'text-font': ['Open Sans Semibold', 'Arial Unicode MS Bold'], 'text-size': 11, 'text-offset': [0, -0.3], 'text-allow-overlap': true, 'text-max-width': 10 }, paint: { 'text-color': 'white', 'text-opacity': 1, 'text-halo-color': '#000', 'text-halo-width': 1 } });
     mapInstance.addLayer({ id: 'pdr-cards-layer-price', type: 'symbol', source: 'pdrs-geojson-source', filter: ['>', ['zoom'], 14], layout: { 'text-field': ['get', 'price'], 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': 13, 'text-offset': [0, 1.0], 'text-allow-overlap': true }, paint: { 'text-color': '#90ee90', 'text-opacity': 1, 'text-halo-color': '#000', 'text-halo-width': 1 } });
     mapInstance.addLayer({ id: 'pdr-cards-layer-availability', type: 'symbol', source: 'pdrs-geojson-source', filter: ['>', ['zoom'], 14], layout: { 'text-field': ['get', 'availability'], 'text-font': ['Open Sans Semibold', 'Arial Unicode MS Bold'], 'text-size': 10, 'text-offset': [0, 2.8], 'text-allow-overlap': true }, paint: { 'text-color': '#e0e0e0', 'text-opacity': 1, 'text-halo-color': '#000', 'text-halo-width': 1 } });
-    mapInstance.addLayer({ id: 'radars-text-layer', type: 'symbol', source: 'reminders-radars-source', filter: ['all', ['==', 'isRadar', true], ['has', 'speed']], layout: { 'text-field': ['get', 'speed'], 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': ['interpolate', ['linear'], ['zoom'], 11.5, 8, 16.5, 21.5], 'text-allow-overlap': true }, paint: { 'text-color': 'yellow' } });
-    mapInstance.addLayer({ id: 'waypoints-labels', type: 'symbol', source: 'waypoints-source', layout: { 'text-field': ['get', 'label'], 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': ['interpolate', ['linear'], ['zoom'], 12, 15, 17, 19], 'text-allow-overlap': true }, paint: { 'text-color': 'white' } });
-
-    // --- 3. REGISTRAR LISTENERS DE EVENTOS ---
-    
-    // Lista de las capas que serán interactivas para el clic
-    const CLICKABLE_LAYERS = [
-        'pdr-simple-circle-layer', 'pdr-cards-layer-bg',
-        'waypoints-circles',
-        'radars-circle-layer', 'radars-generic-icon-layer', 'reminders-icons-layer',
-        'traffic-alerts-layer'
-    ];
-    
-    let draggedWaypointId = null;
-    const onMove = (e) => { if (!draggedWaypointId) return; const coords = e.lngLat; const source = mapInstance.getSource('waypoints-source'); if (source && source._data) { const geojsonData = source._data; const featureIndex = geojsonData.features.findIndex(f => f.properties.id === draggedWaypointId); if (featureIndex > -1) { geojsonData.features[featureIndex].geometry.coordinates = [coords.lng, coords.lat]; source.setData(geojsonData); } } };
-    const onUp = async () => { if (!draggedWaypointId) return; mapInstance.getCanvas().style.cursor = ''; mapInstance.off('mousemove', onMove); mapInstance.off('touchmove', onMove); document.removeEventListener('mouseup', onUp); document.removeEventListener('touchend', onUp); const waypointIndex = navigationWaypoints.findIndex(w => w.id === draggedWaypointId); if (waypointIndex > -1) { const source = mapInstance.getSource('waypoints-source'); const feature = source._data.features.find(f => f.properties.id === draggedWaypointId); const finalCoords = feature.geometry.coordinates; navigationWaypoints[waypointIndex].lat = finalCoords[1]; navigationWaypoints[waypointIndex].lng = finalCoords[0]; navigationWaypoints[waypointIndex].address = await getAddressForWaypoint(finalCoords[1], finalCoords[0]); await recalculateAndDrawRoute(false); updateAllMapLayersData(); } draggedWaypointId = null; };
-
-    mapInstance.on('mousedown', 'waypoints-circles', (e) => { if (isNavigating || e.features.length === 0) return; e.preventDefault(); draggedWaypointId = e.features[0].properties.id; mapInstance.getCanvas().style.cursor = 'grabbing'; mapInstance.on('mousemove', onMove); document.addEventListener('mouseup', onUp, { once: true }); });
-    mapInstance.on('touchstart', 'waypoints-circles', (e) => { if (isNavigating || e.features.length === 0) return; e.preventDefault(); draggedWaypointId = e.features[0].properties.id; mapInstance.on('touchmove', onMove); document.addEventListener('touchend', onUp, { once: true }); });
-    
-    mapInstance.on('click', (e) => {
-        if (draggedWaypointId) { draggedWaypointId = null; return; }
-        if (isAddReminderAtLocationModeActive) { handleMapClickToAddReminder(e); return; }
-        if (isSimulatingGpsLocation) { handleSimulateGpsPositionClick(e); return; }
-        if (isNavigating) { return; }
-        const features = mapInstance.queryRenderedFeatures(e.point, { layers: [...CLICKABLE_LAYERS, 'poi-label'] });
-        console.log(`[MAP CLICK] Features encontrados: ${features.length}`, features.map(f => `${f.layer.id} (ID: ${f.properties.id || f.properties.reminderId || f.properties.ocmId})`));
-        if (features.length > 0) {
-            const feature = features[0];
-            const layerId = feature.layer.id;
-            if (layerId.startsWith('pdr-')) { const fullPdrData = window.lastOcmApiResponse.find(p => p.ID === feature.properties.ocmId); if (fullPdrData) showChargingPointModal(fullPdrData, feature.properties.index); return; }
-            if (layerId === 'waypoints-circles') { showWaypointActionModal(feature.properties.id); return; }
-            if (layerId.startsWith('radars-') || layerId === 'reminders-icons-layer') { showReminderActionModal(feature.properties.reminderId); return; }
-            if (layerId === 'traffic-alerts-layer') { const alertDetailsMap = {1: 'Accidente', 2: 'Averiado', 3: 'Control/Radar', 4: 'Atasco', 5: 'Peligro', 6: 'Mal Estado', 7: 'Obras', 8: 'Cerrada'}; showToast(alertDetailsMap[feature.properties.code] || 'Alerta de tráfico', 'warning', 4000); return; }
-            if (layerId === 'poi-label') { const validPoiFeature = features.find(f => f.properties.name || f.properties.name_en || f.properties.text); if (validPoiFeature) showPoiInfoModal(validPoiFeature); return; }
-        }
-        addWaypoint(e.lngLat);
-    });
-    mapInstance.on('mouseenter', CLICKABLE_LAYERS, () => { if(mapInstance) mapInstance.getCanvas().style.cursor = 'pointer'; });
-    mapInstance.on('mouseleave', CLICKABLE_LAYERS, () => { if(mapInstance) mapInstance.getCanvas().style.cursor = ''; });
+  
 }
-    
+
+// ===================================================================
+// NOMBRE: updateLineWidthsOnPitchChange (NUEVA FUNCIÓN SIMPLE)
+// RESUMEN: Ajusta el grosor de las líneas de ruta según la inclinación.
+function updateLineWidthsOnPitchChange() {
+    if (!navigationMapInstance || !navigationMapInstance.isStyleLoaded()) return;
+
+    const isPitched = navigationMapInstance.getPitch() > 20;
+    const mainWidth = isPitched ? 16 : 12;
+    const altWidth = isPitched ? 12 : 8;
+    const completedWidth = isPitched ? 10 : 6;
+
+    try {
+        if (navigationMapInstance.getLayer('route')) {
+            navigationMapInstance.setPaintProperty('route', 'line-width', mainWidth);
+        }
+        if (navigationMapInstance.getLayer('completed-segments-layer')) {
+            navigationMapInstance.setPaintProperty('completed-segments-layer', 'line-width', completedWidth);
+        }
+        alternativeRouteLayers.forEach(alt => {
+            if (navigationMapInstance.getLayer(alt.layerId)) {
+                navigationMapInstance.setPaintProperty(alt.layerId, 'line-width', altWidth);
+            }
+        });
+    } catch (e) { /* Ignorar errores si la capa no existe */ }
+}
+                                                                                                                                                                                                                                                                                                     
 // ===================================================================
 // NOMBRE: openChatModal (MODIFICADA)
 // RESUMEN: Abre el modal del chat y lo convierte en una función asíncrona.
@@ -12784,24 +12872,26 @@ function enablePoiInteractivity(mapInstance) {
 }
 
 // ===================================================================
-// NOMBRE: loadAndAddMapImages (VERSIÓN FINAL CON TODAS LAS IMÁGENES)
-// RESUMEN: Carga TODAS las imágenes necesarias para las capas GeoJSON, incluyendo alertas.
-// ===================================================================
+// NOMBRE: loadAndAddMapImages (VERSIÓN ROBUSTA)
+// RESUMEN: Carga imágenes y continúa aunque alguna falle.
 async function loadAndAddMapImages(mapInstance) {
     const imagesToLoad = [
         { name: 'reminder-icon', url: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-green.png' },
-        { name: 'alert-icon-1', url: 'PNG/AACCIDENTE.png' },
-        { name: 'alert-icon-2', url: 'PNG/AAVERIADO.png' },
-        { name: 'alert-icon-3', url: 'PNG/AGUARDIA.png' },
-        { name: 'alert-icon-4', url: 'PNG/AATASCO.png' },
-        { name: 'alert-icon-5', url: 'PNG/APELIGRO.png' },
-        { name: 'alert-icon-6', url: 'PNG/ARESVALAR.png' },
-        { name: 'alert-icon-7', url: 'PNG/AOBRAS.png' },
-        { name: 'alert-icon-8', url: 'PNG/ACERRADA.png' }
+        { name: 'radar-generic-icon', url: 'PNG/RADARAQUI.PNG' },
+        { name: 'pdr-icon-simple', url: 'PNG/pdrs.png' },
+        // === REFACTORIZADO: AÑADIDAS LAS IMÁGENES DE ALERTA ===
+        { name: 'alert-1', url: 'PNG/AACCIDENTE.png' },
+        { name: 'alert-2', url: 'PNG/AAVERIADO.png' },
+        { name: 'alert-3', url: 'PNG/AGUARDIA.png' },
+        { name: 'alert-4', url: 'PNG/AATASCO.png' },
+        { name: 'alert-5', url: 'PNG/APELIGRO.png' },
+        { name: 'alert-6', url: 'PNG/ARESVALAR.png' },
+        { name: 'alert-7', url: 'PNG/AOBRAS.png' },
+        { name: 'alert-8', url: 'PNG/ACERRADA.png' }
     ];
 
     const imageLoadPromises = imagesToLoad.map(img => 
-        new Promise((resolve) => {
+        new Promise((resolve) => { // No usamos reject para no detener Promise.all
             if (mapInstance.hasImage(img.name)) {
                 resolve();
                 return;
@@ -16831,7 +16921,7 @@ function filterForCheapestPDRs() {
         .filter(p => p !== null);
      cheapestPoints.forEach(p => { p.isCheapest = true; });
     lastPdrSearchResults = cheapestPoints;
-    updateAllMapLayersData();
+    displayChargingPointsOnMap();
 }
 
 // ===================================================================
@@ -16908,7 +16998,7 @@ async function addChargingPointToRoute(pointIndex) {
     }
     
     updateWaypointTypesAndLabels();
-    updateAllMapLayersData()
+    renderWaypointMarkers();
 
     try {
         await recalculateAndDrawRoute(true);
@@ -16947,7 +17037,141 @@ async function addChargingPointToRoute(pointIndex) {
         return totalDistance;
     }
 
+
+// ===================================================================
+// NOMBRE: plotRemindersOnNavigationMap (NUEVA VERSIÓN GEOJSON - LIMPIA Y CORRECTA)
+// RESUMEN: Dibuja los recordatorios y radares en el mapa. La gestión de clics
+//          se ha centralizado en el listener general del mapa.
+// ===================================================================
+function plotRemindersOnNavigationMap() {
+    if (!navigationMapInstance || !navigationMapInstance.isStyleLoaded()) return;
+
+    // === REFACTORIZADO (INICIO): Limpieza unificada ===
+    // 1. Limpia los marcadores HTML antiguos (si quedara alguno de una versión anterior)
+    reminderMapObjects.forEach(obj => {
+        if (obj.marker) {
+            try { obj.marker.remove(); } catch (e) { /* Ignorar */ }
+        }
+    });
+    reminderMapObjects = [];
+
+    // 2. Limpia TODAS las capas y fuentes de recordatorios/radares para reconstruirlas.
+    const layersAndSourcesToRemove = [
+        'radar-speed-text-layer', 'radar-circles-layer', 'radar-generic-icon-layer',
+        'reminders-icons-layer', 'reminders-geojson-source'
+    ];
+    layersAndSourcesToRemove.forEach(id => {
+        try {
+            if (navigationMapInstance.getLayer(id)) navigationMapInstance.removeLayer(id);
+            if (navigationMapInstance.getSource(id)) navigationMapInstance.removeSource(id);
+        } catch (e) { /* Silenciar errores */ }
+    });
+    // === REFACTORIZADO (FIN): Limpieza unificada ===
+
+
+    // 3. Prepara los datos a dibujar (Unificando radares y tareas)
+    const reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
+    const remindersWithLocation = reminders.filter(r => r.isLocationEnabled && r.locationCoordinates?.latitude && r.locationCoordinates?.longitude && !r.isFromRuta);
+
+    // === REFACTORIZADO (INICIO): Creación de un único GeoJSON ===
+    const geojsonFeatures = remindersWithLocation.map(reminder => {
+        const isRadar = reminder.text.toUpperCase().includes("RADAR") || reminder.excludeFromList;
+        const speed = isRadar ? extractSpeedFromRadarText(reminder.text) : null;
+        
+        return {
+            type: 'Feature',
+            geometry: {
+                type: 'Point',
+                coordinates: [reminder.locationCoordinates.longitude, reminder.locationCoordinates.latitude]
+            },
+            properties: {
+                reminderId: reminder.id,
+                isRadar: isRadar,
+                isFromTarea: reminder.isFromTarea || false, // Mantenemos esta propiedad
+                speed: speed !== null ? String(speed) : null // Aseguramos que sea string o null
+            }
+        };
+    });
+
+    navigationMapInstance.addSource('reminders-geojson-source', {
+        type: 'geojson',
+        data: { type: 'FeatureCollection', features: geojsonFeatures }
+    });
+    // === REFACTORIZADO (FIN): Creación de un único GeoJSON ===
+
+
+    // 4. Dibuja los recordatorios normales (capa de iconos verdes)
+    navigationMapInstance.addLayer({
+        id: 'reminders-icons-layer',
+        type: 'symbol',
+        source: 'reminders-geojson-source',
+        filter: ['==', 'isRadar', false], // Filtro para mostrar solo tareas
+        layout: {
+            'icon-image': 'reminder-icon',
+            'icon-size': ['interpolate', ['linear'], ['zoom'], 10, 0.4, 14, 0.6, 17, 0.8],
+            'icon-allow-overlap': true,
+            'icon-anchor': 'bottom'
+        }
+    });
+
+    // === REFACTORIZADO (INICIO): Capas GeoJSON para Radares ===
+    // 5. Dibuja los radares en tres capas para replicar el estilo visual
     
+    // Capa 5.1: Círculo de fondo rojo
+    navigationMapInstance.addLayer({
+        id: 'radar-circles-layer',
+        type: 'circle',
+        source: 'reminders-geojson-source',
+        filter: ['==', 'isRadar', true],
+        paint: {
+            'circle-radius': ['interpolate', ['linear'], ['zoom'], 11.5, 9, 16.5, 24], // 18px y 48px de diámetro
+            'circle-color': 'red',
+            'circle-stroke-width': ['interpolate', ['linear'], ['zoom'], 11.5, 1, 16.5, 2],
+            'circle-stroke-color': ['case', ['get', 'isFromTarea'], '#00FF00', 'white'] // Borde verde si es tarea
+        }
+    });
+
+    // Capa 5.2: Texto de la velocidad (solo para radares con velocidad)
+    navigationMapInstance.addLayer({
+        id: 'radar-speed-text-layer',
+        type: 'symbol',
+        source: 'reminders-geojson-source',
+        filter: ['all', ['==', 'isRadar', true], ['has', 'speed']],
+        layout: {
+            'text-field': '{speed}',
+            'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'],
+            'text-size': ['interpolate', ['linear'], ['zoom'], 11.5, 8, 16.5, 22],
+            'text-allow-overlap': true
+        },
+        paint: {
+            'text-color': 'yellow',
+            'text-halo-color': 'black',
+            'text-halo-width': 1.5
+        }
+    });
+    
+    // Capa 5.3: Icono de radar genérico (solo para radares sin velocidad)
+    navigationMapInstance.addLayer({
+        id: 'radar-generic-icon-layer',
+        type: 'symbol',
+        source: 'reminders-geojson-source',
+        filter: ['all', ['==', 'isRadar', true], ['!', ['has', 'speed']]],
+        layout: {
+            'icon-image': 'radar-generic-icon',
+            'icon-size': ['interpolate', ['linear'], ['zoom'], 11.5, 0.3, 16.5, 0.65],
+            'icon-allow-overlap': true
+        }
+    });
+    // === REFACTORIZADO (FIN): Capas GeoJSON para Radares ===
+
+    // 6. Configura el cursor para TODAS las capas interactivas
+    const interactiveLayers = [
+        'reminders-icons-layer', 'radar-circles-layer', 
+        'radar-speed-text-layer', 'radar-generic-icon-layer'
+    ];
+    navigationMapInstance.on('mouseenter', interactiveLayers, () => { if(navigationMapInstance) navigationMapInstance.getCanvas().style.cursor = 'pointer'; });
+    navigationMapInstance.on('mouseleave', interactiveLayers, () => { if(navigationMapInstance) navigationMapInstance.getCanvas().style.cursor = ''; });
+}    
 // ===================================================================
 // NOMBRE: updateLocateMeButtonsUI (NUEVA FUNCIÓN)
 // RESUMEN: Sincroniza la apariencia (icono y título) de ambos botones de localización.
@@ -17250,10 +17474,10 @@ function getCurrentLocationAsync() {
     });
 }
 
+    
 // ===================================================================
-// NOMBRE: displayChargingPointsOnMap (VERSIÓN ROBUSTA CON TIPADO CORRECTO)
-// RESUMEN: Carga los PDRs a una fuente GeoJSON.
-// ===================================================================
+// NOMBRE: displayChargingPointsOnMap (VERSIÓN GEOJSON CON DISPONIBILIDAD)
+// RESUMEN: Carga los PDRs a una fuente GeoJSON para un renderizado nativo y eficiente.
 function displayChargingPointsOnMap() {
     if (!navigationMapInstance || !navigationMapInstance.getSource('pdrs-geojson-source')) return;
     
@@ -17267,15 +17491,14 @@ function displayChargingPointsOnMap() {
                 coordinates: [point.lon, point.lat]
             },
             properties: {
-                // CORRECCIÓN: Aseguramos que el ID es un número.
-                ocmId: Number(point.ocmId), 
+                ocmId: point.ocmId,
                 index: index,
                 bgColor: getChargingPointColorByPower(parseFloat(point.power)),
-                isCheapest: !!point.isCheapest,
-                power: String(point.power),
+                isCheapest: point.isCheapest || false,
+                power: point.power,
                 operator: operatorText,
-                price: String(point.price),
-                availability: String(point.availabilityText)
+                price: point.price,
+                availability: point.availabilityText
             }
         };
     });
@@ -17287,8 +17510,7 @@ function displayChargingPointsOnMap() {
     
     navigationMapInstance.getSource('pdrs-geojson-source').setData(geojsonData);
     chargingPointsLayer = 'pdrs-geojson-source';
-}    
-
+}
 
 // ===================================================================
 // NOMBRE: plotSingleReminderOnMap (VERSIÓN FINAL CON MODAL PERSONALIZADO)
@@ -17344,8 +17566,121 @@ function plotSingleReminderOnMap(reminder, mapInstance) {
         mapInstance.once('style.load', plot);
     }
     return mapObject;
-}   
+}    
+
+// ===================================================================
+// NOMBRE: renderWaypointMarkers (VERSIÓN FINAL CON CORRECCIÓN DE OFFSET DE ARRASTRE)
+// RESUMEN: Corrige el desplazamiento visual durante el arrastre al tener en cuenta la
+function renderWaypointMarkers() {
+    if (!navigationMapInstance) return;
+
+    navigationWaypoints.forEach(wp => {
+        if (wp && wp.marker) {
+            try { wp.marker.remove(); } catch (e) {}
+            wp.marker = null;
+        }
+    });
+
+    const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
     
+    actualWaypoints.forEach(wp => {
+        if (!wp || typeof wp.lat !== 'number' || typeof wp.lng !== 'number') return;
+        
+        const waypointIconElement = createWaypointMarkerIcon(wp.label, wp.type, wp.visited, wp.id);
+        
+        waypointIconElement.dataset.waypointId = wp.id;
+        
+        wp.marker = new mapboxgl.Marker({
+            element: waypointIconElement,
+            draggable: false, 
+            anchor: 'center'
+        }).setLngLat([wp.lng, wp.lat]).addTo(navigationMapInstance);
+        
+        const markerElement = wp.marker.getElement();
+
+        let isDragging = false;
+        let hasMovedEnough = false;
+        let startPos = { x: 0, y: 0 };
+
+        const onPointerDown = (e) => {
+            if (isNavigating) return;
+            e.stopPropagation();
+            
+            isDragging = false;
+            hasMovedEnough = false;
+            const point = e.touches ? e.touches[0] : e;
+            startPos = { x: point.clientX, y: point.clientY };
+
+            document.addEventListener('mousemove', onPointerMove);
+            document.addEventListener('mouseup', onPointerUp);
+            document.addEventListener('touchmove', onPointerMove, { passive: false });
+            document.addEventListener('touchend', onPointerUp);
+        };
+
+        const onPointerMove = (e) => {
+            if (e.type === 'touchmove') e.preventDefault();
+            
+            const point = e.touches ? e.touches[0] : e;
+            const deltaX = Math.abs(point.clientX - startPos.x);
+            const deltaY = Math.abs(point.clientY - startPos.y);
+
+            if (!hasMovedEnough && (deltaX > 5 || deltaY > 5)) {
+                hasMovedEnough = true;
+                navigationMapInstance.getCanvas().style.cursor = 'grabbing';
+                markerElement.style.cursor = 'grabbing';
+            }
+
+            if (hasMovedEnough) {
+                isDragging = true;
+                const mapContainer = document.getElementById('mapbox-map-actual-container');
+                const mapRect = mapContainer.getBoundingClientRect();
+                const relativeX = point.clientX - mapRect.left;
+                const relativeY = point.clientY - mapRect.top;
+
+                const coords = navigationMapInstance.unproject([relativeX, relativeY]);
+                wp.marker.setLngLat(coords);
+            }
+        };
+
+        const onPointerUp = async (e) => {
+            document.removeEventListener('mousemove', onPointerMove);
+            document.removeEventListener('mouseup', onPointerUp);
+            document.removeEventListener('touchmove', onPointerMove);
+            document.removeEventListener('touchend', onPointerUp);
+            
+            navigationMapInstance.getCanvas().style.cursor = '';
+            markerElement.style.cursor = 'pointer';
+
+            if (isDragging) {
+                const point = e.changedTouches ? e.changedTouches[0] : e;
+                const mapContainer = document.getElementById('mapbox-map-actual-container');
+                const mapRect = mapContainer.getBoundingClientRect();
+                const relativeX = point.clientX - mapRect.left;
+                const relativeY = point.clientY - mapRect.top;
+                const finalCoords = navigationMapInstance.unproject([relativeX, relativeY]);
+                // *** FIN DE LA CORRECCIÓN DE OFFSET ***
+                
+                const waypointIndex = navigationWaypoints.findIndex(w => w.id === wp.id);
+                if (waypointIndex !== -1) {
+                    navigationWaypoints[waypointIndex].lat = finalCoords.lat;
+                    navigationWaypoints[waypointIndex].lng = finalCoords.lng;
+                    navigationWaypoints[waypointIndex].address = await getAddressForWaypoint(finalCoords.lat, finalCoords.lng);
+                    
+                    await recalculateAndDrawRoute();
+                    renderWaypointMarkers();
+                }
+            } else {
+                showWaypointActionModal(wp.id);
+            }
+            
+            isDragging = false;
+            hasMovedEnough = false;
+        };
+
+        markerElement.addEventListener('mousedown', onPointerDown);
+        markerElement.addEventListener('touchstart', onPointerDown, { passive: false });
+    });
+}
 // ===================================================================
 // NOMBRE: handleProgressBarLockToggle (CORREGIDA)
 // RESUMEN: Cambia el estado del candado, lo guarda y actualiza la UI,
@@ -17451,7 +17786,7 @@ async function addWaypoint(latlng, displayName = null) {
 
     navigationWaypoints.push(newWaypoint);
     await updateWaypointTypesAndLabels();
-    updateAllMapLayersData()
+    renderWaypointMarkers();
 
     if (navigationWaypoints.filter(wp => wp && !wp.isInternal).length >= 2) {
         if (navigationWaypoints.filter(wp => wp && !wp.isInternal).length === 2) {
@@ -17896,7 +18231,7 @@ async function handleDeleteWaypointClick(waypointId) {
         }
     } else {
         await updateWaypointTypesAndLabels();
-        updateAllMapLayersData()
+        renderWaypointMarkers();
         if (navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart).length < 2) {
             if (navigationMapInstance && navigationMapInstance.getLayer('route')) { navigationMapInstance.removeLayer('route'); navigationMapInstance.removeSource('route'); }
             navigationRouteLayer = null;
@@ -18897,7 +19232,7 @@ async function handleFinalDestinationSelection() {
     
     try {
         await recalculateAndDrawRoute(true, true);
-        updateAllMapLayersData()
+        renderWaypointMarkers();
         deviationCheckGracePeriodUntil = Date.now() + 5000;
     } catch (error) {
         showToast("Error al recalcular la ruta hacia el destino final.", "error");
@@ -18931,7 +19266,7 @@ async function handleStageSelectionFromDeviationModal(selectedWaypointId) {
     
     try {
         await recalculateAndDrawRoute(true, true);
-        updateAllMapLayersData()
+        renderWaypointMarkers();
         deviationCheckGracePeriodUntil = Date.now() + 5000;
     } catch (error) {
         showToast("Error al recalcular la ruta hacia la etapa seleccionada.", "error");
