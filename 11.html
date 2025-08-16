@@ -1,4 +1,4 @@
-S21
+S22
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -6203,10 +6203,13 @@ async function drawRouteOnMap(route) {
         }
     });
 }
-  
+
+
+
 // ===================================================================
-// NOMBRE: handleAddRadarHereClick
-// RESUMEN: Inicia el proceso para añadir un radar, mostrando el modal de selección de velocidad.
+// NOMBRE: handleAddRadarHereClick (CORREGIDA - NO CREA MARCADORES)
+// RESUMEN: Crea el radar en localStorage y luego redibuja la capa completa.
+// ===================================================================
 function handleAddRadarHereClick(button) {
     showRadarSpeedModal((selectedSpeed) => {
         if (selectedSpeed === null) {
@@ -6215,7 +6218,7 @@ function handleAddRadarHereClick(button) {
 
         button.disabled = true;
         const radarImg = button.querySelector('img');
-        if (radarImg) radarImg.src = "PNG/radar.png";
+        if (radarImg) radarImg.src = "PNG/RADAR.PNG";
 
         getCurrentLocation(
             (coords) => {
@@ -6249,12 +6252,10 @@ function handleAddRadarHereClick(button) {
                 
                 updateReminderCount();
                 updateButtonStyles();
+                markRemindersCacheAsDirty();
                 
                 if (navigationMapInstance) {
-                    const newMapObject = plotSingleReminderOnMap(newRadarReminder, navigationMapInstance);
-                    if (newMapObject) {
-                        reminderMapObjects.push(newMapObject);
-                    }
+                    plotRemindersOnNavigationMap();
                     navigationMapInstance.flyTo({ center: [coords.longitude, coords.latitude], zoom: 15 });
                 }
                 
@@ -6269,6 +6270,7 @@ function handleAddRadarHereClick(button) {
         );
     });
 }
+    
 // ===================================================================
 // NOMBRE: proceedWithRecalculation (MODIFICADA - ACTIVA EL TOAST)
 // RESUMEN: Gestiona la lógica de recálculo de ruta según la acción del usuario.
@@ -16972,134 +16974,141 @@ async function addChargingPointToRoute(pointIndex) {
     }
 
 // ===================================================================
-// NOMBRE: plotRemindersOnNavigationMap (NUEVA VERSIÓN GEOJSON - LIMPIA Y CORRECTA)
-// RESUMEN: Dibuja los recordatorios y radares en el mapa. La gestión de clics
-//          se ha centralizado en el listener general del mapa.
+// NOMBRE: plotRemindersOnNavigationMap (VERSIÓN FINAL CON TRY-CATCH)
+// RESUMEN: Dibuja todas las capas de recordatorios de forma robusta,
+//          capturando y reportando errores si alguna capa individual falla.
 // ===================================================================
 function plotRemindersOnNavigationMap() {
-    if (!navigationMapInstance || !navigationMapInstance.isStyleLoaded()) return;
+    if (!navigationMapInstance || !navigationMapInstance.isStyleLoaded()) {
+        console.warn("plotRemindersOnNavigationMap llamado pero el mapa no está listo.");
+        return;
+    }
 
-    // Limpieza robusta de capas y marcadores anteriores
+    const sourceId = 'reminders-geojson-source';
+    const layersToRemove = [
+        'radar-speed-text-layer', 'radar-circles-layer', 'radar-no-speed-icon-layer', 'reminders-icons-layer'
+    ];
+
+    layersToRemove.forEach(id => {
+        try {
+            if (navigationMapInstance.getLayer(id)) navigationMapInstance.removeLayer(id);
+        } catch (e) { /* Silenciar si ya se está quitando */ }
+    });
+    try {
+        if (navigationMapInstance.getSource(sourceId)) navigationMapInstance.removeSource(sourceId);
+    } catch(e) { /* Silenciar */ }
+    
     reminderMapObjects.forEach(obj => {
-        if (obj.marker) {
-            try { obj.marker.remove(); } catch (e) { /* Ignorar */ }
-        }
+        if (obj.marker) { try { obj.marker.remove(); } catch (e) {} }
     });
     reminderMapObjects = [];
 
-    const layersAndSourcesToRemove = [
-        'radar-speed-text-layer', 'radar-circles-layer', 'radar-no-speed-icon-layer',
-        'reminders-icons-layer', 'reminders-geojson-source'
-    ];
-    layersAndSourcesToRemove.forEach(id => {
-        try {
-            if (navigationMapInstance.getLayer(id)) navigationMapInstance.removeLayer(id);
-            if (navigationMapInstance.getSource(id)) navigationMapInstance.removeSource(id);
-        } catch (e) { /* Silenciar errores */ }
-    });
-
-    // Prepara los datos a dibujar
     const reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
     const remindersWithLocation = reminders.filter(r => r.isLocationEnabled && r.locationCoordinates?.latitude && r.locationCoordinates?.longitude && !r.isFromRuta);
 
     const geojsonFeatures = remindersWithLocation.map(reminder => {
         const isRadar = reminder.text.toUpperCase().includes("RADAR") || reminder.excludeFromList;
         const speed = isRadar ? extractSpeedFromRadarText(reminder.text) : null;
-        
-        const properties = {
-            reminderId: reminder.id,
-            isRadar: isRadar,
-            isFromTarea: reminder.isFromTarea || false,
-        };
-
-        if (speed !== null) {
-            properties.speed = speed; 
-        }
-
+        const properties = { reminderId: reminder.id, isRadar: isRadar, isFromTarea: reminder.isFromTarea || false };
+        if (speed !== null) { properties.speed = speed; }
         return {
             type: 'Feature',
-            geometry: {
-                type: 'Point',
-                coordinates: [reminder.locationCoordinates.longitude, reminder.locationCoordinates.latitude]
-            },
+            geometry: { type: 'Point', coordinates: [reminder.locationCoordinates.longitude, reminder.locationCoordinates.latitude] },
             properties: properties
         };
     });
 
-    navigationMapInstance.addSource('reminders-geojson-source', {
-        type: 'geojson',
-        data: { type: 'FeatureCollection', features: geojsonFeatures }
-    });
-
-    // Dibuja los recordatorios normales (capa de iconos verdes)
-    navigationMapInstance.addLayer({
-        id: 'reminders-icons-layer',
-        type: 'symbol',
-        source: 'reminders-geojson-source',
-        filter: ['==', 'isRadar', false],
-        layout: {
-            'icon-image': 'reminder-icon',
-            'icon-size': ['interpolate', ['linear'], ['zoom'], 10, 0.3, 14, 0.4, 17, 0.5],
-            'icon-allow-overlap': true,
-            'icon-anchor': 'bottom'
-        }
-    });
+    try {
+        navigationMapInstance.addSource(sourceId, {
+            type: 'geojson',
+            data: { type: 'FeatureCollection', features: geojsonFeatures }
+        });
+    } catch (e) {
+        console.error("Error FATAL al añadir la fuente GeoJSON de recordatorios:", e);
+        return;
+    }
     
-    // === LÓGICA DE RADARES CORRECTA Y FINAL ===
+    // === INICIO DE LA CORRECCIÓN CLAVE: TRY...CATCH INDIVIDUALES ===
 
-    // Capa 1: Círculo de fondo rojo (SÓLO para radares CON velocidad)
-    navigationMapInstance.addLayer({
-        id: 'radar-circles-layer',
-        type: 'circle',
-        source: 'reminders-geojson-source',
-        filter: ['all', ['==', 'isRadar', true], ['has', 'speed']], 
-        paint: {
-            'circle-radius': ['interpolate', ['linear'], ['zoom'], 11.5, 9, 16.5, 24],
-            'circle-color': 'red',
-            'circle-stroke-width': ['interpolate', ['linear'], ['zoom'], 11.5, 1, 16.5, 2],
-            'circle-stroke-color': ['case', ['get', 'isFromTarea'], '#00FF00', 'white']
-        }
-    });
+    // Capa 1: Recordatorios normales (iconos verdes)
+    try {
+        navigationMapInstance.addLayer({
+            id: 'reminders-icons-layer',
+            type: 'symbol',
+            source: sourceId,
+            filter: ['==', 'isRadar', false],
+            layout: {
+                'icon-image': 'reminder-icon',
+                'icon-size': ['interpolate', ['linear'], ['zoom'], 10, 0.3, 14, 0.4, 17, 0.5],
+                'icon-allow-overlap': true,
+                'icon-anchor': 'bottom'
+            }
+        });
+    } catch (e) {
+        console.error("Error al añadir la capa 'reminders-icons-layer':", e);
+    }
+    
+    // Capa 2: Círculo de fondo rojo (SÓLO para radares CON velocidad)
+    try {
+        navigationMapInstance.addLayer({
+            id: 'radar-circles-layer',
+            type: 'circle',
+            source: sourceId,
+            filter: ['all', ['==', 'isRadar', true], ['has', 'speed']], 
+            paint: {
+                'circle-radius': ['interpolate', ['linear'], ['zoom'], 11.5, 9, 16.5, 24],
+                'circle-color': 'red',
+                'circle-stroke-width': ['interpolate', ['linear'], ['zoom'], 11.5, 1, 16.5, 2],
+                'circle-stroke-color': ['case', ['get', 'isFromTarea'], '#00FF00', 'white']
+            }
+        });
+    } catch (e) {
+        console.error("Error al añadir la capa 'radar-circles-layer':", e);
+    }
 
-    // Capa 2: Texto de la velocidad (SÓLO para radares CON velocidad)
-    navigationMapInstance.addLayer({
-        id: 'radar-speed-text-layer',
-        type: 'symbol',
-        source: 'reminders-geojson-source',
-        filter: ['all', ['==', 'isRadar', true], ['has', 'speed']], 
-        layout: {
-            'text-field': ["to-string", ['get', 'speed']], // Convertir a string explícitamente por si acaso
-            'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'],
-            'text-size': ['interpolate', ['linear'], ['zoom'], 11.5, 8, 16.5, 22],
-            'text-allow-overlap': true
-        },
-        paint: {
-            'text-color': 'yellow',
-            'text-halo-color': 'black',
-            'text-halo-width': 1.5
-        }
-    });
+    // Capa 3: Texto de la velocidad (SÓLO para radares CON velocidad)
+    try {
+        navigationMapInstance.addLayer({
+            id: 'radar-speed-text-layer',
+            type: 'symbol',
+            source: sourceId,
+            filter: ['all', ['==', 'isRadar', true], ['has', 'speed']], 
+            layout: {
+                'text-field': ["to-string", ['get', 'speed']],
+                'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'],
+                'text-size': ['interpolate', ['linear'], ['zoom'], 11.5, 8, 16.5, 22],
+                'text-allow-overlap': true
+            },
+            paint: { 'text-color': 'yellow', 'text-halo-color': 'black', 'text-halo-width': 1.5 }
+        });
+    } catch (e) {
+        console.error("Error al añadir la capa 'radar-speed-text-layer':", e);
+    }
     
-    // Capa 3: Icono específico para radares SIN velocidad (sin círculo de fondo)
-    navigationMapInstance.addLayer({
-        id: 'radar-no-speed-icon-layer',
-        type: 'symbol',
-        source: 'reminders-geojson-source',
-        filter: ['all', ['==', 'isRadar', true], ['!', ['has', 'speed']]], 
-        layout: {
-            'icon-image': 'radar-no-speed-icon',
-            'icon-size': ['interpolate', ['linear'], ['zoom'], 11.5, 0.1, 16.5, 0.27],
-            'icon-allow-overlap': true,
-            'icon-anchor': 'center'
-        }
-    });
+    // Capa 4: Icono específico para radares SIN velocidad (la capa que faltaba)
+    try {
+        navigationMapInstance.addLayer({
+            id: 'radar-no-speed-icon-layer',
+            type: 'symbol',
+            source: sourceId,
+            filter: ['all', ['==', 'isRadar', true], ['!', ['has', 'speed']]], 
+            layout: {
+                'icon-image': 'radar-no-speed-icon',
+                'icon-size': ['interpolate', ['linear'], ['zoom'], 11.5, 0.1, 16.5, 0.27],
+                'icon-allow-overlap': true,
+                'icon-anchor': 'center'
+            }
+        });
+    } catch (e) {
+        console.error("Error al añadir la capa 'radar-no-speed-icon-layer':", e);
+    }
     
-    // Configura la interactividad para TODAS las capas de recordatorios/radares
+    // === FIN DE LA CORRECCIÓN CLAVE ===
+    
     const interactiveLayers = ['reminders-icons-layer', 'radar-circles-layer', 'radar-no-speed-icon-layer'];
     navigationMapInstance.on('mouseenter', interactiveLayers, () => { if(navigationMapInstance) navigationMapInstance.getCanvas().style.cursor = 'pointer'; });
     navigationMapInstance.on('mouseleave', interactiveLayers, () => { if(navigationMapInstance) navigationMapInstance.getCanvas().style.cursor = ''; });
 }
-
     
 // ===================================================================
 // NOMBRE: updateLocateMeButtonsUI (NUEVA FUNCIÓN)
