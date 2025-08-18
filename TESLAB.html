@@ -1,4 +1,4 @@
-m09
+m10
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -812,7 +812,11 @@ m09
     window.mapCustomControlsInstance = null;
     window.offsetXBeforeManeuver = null;
     window.offsetYBeforeManeuver = null;
-    window.maneuverHorizontalTarget = 0; 
+    window.maneuverHorizontalTarget = 0;
+
+
+    const _turfLastPoint = turf.point([0, 0]);
+    const _turfCurrentPoint = turf.point([0, 0]);
     
     const PERFORMANCE_RATIO_ROUTE_KEY = 'perf_ratio_route';
     const PERFORMANCE_RATIO_ALERTS_KEY = 'perf_ratio_alerts';
@@ -5453,6 +5457,72 @@ function updateVehicleMarker(coords, mapInstanceToUse) {
     }
 }
 
+// =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+// NOMBRE: updateVehicleMarker (VERSIÓN OPTIMIZADA Y ADAPTADA)
+// RESUMEN: Actualiza los "objetivos" para la animación del marcador.
+function updateVehicleMarker(coords, mapInstanceToUse) {
+    lastGpsUpdateTime = Date.now();
+    const lngLat = new mapboxgl.LngLat(coords.longitude, coords.latitude);
+    initialUserLocationMarkerLat = coords.latitude;
+    initialUserLocationMarkerLng = coords.longitude;
+
+    let validatedHeading = null;
+    
+    // 1. Intento con el heading del GPS
+    if (coords.heading !== null && typeof coords.heading === 'number' && !isNaN(coords.heading) && coords.heading >= 0) {
+        validatedHeading = coords.heading;
+    
+    // 2. Fallback calculando el rumbo (optimizado)
+    } else if (window.lastPositionForSpeedCalc && typeof turf !== 'undefined' && (window.currentSpeedKmh || 0) > 5) {
+        _turfLastPoint.geometry.coordinates[0] = window.lastPositionForSpeedCalc.longitude;
+        _turfLastPoint.geometry.coordinates[1] = window.lastPositionForSpeedCalc.latitude;
+        _turfCurrentPoint.geometry.coordinates[0] = coords.longitude;
+        _turfCurrentPoint.geometry.coordinates[1] = coords.latitude;
+        
+        if (turf.distance(_turfLastPoint, _turfCurrentPoint, { units: 'meters' }) > 1) {
+            const bearing = turf.bearing(_turfLastPoint, _turfCurrentPoint);
+            validatedHeading = (bearing < 0) ? bearing + 360 : bearing;
+        }
+    }
+    
+    // 3. Último recurso (si está parado o es el primer punto)
+    if (validatedHeading === null) {
+        // Mantenemos el rumbo actual para que no haya saltos
+        validatedHeading = (markerAnimationState.currentIconRotation + 90 + 360) % 360; 
+    }
+
+    // Creación del marcador (solo la primera vez)
+    if (!initialUserLocationMarker) {
+        const vehicleIconElement = document.createElement('div');
+        vehicleIconElement.style.width = '48px';
+        vehicleIconElement.style.height = '48px';
+        vehicleIconElement.innerHTML = `<img src="PNG/AVANCE.PNG" alt="Coche" style="width:100%; height:100%; object-fit:contain;">`;
+        initialUserLocationMarker = new mapboxgl.Marker({ element: vehicleIconElement, rotationAlignment: 'map', anchor: 'center' })
+            .setLngLat(lngLat)
+            .addTo(mapInstanceToUse);
+        // Inicializamos la rotación actual de la animación al crear el marcador
+        markerAnimationState.currentIconRotation = validatedHeading - 90;
+    }
+    
+    // Configuración de los objetivos para la animación
+    if (!markerAnimationState.currentLngLat) {
+        markerAnimationState.currentLngLat = lngLat;
+    }
+   
+    markerAnimationState.targetLngLat = lngLat;
+    // --- MEJORA #3: Establecemos la rotación objetivo. La animación la suavizará.
+    markerAnimationState.targetIconRotation = validatedHeading - 90; 
+    
+    if (!markerAnimationState.animationFrameId) {
+        markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
+    }
+
+    if (compassAndModeControl) {
+        compassAndModeControl.updateOrientation(validatedHeading);
+    }
+}
+    
+    
 // ===================================================================
 // NOMBRE: updateMapCamera (NUEVA FUNCIÓN AUXILIAR)
 // RESUMEN: Gestiona exclusivamente el movimiento de la cámara del mapa.
@@ -16337,7 +16407,53 @@ function animateMarkerAndMap(timestamp) {
     }
     
     markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
-}    
+}  
+
+// ===================================================================
+// NOMBRE: animateMarkerAndMap (VERSIÓN CON SUAVIZADO DE RUMBO)
+// RESUMEN: Bucle de animación que interpola suavemente la posición
+//          y, ahora también, la rotación del icono del vehículo.
+// ===================================================================
+function animateMarkerAndMap(timestamp) {
+    if (!markerAnimationState.lastTimestamp) {
+        markerAnimationState.lastTimestamp = timestamp;
+        markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
+        return;
+    }
+
+    const deltaTime = timestamp - markerAnimationState.lastTimestamp;
+    markerAnimationState.lastTimestamp = timestamp;
+
+    const LERP_RATE = 0.005; 
+    const ROTATION_LERP_RATE = 0.006;
+    const lerpFactor = 1.0 - Math.exp(-deltaTime * LERP_RATE);
+    const rotationLerpFactor = 1.0 - Math.exp(-deltaTime * ROTATION_LERP_RATE);
+
+    // Interpolar la posición (sin cambios)
+    if (markerAnimationState.currentLngLat && markerAnimationState.targetLngLat) {
+        markerAnimationState.currentLngLat.lng += (markerAnimationState.targetLngLat.lng - markerAnimationState.currentLngLat.lng) * lerpFactor;
+        markerAnimationState.currentLngLat.lat += (markerAnimationState.targetLngLat.lat - markerAnimationState.currentLngLat.lat) * lerpFactor;
+        if (initialUserLocationMarker) {
+            initialUserLocationMarker.setLngLat(markerAnimationState.currentLngLat);
+        }
+    }
+
+    // --- MEJORA #3: Lógica de suavizado de rotación del icono ---
+    let deltaIconRotation = markerAnimationState.targetIconRotation - markerAnimationState.currentIconRotation;
+    if (deltaIconRotation > 180) deltaIconRotation -= 360;
+    if (deltaIconRotation < -180) deltaIconRotation += 360;
+
+    // Interpola suavemente la rotación actual del icono hacia el objetivo
+    markerAnimationState.currentIconRotation += deltaIconRotation * rotationLerpFactor;
+    
+    if (initialUserLocationMarker) {
+        initialUserLocationMarker.setRotation(markerAnimationState.currentIconRotation);
+    }
+    // --- Fin de la mejora ---
+    
+    markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
+}
+    
     
 // ===================================================================
 // NOMBRE: getRouteStyleProperties (VERSIÓN CORREGIDA)
