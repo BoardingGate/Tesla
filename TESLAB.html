@@ -1,4 +1,4 @@
-m12
+m13
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -549,22 +549,14 @@ m12
     
 
     let markerAnimationState = {
-        animationFrameId: null,
-        // Estado de Posición
-        currentLngLat: null,
-        targetLngLat: null,
-        // Estado de Rotación (Suavizado)
-        currentBearing: 0,
-        targetBearing: 0,
-        // Estado de la Cámara (Suavizado)
-        currentZoom: 16,
-        targetZoom: 16,
-        currentPitch: 0,
-        targetPitch: 0,
-        // Timestamp para la animación
-        lastTimestamp: null,
-        // Flag de control
-        isFirstCameraUpdate: true 
+    animationFrameId: null,
+    currentLngLat: null,
+    targetLngLat: null,
+    currentIconRotation: 0,
+    targetIconRotation: 0,
+    currentMapBearing: 0,
+    targetMapBearing: 0,
+    lastTimestamp: null
     };
 
     let nextManeuverStepForPreview = null;
@@ -5466,9 +5458,11 @@ function updateVehicleMarker(coords, mapInstanceToUse) {
     }
 }
 
-// =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
-// NOMBRE: updateVehicleMarker (VERSIÓN OPTIMIZADA Y ADAPTADA)
-// RESUMEN: Actualiza los "objetivos" para la animación del marcador.
+// ===================================================================
+// NOMBRE: updateVehicleMarker (CORRECCIÓN V2.0)
+// RESUMEN: Establece los objetivos de posición y rotación (tanto del
+//          icono como del mapa) para que la animación los suavice.
+// ===================================================================
 function updateVehicleMarker(coords, mapInstanceToUse) {
     lastGpsUpdateTime = Date.now();
     const lngLat = new mapboxgl.LngLat(coords.longitude, coords.latitude);
@@ -5477,11 +5471,8 @@ function updateVehicleMarker(coords, mapInstanceToUse) {
 
     let validatedHeading = null;
     
-    // 1. Intento con el heading del GPS
     if (coords.heading !== null && typeof coords.heading === 'number' && !isNaN(coords.heading) && coords.heading >= 0) {
         validatedHeading = coords.heading;
-    
-    // 2. Fallback calculando el rumbo (optimizado)
     } else if (window.lastPositionForSpeedCalc && typeof turf !== 'undefined' && (window.currentSpeedKmh || 0) > 5) {
         _turfLastPoint.geometry.coordinates[0] = window.lastPositionForSpeedCalc.longitude;
         _turfLastPoint.geometry.coordinates[1] = window.lastPositionForSpeedCalc.latitude;
@@ -5494,33 +5485,33 @@ function updateVehicleMarker(coords, mapInstanceToUse) {
         }
     }
     
-    // 3. Último recurso (si está parado o es el primer punto)
     if (validatedHeading === null) {
-        // Mantenemos el rumbo actual para que no haya saltos
-        validatedHeading = (markerAnimationState.currentIconRotation + 90 + 360) % 360; 
+        // Mantenemos el rumbo actual del mapa para que no haya saltos
+        validatedHeading = markerAnimationState.currentMapBearing; 
     }
 
-    // Creación del marcador (solo la primera vez)
     if (!initialUserLocationMarker) {
         const vehicleIconElement = document.createElement('div');
+        // ... (resto de la creación del elemento)
         vehicleIconElement.style.width = '48px';
         vehicleIconElement.style.height = '48px';
         vehicleIconElement.innerHTML = `<img src="PNG/AVANCE.PNG" alt="Coche" style="width:100%; height:100%; object-fit:contain;">`;
         initialUserLocationMarker = new mapboxgl.Marker({ element: vehicleIconElement, rotationAlignment: 'map', anchor: 'center' })
             .setLngLat(lngLat)
             .addTo(mapInstanceToUse);
-        // Inicializamos la rotación actual de la animación al crear el marcador
+        // Inicializamos la rotación y el bearing al crear el marcador
         markerAnimationState.currentIconRotation = validatedHeading - 90;
+        markerAnimationState.currentMapBearing = validatedHeading;
     }
     
-    // Configuración de los objetivos para la animación
     if (!markerAnimationState.currentLngLat) {
         markerAnimationState.currentLngLat = lngLat;
     }
    
     markerAnimationState.targetLngLat = lngLat;
-    // --- MEJORA #3: Establecemos la rotación objetivo. La animación la suavizará.
+    // Establecemos ambos objetivos: la rotación del icono y el rumbo del mapa
     markerAnimationState.targetIconRotation = validatedHeading - 90; 
+    markerAnimationState.targetMapBearing = validatedHeading;
     
     if (!markerAnimationState.animationFrameId) {
         markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
@@ -5529,9 +5520,7 @@ function updateVehicleMarker(coords, mapInstanceToUse) {
     if (compassAndModeControl) {
         compassAndModeControl.updateOrientation(validatedHeading);
     }
-}
-    
-    
+}    
 // ===================================================================
 // NOMBRE: updateMapCamera (NUEVA FUNCIÓN AUXILIAR)
 // RESUMEN: Gestiona exclusivamente el movimiento de la cámara del mapa.
@@ -5656,6 +5645,63 @@ function updateMapCamera(coords, mapInstanceToUse) {
     }
 }    
 
+
+// ===================================================================
+// NOMBRE: updateMapCamera (CORRECCIÓN V2.0 - CÁMARA FLUIDA)
+// RESUMEN: Mueve la cámara de forma fluida, obteniendo los valores de
+//          la animación y llamando a `easeTo` con una duración corta
+//          para simular un movimiento continuo y suave.
+// ===================================================================
+function updateMapCamera(coords, mapInstanceToUse) {
+    const shouldFollow = (shouldCenterOnUser || navigationFollowUser);
+    if (!shouldFollow || isRecalculatingRoute || !mapInstanceToUse || !markerAnimationState.currentLngLat) {
+        return;
+    }
+    
+    const cameraAdjustments = handleProgressiveManeuverZoom(
+        navigationCurrentRouteData?.routes?.[0]?.legs?.[currentLegIndexNav]?.steps?.[currentStepIndexNav],
+        distanceToNextManeuverOSRM,
+        lastCarDistanceAlongRouteForNavLogic
+    );
+
+    let targetZoom = cameraAdjustments?.zoom ?? null;
+    let targetPitch = cameraAdjustments?.pitch ?? null;
+    let finalOffsetX = cameraAdjustments?.offsetX ?? mapOffsetX;
+    let finalOffsetY = cameraAdjustments?.offsetY ?? mapOffsetY;
+
+    if (targetZoom === null) {
+        targetZoom = handleAutoZoom();
+    }
+    
+    // Usamos los valores suavizados del bucle de animación como base
+    const currentMapZoom = mapInstanceToUse.getZoom();
+    const currentMapPitch = mapInstanceToUse.getPitch();
+
+    // Si hay un objetivo específico (de maniobra o velocidad), usamos ese. Si no, mantenemos el actual.
+    const finalZoom = (targetZoom !== null && !isManualZoomActive) ? targetZoom : currentMapZoom;
+    const finalPitch = (targetPitch !== null) ? targetPitch : ((mapViewMode === 'perspective') ? mapPitchValue : 0);
+
+    const mapHeight = mapInstanceToUse.getCanvas().clientHeight;
+    const mapWidth = mapInstanceToUse.getCanvas().clientWidth;
+
+    const viewOptions = {
+        center: markerAnimationState.currentLngLat, // Usa la posición suavizada del icono
+        zoom: finalZoom,
+        pitch: finalPitch,
+        bearing: (mapViewMode === 'heading' || mapViewMode === 'perspective') ? markerAnimationState.currentMapBearing : 0, // Usa el rumbo suavizado
+        padding: {
+            top: finalOffsetY > 0 ? mapHeight * Math.abs(finalOffsetY / 100) : 0,
+            bottom: finalOffsetY < 0 ? mapHeight * Math.abs(finalOffsetY / 100) : 0,
+            left: finalOffsetX < 0 ? mapWidth * Math.abs(finalOffsetX / 100) : 0,
+            right: finalOffsetX > 0 ? mapWidth * Math.abs(finalOffsetX / 100) : 0
+        },
+        duration: 800, // Una duración corta para que se sienta reactivo pero suave
+        essential: true
+    };
+
+    // La llamada a easeTo se hace aquí, permitiendo que la cámara se mueva de forma fluida
+    mapInstanceToUse.easeTo(viewOptions);
+}
     
 // NOMBRE: updateTripStatistics (NUEVA FUNCIÓN AUXILIAR)
 // RESUMEN: Gestiona los cálculos y la actualización de la UI de estadísticas de viaje.
@@ -16462,14 +16508,13 @@ function animateMarkerAndMap(timestamp) {
     markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
 }  
 
-
 // ===================================================================
-// NOMBRE: animateMarkerAndMap (VERSIÓN CORREGIDA Y ROBUSTA)
-// RESUMEN: Bucle de animación que suaviza y aplica la posición/rotación
-//          del icono Y la posición/zoom/pitch/bearing de la cámara.
+// NOMBRE: animateMarkerAndMap (CORRECCIÓN V2.0 - SOLO ICONO)
+// RESUMEN: Bucle de animación que se centra EXCLUSIVAMENTE en suavizar
+//          la posición y rotación del icono del vehículo.
 // ===================================================================
 function animateMarkerAndMap(timestamp) {
-    if (!initialUserLocationMarker || !navigationMapInstance) {
+    if (!initialUserLocationMarker) {
         markerAnimationState.animationFrameId = null;
         return;
     }
@@ -16485,77 +16530,31 @@ function animateMarkerAndMap(timestamp) {
 
     const LERP_RATE = 0.005; 
     const ROTATION_LERP_RATE = 0.006;
-    const CAMERA_LERP_RATE = 0.004;
     
     const posLerpFactor = 1.0 - Math.exp(-deltaTime * LERP_RATE);
     const rotLerpFactor = 1.0 - Math.exp(-deltaTime * ROTATION_LERP_RATE);
-    const camLerpFactor = 1.0 - Math.exp(-deltaTime * CAMERA_LERP_RATE);
 
-    // --- 1. Animación del Marcador (Posición y Rotación) ---
+    // --- 1. Animación de la Posición del Marcador ---
     if (markerAnimationState.currentLngLat && markerAnimationState.targetLngLat) {
         markerAnimationState.currentLngLat.lng += (markerAnimationState.targetLngLat.lng - markerAnimationState.currentLngLat.lng) * posLerpFactor;
         markerAnimationState.currentLngLat.lat += (markerAnimationState.targetLngLat.lat - markerAnimationState.currentLngLat.lat) * posLerpFactor;
         initialUserLocationMarker.setLngLat(markerAnimationState.currentLngLat);
     }
     
-    let deltaBearing = markerAnimationState.targetBearing - markerAnimationState.currentBearing;
-    if (deltaBearing > 180) deltaBearing -= 360;
-    if (deltaBearing < -180) deltaBearing += 360;
-    markerAnimationState.currentBearing += deltaBearing * rotLerpFactor;
-    initialUserLocationMarker.setRotation(markerAnimationState.currentBearing - 90);
+    // --- 2. Animación de la Rotación del Marcador (y del Mapa) ---
+    // Suavizado de la rotación del icono
+    let deltaIconRotation = markerAnimationState.targetIconRotation - markerAnimationState.currentIconRotation;
+    if (deltaIconRotation > 180) deltaIconRotation -= 360;
+    if (deltaIconRotation < -180) deltaIconRotation += 360;
+    markerAnimationState.currentIconRotation += deltaIconRotation * rotLerpFactor;
+    initialUserLocationMarker.setRotation(markerAnimationState.currentIconRotation);
 
-    // --- 2. Animación de la Cámara (Zoom, Pitch y Movimiento) ---
-    const shouldFollow = (shouldCenterOnUser || navigationFollowUser);
-    if (shouldFollow) {
-        
-        // **CORRECCIÓN CLAVE 1: Manejar el primer fotograma**
-        // Si es la primera actualización, saltamos directamente a la posición/zoom/pitch objetivo
-        // para evitar una animación lenta desde el estado inicial por defecto.
-        if (markerAnimationState.isFirstCameraUpdate) {
-            markerAnimationState.currentZoom = markerAnimationState.targetZoom;
-            markerAnimationState.currentPitch = markerAnimationState.targetPitch;
-            markerAnimationState.isFirstCameraUpdate = false;
-        } else {
-            // Suaviza el zoom y el pitch en los fotogramas siguientes
-            markerAnimationState.currentZoom += (markerAnimationState.targetZoom - markerAnimationState.currentZoom) * camLerpFactor;
-            markerAnimationState.currentPitch += (markerAnimationState.targetPitch - markerAnimationState.currentPitch) * camLerpFactor;
-        }
-
-        const cameraAdjustments = handleProgressiveManeuverZoom(
-            navigationCurrentRouteData?.routes?.[0]?.legs?.[currentLegIndexNav]?.steps?.[currentStepIndexNav],
-            distanceToNextManeuverOSRM,
-            lastCarDistanceAlongRouteForNavLogic
-        );
-        const finalOffsetX = cameraAdjustments?.offsetX ?? mapOffsetX;
-        const finalOffsetY = cameraAdjustments?.offsetY ?? mapOffsetY;
-        
-        const mapHeight = navigationMapInstance.getCanvas().clientHeight;
-        const mapWidth = navigationMapInstance.getCanvas().clientWidth;
-
-        const viewOptions = {
-            center: markerAnimationState.currentLngLat,
-            zoom: markerAnimationState.currentZoom,
-            pitch: markerAnimationState.currentPitch,
-            bearing: (mapViewMode === 'heading' || mapViewMode === 'perspective') ? markerAnimationState.currentBearing : 0,
-            padding: {
-                top: finalOffsetY > 0 ? mapHeight * Math.abs(finalOffsetY / 100) : 0,
-                bottom: finalOffsetY < 0 ? mapHeight * Math.abs(finalOffsetY / 100) : 0,
-                left: finalOffsetX < 0 ? mapWidth * Math.abs(finalOffsetX / 100) : 0,
-                right: finalOffsetX > 0 ? mapWidth * Math.abs(finalOffsetX / 100) : 0
-            },
-            duration: 0, 
-            essential: true
-        };
-        
-        // **CORRECCIÓN CLAVE 2: Se llama a `easeTo` en cada frame que deba seguir**
-        // Esto es correcto, ya que con duration: 0, es muy eficiente y asegura el seguimiento.
-        navigationMapInstance.easeTo(viewOptions);
-    } else {
-        // **CORRECCIÓN CLAVE 3: Resetear el flag si se deja de seguir**
-        // Para que la próxima vez que se active el seguimiento, salte a la posición correcta.
-        markerAnimationState.isFirstCameraUpdate = true;
-    }
-
+    // Suavizado del rumbo del mapa
+    let deltaMapBearing = markerAnimationState.targetMapBearing - markerAnimationState.currentMapBearing;
+    if (deltaMapBearing > 180) deltaMapBearing -= 360;
+    if (deltaMapBearing < -180) deltaMapBearing += 360;
+    markerAnimationState.currentMapBearing += deltaMapBearing * rotLerpFactor;
+    
     markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
 }
     
