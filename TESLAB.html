@@ -5406,6 +5406,113 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
         plotIntervalData();
     }
 }
+
+
+// ===================================================================
+// NOMBRE: updateInitialUserPosition (VERSIÓN MAESTRA SIMPLIFICADA)
+// RESUMEN: Orquestador principal que se ejecuta en cada tick del GPS.
+//          Controla directamente tanto el icono como la cámara para
+//          garantizar una sincronización perfecta.
+// ===================================================================
+function updateInitialUserPosition(coords, mapInstanceToUse) {
+    if (!mapInstanceToUse || !coords || typeof coords.latitude !== 'number' || isNaN(coords.latitude)) {
+        return;
+    }
+
+    // 1. Actualiza el estado global
+    lastGpsUpdateTime = Date.now();
+    navigationCurrentLocation = { ...coords };
+    const lngLat = new mapboxgl.LngLat(coords.longitude, coords.latitude);
+
+    // 2. Calcula un rumbo validado (lógica que ya funciona)
+    let validatedHeading = null;
+    if (coords.heading !== null && typeof coords.heading === 'number' && !isNaN(coords.heading) && coords.heading >= 0) {
+        validatedHeading = coords.heading;
+    } else if (window.lastPositionForSpeedCalc && typeof turf !== 'undefined' && (window.currentSpeedKmh || 0) > 5) {
+        _turfLastPoint.geometry.coordinates = [window.lastPositionForSpeedCalc.longitude, window.lastPositionForSpeedCalc.latitude];
+        _turfCurrentPoint.geometry.coordinates = [coords.longitude, coords.latitude];
+        if (turf.distance(_turfLastPoint, _turfCurrentPoint, { units: 'meters' }) > 1) {
+            const bearing = turf.bearing(_turfLastPoint, _turfCurrentPoint);
+            validatedHeading = (bearing < 0) ? bearing + 360 : bearing;
+        }
+    }
+    if (validatedHeading === null && initialUserLocationMarker) {
+        validatedHeading = initialUserLocationMarker.getRotation() + 90; // Usa la última rotación conocida
+    } else if (validatedHeading === null) {
+        validatedHeading = 0; // Valor por defecto si no hay nada más
+    }
+
+    // 3. Actualiza el marcador (crea o mueve/rota directamente)
+    if (!initialUserLocationMarker) {
+        const vehicleIconElement = document.createElement('div');
+        vehicleIconElement.style.width = '48px';
+        vehicleIconElement.style.height = '48px';
+        vehicleIconElement.innerHTML = `<img src="PNG/AVANCE.PNG" alt="Coche" style="width:100%; height:100%; object-fit:contain;">`;
+        initialUserLocationMarker = new mapboxgl.Marker({ element: vehicleIconElement, rotationAlignment: 'map', anchor: 'center' })
+            .setLngLat(lngLat)
+            .setRotation(validatedHeading - 90)
+            .addTo(mapInstanceToUse);
+    } else {
+        initialUserLocationMarker.setLngLat(lngLat);
+        initialUserLocationMarker.setRotation(validatedHeading - 90);
+    }
+
+    // 4. Mueve la cámara si es necesario
+    const shouldFollow = (shouldCenterOnUser || navigationFollowUser);
+    if (shouldFollow) {
+        const cameraAdjustments = handleProgressiveManeuverZoom(
+            navigationCurrentRouteData?.routes?.[0]?.legs?.[currentLegIndexNav]?.steps?.[currentStepIndexNav],
+            distanceToNextManeuverOSRM,
+            lastCarDistanceAlongRouteForNavLogic
+        );
+
+        let targetZoom = cameraAdjustments?.zoom ?? null;
+        if (targetZoom === null) {
+            targetZoom = handleAutoZoom();
+        }
+
+        const viewOptions = {
+            center: lngLat, // Usa el punto GPS crudo
+            duration: 800,  // La duración de la animación de Mapbox dará la fluidez
+            essential: true
+        };
+
+        if (mapViewMode === 'heading' || mapViewMode === 'perspective') {
+            viewOptions.bearing = validatedHeading; // Usa el rumbo calculado
+        }
+        
+        // El resto de la lógica de la cámara es la que ya funcionaba bien
+        const targetPitch = cameraAdjustments?.pitch ?? ((mapViewMode === 'perspective') ? mapPitchValue : 0);
+        const finalOffsetX = cameraAdjustments?.offsetX ?? mapOffsetX;
+        const finalOffsetY = cameraAdjustments?.offsetY ?? mapOffsetY;
+        const mapHeight = mapInstanceToUse.getCanvas().clientHeight;
+        const mapWidth = mapInstanceToUse.getCanvas().clientWidth;
+        
+        viewOptions.padding = {
+            top: finalOffsetY > 0 ? mapHeight * Math.abs(finalOffsetY / 100) : 0,
+            bottom: finalOffsetY < 0 ? mapHeight * Math.abs(finalOffsetY / 100) : 0,
+            left: finalOffsetX < 0 ? mapWidth * Math.abs(finalOffsetX / 100) : 0,
+            right: finalOffsetX > 0 ? mapWidth * Math.abs(finalOffsetX / 100) : 0
+        };
+
+        if (targetZoom !== null && !isManualZoomActive) {
+            viewOptions.zoom = targetZoom;
+        }
+        viewOptions.pitch = targetPitch;
+
+        mapInstanceToUse.easeTo(viewOptions);
+    }
+    
+    // 5. Llama al resto de funciones de actualización que dependen de la posición
+    if (gpsTickCounter % performanceRatios.routeProgress === 0) {
+        if (isNavigating) { processRouteProgress(coords, mapInstanceToUse); }
+    }
+    if (gpsTickCounter % performanceRatios.trafficAlerts === 0) { checkAlertsProximity(); }
+    if (gpsTickCounter % performanceRatios.tripStats === 0) { updateTripStatistics(coords); }
+    if (gpsTickCounter % performanceRatios.performanceGraph === 0) { plotIntervalData(); }
+    if (compassAndModeControl) { compassAndModeControl.updateOrientation(validatedHeading); }
+    gpsTickCounter = (gpsTickCounter + 1) % 60000;
+}
     
 // ===================================================================
 // NOMBRE: updateVehicleMarker (NUEVA FUNCIÓN AUXILIAR)
