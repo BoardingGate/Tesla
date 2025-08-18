@@ -546,16 +546,16 @@
     };
     
     let markerAnimationState = {
-        animationFrameId: null,
-        currentLngLat: null,
-        targetLngLat: null,
-        currentIconRotation: 0,
-        targetIconRotation: 0,
-        currentMapBearing: 0,
-        targetMapBearing: 0,
-        lastTimestamp: null
+    animationFrameId: null,
+    currentLngLat: null,
+    targetLngLat: null,
+    currentIconRotation: 0,
+    targetIconRotation: 0,
+    currentMapBearing: 0,
+    targetMapBearing: 0,
+    lastTimestamp: null
     };
-
+  
     let nextManeuverStepForPreview = null;
     let isMobileSession = false;
     let processedRemindersCache = [];
@@ -810,7 +810,11 @@
     window.mapCustomControlsInstance = null;
     window.offsetXBeforeManeuver = null;
     window.offsetYBeforeManeuver = null;
-    window.maneuverHorizontalTarget = 0; 
+    window.maneuverHorizontalTarget = 0;
+
+
+    const _turfLastPoint = turf.point([0, 0]);
+    const _turfCurrentPoint = turf.point([0, 0]);
     
     const PERFORMANCE_RATIO_ROUTE_KEY = 'perf_ratio_route';
     const PERFORMANCE_RATIO_ALERTS_KEY = 'perf_ratio_alerts';
@@ -5401,9 +5405,12 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
     }
 }
     
+
 // ===================================================================
-// NOMBRE: updateVehicleMarker (NUEVA FUNCIÓN AUXILIAR)
-// RESUMEN: Gestiona exclusivamente la posición y rotación del marcador del vehículo.
+// NOMBRE: updateVehicleMarker (VERSIÓN ESTABLE)
+// RESUMEN: Establece los objetivos de posición y rotación solo para
+//          el icono, para que `animateMarkerAndMap` los suavice.
+// ===================================================================
 function updateVehicleMarker(coords, mapInstanceToUse) {
     lastGpsUpdateTime = Date.now();
     const lngLat = new mapboxgl.LngLat(coords.longitude, coords.latitude);
@@ -5411,16 +5418,21 @@ function updateVehicleMarker(coords, mapInstanceToUse) {
     initialUserLocationMarkerLng = coords.longitude;
 
     let validatedHeading = null;
+    
     if (coords.heading !== null && typeof coords.heading === 'number' && !isNaN(coords.heading) && coords.heading >= 0) {
         validatedHeading = coords.heading;
-    } else if (window.lastPositionForSpeedCalc && typeof turf !== 'undefined') {
-        const lastPoint = turf.point([window.lastPositionForSpeedCalc.longitude, window.lastPositionForSpeedCalc.latitude]);
-        const currentPoint = turf.point([coords.longitude, coords.latitude]);
-        if (turf.distance(lastPoint, currentPoint, { units: 'meters' }) > 1) {
-            const bearing = turf.bearing(lastPoint, currentPoint);
+    } else if (window.lastPositionForSpeedCalc && typeof turf !== 'undefined' && (window.currentSpeedKmh || 0) > 5) {
+        _turfLastPoint.geometry.coordinates[0] = window.lastPositionForSpeedCalc.longitude;
+        _turfLastPoint.geometry.coordinates[1] = window.lastPositionForSpeedCalc.latitude;
+        _turfCurrentPoint.geometry.coordinates[0] = coords.longitude;
+        _turfCurrentPoint.geometry.coordinates[1] = coords.latitude;
+        
+        if (turf.distance(_turfLastPoint, _turfCurrentPoint, { units: 'meters' }) > 1) {
+            const bearing = turf.bearing(_turfLastPoint, _turfCurrentPoint);
             validatedHeading = (bearing < 0) ? bearing + 360 : bearing;
         }
     }
+    
     if (validatedHeading === null) {
         validatedHeading = (markerAnimationState.currentIconRotation + 90 + 360) % 360; 
     }
@@ -5433,6 +5445,7 @@ function updateVehicleMarker(coords, mapInstanceToUse) {
         initialUserLocationMarker = new mapboxgl.Marker({ element: vehicleIconElement, rotationAlignment: 'map', anchor: 'center' })
             .setLngLat(lngLat)
             .addTo(mapInstanceToUse);
+        markerAnimationState.currentIconRotation = validatedHeading - 90;
     }
     
     if (!markerAnimationState.currentLngLat) {
@@ -5450,19 +5463,20 @@ function updateVehicleMarker(coords, mapInstanceToUse) {
         compassAndModeControl.updateOrientation(validatedHeading);
     }
 }
-
-// ===================================================================
-// NOMBRE: updateMapCamera (NUEVA FUNCIÓN AUXILIAR)
-// RESUMEN: Gestiona exclusivamente el movimiento de la cámara del mapa.
-// ===================================================================
-function updateMapCamera(coords, mapInstanceToUse) {
+    
+//=====================================================================
+ function updateMapCamera(coords, mapInstanceToUse) {
     const shouldFollow = (shouldCenterOnUser || navigationFollowUser);
-    if (!shouldFollow || isRecalculatingRoute || !mapInstanceToUse) {
+
+    if (!shouldFollow || isRecalculatingRoute || !mapInstanceToUse || !markerAnimationState.currentLngLat) {
         return;
     }
     
-    const lngLat = new mapboxgl.LngLat(coords.longitude, coords.latitude);
-
+    const GPS_INTERVAL_MS = 100; // Frecuencia fija de 10 Hz
+    const DURATION_MULTIPLIER = 10+performanceRatios.criticalUpdate; 
+    const effectiveUpdateInterval = GPS_INTERVAL_MS * 1;
+     
+    const dynamicCameraDuration = effectiveUpdateInterval * DURATION_MULTIPLIER;
     const cameraAdjustments = handleProgressiveManeuverZoom(
         navigationCurrentRouteData?.routes?.[0]?.legs?.[currentLegIndexNav]?.steps?.[currentStepIndexNav],
         distanceToNextManeuverOSRM,
@@ -5483,24 +5497,22 @@ function updateMapCamera(coords, mapInstanceToUse) {
     }
     
     if (targetZoom !== null && (typeof targetZoom !== 'number' || isNaN(targetZoom))) {
-        console.error(`[VALIDACIÓN] Se ha detectado un valor de zoom inválido (${targetZoom}). Se anulará el cambio de zoom en este ciclo para prevenir un error.`);
         targetZoom = null;
     }
     
-    const viewOptions = {
-        center: lngLat,
-        duration: 1000,
-        essential: true
-    };
-    
     const mapHeight = mapInstanceToUse.getCanvas().clientHeight;
     const mapWidth = mapInstanceToUse.getCanvas().clientWidth;
-    
-    viewOptions.padding = {
-        top: finalOffsetY > 0 ? mapHeight * Math.abs(finalOffsetY / 100) : 0,
-        bottom: finalOffsetY < 0 ? mapHeight * Math.abs(finalOffsetY / 100) : 0,
-        left: finalOffsetX < 0 ? mapWidth * Math.abs(finalOffsetX / 100) : 0,
-        right: finalOffsetX > 0 ? mapWidth * Math.abs(finalOffsetX / 100) : 0
+
+    const viewOptions = {
+        center: markerAnimationState.currentLngLat, // Sigue la posición SUAVIZADA del icono.
+        duration: dynamicCameraDuration,           // ¡USA LA DURACIÓN CALCULADA!
+        essential: true,
+        padding: {
+            top: finalOffsetY > 0 ? mapHeight * Math.abs(finalOffsetY / 100) : 0,
+            bottom: finalOffsetY < 0 ? mapHeight * Math.abs(finalOffsetY / 100) : 0,
+            left: finalOffsetX < 0 ? mapWidth * Math.abs(finalOffsetX / 100) : 0,
+            right: finalOffsetX > 0 ? mapWidth * Math.abs(finalOffsetX / 100) : 0
+        }
     };
 
     if (mapViewMode === 'heading' || mapViewMode === 'perspective') {
@@ -5508,10 +5520,12 @@ function updateMapCamera(coords, mapInstanceToUse) {
         if (coords.heading !== null && typeof coords.heading === 'number' && !isNaN(coords.heading) && coords.heading >= 0) {
              validatedHeading = coords.heading;
         } else if (window.lastPositionForSpeedCalc && typeof turf !== 'undefined') {
-            const lastPoint = turf.point([window.lastPositionForSpeedCalc.longitude, window.lastPositionForSpeedCalc.latitude]);
-            const currentPoint = turf.point([coords.longitude, coords.latitude]);
-            if (turf.distance(lastPoint, currentPoint, { units: 'meters' }) > 1) {
-                const bearing = turf.bearing(lastPoint, currentPoint);
+            _turfLastPoint.geometry.coordinates[0] = window.lastPositionForSpeedCalc.longitude;
+            _turfLastPoint.geometry.coordinates[1] = window.lastPositionForSpeedCalc.latitude;
+            _turfCurrentPoint.geometry.coordinates[0] = coords.longitude;
+            _turfCurrentPoint.geometry.coordinates[1] = coords.latitude;
+            if (turf.distance(_turfLastPoint, _turfCurrentPoint, { units: 'meters' }) > 1) {
+                const bearing = turf.bearing(_turfLastPoint, _turfCurrentPoint);
                 validatedHeading = (bearing < 0) ? bearing + 360 : bearing;
             }
         }
@@ -5531,7 +5545,9 @@ function updateMapCamera(coords, mapInstanceToUse) {
     }
 
     mapInstanceToUse.easeTo(viewOptions);
-}    
+}
+    
+    
 // NOMBRE: updateTripStatistics (NUEVA FUNCIÓN AUXILIAR)
 // RESUMEN: Gestiona los cálculos y la actualización de la UI de estadísticas de viaje.
 // ===================================================================
@@ -5684,7 +5700,6 @@ function startGpsWatching() {
     }
     gpsRetryAttempt++;
     
-    // <-- CORRECCIÓN: Se crea una copia de la última posición para evitar que se modifique antes de usarla en la lógica de Free Drive.
     const lastPositionBeforeUpdate = lastPositionForStats ? { ...lastPositionForStats } : null;
 
     locationWatchId = navigator.geolocation.watchPosition(
@@ -5708,14 +5723,7 @@ function startGpsWatching() {
 
             updateInitialUserPosition(coordsForUpdate, navigationMapInstance);
 
-            // <-- INICIO DE LA LÓGICA DE AUTO-INICIO CORREGIDA -->
-
-            // 1. Condición de auto-inicio para NAVEGACIÓN DE RUTA
-            // Se comprueba que no se esté navegando y que haya waypoints cargados.
             if (!isNavigating && navigationWaypoints.length >= 2) {
-                // <-- CORRECCIÓN CLAVE: Se añade una comprobación mucho más estricta.
-                // No basta con que `navigationCurrentRouteData` exista, debe contener la geometría de la ruta.
-                // Esto garantiza que la API ya ha respondido y la ruta está lista para ser navegada.
                 const isRouteDataFullyAvailable = navigationCurrentRouteData &&
                                                 navigationCurrentRouteData.routes &&
                                                 navigationCurrentRouteData.routes[0] &&
@@ -5732,14 +5740,10 @@ function startGpsWatching() {
 
                     if (!isRouteCompleted && distanceFromStart > START_TRIGGER_DISTANCE && distanceFromStart < RELEVANCE_DISTANCE) {
                         toggleNavigationState(); 
-                        return; // Se sale de la función para evitar que se ejecute la lógica de Free Drive.
-                    }
+                        return; }
                 }
             }
             
-            // 2. Condición de auto-inicio para MODO CONDUCCIÓN LIBRE
-            // <-- CORRECCIÓN CLAVE: La condición ahora es `navigationWaypoints.length === 0`.
-            // Esto evita que se inicie el modo libre si estamos en el proceso de cargar una ruta (donde waypoints.length sería >= 1 pero isRouteDataFullyAvailable sería false).
             if (!isNavigating && !isFreeDriveActive && navigationWaypoints.length === 0) {
                 if (lastPositionBeforeUpdate) {
                     const distanceMoved = calculateDistance(
@@ -5752,8 +5756,7 @@ function startGpsWatching() {
                     }
                 }
             }
-            // <-- FIN DE LA LÓGICA DE AUTO-INICIO CORREGIDA -->
-        },
+           },
         (error) => {
             if (locationWatchId !== null) {
                 navigator.geolocation.clearWatch(locationWatchId);
@@ -5865,11 +5868,6 @@ function plotSingleReminderOnMap(reminder, mapInstance) {
     plotRemindersOnNavigationMap();
     return null; // Ya no devuelve un objeto de mapa individual.
 }
-// ===================================================================
-function redrawReminderMapObjects() {
-    plotRemindersOnNavigationMap();
-}
-
     
 // ===================================================================
 // NOMBRE: hidePostArrivalActionModal (NUEVA FUNCIÓN)
@@ -6914,17 +6912,15 @@ async function getInitialGpsPositionForMap() {
     }
 }
 
-
 // ===================================================================
-// NOMBRE: checkForAndExecuteCrashRecovery (MODIFICADA)
-// RESUMEN: Llama a openNavigationMap con el nuevo parámetro isRecovery = true.
-// ===================================================================
+// NOMBRE: checkForAndExecuteCrashRecovery (VERSIÓN ROBUSTA CON BLOQUEO)
+// RESUMEN: Gestiona la recuperación de sesión, asegurando un bloqueo
 async function checkForAndExecuteCrashRecovery() {
     const recoveryFlagJSON = localStorage.getItem('boardinggate_nav_recovery_flag');
     if (!recoveryFlagJSON) {
-        return false; // No hay nada que recuperar, carga normal.
-    }
+        return false; }
 
+    
     try {
         const recoveryData = JSON.parse(recoveryFlagJSON);
         if (recoveryData && recoveryData.isActive && recoveryData.route) {
@@ -6942,25 +6938,24 @@ async function checkForAndExecuteCrashRecovery() {
                 
                 await loadRouteFromObject(recoveryData.route, true, true);
 
-                return true; 
-            
+                return true;  
             } catch (recoveryError) {
                 console.error("Fallo durante la ejecución de la recuperación automática:", recoveryError);
                 showToast("La recuperación automática falló. Cargando la app normalmente.", "error", 6000);
                 clearRecoveryFlag();
                 setTimeout(() => location.reload(), 2000);
-                return true; 
-            }
+                return true; }
         }
     } catch (e) {
         console.error("Error al procesar los datos de recuperación. Limpiando bandera.", e);
-        clearRecoveryFlag();
-        return false;
+    } finally {
+        clearRecoveryFlag(); 
     }
-
-    clearRecoveryFlag();
-    return false;
+    clearRecoveryFlag(); 
+     
+    return false; 
 }
+
 
 // ===================================================================
 // NOMBRE: openNavigationMap (VERSIÓN FINAL CON CORRECCIÓN DE RACE CONDITION)
@@ -7209,7 +7204,6 @@ async function openNavigationMap(isRecovery = false) {
                                 return;
                             }
                             
-                            // === LISTENER DE CLICS CORREGIDO Y FINAL ===
                             const reminderLayers = ['reminders-icons-layer', 'radar-circles-layer'];
                             const reminderFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: reminderLayers });
                             if (reminderFeatures.length > 0) {
@@ -7656,10 +7650,7 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
 // ===================================================================
 // NOMBRE: loadRouteFromObject (VERSIÓN CORREGIDA - USA EL BLOQUEO MAESTRO)
 // RESUMEN: Gestiona la carga de una ruta, adquiriendo el bloqueo para evitar
-//          interferencias del GPS durante el proceso.
-// ===================================================================
 async function loadRouteFromObject(routeObject, autoStartNavigation = false, forceImmediateStart = false) {
-    // === CAMBIO CLAVE: VERIFICAR SI YA HAY UNA OPERACIÓN EN CURSO ===
     if (isRecalculatingRoute) {
         showToast("Procesando otra ruta, por favor espere.", "warning");
         return;
@@ -7670,7 +7661,6 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
         return;
     }
 
-    // === CAMBIO CLAVE: ADQUIRIR EL BLOQUEO Y USAR TRY...FINALLY ===
     isRecalculatingRoute = true;
     try {
         if (isFreeDriveActive) {
@@ -7713,7 +7703,6 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
             await new Promise(resolve => {
                 navigationMapInstance.once('idle', async () => {
                     try {
-                        // DELEGAR EL TRABAJO A LA FUNCIÓN ATÓMICA
                         await recalculateAndDrawRoute(false);
                         
                         if (autoStartNavigation) {
@@ -7747,7 +7736,6 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
     } catch (error) {
         console.error("Error al cargar la ruta desde el objeto:", error);
     } finally {
-        // === CAMBIO CLAVE: LIBERAR EL BLOQUEO ===
         isRecalculatingRoute = false;
         updateStartNavigationButtonState();
         updateNavigationButtonColor();
@@ -7772,7 +7760,6 @@ async function fetchAndRenderChatUsers() {
     const isAdmin = (localStorage.getItem('userData_userId') || '').toLowerCase() === 'boardinggate';
 
     if (isAdmin) {
-        // Obtenemos ambas estadísticas globales en paralelo para mayor eficiencia
         const [sessionStats, poiStats] = await Promise.all([
             getGlobalMapSessionStats(),
             getGlobalPoiStats()
@@ -7939,7 +7926,6 @@ async function fetchAndRenderChatUsers() {
 // NOMBRE: handleProgressiveManeuverZoom (VERSIÓN FINAL CON CORRECCIÓN DE ÁMBITO)
 // RESUMEN: Incluye mejoras y corrección del bug de estado. Ahora recibe
 //          carDistanceAlongRouteForNavLogic como argumento para funcionar correctamente.
-// ===================================================================
 const easeInOutQuad = t => t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
 function findNextValidStep(route, currentLeg, currentStep) {
     let legIndex = currentLeg;
@@ -7969,7 +7955,6 @@ function findNextValidStep(route, currentLeg, currentStep) {
 // NOMBRE: handleProgressiveManeuverZoom (VERSIÓN CON LÍMITE DE OFFSET IZQUIERDO)
 // RESUMEN: Limita el desplazamiento horizontal a la izquierda a un máximo de 20
 //          para evitar que la tarjeta de progreso oculte la ruta.
-// ===================================================================
 function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDistanceAlongRouteForNavLogic) {
     if (isManualZoomActive) return null;
 
@@ -8078,7 +8063,6 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
                         let geometricAngleChange = bearingOut - bearingIn;
                         geometricAngleChange = (geometricAngleChange + 540) % 360 - 180;
                         
-                        // <<< INICIO DE LA LÓGICA DE LÍMITE DE OFFSET >>>
                         if (geometricAngleChange > 160) {
                             dynamicHorizontalTarget = -55; // Giro brusco DERECHA
                         } else if (geometricAngleChange < -160) {
@@ -8088,7 +8072,6 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
                         } else if (geometricAngleChange < -25) {
                             dynamicHorizontalTarget = 20; // LÍMITE para giro normal IZQUIERDA
                         }
-                        // <<< FIN DE LA LÓGICA DE LÍMITE DE OFFSET >>>
                         
                     } catch (e) {
                         dynamicHorizontalTarget = -10;
@@ -8789,7 +8772,6 @@ function showSavedLocationsModal(callbackOnClose, callbackOnSelectLocation, opti
     const existingModal = document.querySelector('.saved-locations-modal');
     if (existingModal) {
         if (locationPickerMap) { 
-            // Si el modal se cierra de forma inesperada, devolvemos el mapa al garaje
             const mapGarage = document.getElementById('map-garage');
             const mapContainer = locationPickerMap.getContainer();
             if (mapGarage && mapContainer) mapGarage.appendChild(mapContainer);
@@ -8864,7 +8846,6 @@ function showSavedLocationsModal(callbackOnClose, callbackOnSelectLocation, opti
                         callbackOnSelectLocation({ name: selectedLocData.name, lat: selectedLocData.lat, lng: selectedLocData.lng, radius: selectedLocData.radius || DEFAULT_LOCATION_RADIUS });
                     }
                     
-                    // --- CORRECCIÓN: Al seleccionar, también devolvemos el mapa al garaje ---
                     if (locationPickerMap) {
                         const mapGarage = document.getElementById('map-garage');
                         const mapContainer = locationPickerMap.getContainer();
@@ -8895,7 +8876,6 @@ function showSavedLocationsModal(callbackOnClose, callbackOnSelectLocation, opti
         }
         mapPickerContainer.classList.remove('expanded');
         
-        // --- CORRECCIÓN: No se destruye el mapa, solo se mueve al garaje ---
         if (locationPickerMap) {
             const mapGarage = document.getElementById('map-garage');
             const mapContainer = locationPickerMap.getContainer();
@@ -16331,11 +16311,19 @@ function reactivateRealGpsAfterSimulation() {
         });
     }
 }
+    
+
 // ===================================================================
-// NOMBRE: animateMarkerAndMap (VERSIÓN CORREGIDA - YA NO CONTROLA EL MAPA)
-// RESUMEN: Bucle de animación que mueve y rota suavemente el ICONO del coche.
+// NOMBRE: animateMarkerAndMap (VERSIÓN ESTABLE - SOLO ICONO)
+// RESUMEN: Bucle de animación que suaviza EXCLUSIVAMENTE la posición
+//          y rotación del icono del vehículo.
 // ===================================================================
 function animateMarkerAndMap(timestamp) {
+    if (!initialUserLocationMarker) {
+        markerAnimationState.animationFrameId = null;
+        return;
+    }
+
     if (!markerAnimationState.lastTimestamp) {
         markerAnimationState.lastTimestamp = timestamp;
         markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
@@ -16347,25 +16335,23 @@ function animateMarkerAndMap(timestamp) {
 
     const LERP_RATE = 0.005; 
     const ROTATION_LERP_RATE = 0.006;
-    const lerpFactor = 1.0 - Math.exp(-deltaTime * LERP_RATE);
-    const rotationLerpFactor = 1.0 - Math.exp(-deltaTime * ROTATION_LERP_RATE);
+    
+    const posLerpFactor = 1.0 - Math.exp(-deltaTime * LERP_RATE);
+    const rotLerpFactor = 1.0 - Math.exp(-deltaTime * ROTATION_LERP_RATE);
 
+    // Animación de la Posición del Marcador
     if (markerAnimationState.currentLngLat && markerAnimationState.targetLngLat) {
-        markerAnimationState.currentLngLat.lng += (markerAnimationState.targetLngLat.lng - markerAnimationState.currentLngLat.lng) * lerpFactor;
-        markerAnimationState.currentLngLat.lat += (markerAnimationState.targetLngLat.lat - markerAnimationState.currentLngLat.lat) * lerpFactor;
-        if (initialUserLocationMarker) {
-            initialUserLocationMarker.setLngLat(markerAnimationState.currentLngLat);
-        }
+        markerAnimationState.currentLngLat.lng += (markerAnimationState.targetLngLat.lng - markerAnimationState.currentLngLat.lng) * posLerpFactor;
+        markerAnimationState.currentLngLat.lat += (markerAnimationState.targetLngLat.lat - markerAnimationState.currentLngLat.lat) * posLerpFactor;
+        initialUserLocationMarker.setLngLat(markerAnimationState.currentLngLat);
     }
-
-    // Rotar el icono del marcador
+    
+    // Animación de la Rotación del Marcador
     let deltaIconRotation = markerAnimationState.targetIconRotation - markerAnimationState.currentIconRotation;
     if (deltaIconRotation > 180) deltaIconRotation -= 360;
     if (deltaIconRotation < -180) deltaIconRotation += 360;
-    markerAnimationState.currentIconRotation += deltaIconRotation * rotationLerpFactor;
-    if (initialUserLocationMarker) {
-        initialUserLocationMarker.setRotation(markerAnimationState.currentIconRotation);
-    }
+    markerAnimationState.currentIconRotation += deltaIconRotation * rotLerpFactor;
+    initialUserLocationMarker.setRotation(markerAnimationState.currentIconRotation);
     
     markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
 }    
@@ -17119,7 +17105,6 @@ function plotRemindersOnNavigationMap() {
         'radar-text-layer' // Solo hay una capa de texto ahora
     ];
     
-    // Limpieza de capas y fuentes
     layersToRemove.forEach(id => {
         try { if (navigationMapInstance.getLayer(id)) navigationMapInstance.removeLayer(id); } catch (e) {}
     });
