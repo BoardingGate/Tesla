@@ -4892,22 +4892,26 @@ function precalculateRouteStepDistances(routeData) {
 }  
 
 // ===================================================================
-// NOMBRE: recalculateAndDrawRoute (VERSIÓN FINAL CORREGIDA)
-// RESUMEN: Se elimina únicamente el break prematuro que impedía los reintentos
-//          cuando el modal de desvío estaba activo.
+// NOMBRE: recalculateAndDrawRoute (VERSIÓN CORREGIDA - ATÓMICA Y ROBUSTA)
+// RESUMEN: Encapsula todo el proceso de recálculo en una operación atómica
+//          para evitar condiciones de carrera. El orden de ejecución es ahora estricto.
+// ===================================================================
 async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
     const RETRY_CADENCE_MS = 3000;
     const MAX_RETRIES = 5;
     let attempt = 1;
 
     while (attempt <= MAX_RETRIES) {
-     
-        console.log(`[RECALC] Intento #${attempt} de ${MAX_RETRIES}...`);
+        // === CAMBIO CLAVE: ADQUIRIR BLOQUEO INMEDIATAMENTE ===
         isRecalculatingRoute = true;
+        
+        // Feedback visual para el usuario
+        const toastId = `recalc-toast-${Date.now()}`;
+        showToast(`Calculando ruta... (Intento ${attempt}/${MAX_RETRIES})`, "info", 0, false, toastId);
+
         const wasNavigatingBeforeRecalc = isNavigating;
 
         try {
-            const completedDistance = preserveAccumulatedStats ? totalDistanceTravelledForStats : 0;
             let waypointsForAPI = [];
             let currentHeading = null;
             
@@ -4926,10 +4930,12 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
             
             const validWaypoints = waypointsForAPI.filter(wp => wp && typeof wp.lat === 'number' && typeof wp.lng === 'number');
             if (validWaypoints.length < 2) { 
-                isRecalculatingRoute = false; 
-                return;
+                return; // Salir silenciosamente si no hay ruta que trazar
             };
 
+            // === ORDEN ATÓMICO DE OPERACIONES ===
+
+            // 1. OBTENER DATOS DE LA API
             const coordsString = validWaypoints.map(wp => `${wp.lng},${wp.lat}`).join(';');
             const result = await fetchRouteData(coordsString, currentHeading);
             if (result.error) throw result.error;
@@ -4937,26 +4943,16 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
             const newRouteData = result.routeData;
             const newRemainingRoute = newRouteData.routes[0];
 
-            if (newRemainingRoute && newRemainingRoute.distance < 10) { 
-                const startPointOfRecalc = validWaypoints[0];
-                const endPointOfRecalc = validWaypoints[validWaypoints.length - 1];
-                const physicalDistanceToDestination = calculateDistance(startPointOfRecalc.lat, startPointOfRecalc.lng, endPointOfRecalc.lat, endPointOfRecalc.lng);
-                if (physicalDistanceToDestination > WAYPOINT_VISITED_THRESHOLD_METERS) {
-                    throw new Error("Ruta inválida (distancia cero) recibida del servidor.");
-                }
-            }
-            
-            // <<<--- CAMBIO 1: ACTUALIZAR LA MEMORIA DE LA RUTA PRIMERO ---<<<
-            // Esto es crucial. Asegura que cualquier proceso que se ejecute a partir de ahora,
-            // como el deviationChecker, utilice la NUEVA ruta, no la antigua.
+            // 2. ACTUALIZAR EL ESTADO EN MEMORIA (ANTES DE DIBUJAR)
             navigationCurrentRouteData = newRouteData;
-            precalculateRouteStepDistances(navigationCurrentRouteData); // <-- Ahora usa la variable global ya actualizada
+            precalculateRouteStepDistances(navigationCurrentRouteData);
             
-            // <<<--- CAMBIO 2: DIBUJAR LA RUTA DESPUÉS DE ACTUALIZAR LA MEMORIA ---<<<
+            // 3. DIBUJAR EN EL MAPA (Y ESPERAR A QUE TERMINE)
             await drawRouteOnMap(newRemainingRoute);
             
+            // 4. ACTUALIZAR TODO EL ESTADO SECUNDARIO Y LA UI
             if (preserveAccumulatedStats) {
-                accumulatedDistanceBeforeCurrentSegment = completedDistance;
+                accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
             } else {
                 accumulatedDistanceBeforeCurrentSegment = 0;
             }
@@ -4984,16 +4980,15 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
             updateStartNavigationButtonState();
             updateNavigationButtonColor();
 
-            showToast("¡Ruta recalculada con éxito!", "success");
-
-            // <<<--- CAMBIO 3: ESTABLECER EL PERÍODO DE GRACIA JUSTO ANTES DE FINALIZAR ---<<<
-            // Se mueve aquí para garantizar que el deviationChecker se detenga durante 5 segundos
-            // DESPUÉS de que todo el estado haya sido actualizado, evitando falsos positivos.
+            // 5. ESTABLECER PERÍODO DE GRACIA (SOLO DESPUÉS DE QUE TODO ESTÉ SINCRONIZADO)
             if (isDeviationModalActive) {
                 deviationCheckGracePeriodUntil = Date.now() + 5000;
             }
 
+            // 6. CERRAR MODAL SI ESTÁ ABIERTO
             closeModalAndProceed();
+            
+            // Si todo ha ido bien, salimos del bucle de reintentos
             return;
             
         } catch (error) {
@@ -5003,18 +4998,25 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
                 closeModalAndProceed();
                 throw new Error("Fallo al recalcular la ruta tras múltiples intentos.");
             } else {
-                showToast(`Error al recalcular (${attempt}/${MAX_RETRIES}). Reintentando...`, "warning");
                 await new Promise(resolve => setTimeout(resolve, RETRY_CADENCE_MS));
             }
         } finally {
+            // === CAMBIO CLAVE: LIBERAR BLOQUEO Y FEEDBACK VISUAL ===
+            const existingToast = document.getElementById(toastId);
+            if (existingToast) existingToast.remove();
+            activeToasts = activeToasts.filter(t => t.id !== toastId);
+
             isRecalculatingRoute = false;
-            isNavigating = wasNavigatingBeforeRecalc;
-            attempt++;
+            isNavigating = wasNavigatingBeforeRecalc; // Restaurar estado de navegación
+            
+            if (attempt > MAX_RETRIES) { // Si salimos por error
+                 updateStartNavigationButtonState();
+                 updateNavigationButtonColor();
+            }
         }
+        attempt++; // Incrementar para el siguiente reintento
     }
-    console.log("[RECALC] Bucle de recálculo finalizado sin éxito.");
-}
-    
+}    
     
 // ===================================================================
 // NOMBRE: checkAndIncrementPoiCount (VERSIÓN CORREGIDA PARA CLIENTE)
@@ -5349,19 +5351,26 @@ function setupZoomButtons() {
 }
 
 // ===================================================================
-// NOMBRE: updateInitialUserPosition (VERSIÓN FINAL CON RATIOS CORREGIDOS)
+// NOMBRE: updateInitialUserPosition (VERSIÓN CORREGIDA - RESPETA EL BLOQUEO DE RECÁLCULO)
 // RESUMEN: Orquestador principal que se ejecuta en cada tick del GPS.
-//          Ahora, TODAS las tareas, incluidas las críticas, respetan
-//          su ratio de rendimiento configurable.
+//          Ahora se detiene por completo si una operación de recálculo de ruta está en progreso.
+// ===================================================================
 function updateInitialUserPosition(coords, mapInstanceToUse) {
+    // === CAMBIO CLAVE: BLOQUEO MAESTRO ===
+    // Si se está recalculando una ruta, detenemos TODO el procesamiento dependiente del GPS.
+    // Esto previene las condiciones de carrera que causaban el bucle de desvío y el trazado fantasma.
+    if (isRecalculatingRoute) {
+        return;
+    }
+
     if (!mapInstanceToUse || !coords || typeof coords.latitude !== 'number' || typeof coords.longitude !== 'number' || isNaN(coords.latitude) || isNaN(coords.longitude)) {
         console.warn("[GPS] Datos de coordenadas inválidos recibidos. Omitiendo actualización.");
         return;
     }
 
     gpsTickCounter = (gpsTickCounter + 1) % 60000;
-    navigationCurrentLocation = { ...coords }; 
-    
+    navigationCurrentLocation = { ...coords };
+
     // --- NIVEL 1: PROCESOS CRÍTICOS (Controlado por Ratio) ---
     if (gpsTickCounter % performanceRatios.criticalUpdate === 0) {
         updateVehicleMarker(coords, mapInstanceToUse);
@@ -5388,8 +5397,8 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
     if (gpsTickCounter % performanceRatios.performanceGraph === 0) {
         plotIntervalData();
     }
-}    
-
+}
+    
 // ===================================================================
 // NOMBRE: updateVehicleMarker (NUEVA FUNCIÓN AUXILIAR)
 // RESUMEN: Gestiona exclusivamente la posición y rotación del marcador del vehículo.
@@ -7629,106 +7638,106 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
         }
     }
 }    
-   
+
 // ===================================================================
-// NOMBRE: loadRouteFromObject (VERSIÓN FINAL Y ROBUSTA CONTRA MOVIMIENTO Y FALLOS)
-// RESUMEN: "Salva" la ubicación GPS actual, garantiza un recálculo fiable y maneja los errores.
+// NOMBRE: loadRouteFromObject (VERSIÓN CORREGIDA - USA EL BLOQUEO MAESTRO)
+// RESUMEN: Gestiona la carga de una ruta, adquiriendo el bloqueo para evitar
+//          interferencias del GPS durante el proceso.
 // ===================================================================
 async function loadRouteFromObject(routeObject, autoStartNavigation = false, forceImmediateStart = false) {
+    // === CAMBIO CLAVE: VERIFICAR SI YA HAY UNA OPERACIÓN EN CURSO ===
+    if (isRecalculatingRoute) {
+        showToast("Procesando otra ruta, por favor espere.", "warning");
+        return;
+    }
+    
     if (!routeObject || !routeObject.waypoints || routeObject.waypoints.length === 0) {
         showToast("Error: El objeto de la ruta es inválido.", "error");
         return;
     }
 
-    if (isFreeDriveActive) {
-        isFreeDrivePaused = true;
-        isFreeDriveActive = false;
-        showToast("Modo Conducción Libre en pausa.", "info");
-        updateStartNavigationButtonState();
-        updateNavigationButtonColor();
-        clearNavigationGraph();
-    }
-
-    const startLocation = navigationCurrentLocation ? { ...navigationCurrentLocation } : null;
-    resetNavigationState();
-    currentRouteNameForSaving = routeObject.name;
-    const waypointsFromLoadedRoute = routeObject.waypoints;
-    
-    if (waypointsFromLoadedRoute.length === 1) {
-        if (startLocation) {
-            const startPoint = {
-                id: Date.now() - 1,
-                lat: startLocation.latitude,
-                lng: startLocation.longitude,
-                type: 'S', marker: null, label: 'S', address: 'Posición Actual (GPS)',
-                visited: true, isCriticalForRecalc: true, isInternal: false, isRecalculatedStart: false 
-            };
-            const destinationWp = sanitizeWaypointsForStorage(waypointsFromLoadedRoute)[0];
-            navigationWaypoints = [startPoint, destinationWp];
-        } else {
-            showToast("Señal GPS no disponible. No se puede iniciar ruta a un único destino.", "error");
-            return;
+    // === CAMBIO CLAVE: ADQUIRIR EL BLOQUEO Y USAR TRY...FINALLY ===
+    isRecalculatingRoute = true;
+    try {
+        if (isFreeDriveActive) {
+            isFreeDrivePaused = true;
+            isFreeDriveActive = false;
+            showToast("Modo Conducción Libre en pausa.", "info");
+            updateStartNavigationButtonState();
+            updateNavigationButtonColor();
+            clearNavigationGraph();
         }
-    } else {
-        if (startLocation) {
-            const startPoint = {
-                id: Date.now() - 1,
-                lat: startLocation.latitude,
-                lng: startLocation.longitude,
-                type: 'S', marker: null, label: 'S', address: 'Posición Actual (GPS)',
-                visited: true, isCriticalForRecalc: true, isInternal: false, isRecalculatedStart: false 
-            };
-            navigationWaypoints = [startPoint, ...sanitizeWaypointsForStorage(waypointsFromLoadedRoute.slice(1))];
-        } else {
-            showToast("Señal GPS no disponible. Cargando ruta original...", "warning");
-            navigationWaypoints = sanitizeWaypointsForStorage(waypointsFromLoadedRoute);
-        }
-    }
-    
-    await updateWaypointTypesAndLabels();
-    renderWaypointMarkers();
 
-    if (navigationWaypoints.filter(wp => wp && !wp.isInternal).length >= 2) {
-        return new Promise((resolve, reject) => {
-            navigationMapInstance.once('idle', async () => {
-                try {
-                    await recalculateAndDrawRoute(false);
-                    
-                    if (autoStartNavigation) {
-                        if (forceImmediateStart) {
-                            toggleNavigationState(); 
-                        } else {
-                            if (navigationMapInstance && navigationMapInstance.getSource('route') && navigationMapInstance.getSource('route')._data) {
+        const startLocation = navigationCurrentLocation ? { ...navigationCurrentLocation } : null;
+        resetNavigationState(); // Llama a la limpieza completa
+        currentRouteNameForSaving = routeObject.name;
+        const waypointsFromLoadedRoute = routeObject.waypoints;
+        
+        if (waypointsFromLoadedRoute.length === 1) {
+            if (startLocation) {
+                const startPoint = { id: Date.now() - 1, lat: startLocation.latitude, lng: startLocation.longitude, type: 'S', marker: null, label: 'S', address: 'Posición Actual (GPS)', visited: true, isCriticalForRecalc: true, isInternal: false, isRecalculatedStart: false };
+                const destinationWp = sanitizeWaypointsForStorage(waypointsFromLoadedRoute)[0];
+                navigationWaypoints = [startPoint, destinationWp];
+            } else {
+                showToast("Señal GPS no disponible. No se puede iniciar ruta a un único destino.", "error");
+                return; // Salir de la función si no hay GPS
+            }
+        } else {
+            if (startLocation) {
+                const startPoint = { id: Date.now() - 1, lat: startLocation.latitude, lng: startLocation.longitude, type: 'S', marker: null, label: 'S', address: 'Posición Actual (GPS)', visited: true, isCriticalForRecalc: true, isInternal: false, isRecalculatedStart: false };
+                navigationWaypoints = [startPoint, ...sanitizeWaypointsForStorage(waypointsFromLoadedRoute.slice(1))];
+            } else {
+                showToast("Señal GPS no disponible. Cargando ruta original...", "warning");
+                navigationWaypoints = sanitizeWaypointsForStorage(waypointsFromLoadedRoute);
+            }
+        }
+        
+        await updateWaypointTypesAndLabels();
+        renderWaypointMarkers();
+
+        if (navigationWaypoints.filter(wp => wp && !wp.isInternal).length >= 2) {
+            await new Promise(resolve => {
+                navigationMapInstance.once('idle', async () => {
+                    try {
+                        // DELEGAR EL TRABAJO A LA FUNCIÓN ATÓMICA
+                        await recalculateAndDrawRoute(false);
+                        
+                        if (autoStartNavigation) {
+                            if (forceImmediateStart) {
+                                toggleNavigationState(); 
+                            } else {
                                 const routeGeoJSON = navigationMapInstance.getSource('route')._data;
                                 if (routeGeoJSON.geometry && routeGeoJSON.geometry.coordinates.length > 1) {
-                                    const coordinates = routeGeoJSON.geometry.coordinates;
                                     const bounds = new mapboxgl.LngLatBounds();
-                                    coordinates.forEach(coord => bounds.extend(coord));
+                                    routeGeoJSON.geometry.coordinates.forEach(coord => bounds.extend(coord));
                                     if (!bounds.isEmpty()) {
                                         mapPreviousZoomLevel = navigationMapInstance.getZoom();
                                         navigationMapInstance.fitBounds(bounds, { padding: 80, animate: true, duration: 1500 });
                                     }
                                 }
+                                const firstDestination = navigationWaypoints.find(wp => wp && !wp.isInternal && wp.type !== 'S' && !wp.visited);
+                                if (firstDestination) { fetchAndDisplayAlternativeRoutes(firstDestination.id); }
+                                showAutoStartNavigationModal();
                             }
-                            const firstDestination = navigationWaypoints.find(wp => wp && !wp.isInternal && wp.type !== 'S' && !wp.visited);
-                            if (firstDestination) { fetchAndDisplayAlternativeRoutes(firstDestination.id); }
-                            showAutoStartNavigationModal();
                         }
+                    } catch (error) {
+                        showToast("No se pudo trazar la ruta. Comprueba la conexión o intenta mover un punto.", "error", 8000);
+                        const fallbackCoords = navigationWaypoints.map(wp => [wp.lng, wp.lat]);
+                        await drawRouteOnMap({ geometry: { type: 'LineString', coordinates: fallbackCoords } });
+                    } finally {
+                        resolve();
                     }
-                    resolve();
-                } catch (error) {
-                    showToast("No se pudo trazar la ruta. Comprueba la conexión. Intenta mover un punto.", "error", 8000);
-                    const fallbackCoords = navigationWaypoints.map(wp => [wp.lng, wp.lat]);
-                    await drawRouteOnMap({ geometry: { type: 'LineString', coordinates: fallbackCoords } });
-                    updateStartNavigationButtonState();
-                    updateNavigationButtonColor();
-                    reject(new Error("Recalculation failed after all retries"));
-                }
+                });
             });
-        });
+        }
+    } catch (error) {
+        console.error("Error al cargar la ruta desde el objeto:", error);
+    } finally {
+        // === CAMBIO CLAVE: LIBERAR EL BLOQUEO ===
+        isRecalculatingRoute = false;
+        updateStartNavigationButtonState();
+        updateNavigationButtonColor();
     }
-    updateStartNavigationButtonState();
-    updateNavigationButtonColor();
 }    
     
 // ===================================================================
