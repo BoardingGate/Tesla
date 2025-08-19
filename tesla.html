@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -5598,81 +5597,80 @@ function updateTripStatistics(coords) {
     }
 }
 
+
 // ===================================================================
-// NOMBRE: processRouteProgress (NUEVA FUNCIÓN AUXILIAR - CORREGIDA)
+// NOMBRE: processRouteProgress (OPTIMIZADO CON VENTANA DE DISTANCIA)
 // RESUMEN: Lógica de progreso en ruta que CALCULA y LUEGO LLAMA a las funciones de UI.
+//          Utiliza una ventana de búsqueda de longitud fija para un rendimiento consistente.
+// ===================================================================
 function processRouteProgress(coords, mapInstanceToUse) {
-    if(!isNavigating || !navigationCurrentRouteData || !navigationCurrentRouteData.routes[0] || !coords) return;
+    if (!isNavigating || !navigationCurrentRouteData || !navigationCurrentRouteData.routes[0] || !coords) {
+        return;
+    }
 
     const route = navigationCurrentRouteData.routes[0];
-    let carDistTurf = 0;
+    let carDistCalculated = 0;
 
     try {
+        // --- INICIO: LÓGICA DE VENTANA POR DISTANCIA (MÉTODO PRIMARIO) ---
         const carPoint = turf.point([coords.longitude, coords.latitude]);
-        const searchWindowCoords = [];
-        const stepsToIncludeInWindow = 5;
-        let legIdx = currentLegIndexNav;
-        let stepIdx = currentStepIndexNav;
+        const fullRouteLineString = turf.lineString(route.geometry.coordinates);
 
-        for (let i = 0; i < stepsToIncludeInWindow && legIdx < route.legs.length; i++) {
-            const currentLeg = route.legs[legIdx];
-            if (stepIdx < currentLeg.steps.length) {
-                const currentStep = currentLeg.steps[stepIdx];
-                if (currentStep.geometry && currentStep.geometry.coordinates) {
-                    if (searchWindowCoords.length > 0) {
-                        searchWindowCoords.push(...currentStep.geometry.coordinates.slice(1));
-                    } else {
-                        searchWindowCoords.push(...currentStep.geometry.coordinates);
-                    }
-                }
-                stepIdx++;
-            } else {
-                legIdx++;
-                stepIdx = 0;
-                i--; 
-            }
-        }
-        
-        if (searchWindowCoords.length < 2) {
-             throw new Error("Ventana de búsqueda insuficiente. Usando fallback.");
-        }
+        // Definimos la ventana de búsqueda: 500m hacia adelante y 100m hacia atrás desde la última posición conocida
+        const WINDOW_LOOKAHEAD_METERS = 500;
+        const WINDOW_LOOKBEHIND_METERS = 100;
 
-        const routeWindowLineString = turf.lineString(searchWindowCoords);
+        const startDistance = Math.max(0, lastCarDistanceAlongRouteForNavLogic - WINDOW_LOOKBEHIND_METERS);
+        const endDistance = Math.min(route.distance, lastCarDistanceAlongRouteForNavLogic + WINDOW_LOOKAHEAD_METERS);
+
+        // Cortamos el segmento de la ruta que forma nuestra ventana de búsqueda
+        const startPoint = turf.along(fullRouteLineString, startDistance, { units: 'meters' });
+        const endPoint = turf.along(fullRouteLineString, endDistance, { units: 'meters' });
+        const routeWindowLineString = turf.lineSlice(startPoint, endPoint, fullRouteLineString);
+
+        // Buscamos el punto más cercano del coche SOLO dentro de esta pequeña ventana
         const nearestPointOnWindow = turf.nearestPointOnLine(routeWindowLineString, carPoint, { units: 'meters' });
         
-        const bestStepInWindow = route.legs[currentLegIndexNav].steps[currentStepIndexNav];
-        const cumulativeDistance = bestStepInWindow.cumulativeDistance || 0;
-        
+        // Calculamos la distancia desde el inicio de la ventana hasta el punto encontrado
         const startOfWindowPoint = turf.point(routeWindowLineString.geometry.coordinates[0]);
-        const sliceToPoint = turf.lineSlice(startOfWindowPoint, nearestPointOnWindow, routeWindowLineString);
-        const distanceAlongWindow = turf.length(sliceToPoint, { units: 'meters' });
-        
-        carDistTurf = cumulativeDistance + distanceAlongWindow;
+        const sliceToPointInWindow = turf.lineSlice(startOfWindowPoint, nearestPointOnWindow, routeWindowLineString);
+        const distanceAlongWindow = turf.length(sliceToPointInWindow, { units: 'meters' });
+
+        // La distancia total es la distancia hasta el inicio de la ventana + la distancia dentro de ella
+        carDistCalculated = startDistance + distanceAlongWindow;
+        // --- FIN: LÓGICA DE VENTANA POR DISTANCIA ---
 
     } catch (e) {
-        if (!window.optimizationHasFailed) {
-            console.warn("[OPTIMIZATION FALLBACK] Error en búsqueda por ventana. Usando método original.", e);
-            window.optimizationHasFailed = true;
-        }
+        // --- INICIO: MÉTODO DE RESPALDO (SI LA LÓGICA DE VENTANA FALLA) ---
+        // Esto solo debería ocurrir en casos muy extraños o si Turf.js falla.
+        console.warn("[OPTIMIZATION FALLBACK] El método de ventana de distancia falló. Usando método de ruta completa.", e);
         try {
             const carPointTurf = turf.point([coords.longitude, coords.latitude]);
             const routeGeoJSON = mapInstanceToUse.getSource('route')._data;
             const routeLineStringTurf = turf.lineString(routeGeoJSON.geometry.coordinates);
             const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
             const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
-            carDistTurf = turf.length(lineSliceToNearestTurf, { units: 'meters' });
-        } catch (turfError) { /* Silenciar error de fallback */ }
+            carDistCalculated = turf.length(lineSliceToNearestTurf, { units: 'meters' });
+        } catch (turfError) {
+            console.error("Fallo crítico: Incluso el método de respaldo de Turf falló.", turfError);
+            carDistCalculated = lastCarDistanceAlongRouteForNavLogic; // Mantenemos la última distancia válida
+        }
+        // --- FIN: MÉTODO DE RESPALDO ---
     }
 
+    // Saneamiento de la distancia para evitar saltos hacia atrás del GPS
     const totalRouteLength = route.distance;
-    if (carDistTurf >= 0 && carDistTurf <= totalRouteLength + 500) {
-        if (carDistTurf > lastCarDistanceAlongRouteForNavLogic - 100) {
-             lastCarDistanceAlongRouteForNavLogic = carDistTurf;
+    if (carDistCalculated >= 0 && carDistCalculated <= totalRouteLength + 500) { // Margen de 500m
+        // Solo actualizamos si el coche avanza o retrocede menos de 100m (filtra ruido del GPS)
+        if (carDistCalculated > lastCarDistanceAlongRouteForNavLogic - 100) {
+             lastCarDistanceAlongRouteForNavLogic = carDistCalculated;
         }
-    } else if (carDistTurf > totalRouteLength + 500) {
+    } else if (carDistCalculated > totalRouteLength + 500) {
+        // Si el cálculo da una distancia muy por delante del final, la limitamos al final de la ruta.
         lastCarDistanceAlongRouteForNavLogic = totalRouteLength;
     }
 
+    // Una vez calculada y validada la distancia, actualizamos toda la UI
     checkAndMarkWaypointsAsVisited(route, lastCarDistanceAlongRouteForNavLogic, coords);
     renderWaypointMarkers(); // Necesario para actualizar el color de los visitados
     updateTurnByTurnDisplay(route, lastCarDistanceAlongRouteForNavLogic);
@@ -5680,6 +5678,7 @@ function processRouteProgress(coords, mapInstanceToUse) {
 }
 
 
+    
 // ===================================================================
 // NOMBRE: startGpsWatching (VERSIÓN SIMPLIFICADA CON COPIA TEMPORAL)
 // RESUMEN: Inicia el seguimiento GPS, reintentando silenciosamente
@@ -17562,119 +17561,146 @@ function displayChargingPointsOnMap() {
     navigationMapInstance.addLayer({ id: 'pdr-cards-layer-availability', type: 'symbol', source: sourceId, filter: ['>', ['zoom'], 14], layout: { 'text-field': ['get', 'availability'], 'text-font': ['Open Sans Semibold', 'Arial Unicode MS Bold'], 'text-size': 10, 'text-offset': [0, 2.8], 'text-allow-overlap': true }, paint: { 'text-color': '#e0e0e0', 'text-opacity': 1, 'text-halo-color': '#000', 'text-halo-width': 1 } });
 }    
 
+
 // ===================================================================
-// NOMBRE: renderWaypointMarkers (VERSIÓN FINAL CON CORRECCIÓN DE OFFSET DE ARRASTRE)
-// RESUMEN: Corrige el desplazamiento visual durante el arrastre al tener en cuenta la
+// NOMBRE: renderWaypointMarkers (VERSIÓN OPTIMIZADA - CORRECCIÓN DE ÁMBITO)
+// RESUMEN: Actualiza los marcadores de etapa de forma eficiente, solucionando
+//          el error de redeclaración de funciones de eventos al encapsular
+//          la lógica de asignación para cada marcador nuevo.
+// ===================================================================
 function renderWaypointMarkers() {
     if (!navigationMapInstance) return;
 
-    navigationWaypoints.forEach(wp => {
-        if (wp && wp.marker) {
-            try { wp.marker.remove(); } catch (e) {}
+    const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
+    const actualWaypointIds = new Set(actualWaypoints.map(wp => wp.id));
+
+    // 1. ELIMINAR MARCADORES ANTIGUOS
+    navigationWaypoints.forEach((wp) => {
+        if (wp && wp.marker && !actualWaypointIds.has(wp.id)) {
+            try {
+                wp.marker.remove();
+            } catch (e) {}
             wp.marker = null;
         }
     });
 
-    const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
-    
+    // 2. AÑADIR O ACTUALIZAR MARCADORES EXISTENTES
     actualWaypoints.forEach(wp => {
         if (!wp || typeof wp.lat !== 'number' || typeof wp.lng !== 'number') return;
-        
-        const waypointIconElement = createWaypointMarkerIcon(wp.label, wp.type, wp.visited, wp.id);
-        
-        waypointIconElement.dataset.waypointId = wp.id;
-        
-        wp.marker = new mapboxgl.Marker({
-            element: waypointIconElement,
-            draggable: false, 
-            anchor: 'center'
-        }).setLngLat([wp.lng, wp.lat]).addTo(navigationMapInstance);
-        
-        const markerElement = wp.marker.getElement();
 
-        let isDragging = false;
-        let hasMovedEnough = false;
-        let startPos = { x: 0, y: 0 };
+        // Si el waypoint NO tiene un marcador asociado, lo creamos.
+        if (!wp.marker) {
+            const waypointIconElement = createWaypointMarkerIcon(wp.label, wp.type, wp.visited, wp.id);
+            waypointIconElement.dataset.waypointId = wp.id;
 
-        const onPointerDown = (e) => {
-            if (isNavigating) return;
-            e.stopPropagation();
-            
-            isDragging = false;
-            hasMovedEnough = false;
-            const point = e.touches ? e.touches[0] : e;
-            startPos = { x: point.clientX, y: point.clientY };
+            wp.marker = new mapboxgl.Marker({
+                element: waypointIconElement,
+                draggable: false,
+                anchor: 'center'
+            }).setLngLat([wp.lng, wp.lat]).addTo(navigationMapInstance);
 
-            document.addEventListener('mousemove', onPointerMove);
-            document.addEventListener('mouseup', onPointerUp);
-            document.addEventListener('touchmove', onPointerMove, { passive: false });
-            document.addEventListener('touchend', onPointerUp);
-        };
+            // --- INICIO DE LA CORRECCIÓN: Encapsular la lógica de eventos ---
+            // Usamos una función anónima autoejecutable para crear un nuevo ámbito para cada marcador.
+            ((waypoint, marker) => {
+                const markerElement = marker.getElement();
+                let isDragging = false;
+                let hasMovedEnough = false;
+                let startPos = { x: 0, y: 0 };
 
-        const onPointerMove = (e) => {
-            if (e.type === 'touchmove') e.preventDefault();
-            
-            const point = e.touches ? e.touches[0] : e;
-            const deltaX = Math.abs(point.clientX - startPos.x);
-            const deltaY = Math.abs(point.clientY - startPos.y);
+                const onPointerDown = (e) => {
+                    if (isNavigating) return;
+                    e.stopPropagation();
+                    isDragging = false;
+                    hasMovedEnough = false;
+                    const point = e.touches ? e.touches[0] : e;
+                    startPos = { x: point.clientX, y: point.clientY };
+                    document.addEventListener('mousemove', onPointerMove);
+                    document.addEventListener('mouseup', onPointerUp);
+                    document.addEventListener('touchmove', onPointerMove, { passive: false });
+                    document.addEventListener('touchend', onPointerUp);
+                };
 
-            if (!hasMovedEnough && (deltaX > 5 || deltaY > 5)) {
-                hasMovedEnough = true;
-                navigationMapInstance.getCanvas().style.cursor = 'grabbing';
-                markerElement.style.cursor = 'grabbing';
-            }
+                const onPointerMove = (e) => {
+                    if (e.type === 'touchmove') e.preventDefault();
+                    const point = e.touches ? e.touches[0] : e;
+                    const deltaX = Math.abs(point.clientX - startPos.x);
+                    const deltaY = Math.abs(point.clientY - startPos.y);
+                    if (!hasMovedEnough && (deltaX > 5 || deltaY > 5)) {
+                        hasMovedEnough = true;
+                        navigationMapInstance.getCanvas().style.cursor = 'grabbing';
+                        markerElement.style.cursor = 'grabbing';
+                    }
+                    if (hasMovedEnough) {
+                        isDragging = true;
+                        const mapContainer = document.getElementById('mapbox-map-actual-container');
+                        const mapRect = mapContainer.getBoundingClientRect();
+                        const relativeX = point.clientX - mapRect.left;
+                        const relativeY = point.clientY - mapRect.top;
+                        const coords = navigationMapInstance.unproject([relativeX, relativeY]);
+                        marker.setLngLat(coords);
+                    }
+                };
 
-            if (hasMovedEnough) {
-                isDragging = true;
-                const mapContainer = document.getElementById('mapbox-map-actual-container');
-                const mapRect = mapContainer.getBoundingClientRect();
-                const relativeX = point.clientX - mapRect.left;
-                const relativeY = point.clientY - mapRect.top;
+                const onPointerUp = async (e) => {
+                    document.removeEventListener('mousemove', onPointerMove);
+                    document.removeEventListener('mouseup', onPointerUp);
+                    document.removeEventListener('touchmove', onPointerMove);
+                    document.removeEventListener('touchend', onPointerUp);
+                    navigationMapInstance.getCanvas().style.cursor = '';
+                    markerElement.style.cursor = 'pointer';
+                    if (isDragging) {
+                        const point = e.changedTouches ? e.changedTouches[0] : e;
+                        const mapContainer = document.getElementById('mapbox-map-actual-container');
+                        const mapRect = mapContainer.getBoundingClientRect();
+                        const relativeX = point.clientX - mapRect.left;
+                        const relativeY = point.clientY - mapRect.top;
+                        const finalCoords = navigationMapInstance.unproject([relativeX, relativeY]);
+                        const waypointIndex = navigationWaypoints.findIndex(w => w.id === waypoint.id);
+                        if (waypointIndex !== -1) {
+                            navigationWaypoints[waypointIndex].lat = finalCoords.lat;
+                            navigationWaypoints[waypointIndex].lng = finalCoords.lng;
+                            navigationWaypoints[waypointIndex].address = await getAddressForWaypoint(finalCoords.lat, finalCoords.lng);
+                            await recalculateAndDrawRoute();
+                            renderWaypointMarkers();
+                        }
+                    } else {
+                        showWaypointActionModal(waypoint.id);
+                    }
+                    isDragging = false;
+                    hasMovedEnough = false;
+                };
 
-                const coords = navigationMapInstance.unproject([relativeX, relativeY]);
-                wp.marker.setLngLat(coords);
-            }
-        };
+                markerElement.addEventListener('mousedown', onPointerDown);
+                markerElement.addEventListener('touchstart', onPointerDown, { passive: false });
+            })(wp, wp.marker); // Pasamos el waypoint y el marcador actual a la función
+            // --- FIN DE LA CORRECCIÓN ---
 
-        const onPointerUp = async (e) => {
-            document.removeEventListener('mousemove', onPointerMove);
-            document.removeEventListener('mouseup', onPointerUp);
-            document.removeEventListener('touchmove', onPointerMove);
-            document.removeEventListener('touchend', onPointerUp);
-            
-            navigationMapInstance.getCanvas().style.cursor = '';
-            markerElement.style.cursor = 'pointer';
-
-            if (isDragging) {
-                const point = e.changedTouches ? e.changedTouches[0] : e;
-                const mapContainer = document.getElementById('mapbox-map-actual-container');
-                const mapRect = mapContainer.getBoundingClientRect();
-                const relativeX = point.clientX - mapRect.left;
-                const relativeY = point.clientY - mapRect.top;
-                const finalCoords = navigationMapInstance.unproject([relativeX, relativeY]);
-                // *** FIN DE LA CORRECCIÓN DE OFFSET ***
-                
-                const waypointIndex = navigationWaypoints.findIndex(w => w.id === wp.id);
-                if (waypointIndex !== -1) {
-                    navigationWaypoints[waypointIndex].lat = finalCoords.lat;
-                    navigationWaypoints[waypointIndex].lng = finalCoords.lng;
-                    navigationWaypoints[waypointIndex].address = await getAddressForWaypoint(finalCoords.lat, finalCoords.lng);
-                    
-                    await recalculateAndDrawRoute();
-                    renderWaypointMarkers();
-                }
+        } else {
+            // Si el marcador ya existe, solo actualizamos su estilo (lógica sin cambios)
+            const markerElement = wp.marker.getElement();
+            const currentColor = markerElement.style.backgroundColor;
+            let newColor;
+            if (wp.visited) {
+                newColor = 'rgba(85, 85, 85, 0.8)';
+            } else if (wp.type === 'S') {
+                newColor = 'rgba(0, 128, 0, 0.8)';
+            } else if (wp.type === 'F') {
+                newColor = 'rgba(0, 0, 255, 0.8)';
             } else {
-                showWaypointActionModal(wp.id);
+                newColor = 'rgba(230, 140, 0, 0.8)';
             }
-            
-            isDragging = false;
-            hasMovedEnough = false;
-        };
-
-        markerElement.addEventListener('mousedown', onPointerDown);
-        markerElement.addEventListener('touchstart', onPointerDown, { passive: false });
+            if (currentColor !== newColor) {
+                markerElement.style.backgroundColor = newColor;
+                markerElement.style.border = `2px solid ${wp.visited ? '#555' : 'white'}`;
+                markerElement.style.opacity = wp.visited ? '0.7' : '1';
+            }
+            wp.marker.setLngLat([wp.lng, wp.lat]);
+            markerElement.textContent = wp.label;
+        }
     });
-}
+}    
+
+    
 // ===================================================================
 // NOMBRE: handleProgressBarLockToggle (CORREGIDA)
 // RESUMEN: Cambia el estado del candado, lo guarda y actualiza la UI,
