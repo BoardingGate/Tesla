@@ -1,4 +1,4 @@
-mi016
+mi017
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -5471,51 +5471,120 @@ function setupZoomButtons() {
 }
 
 // ===================================================================
-// NOMBRE: updateInitialUserPosition (VERSIÓN CORREGIDA - RESPETA EL BLOQUEO DE RECÁLCULO)
-// RESUMEN: Orquestador principal que se ejecuta en cada tick del GPS.
-//          Ahora se detiene por completo si una operación de recálculo de ruta está en progreso.
+// NOMBRE: updateInitialUserPosition (VERSIÓN FINAL ORQUESTADORA)
+// RESUMEN: Orquestador principal del GPS. Lee LERPs, actualiza objetivos
+//          y delega el resto de tareas a funciones especializadas.
 // ===================================================================
 function updateInitialUserPosition(coords, mapInstanceToUse) {
-    // === CAMBIO CLAVE: BLOQUEO MAESTRO ===
-    // Si se está recalculando una ruta, detenemos TODO el procesamiento dependiente del GPS.
-    // Esto previene las condiciones de carrera que causaban el bucle de desvío y el trazado fantasma.
-    if (isRecalculatingRoute) {
-        return;
-    }
+    if (isRecalculatingRoute) return;
 
     if (!mapInstanceToUse || !coords || typeof coords.latitude !== 'number' || typeof coords.longitude !== 'number' || isNaN(coords.latitude) || isNaN(coords.longitude)) {
-        console.warn("[GPS] Datos de coordenadas inválidos recibidos. Omitiendo actualización.");
         return;
     }
 
     gpsTickCounter = (gpsTickCounter + 1) % 60000;
     navigationCurrentLocation = { ...coords };
-
-    // --- NIVEL 1: PROCESOS CRÍTICOS (Controlado por Ratio) ---
+    
+    // --- PASO 1: PROCESOS CRÍTICOS (Actualizar animación y cámara) ---
     if (gpsTickCounter % performanceRatios.criticalUpdate === 0) {
-        updateVehicleMarker(coords, mapInstanceToUse);
-        updateMapCamera(coords, mapInstanceToUse);
+        // Leemos los LERPs configurables en cada tick crítico
+        const LERP_RATE = parseFloat(localStorage.getItem(LERP_RATE_POS_KEY)) || 0.004;
+        const ROTATION_LERP_RATE = parseFloat(localStorage.getItem(LERP_RATE_ROT_KEY)) || 0.002;
+        const ZOOM_PITCH_LERP_RATE = parseFloat(localStorage.getItem(LERP_RATE_ZOOM_KEY)) || 0.001;
+
+        // Actualizamos los objetivos de la animación
+        updateAnimationTargets(coords, mapInstanceToUse);
+        
+        // Iniciamos el bucle de animación si no está corriendo
+        if (!markerAnimationState.animationFrameId) {
+            markerAnimationState.animationFrameId = requestAnimationFrame((timestamp) => 
+                animateMarkerAndMap(timestamp, LERP_RATE, ROTATION_LERP_RATE, ZOOM_PITCH_LERP_RATE)
+            );
+        }
     }
     
-    // --- NIVEL 2: PROGRESO DE RUTA (Controlado por Ratio) ---
+    // --- PASO 2: PROGRESO DE RUTA ---
     if (gpsTickCounter % performanceRatios.routeProgress === 0) {
         if (isNavigating) {
             processRouteProgress(coords, mapInstanceToUse);
         }
     }
 
-    // --- NIVEL 3: ALERTAS Y ESTADÍSTICAS (Controlado por Ratio) ---
-    if (gpsTickCounter % performanceRatios.trafficAlerts === 0) {
-        checkAlertsProximity();
+    // --- PASO 3: ALERTAS Y ESTADÍSTICAS ---
+    if (gpsTickCounter % performanceRatios.trafficAlerts === 0) { checkAlertsProximity(); }
+    if (gpsTickCounter % performanceRatios.tripStats === 0) { updateTripStatistics(coords); }
+
+    // --- PASO 4: GRÁFICA ---
+    if (gpsTickCounter % performanceRatios.performanceGraph === 0) { plotIntervalData(); }
+}    
+
+// ===================================================================
+// NOMBRE: updateAnimationTargets (NUEVA FUNCIÓN)
+// RESUMEN: Centraliza el cálculo de TODOS los objetivos de la animación
+//          (icono y cámara) y los almacena en el estado global.
+// ===================================================================
+function updateAnimationTargets(coords, mapInstanceToUse) {
+    const lngLat = new mapboxgl.LngLat(coords.longitude, coords.latitude);
+
+    // --- 1. Calcular Rumbo Validado ---
+    let validatedHeading = null;
+    if (coords.heading !== null && typeof coords.heading === 'number' && !isNaN(coords.heading) && coords.heading >= 0) {
+        validatedHeading = coords.heading;
+    } else if (window.lastPositionForSpeedCalc && typeof turf !== 'undefined' && (window.currentSpeedKmh || 0) > 5) {
+        // ... (código de cálculo de rumbo por movimiento) ...
+        _turfLastPoint.geometry.coordinates[0] = window.lastPositionForSpeedCalc.longitude;
+        _turfLastPoint.geometry.coordinates[1] = window.lastPositionForSpeedCalc.latitude;
+        _turfCurrentPoint.geometry.coordinates[0] = coords.longitude;
+        _turfCurrentPoint.geometry.coordinates[1] = coords.latitude;
+        if (turf.distance(_turfLastPoint, _turfCurrentPoint, { units: 'meters' }) > 1) {
+            const bearing = turf.bearing(_turfLastPoint, _turfCurrentPoint);
+            validatedHeading = (bearing < 0) ? bearing + 360 : bearing;
+        }
     }
-    
-    if (gpsTickCounter % performanceRatios.tripStats === 0) {
-        updateTripStatistics(coords);
+    if (validatedHeading === null) {
+        validatedHeading = (markerAnimationState.currentIconRotation + 90 + 360) % 360;
     }
 
-    // --- NIVEL 4: GRÁFICA DE RENDIMIENTO (Controlado por Ratio) ---
-    if (gpsTickCounter % performanceRatios.performanceGraph === 0) {
-        plotIntervalData();
+    // --- 2. Establecer Objetivos del ÍCONO ---
+    markerAnimationState.targetLngLat = lngLat;
+    markerAnimationState.targetIconRotation = validatedHeading - 90;
+
+    // --- 3. Calcular Objetivos de la CÁMARA ---
+    const cameraAdjustments = handleProgressiveManeuverZoom(
+        navigationCurrentRouteData?.routes?.[0]?.legs?.[currentLegIndexNav]?.steps?.[currentStepIndexNav],
+        distanceToNextManeuverOSRM,
+        lastCarDistanceAlongRouteForNavLogic
+    );
+
+    let targetZoom = cameraAdjustments?.zoom ?? null;
+    if (targetZoom === null && !isManualZoomActive) {
+        targetZoom = handleAutoZoom();
+    }
+    
+    if (targetZoom !== null) {
+        markerAnimationState.targetMapZoom = targetZoom;
+    } else if (mapInstanceToUse) {
+        markerAnimationState.targetMapZoom = mapInstanceToUse.getZoom();
+    }
+
+    markerAnimationState.targetMapPitch = cameraAdjustments?.pitch ?? ((mapViewMode === 'perspective') ? mapPitchValue : 0);
+    markerAnimationState.targetMapOffsetX = cameraAdjustments?.offsetX ?? mapOffsetX;
+    markerAnimationState.targetMapOffsetY = cameraAdjustments?.offsetY ?? mapOffsetY;
+    
+    let targetBearing = markerAnimationState.currentMapBearing;
+    if (mapViewMode === 'heading' || mapViewMode === 'perspective') {
+        targetBearing = validatedHeading;
+    } else if (mapViewMode === 'static') {
+        targetBearing = 0;
+    }
+    markerAnimationState.targetMapBearing = targetBearing;
+
+    // --- 4. Crear Marcador si no existe y actualizar UI de brújula ---
+    if (!initialUserLocationMarker && mapInstanceToUse) {
+        // ... (código para crear el marker por primera vez) ...
+    }
+    if (compassAndModeControl) {
+        compassAndModeControl.updateOrientation(validatedHeading);
     }
 }
     
@@ -16471,20 +16540,19 @@ function reactivateRealGpsAfterSimulation() {
         });
     }
 }
-
 // ===================================================================
-// NOMBRE: animateMarkerAndMap (VERSIÓN FINAL CON LERPS CONFIGURABLES)
-// RESUMEN: Lee los valores de suavizado desde localStorage para permitir
-//          la personalización del usuario en tiempo real.
+// NOMBRE: animateMarkerAndMap (VERSIÓN FINAL CON LERPS COMO ARGUMENTOS)
+// RESUMEN: Bucle de animación puro que recibe los ratios de suavizado como
+//          argumentos y mueve suavemente el icono y la cámara.
 // ===================================================================
-function animateMarkerAndMap(timestamp) {
+function animateMarkerAndMap(timestamp, LERP_RATE, ROTATION_LERP_RATE, ZOOM_PITCH_LERP_RATE) {
     if (!initialUserLocationMarker || !navigationMapInstance) {
         markerAnimationState.animationFrameId = null;
         return;
     }
 
     if (!markerAnimationState.lastTimestamp) {
-        // ... (código de inicialización sin cambios) ...
+        // ... (inicialización sin cambios) ...
         markerAnimationState.lastTimestamp = timestamp;
         markerAnimationState.currentMapZoom = navigationMapInstance.getZoom();
         markerAnimationState.currentMapPitch = navigationMapInstance.getPitch();
@@ -16492,37 +16560,70 @@ function animateMarkerAndMap(timestamp) {
         markerAnimationState.currentMapCenter = navigationMapInstance.getCenter();
         markerAnimationState.currentMapOffsetX = mapOffsetX;
         markerAnimationState.currentMapOffsetY = mapOffsetY;
-        markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
+        markerAnimationState.animationFrameId = requestAnimationFrame((ts) => animateMarkerAndMap(ts, LERP_RATE, ROTATION_LERP_RATE, ZOOM_PITCH_LERP_RATE));
         return;
     }
 
     const deltaTime = timestamp - markerAnimationState.lastTimestamp;
     markerAnimationState.lastTimestamp = timestamp;
 
-    // --- INICIO: LECTURA DINÁMICA DE PARÁMETROS DE SUAVIDAD ---
-    const LERP_RATE = parseFloat(localStorage.getItem('boardinggate_lerp_rate_position')) || 0.004;
-    const ROTATION_LERP_RATE = parseFloat(localStorage.getItem('boardinggate_lerp_rate_rotation')) || 0.002;
-    const ZOOM_PITCH_LERP_RATE = parseFloat(localStorage.getItem('boardinggate_lerp_rate_zoom')) || 0.001;
-    // --- FIN: LECTURA DINÁMICA ---
-
     const posLerpFactor = 1.0 - Math.exp(-deltaTime * LERP_RATE);
     const rotLerpFactor = 1.0 - Math.exp(-deltaTime * ROTATION_LERP_RATE);
     const zoomPitchLerpFactor = 1.0 - Math.exp(-deltaTime * ZOOM_PITCH_LERP_RATE);
 
-    // ... (el resto de la función `animateMarkerAndMap` permanece exactamente igual) ...
-    // --- 1. Animación del Marcador ---
+    // --- Animación del Marcador (Posición + Rotación) ---
     if (markerAnimationState.currentLngLat && markerAnimationState.targetLngLat) {
-        // ...
+        markerAnimationState.currentLngLat.lng += (markerAnimationState.targetLngLat.lng - markerAnimationState.currentLngLat.lng) * posLerpFactor;
+        markerAnimationState.currentLngLat.lat += (markerAnimationState.targetLngLat.lat - markerAnimationState.currentLngLat.lat) * posLerpFactor;
+        initialUserLocationMarker.setLngLat(markerAnimationState.currentLngLat);
     }
-    // ...
-    
-    // --- 2. Animación de la Cámara ---
+    let deltaIconRotation = markerAnimationState.targetIconRotation - markerAnimationState.currentIconRotation;
+    if (deltaIconRotation > 180) deltaIconRotation -= 360;
+    if (deltaIconRotation < -180) deltaIconRotation += 360;
+    markerAnimationState.currentIconRotation += deltaIconRotation * rotLerpFactor;
+    initialUserLocationMarker.setRotation(markerAnimationState.currentIconRotation);
+
+    // --- Animación de la Cámara (si estamos siguiendo al usuario) ---
     if (shouldCenterOnUser || navigationFollowUser) {
-        // ... (resto del código sin cambios) ...
+        if (markerAnimationState.currentMapCenter && markerAnimationState.targetLngLat) {
+            markerAnimationState.currentMapCenter.lng += (markerAnimationState.targetLngLat.lng - markerAnimationState.currentMapCenter.lng) * posLerpFactor;
+            markerAnimationState.currentMapCenter.lat += (markerAnimationState.targetLngLat.lat - markerAnimationState.currentMapCenter.lat) * posLerpFactor;
+        }
+
+        let deltaMapBearing = markerAnimationState.targetMapBearing - markerAnimationState.currentMapBearing;
+        if (deltaMapBearing > 180) deltaMapBearing -= 360;
+        if (deltaMapBearing < -180) deltaMapBearing += 360;
+        markerAnimationState.currentMapBearing += deltaMapBearing * rotLerpFactor;
+
+        markerAnimationState.currentMapZoom += (markerAnimationState.targetMapZoom - markerAnimationState.currentMapZoom) * zoomPitchLerpFactor;
+        markerAnimationState.currentMapPitch += (markerAnimationState.targetMapPitch - markerAnimationState.currentMapPitch) * zoomPitchLerpFactor;
+        markerAnimationState.currentMapOffsetX += (markerAnimationState.targetMapOffsetX - markerAnimationState.currentMapOffsetX) * zoomPitchLerpFactor;
+        markerAnimationState.currentMapOffsetY += (markerAnimationState.targetMapOffsetY - markerAnimationState.currentMapOffsetY) * zoomPitchLerpFactor;
+
+        if (markerAnimationState.currentMapCenter) {
+            navigationMapInstance.jumpTo({
+                center: markerAnimationState.currentMapCenter,
+                bearing: markerAnimationState.currentMapBearing,
+                zoom: markerAnimationState.currentMapZoom,
+                pitch: markerAnimationState.currentMapPitch,
+                padding: {
+                    top: markerAnimationState.currentMapOffsetY > 0 ? navigationMapInstance.getCanvas().clientHeight * Math.abs(markerAnimationState.currentMapOffsetY / 100) : 0,
+                    bottom: markerAnimationState.currentMapOffsetY < 0 ? navigationMapInstance.getCanvas().clientHeight * Math.abs(markerAnimationState.currentMapOffsetY / 100) : 0,
+                    left: markerAnimationState.currentMapOffsetX < 0 ? navigationMapInstance.getCanvas().clientWidth * Math.abs(markerAnimationState.currentMapOffsetX / 100) : 0,
+                    right: markerAnimationState.currentMapOffsetX > 0 ? navigationMapInstance.getCanvas().clientWidth * Math.abs(markerAnimationState.currentMapOffsetX / 100) : 0
+                }
+            });
+            if (window.mapCustomControlsInstance && typeof window.mapCustomControlsInstance.updateOffsetDisplay === 'function') {
+                window.mapCustomControlsInstance.updateOffsetDisplay(
+                    markerAnimationState.currentMapOffsetX,
+                    markerAnimationState.currentMapOffsetY
+                );
+            }
+        }
     }
 
-    markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
-}    
+    markerAnimationState.animationFrameId = requestAnimationFrame((ts) => animateMarkerAndMap(ts, LERP_RATE, ROTATION_LERP_RATE, ZOOM_PITCH_LERP_RATE));
+}
     
 // ===================================================================
 // NOMBRE: getRouteStyleProperties (VERSIÓN CORREGIDA)
