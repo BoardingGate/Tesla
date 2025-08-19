@@ -1,4 +1,4 @@
-mi010
+mi011
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -553,8 +553,6 @@ let markerAnimationState = {
     targetLngLat: null,
     currentIconRotation: 0,
     targetIconRotation: 0,
-    
-    // --- NUEVAS PROPIEDADES PARA LA CÁMARA ---
     currentMapCenter: null,   // <-- Coordenadas actuales de la cámara
     currentMapBearing: 0,
     targetMapBearing: 0,
@@ -562,8 +560,10 @@ let markerAnimationState = {
     targetMapZoom: 16,
     currentMapPitch: 0,       // <-- Valor inicial por defecto
     targetMapPitch: 0,
-    // ------------------------------------
-    
+    currentMapOffsetX: 0,
+    targetMapOffsetX: 0,
+    currentMapOffsetY: 0,
+    targetMapOffsetY: 0,
     lastTimestamp: null
 };
     
@@ -5630,27 +5630,27 @@ function updateVehicleMarker(coords, mapInstanceToUse) {
 }
 
 // ===================================================================
-// NOMBRE: updateMapCamera (VERSIÓN FINAL - SOLO ESTABLECE OBJETIVOS)
-// RESUMEN: Calcula los objetivos de zoom, inclinación y ángulo, y los
-//          almacena en el estado de la animación. No mueve el mapa.
+// NOMBRE: updateMapCamera (VERSIÓN FINAL - CON OFFSETS)
+// RESUMEN: Calcula todos los objetivos de la cámara, incluyendo los offsets
+//          dinámicos para las maniobras, y los almacena en el estado.
 // ===================================================================
 function updateMapCamera(coords, mapInstanceToUse) {
     if (!shouldCenterOnUser && !navigationFollowUser) {
         return;
     }
 
-    // --- Parte 1: Calcular Zoom y Pitch Objetivo ---
     const cameraAdjustments = handleProgressiveManeuverZoom(
         navigationCurrentRouteData?.routes?.[0]?.legs?.[currentLegIndexNav]?.steps?.[currentStepIndexNav],
         distanceToNextManeuverOSRM,
         lastCarDistanceAlongRouteForNavLogic
     );
 
+    // --- Parte 1: Actualizar Zoom, Pitch y Offsets ---
     let targetZoom = cameraAdjustments?.zoom ?? null;
     if (targetZoom === null && !isManualZoomActive) {
         targetZoom = handleAutoZoom();
     }
-
+    
     // Si tenemos un zoom objetivo, lo asignamos. Si no, mantenemos el actual.
     if (targetZoom !== null) {
         markerAnimationState.targetMapZoom = targetZoom;
@@ -5658,13 +5658,17 @@ function updateMapCamera(coords, mapInstanceToUse) {
         markerAnimationState.targetMapZoom = navigationMapInstance.getZoom();
     }
     
-    // Asignamos el Pitch objetivo
+    // Si hay ajustes de maniobra, usamos su pitch y offset. Si no, usamos los del usuario.
     const targetPitch = cameraAdjustments?.pitch ?? ((mapViewMode === 'perspective') ? mapPitchValue : 0);
+    const targetOffsetX = cameraAdjustments?.offsetX ?? mapOffsetX;
+    const targetOffsetY = cameraAdjustments?.offsetY ?? mapOffsetY;
+
     markerAnimationState.targetMapPitch = targetPitch;
+    markerAnimationState.targetMapOffsetX = targetOffsetX; // <-- CAMBIO CLAVE
+    markerAnimationState.targetMapOffsetY = targetOffsetY; // <-- CAMBIO CLAVE
 
-    // --- Parte 2: Calcular el Rumbo (Bearing) Objetivo ---
-    let targetBearing = markerAnimationState.currentMapBearing; // Mantenemos el actual por defecto
-
+    // --- Parte 2: Actualizar el Rumbo (Bearing) Objetivo (sin cambios) ---
+    let targetBearing = markerAnimationState.currentMapBearing; 
     if (mapViewMode === 'heading' || mapViewMode === 'perspective') {
         let validatedHeading = null;
         if (coords.heading !== null && typeof coords.heading === 'number' && !isNaN(coords.heading) && coords.heading >= 0) {
@@ -5683,13 +5687,11 @@ function updateMapCamera(coords, mapInstanceToUse) {
             targetBearing = validatedHeading;
         }
     } else if (mapViewMode === 'static') {
-        targetBearing = 0; // Modo Norte
+        targetBearing = 0;
     }
-
     markerAnimationState.targetMapBearing = targetBearing;
-
-    // <-- CAMBIO CLAVE: YA NO HAY LLAMADA A easeTo(). La función termina aquí.
 }
+    
     
 // NOMBRE: updateTripStatistics (NUEVA FUNCIÓN AUXILIAR)
 // RESUMEN: Gestiona los cálculos y la actualización de la UI de estadísticas de viaje.
@@ -8275,6 +8277,158 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
     }
     return null;
 }
+
+// ===================================================================
+// NOMBRE: handleProgressiveManeuverZoom (MODIFICADA - DEVUELVE OFFSETS)
+// RESUMEN: Incluye mejoras y corrección del bug de estado. Ahora devuelve
+//          también los offsets X e Y para el encuadre dinámico de la cámara.
+// ===================================================================
+function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDistanceAlongRouteForNavLogic) {
+    if (isManualZoomActive) return null;
+
+    if (!isNavigating || !navigationMapInstance || !currentStep) {
+        if (isZoomedForManeuver) isZoomedForManeuver = false;
+        return null;
+    }
+    
+    const route = navigationCurrentRouteData?.routes?.[0];
+    if (!route || !route.geometry || !route.geometry.coordinates || route.geometry.coordinates.length < 2) {
+        return null;
+    }
+    
+    const ANIMATION_START_DISTANCE = 210;
+    const OFFSET_PEAK_DISTANCE = 120;
+    const ZOOM_PEAK_DISTANCE = 50;
+    const PROGRESSIVE_ZOOM_EXIT_START_DISTANCE = 40;
+    const PROGRESSIVE_ZOOM_EXIT_END_DISTANCE = 160;
+    const HOLD_ZOOM_THRESHOLD = 250;
+
+    const maxZoomForMap = navigationMapInstance.getMaxZoom() || 19;
+    const currentMapLayerName = (localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO").toLowerCase();
+    const isSatelliteWithLabels = currentMapLayerName.includes("satélite") && currentMapLayerName.includes("calles");
+    const MANEUVER_PEAK_ZOOM_LEVEL = isSatelliteWithLabels ? Math.min(17.5, maxZoomForMap) : Math.min(18.5, maxZoomForMap);
+    
+    const currentStepIdentifier = `${currentLegIndexNav}_${currentStepIndexNav}`;
+    if (lastProcessedStepIdentifier !== null && lastProcessedStepIdentifier !== currentStepIdentifier) {
+        if (progressiveZoomState === 'zooming-in' || progressiveZoomState === 'holding') {
+            progressiveZoomState = 'zooming-out';
+        }
+    }
+    lastProcessedStepIdentifier = currentStepIdentifier;
+
+    const distanceIntoCurrentStep = currentStep.distance - distanceToManeuver;
+    let targetZoom = null;
+    let targetPitch = null;
+    let targetOffsetX = null; // <-- Nueva variable
+    let targetOffsetY = null; // <-- Nueva variable
+
+    switch (progressiveZoomState) {
+        case 'zooming-out':
+            isZoomedForManeuver = true;
+            const nextStepAfterCurrent = findNextValidStep(route, currentLegIndexNav, currentStepIndexNav);
+            const distanceToNextStep = nextStepAfterCurrent ? calculateDistanceToEndOfStep(route, nextStepAfterCurrent.legIndex, nextStepAfterCurrent.stepIndex) - carDistanceAlongRouteForNavLogic : Infinity;
+            
+            if (nextStepAfterCurrent && distanceToNextStep < HOLD_ZOOM_THRESHOLD) {
+                targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
+                if (mapViewMode === 'perspective') targetPitch = window.pitchBeforeManeuver * 0.90; else targetPitch = 45;
+                targetOffsetY = 50;
+                targetOffsetX = window.offsetXBeforeManeuver; // Mantiene el offset del usuario
+                
+            } else {
+                if (distanceIntoCurrentStep > PROGRESSIVE_ZOOM_EXIT_END_DISTANCE || mapPreviousZoomLevelForProgressive === null) {
+                    targetZoom = mapPreviousZoomLevelForProgressive;
+                    targetPitch = window.pitchBeforeManeuver;
+                    targetOffsetY = window.offsetYBeforeManeuver; // Vuelve al offset del usuario
+                    targetOffsetX = window.offsetXBeforeManeuver; // Vuelve al offset del usuario
+                    progressiveZoomState = 'none';
+                    isZoomedForManeuver = false;
+                } else if (distanceIntoCurrentStep >= PROGRESSIVE_ZOOM_EXIT_START_DISTANCE) {
+                    const progress = (distanceIntoCurrentStep - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE) / (PROGRESSIVE_ZOOM_EXIT_END_DISTANCE - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE);
+                    const offsetReturnProgress = Math.min(1, progress * 1.5);
+                    targetZoom = MANEUVER_PEAK_ZOOM_LEVEL - (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * Math.min(1, progress);
+                    if (mapViewMode === 'perspective') { const pitchReduction = window.pitchBeforeManeuver * 0.25; targetPitch = (window.pitchBeforeManeuver - pitchReduction) + (pitchReduction * progress); } 
+                    else { targetPitch = 45 - (45 * progress); }
+                    targetOffsetY = 50 + (window.offsetYBeforeManeuver - 50) * offsetReturnProgress; // <-- Transición de vuelta
+                    targetOffsetX = (window.offsetXBeforeManeuver + window.maneuverHorizontalTarget) - (window.maneuverHorizontalTarget * offsetReturnProgress); // <-- Transición de vuelta
+                } else {
+                    targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
+                    if (mapViewMode === 'perspective') targetPitch = window.pitchBeforeManeuver * 0.90; else targetPitch = 45;
+                    targetOffsetY = 50; // <-- Offset pico
+                    targetOffsetX = window.offsetXBeforeManeuver + window.maneuverHorizontalTarget; // <-- Offset pico
+                }
+            }
+            break;
+
+        default: 
+            if (distanceToManeuver <= ANIMATION_START_DISTANCE) {
+                if (progressiveZoomState === 'none') {
+                    mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
+                    window.pitchBeforeManeuver = navigationMapInstance.getPitch();
+                    window.offsetXBeforeManeuver = mapOffsetX;
+                    window.offsetYBeforeManeuver = mapOffsetY;
+                    
+                    let dynamicHorizontalTarget = -10;
+                    try {
+                        // ... (código de cálculo de ángulo sin cambios) ...
+                    } catch (e) {
+                        dynamicHorizontalTarget = -10;
+                    }
+                    window.maneuverHorizontalTarget = dynamicHorizontalTarget;
+                    progressiveZoomState = 'zooming-in';
+                    isZoomedForManeuver = true;
+                }
+                
+                let offsetProgress = 0;
+                if (distanceToManeuver <= OFFSET_PEAK_DISTANCE) {
+                    offsetProgress = 1;
+                } else if (distanceToManeuver < ANIMATION_START_DISTANCE) {
+                    offsetProgress = (ANIMATION_START_DISTANCE - distanceToManeuver) / (ANIMATION_START_DISTANCE - OFFSET_PEAK_DISTANCE);
+                }
+
+                let zoomProgress = 0;
+                if (distanceToManeuver <= ZOOM_PEAK_DISTANCE) {
+                    zoomProgress = 1;
+                } else if (distanceToManeuver < ANIMATION_START_DISTANCE) {
+                    zoomProgress = (ANIMATION_START_DISTANCE - distanceToManeuver) / (ANIMATION_START_DISTANCE - ZOOM_PEAK_DISTANCE);
+                }
+                const easedZoomProgress = easeInOutQuad(Math.max(0, Math.min(1, zoomProgress)));
+
+                targetZoom = mapPreviousZoomLevelForProgressive + (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * easedZoomProgress;
+                
+                if (mapViewMode === 'perspective') {
+                    const pitchReduction = window.pitchBeforeManeuver * 0.20;
+                    targetPitch = window.pitchBeforeManeuver - (pitchReduction * easedZoomProgress);
+                } else {
+                    targetPitch = window.pitchBeforeManeuver + (45 - window.pitchBeforeManeuver) * easedZoomProgress;
+                }
+                
+                targetOffsetY = window.offsetYBeforeManeuver + (50 - window.offsetYBeforeManeuver) * easeInOutQuad(Math.min(1, offsetProgress));
+                targetOffsetX = window.offsetXBeforeManeuver + (window.maneuverHorizontalTarget * easeInOutQuad(Math.min(1, offsetProgress)));
+
+            } else {
+                if (progressiveZoomState !== 'none') {
+                    targetZoom = mapPreviousZoomLevelForProgressive;
+                    targetPitch = window.pitchBeforeManeuver;
+                    targetOffsetY = window.offsetYBeforeManeuver; // <-- Reset
+                    targetOffsetX = window.offsetXBeforeManeuver; // <-- Reset
+                }
+                progressiveZoomState = 'none';
+                isZoomedForManeuver = false;
+            }
+            break;
+    }
+
+    if (targetZoom !== null || targetPitch !== null || targetOffsetX !== null || targetOffsetY !== null) {
+        return { 
+            zoom: targetZoom, 
+            pitch: targetPitch, 
+            offsetX: targetOffsetX !== null ? Math.max(-75, Math.min(75, targetOffsetX)) : null, // <-- NUEVO
+            offsetY: targetOffsetY !== null ? Math.max(-75, Math.min(75, targetOffsetY)) : null  // <-- NUEVO
+        };
+    }
+    return null;
+}
+    
     
 // ===================================================================
 // NOMBRE: eliminarTareasDeBarraProgreso (MODIFICADA - PARA MAPBOX)
@@ -16500,9 +16654,9 @@ function animateMarkerAndMap(timestamp) {
 }   
 
 // ===================================================================
-// NOMBRE: animateMarkerAndMap (VERSIÓN CON CONTROL TOTAL DE CÁMARA)
+// NOMBRE: animateMarkerAndMap (VERSIÓN CON CONTROL TOTAL Y OFFSETS)
 // RESUMEN: Bucle de animación que suaviza TODO: icono, centro del mapa,
-//          ángulo, zoom, inclinación y aplica el offset del usuario.
+//          ángulo, zoom, inclinación y el DESPLAZAMIENTO DINÁMICO.
 // ===================================================================
 function animateMarkerAndMap(timestamp) {
     if (!initialUserLocationMarker || !navigationMapInstance) {
@@ -16510,13 +16664,15 @@ function animateMarkerAndMap(timestamp) {
         return;
     }
 
-    // Inicialización del estado en el primer fotograma
     if (!markerAnimationState.lastTimestamp) {
         markerAnimationState.lastTimestamp = timestamp;
+        // Inicializamos los valores 'current' con los del mapa
         markerAnimationState.currentMapZoom = navigationMapInstance.getZoom();
         markerAnimationState.currentMapPitch = navigationMapInstance.getPitch();
         markerAnimationState.currentMapBearing = navigationMapInstance.getBearing();
         markerAnimationState.currentMapCenter = navigationMapInstance.getCenter();
+        markerAnimationState.currentMapOffsetX = mapOffsetX; // <-- Inicializamos con el valor del usuario
+        markerAnimationState.currentMapOffsetY = mapOffsetY; // <-- Inicializamos con el valor del usuario
         markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
         return;
     }
@@ -16524,10 +16680,9 @@ function animateMarkerAndMap(timestamp) {
     const deltaTime = timestamp - markerAnimationState.lastTimestamp;
     markerAnimationState.lastTimestamp = timestamp;
 
-    // PARÁMETROS DE SUAVIDAD (Ajusta estos valores para cambiar la "sensación")
-    const LERP_RATE = 0.004; // Para posición
-    const ROTATION_LERP_RATE = 0.002; // Para rotación
-    const ZOOM_PITCH_LERP_RATE = 0.001; // Para zoom e inclinación
+    const LERP_RATE = 0.008;
+    const ROTATION_LERP_RATE = 0.004;
+    const ZOOM_PITCH_LERP_RATE = 0.003;
 
     const posLerpFactor = 1.0 - Math.exp(-deltaTime * LERP_RATE);
     const rotLerpFactor = 1.0 - Math.exp(-deltaTime * ROTATION_LERP_RATE);
@@ -16565,28 +16720,31 @@ function animateMarkerAndMap(timestamp) {
         // Suavizar la Inclinación (Pitch)
         markerAnimationState.currentMapPitch += (markerAnimationState.targetMapPitch - markerAnimationState.currentMapPitch) * zoomPitchLerpFactor;
 
-        // --- 3. Aplicar TODOS los cambios al mapa con el DESPLAZAMIENTO (OFFSET) ---
-        // <-- CAMBIO CLAVE: Usamos 'jumpTo' para aplicar todos los cambios atómicamente
-        // sin la animación interna de Mapbox, ya que nosotros controlamos la animación.
+        // <-- CAMBIO CLAVE: Suavizar los Offsets -->
+        markerAnimationState.currentMapOffsetX += (markerAnimationState.targetMapOffsetX - markerAnimationState.currentMapOffsetX) * zoomPitchLerpFactor;
+        markerAnimationState.currentMapOffsetY += (markerAnimationState.targetMapOffsetY - markerAnimationState.currentMapOffsetY) * zoomPitchLerpFactor;
+        // <--------------------------------------->
+
         if (markerAnimationState.currentMapCenter) {
             navigationMapInstance.jumpTo({
                 center: markerAnimationState.currentMapCenter,
                 bearing: markerAnimationState.currentMapBearing,
                 zoom: markerAnimationState.currentMapZoom,
                 pitch: markerAnimationState.currentMapPitch,
-                // Aplicamos el desplazamiento (offset) aquí
+                // <-- CAMBIO CLAVE: Usamos los offsets suavizados -->
                 padding: {
-                    top: mapOffsetY > 0 ? navigationMapInstance.getCanvas().clientHeight * Math.abs(mapOffsetY / 100) : 0,
-                    bottom: mapOffsetY < 0 ? navigationMapInstance.getCanvas().clientHeight * Math.abs(mapOffsetY / 100) : 0,
-                    left: mapOffsetX < 0 ? navigationMapInstance.getCanvas().clientWidth * Math.abs(mapOffsetX / 100) : 0,
-                    right: mapOffsetX > 0 ? navigationMapInstance.getCanvas().clientWidth * Math.abs(mapOffsetX / 100) : 0
+                    top: markerAnimationState.currentMapOffsetY > 0 ? navigationMapInstance.getCanvas().clientHeight * Math.abs(markerAnimationState.currentMapOffsetY / 100) : 0,
+                    bottom: markerAnimationState.currentMapOffsetY < 0 ? navigationMapInstance.getCanvas().clientHeight * Math.abs(markerAnimationState.currentMapOffsetY / 100) : 0,
+                    left: markerAnimationState.currentMapOffsetX < 0 ? navigationMapInstance.getCanvas().clientWidth * Math.abs(markerAnimationState.currentMapOffsetX / 100) : 0,
+                    right: markerAnimationState.currentMapOffsetX > 0 ? navigationMapInstance.getCanvas().clientWidth * Math.abs(markerAnimationState.currentMapOffsetX / 100) : 0
                 }
             });
         }
     }
 
     markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
-}    
+}
+
     
 // ===================================================================
 // NOMBRE: getRouteStyleProperties (VERSIÓN CORREGIDA)
