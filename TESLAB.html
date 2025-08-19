@@ -1,4 +1,4 @@
-m25
+mi01
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -5681,7 +5681,87 @@ function processRouteProgress(coords, mapInstanceToUse) {
     updateNavigationProgressDisplay(route, lastCarDistanceAlongRouteForNavLogic);
 }
 
+// ===================================================================
+// NOMBRE: processRouteProgress (OPTIMIZADO CON VENTANA DE DISTANCIA)
+// RESUMEN: Lógica de progreso en ruta que CALCULA y LUEGO LLAMA a las funciones de UI.
+//          Utiliza una ventana de búsqueda de longitud fija para un rendimiento consistente.
+// ===================================================================
+function processRouteProgress(coords, mapInstanceToUse) {
+    if (!isNavigating || !navigationCurrentRouteData || !navigationCurrentRouteData.routes[0] || !coords) {
+        return;
+    }
 
+    const route = navigationCurrentRouteData.routes[0];
+    let carDistCalculated = 0;
+
+    try {
+        // --- INICIO: LÓGICA DE VENTANA POR DISTANCIA (MÉTODO PRIMARIO) ---
+        const carPoint = turf.point([coords.longitude, coords.latitude]);
+        const fullRouteLineString = turf.lineString(route.geometry.coordinates);
+
+        // Definimos la ventana de búsqueda: 500m hacia adelante y 100m hacia atrás desde la última posición conocida
+        const WINDOW_LOOKAHEAD_METERS = 500;
+        const WINDOW_LOOKBEHIND_METERS = 100;
+
+        const startDistance = Math.max(0, lastCarDistanceAlongRouteForNavLogic - WINDOW_LOOKBEHIND_METERS);
+        const endDistance = Math.min(route.distance, lastCarDistanceAlongRouteForNavLogic + WINDOW_LOOKAHEAD_METERS);
+
+        // Cortamos el segmento de la ruta que forma nuestra ventana de búsqueda
+        const startPoint = turf.along(fullRouteLineString, startDistance, { units: 'meters' });
+        const endPoint = turf.along(fullRouteLineString, endDistance, { units: 'meters' });
+        const routeWindowLineString = turf.lineSlice(startPoint, endPoint, fullRouteLineString);
+
+        // Buscamos el punto más cercano del coche SOLO dentro de esta pequeña ventana
+        const nearestPointOnWindow = turf.nearestPointOnLine(routeWindowLineString, carPoint, { units: 'meters' });
+        
+        // Calculamos la distancia desde el inicio de la ventana hasta el punto encontrado
+        const startOfWindowPoint = turf.point(routeWindowLineString.geometry.coordinates[0]);
+        const sliceToPointInWindow = turf.lineSlice(startOfWindowPoint, nearestPointOnWindow, routeWindowLineString);
+        const distanceAlongWindow = turf.length(sliceToPointInWindow, { units: 'meters' });
+
+        // La distancia total es la distancia hasta el inicio de la ventana + la distancia dentro de ella
+        carDistCalculated = startDistance + distanceAlongWindow;
+        // --- FIN: LÓGICA DE VENTANA POR DISTANCIA ---
+
+    } catch (e) {
+        // --- INICIO: MÉTODO DE RESPALDO (SI LA LÓGICA DE VENTANA FALLA) ---
+        // Esto solo debería ocurrir en casos muy extraños o si Turf.js falla.
+        console.warn("[OPTIMIZATION FALLBACK] El método de ventana de distancia falló. Usando método de ruta completa.", e);
+        try {
+            const carPointTurf = turf.point([coords.longitude, coords.latitude]);
+            const routeGeoJSON = mapInstanceToUse.getSource('route')._data;
+            const routeLineStringTurf = turf.lineString(routeGeoJSON.geometry.coordinates);
+            const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
+            const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
+            carDistCalculated = turf.length(lineSliceToNearestTurf, { units: 'meters' });
+        } catch (turfError) {
+            console.error("Fallo crítico: Incluso el método de respaldo de Turf falló.", turfError);
+            carDistCalculated = lastCarDistanceAlongRouteForNavLogic; // Mantenemos la última distancia válida
+        }
+        // --- FIN: MÉTODO DE RESPALDO ---
+    }
+
+    // Saneamiento de la distancia para evitar saltos hacia atrás del GPS
+    const totalRouteLength = route.distance;
+    if (carDistCalculated >= 0 && carDistCalculated <= totalRouteLength + 500) { // Margen de 500m
+        // Solo actualizamos si el coche avanza o retrocede menos de 100m (filtra ruido del GPS)
+        if (carDistCalculated > lastCarDistanceAlongRouteForNavLogic - 100) {
+             lastCarDistanceAlongRouteForNavLogic = carDistCalculated;
+        }
+    } else if (carDistCalculated > totalRouteLength + 500) {
+        // Si el cálculo da una distancia muy por delante del final, la limitamos al final de la ruta.
+        lastCarDistanceAlongRouteForNavLogic = totalRouteLength;
+    }
+
+    // Una vez calculada y validada la distancia, actualizamos toda la UI
+    checkAndMarkWaypointsAsVisited(route, lastCarDistanceAlongRouteForNavLogic, coords);
+    renderWaypointMarkers(); // Necesario para actualizar el color de los visitados
+    updateTurnByTurnDisplay(route, lastCarDistanceAlongRouteForNavLogic);
+    updateNavigationProgressDisplay(route, lastCarDistanceAlongRouteForNavLogic);
+}
+
+
+    
 // ===================================================================
 // NOMBRE: startGpsWatching (VERSIÓN SIMPLIFICADA CON COPIA TEMPORAL)
 // RESUMEN: Inicia el seguimiento GPS, reintentando silenciosamente
