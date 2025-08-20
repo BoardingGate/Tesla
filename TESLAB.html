@@ -1,4 +1,4 @@
-JU11
+JU12
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -7757,11 +7757,10 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
         updateNavigationButtonColor();
     }
 }    
-
 // ===================================================================
 // NOMBRE: fetchAndRenderChatUsers 
-// RESUMEN: Carga usuarios en lotes de 100 y gestiona el scroll infinito. (VERSIÓN DE EMERGENCIA SIN ÍNDICE)
-async function fetchAndRenderChatUsers(loadMore = false) {
+// RESUMEN: Carga TODOS los usuarios y los ordena/filtra en el cliente para evitar errores de índice.
+async function fetchAndRenderChatUsers() {
     const usersListContainer = document.getElementById('chat-users-list');
     const messageInput = document.getElementById('chat-message-input');
     const filterInput = document.getElementById('chat-user-filter-input');
@@ -7770,25 +7769,21 @@ async function fetchAndRenderChatUsers(loadMore = false) {
 
     if (!filterInput.listenerAdded) {
         filterInput.addEventListener('input', () => {
-            usersListContainer.innerHTML = '';
-            lastVisibleUserDoc = null;
-            fetchAndRenderChatUsers(false);
+            // No necesitamos recargar desde Firebase, solo volver a renderizar con el nuevo filtro
+            fetchAndRenderChatUsers(); 
         });
         filterInput.listenerAdded = true;
     }
     
-    const filterText = filterInput.value.toLowerCase().trim();
-    
-    if (filterText) {
-        if (loadMore) return; 
-    } else if (loadMore && !lastVisibleUserDoc) {
-        return; 
-    }
-
     isFetchingUsers = true;
+    
+    // Como ahora cargamos todo de una vez, la lógica de "loadMore" se elimina.
+    // Limpiamos el contenedor antes de cada renderizado.
+    usersListContainer.innerHTML = '';
+
     const isAdmin = (localStorage.getItem('userData_userId') || '').toLowerCase() === 'boardinggate';
 
-    if (isAdmin && !loadMore && !filterText) {
+    if (isAdmin) {
         const [sessionStats, poiStats] = await Promise.all([
             getGlobalMapSessionStats(),
             getGlobalPoiStats()
@@ -7849,108 +7844,95 @@ async function fetchAndRenderChatUsers(loadMore = false) {
     }
 
     try {
-        const PAGE_SIZE = 100;
-        let q;
         const usersRef = window.collection(window.db, "user_data");
         
-        if (filterText) {
-            q = window.query(usersRef, window.where("rss", "==", true));
-        } else {
-            if (lastVisibleUserDoc) {
-                q = window.query(usersRef, window.where("rss", "==", true), window.orderBy(window.docId()), window.startAfter(lastVisibleUserDoc), window.limit(PAGE_SIZE));
-            } else {
-                q = window.query(usersRef, window.where("rss", "==", true), window.orderBy(window.docId()), window.limit(PAGE_SIZE));
-            }
-        }
+        // LA CONSULTA MÁS SIMPLE POSIBLE: Solo filtra por 'rss'.
+        const q = window.query(usersRef, window.where("rss", "==", true));
 
         const querySnapshot = await window.getDocs(q);
         const docs = querySnapshot.docs;
         
-        if (!filterText) {
-            if (docs.length > 0) {
-                lastVisibleUserDoc = docs[docs.length - 1];
-            } else {
-                lastVisibleUserDoc = null; 
-            }
-        }
-        
-        let usersData = [];
+        let allUsersData = [];
         docs.forEach(doc => {
             const userData = doc.data();
-            const userId = userData.usuario || doc.id;
-            usersData.push({ id: userId, ...userData });
+            const userId = userData.usuario || doc.id; // Salvaguarda por si 'usuario' no existe
+            allUsersData.push({ id: userId, ...userData });
         });
         
-        if(filterText) {
-            usersData = usersData.filter(userData => {
+        // Ordenamos la lista COMPLETA en el cliente
+        allUsersData.sort((a, b) => a.id.localeCompare(b.id));
+
+        // Filtramos la lista COMPLETA en el cliente
+        const filterText = filterInput.value.toLowerCase().trim();
+        const filteredUsers = filterText 
+            ? allUsersData.filter(userData => {
                 const userString = `${userData.id} ${userData.modelo || ''} ${userData.anio || ''} ${userData.provincia || ''}`.toLowerCase();
                 return userString.includes(filterText);
-            });
-        }
-        
-        usersData.sort((a, b) => a.id.localeCompare(b.id));
+              })
+            : allUsersData;
 
+        
         const now = new Date();
         const currentMonthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
         
-        usersData.forEach(userData => {
-            const userId = userData.id;
-            const isBoardingGateAccount = userId.toLowerCase().includes('boardinggate');
-            const isMainAdminAccount = userId.toLowerCase() === 'boardinggate';
-            if (isBoardingGateAccount && !isMainAdminAccount) {
-                return; 
-            }
-
-            const userElement = document.createElement('div');
-            userElement.className = 'chat-user-item';
-            userElement.style.cursor = 'pointer';
-            userElement.title = `Enviar mensaje privado a ${userId}`;
-            userElement.addEventListener('click', () => {
-                const currentText = messageInput.value;
-                if (currentText.startsWith('@')) {
-                    const existingMentionEndIndex = currentText.indexOf(' ');
-                    if (existingMentionEndIndex !== -1) {
-                        messageInput.value = `@${userId} ` + currentText.substring(existingMentionEndIndex + 1);
-                    } else {
-                        messageInput.value = `@${userId} `;
-                    }
-                } else {
-                    messageInput.value = `@${userId} ` + currentText;
-                }
-                messageInput.focus();
-                messageInput.dispatchEvent(new Event('input'));
-            });
-
-            const userName = document.createElement('span');
-            userName.className = 'chat-user-name';
-            userName.textContent = userId;
-            
-            const userDetails = document.createElement('span');
-            userDetails.className = 'chat-user-details';
-            const detailsParts = [];
-            if (userData.modelo) detailsParts.push(userData.modelo);
-            if (userData.anio) detailsParts.push(userData.anio);
-            if (userData.provincia) detailsParts.push(userData.provincia);
-            userDetails.textContent = `(${detailsParts.join(', ')})`;
-
-            if (isAdmin) {
-                const userMonthSessions = (userData.map_sessions_last_month === currentMonthStr) ? (userData.map_sessions_month || 0) : 0;
-                const userTotalSessions = userData.map_sessions_total || 0;
-                const userPoiClicks = (userData.poi_clicks_last_month === currentMonthStr) ? (userData.poi_clicks_month || 0) : 0;
-                
-                const statsSpan = document.createElement('span');
-                statsSpan.className = 'chat-user-session-stats';
-                statsSpan.textContent = `(Sesiones Mes: ${userMonthSessions} | POI: ${userPoiClicks} | Sesiones Total: ${userTotalSessions})`;
-                userDetails.appendChild(statsSpan);
-            }
-            
-            userElement.appendChild(userName);
-            userElement.appendChild(userDetails);
-            usersListContainer.appendChild(userElement);
-        });
-
-        if (usersListContainer.innerHTML === '' && !loadMore) {
+        if (filteredUsers.length === 0) {
             usersListContainer.innerHTML = '<p class="chat-no-users">No hay usuarios que coincidan con el filtro.</p>';
+        } else {
+            filteredUsers.forEach(userData => {
+                const userId = userData.id;
+                const isBoardingGateAccount = userId.toLowerCase().includes('boardinggate');
+                const isMainAdminAccount = userId.toLowerCase() === 'boardinggate';
+                if (isBoardingGateAccount && !isMainAdminAccount) {
+                    return; 
+                }
+
+                const userElement = document.createElement('div');
+                userElement.className = 'chat-user-item';
+                userElement.style.cursor = 'pointer';
+                userElement.title = `Enviar mensaje privado a ${userId}`;
+                userElement.addEventListener('click', () => {
+                    const currentText = messageInput.value;
+                    if (currentText.startsWith('@')) {
+                        const existingMentionEndIndex = currentText.indexOf(' ');
+                        if (existingMentionEndIndex !== -1) {
+                            messageInput.value = `@${userId} ` + currentText.substring(existingMentionEndIndex + 1);
+                        } else {
+                            messageInput.value = `@${userId} `;
+                        }
+                    } else {
+                        messageInput.value = `@${userId} ` + currentText;
+                    }
+                    messageInput.focus();
+                    messageInput.dispatchEvent(new Event('input'));
+                });
+
+                const userName = document.createElement('span');
+                userName.className = 'chat-user-name';
+                userName.textContent = userId;
+                
+                const userDetails = document.createElement('span');
+                userDetails.className = 'chat-user-details';
+                const detailsParts = [];
+                if (userData.modelo) detailsParts.push(userData.modelo);
+                if (userData.anio) detailsParts.push(userData.anio);
+                if (userData.provincia) detailsParts.push(userData.provincia);
+                userDetails.textContent = `(${detailsParts.join(', ')})`;
+
+                if (isAdmin) {
+                    const userMonthSessions = (userData.map_sessions_last_month === currentMonthStr) ? (userData.map_sessions_month || 0) : 0;
+                    const userTotalSessions = userData.map_sessions_total || 0;
+                    const userPoiClicks = (userData.poi_clicks_last_month === currentMonthStr) ? (userData.poi_clicks_month || 0) : 0;
+                    
+                    const statsSpan = document.createElement('span');
+                    statsSpan.className = 'chat-user-session-stats';
+                    statsSpan.textContent = `(Sesiones Mes: ${userMonthSessions} | POI: ${userPoiClicks} | Sesiones Total: ${userTotalSessions})`;
+                    userDetails.appendChild(statsSpan);
+                }
+                
+                userElement.appendChild(userName);
+                userElement.appendChild(userDetails);
+                usersListContainer.appendChild(userElement);
+            });
         }
 
     } catch (error) {
