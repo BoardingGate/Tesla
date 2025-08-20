@@ -1,4 +1,4 @@
-JU07
+JU08
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -848,6 +848,12 @@ let markerAnimationState = {
     const LERP_RATE_POS_KEY = 'boardinggate_lerp_rate_position';
     const LERP_RATE_ROT_KEY = 'boardinggate_lerp_rate_rotation';
     const LERP_RATE_ZOOM_KEY = 'boardinggate_lerp_rate_zoom';
+
+    let chatUpdateInterval = null;
+    let lastVisibleUserDoc = null; 
+    let lastVisibleMessageDoc = null; 
+    let isFetchingUsers = false; 
+    let isFetchingMessages = false; 
 
     const managedKeys = [ 
         'reminders','darkMode','toggleStates','zoomState','onOffState','noticesActive', 
@@ -7752,25 +7758,41 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
         updateNavigationButtonColor();
     }
 }    
-    
+
 // ===================================================================
 // NOMBRE: fetchAndRenderChatUsers 
-// RESUMEN: Muestra la lista de usuarios y, para el admin, estadísticas
-async function fetchAndRenderChatUsers() {
+// RESUMEN: Carga usuarios en lotes de 100 y gestiona el scroll infinito.
+async function fetchAndRenderChatUsers(loadMore = false) {
     const usersListContainer = document.getElementById('chat-users-list');
     const messageInput = document.getElementById('chat-message-input');
     const filterInput = document.getElementById('chat-user-filter-input');
     
-    if (!usersListContainer || !window.db || !messageInput || !filterInput) return;
+    if (!usersListContainer || !window.db || !messageInput || !filterInput || isFetchingUsers) return;
 
     if (!filterInput.listenerAdded) {
-        filterInput.addEventListener('input', fetchAndRenderChatUsers);
+        filterInput.addEventListener('input', () => {
+            usersListContainer.innerHTML = '';
+            lastVisibleUserDoc = null;
+            fetchAndRenderChatUsers(false);
+        });
         filterInput.listenerAdded = true;
     }
+    
+    const filterText = filterInput.value.toLowerCase().trim();
+    
+    // Si hay un filtro, no paginamos, cargamos todo y filtramos en el cliente.
+    // También, si estamos cargando más pero no hay más documentos (lastVisibleUserDoc es null), nos detenemos.
+    if (filterText) {
+        if (loadMore) return; // No hay "cargar más" en modo filtro.
+    } else if (loadMore && !lastVisibleUserDoc) {
+        return; // No hay más usuarios que cargar en modo paginación.
+    }
 
+    isFetchingUsers = true;
     const isAdmin = (localStorage.getItem('userData_userId') || '').toLowerCase() === 'boardinggate';
 
-    if (isAdmin) {
+    // Lógica del admin (se ejecuta solo en la carga inicial y sin filtro)
+    if (isAdmin && !loadMore && !filterText) {
         const [sessionStats, poiStats] = await Promise.all([
             getGlobalMapSessionStats(),
             getGlobalPoiStats()
@@ -7786,7 +7808,6 @@ async function fetchAndRenderChatUsers() {
                 filterContainer.insertAdjacentElement('afterend', statsHeader);
             }
         }
-        // Mostramos ambas líneas de estadísticas
         statsHeader.innerHTML = `Sesiones-> Mes: ${sessionStats.totalMonth} | Total: ${sessionStats.totalHistoric}<br>POI Clics (Mes): ${poiStats.totalMonth}`;
         
         let maxSessionsControl = document.getElementById('chat-max-sessions-control');
@@ -7801,7 +7822,6 @@ async function fetchAndRenderChatUsers() {
             statsHeader.insertAdjacentElement('afterend', maxSessionsControl);
 
             const maxSessionsInput = document.getElementById('chat-max-sessions-input');
-            
             const localMaxSessions = localStorage.getItem(MAX_SESSIONS_KEY);
             if(localMaxSessions) {
                 maxSessionsInput.value = localMaxSessions;
@@ -7830,54 +7850,64 @@ async function fetchAndRenderChatUsers() {
                 }
             });
         }
-    } else {
-        const statsHeader = document.getElementById('chat-admin-stats-header');
-        if (statsHeader) statsHeader.remove();
-        const maxSessionsControl = document.getElementById('chat-max-sessions-control');
-        if (maxSessionsControl) maxSessionsControl.remove();
     }
-    
-    try {
-        const usersRef = window.collection(window.db, "user_data");
-        const q = window.query(usersRef, window.where("rss", "==", true));
-        const querySnapshot = await window.getDocs(q);
-        
-        const filterText = filterInput.value.toLowerCase();
-        let usersData = [];
 
-        querySnapshot.forEach(doc => {
+    try {
+        const PAGE_SIZE = 100;
+        let q;
+        const usersRef = window.collection(window.db, "user_data");
+        
+        if (filterText) {
+            q = window.query(usersRef, window.where("rss", "==", true));
+        } else {
+            if (lastVisibleUserDoc) {
+                q = window.query(usersRef, window.where("rss", "==", true), window.orderBy("usuario"), window.startAfter(lastVisibleUserDoc), window.limit(PAGE_SIZE));
+            } else {
+                q = window.query(usersRef, window.where("rss", "==", true), window.orderBy("usuario"), window.limit(PAGE_SIZE));
+            }
+        }
+
+        const querySnapshot = await window.getDocs(q);
+        const docs = querySnapshot.docs;
+        
+        if (!filterText) {
+            if (docs.length > 0) {
+                lastVisibleUserDoc = docs[docs.length - 1];
+            } else {
+                lastVisibleUserDoc = null; // No hay más
+            }
+        }
+        
+        let usersData = [];
+        docs.forEach(doc => {
             const userData = doc.data();
             const userId = userData.usuario || doc.id;
             usersData.push({ id: userId, ...userData });
         });
-
-        usersData.sort((a, b) => a.id.localeCompare(b.id));
-
-        usersListContainer.innerHTML = ''; 
-        let userCount = 0;
+        
+        if(filterText) {
+            usersData = usersData.filter(userData => {
+                const userString = `${userData.id} ${userData.modelo || ''} ${userData.anio || ''} ${userData.provincia || ''}`.toLowerCase();
+                return userString.includes(filterText);
+            }).sort((a,b) => a.id.localeCompare(b.id)); // Ordenar después de filtrar
+        }
         
         const now = new Date();
         const currentMonthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
-        
+        let userCount = 0;
+
         usersData.forEach(userData => {
             const userId = userData.id;
-
             const isBoardingGateAccount = userId.toLowerCase().includes('boardinggate');
             const isMainAdminAccount = userId.toLowerCase() === 'boardinggate';
             if (isBoardingGateAccount && !isMainAdminAccount) {
                 return; 
             }
 
-            const userString = `${userId} ${userData.modelo || ''} ${userData.anio || ''} ${userData.provincia || ''}`.toLowerCase();
-            if (filterText && !userString.includes(filterText)) {
-                return;
-            }
-            
             const userElement = document.createElement('div');
             userElement.className = 'chat-user-item';
             userElement.style.cursor = 'pointer';
             userElement.title = `Enviar mensaje privado a ${userId}`;
-
             userElement.addEventListener('click', () => {
                 const currentText = messageInput.value;
                 if (currentText.startsWith('@')) {
@@ -7923,15 +7953,17 @@ async function fetchAndRenderChatUsers() {
             userCount++;
         });
 
-        if (userCount === 0) {
+        if (usersListContainer.innerHTML === '' && !loadMore) {
             usersListContainer.innerHTML = '<p class="chat-no-users">No hay usuarios que coincidan con el filtro.</p>';
         }
 
     } catch (error) {
         console.error("Error al renderizar usuarios del chat:", error);
         usersListContainer.innerHTML = '<p class="chat-no-users">Error al cargar usuarios.</p>';
+    } finally {
+        isFetchingUsers = false;
     }
-}
+}    
 
 // ===================================================================
 // NOMBRE: handleProgressiveManeuverZoom (VERSIÓN FINAL CON CORRECCIÓN DE ÁMBITO)
@@ -9609,10 +9641,15 @@ function updateLineWidthsOnPitchChange() {
                                                                                                                                                                                                                                                                                                      
 // ===================================================================
 // NOMBRE: openChatModal 
-// RESUMEN: Abre el modal del chat y lo convierte en una función asíncrona.
+// RESUMEN: Abre el modal, resetea la paginación e inicia la carga inicial.
 async function openChatModal() {
     const modalOverlay = document.getElementById('chat-modal-overlay');
     if (!modalOverlay) return;
+    
+    lastVisibleUserDoc = null;
+    lastVisibleMessageDoc = null;
+    isFetchingUsers = false;
+    isFetchingMessages = false;
     
     document.body.classList.add('chat-open');
     modalOverlay.classList.remove('hidden');
@@ -9622,6 +9659,10 @@ async function openChatModal() {
     const charCounter = document.getElementById('chat-char-counter');
     const permissionWarning = document.getElementById('chat-permission-warning');
     const messagesContainer = document.getElementById('chat-messages-container');
+    const usersListContainer = document.getElementById('chat-users-list');
+    
+    messagesContainer.innerHTML = '';
+    usersListContainer.innerHTML = '';
     
     const originalPlaceholder = "Escribe un mensaje... (antecede @usuario para mensaje privado, o pulsa en el lateral. Para referirse simplemente nómbralo). Vida de los mensajes 96 horas. En el coche usa los comandos de voz. Elon cree en la humanidad, the White Monkey y yo también, ser educad@s.";
     const pollPlaceholder = "Para encuestas/votaciones, usa el formato: #COMUNIDAD#Pregunta#Opción1 $ Opción2...#";
@@ -9700,11 +9741,26 @@ async function openChatModal() {
                     break;
             }
         });
+        messagesContainer.addEventListener('scroll', () => {
+            if (messagesContainer.scrollTop + messagesContainer.clientHeight >= messagesContainer.scrollHeight - 100) {
+                fetchAndRenderChatMessages(true); // Cargar más
+            }
+        });
         messagesContainer.listenerAdded = true;
     }
 
-    await fetchAndRenderChatUsers();
-    fetchAndRenderChatMessages();
+    if (!usersListContainer.listenerAdded) {
+        usersListContainer.addEventListener('scroll', () => {
+            if (usersListContainer.scrollTop + usersListContainer.clientHeight >= usersListContainer.scrollHeight - 100) {
+                fetchAndRenderChatUsers(true); // Cargar más
+            }
+        });
+        usersListContainer.listenerAdded = true;
+    }
+
+
+    await fetchAndRenderChatUsers(false); 
+    fetchAndRenderChatMessages(false); 
     updateTotalMessageCount();
 
     if (chatUpdateInterval) clearInterval(chatUpdateInterval);
@@ -9714,42 +9770,68 @@ async function openChatModal() {
         }
     }, 15000);
 }
-    
+
 // ===================================================================
 // NOMBRE: fetchAndRenderChatMessages 
-// RESUMEN: Construye los elementos del chat de forma segura con el DOM API.
-async function fetchAndRenderChatMessages() {
+// RESUMEN: Carga mensajes y encuestas en lotes de 100 y gestiona el scroll infinito.
+async function fetchAndRenderChatMessages(loadMore = false) {
     const messagesContainer = document.getElementById('chat-messages-container');
-    if (!messagesContainer || !window.db) return;
+    if (!messagesContainer || !window.db || isFetchingMessages) return;
 
     const currentUserId = (localStorage.getItem('userData_userId') || '').trim();
     if (!currentUserId) {
         messagesContainer.innerHTML = '<p class="chat-system-message">Configura tu ID de usuario para ver el chat.</p>';
         return;
     }
-    
+
+    if (loadMore && !lastVisibleMessageDoc) {
+        return; // No hay más mensajes que cargar
+    }
+
+    isFetchingMessages = true;
     const currentUserIdLower = currentUserId.toLowerCase();
 
     try {
+        const PAGE_SIZE = 100;
         const oneHundredTwentyHoursAgo = new Date(Date.now() - 120 * 60 * 60 * 1000);
-        const messagesQuery = window.query(window.collection(window.db, 'chatMessages'), window.where('timestamp', '>', oneHundredTwentyHoursAgo), window.orderBy('timestamp', 'desc'));
+        
+        let messagesQuery;
+        const messagesRef = window.collection(window.db, 'chatMessages');
+        
+        if (lastVisibleMessageDoc) {
+            messagesQuery = window.query(messagesRef, window.where('timestamp', '>', oneHundredTwentyHoursAgo), window.orderBy('timestamp', 'desc'), window.startAfter(lastVisibleMessageDoc), window.limit(PAGE_SIZE));
+        } else {
+            messagesQuery = window.query(messagesRef, window.where('timestamp', '>', oneHundredTwentyHoursAgo), window.orderBy('timestamp', 'desc'), window.limit(PAGE_SIZE));
+        }
+        
         const pollsQuery = window.query(window.collection(window.db, 'chatPolls'), window.orderBy('timestamp', 'desc'));
         
         const [messagesSnapshot, pollsSnapshot] = await Promise.all([
             window.getDocs(messagesQuery),
-            window.getDocs(pollsQuery)
+            loadMore ? Promise.resolve({ docs: [] }) : window.getDocs(pollsQuery)
         ]);
 
+        const messageDocs = messagesSnapshot.docs;
+        if (messageDocs.length > 0) {
+            lastVisibleMessageDoc = messageDocs[messageDocs.length - 1];
+        } else {
+            lastVisibleMessageDoc = null; 
+        }
+
         let combinedItems = [];
-        messagesSnapshot.forEach(doc => combinedItems.push({ id: doc.id, ...doc.data(), isPoll: false }));
-        pollsSnapshot.forEach(doc => combinedItems.push({ id: doc.id, ...doc.data(), isPoll: true }));
-
-        combinedItems.sort((a, b) => (b.timestamp?.toMillis() || 0) - (a.timestamp?.toMillis() || 0));
-
-        messagesContainer.innerHTML = '';
+        messageDocs.forEach(doc => combinedItems.push({ id: doc.id, ...doc.data(), isPoll: false }));
         
-        if (combinedItems.length === 0) {
+        if (!loadMore) {
+            pollsSnapshot.forEach(doc => combinedItems.push({ id: doc.id, ...doc.data(), isPoll: true }));
+        }
+
+        if (!loadMore) {
+            combinedItems.sort((a, b) => (b.timestamp?.toMillis() || 0) - (a.timestamp?.toMillis() || 0));
+        }
+        
+        if (combinedItems.length === 0 && !loadMore) {
             messagesContainer.innerHTML = '<p class="chat-system-message">No hay mensajes recientes. ¡Sé el primero en escribir!</p>';
+            isFetchingMessages = false;
             return;
         }
 
@@ -9818,12 +9900,17 @@ async function fetchAndRenderChatMessages() {
             }
         });
         
-        messagesContainer.scrollTop = 0;
+        if (!loadMore) {
+            messagesContainer.scrollTop = 0;
+        }
 
     } catch (error) {
         messagesContainer.innerHTML = `<p class="chat-system-message">Error al cargar el chat: ${error.message}</p>`;
+    } finally {
+        isFetchingMessages = false;
     }
 }
+    
 // ===================================================================
 // NOMBRE: renderPollBubble 
 // RESUMEN: Construye un elemento DOM para la encuesta, evitando errores de sintaxis.
@@ -9986,7 +10073,7 @@ async function deleteChatMessage(messageId) {
    
 // ===================================================================
 // NOMBRE: closeChatModal 
-// RESUMEN: Cierra el modal y restaura el scroll del body.
+// RESUMEN: Cierra el modal, detiene timers y limpia el contenido para liberar memoria.
 function closeChatModal() {
     const modalOverlay = document.getElementById('chat-modal-overlay');
     if (modalOverlay) {
@@ -9997,6 +10084,21 @@ function closeChatModal() {
         clearInterval(chatUpdateInterval);
         chatUpdateInterval = null;
     }
+    
+    const messagesContainer = document.getElementById('chat-messages-container');
+    const usersListContainer = document.getElementById('chat-users-list');
+
+    if (messagesContainer) {
+        messagesContainer.innerHTML = ''; 
+    }
+    if (usersListContainer) {
+        usersListContainer.innerHTML = ''; 
+    }
+    
+    lastVisibleUserDoc = null;
+    lastVisibleMessageDoc = null;
+    isFetchingUsers = false;
+    isFetchingMessages = false;
 }
 
 // ===================================================================
