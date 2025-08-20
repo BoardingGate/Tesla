@@ -1,4 +1,4 @@
-JU19
+JU20
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -3498,9 +3498,9 @@ function saveCustomData() {
 }
 
 // ===================================================================
-// NOMBRE: showIntersectionPreviewMap (VERSIÓN CORREGIDA Y ROBUSTA)
-// RESUMEN: Reutiliza el mapa del minimapa, asegurando que se inicialice
-//          correctamente antes del primer uso y se actualice de forma segura.
+// NOMBRE: showIntersectionPreviewMap (VERSIÓN FINAL Y COMPLETA)
+// RESUMEN: Gestiona la creación y reutilización del minimapa de forma segura,
+//          con toda la lógica encapsulada para evitar errores.
 // ===================================================================
 function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = false, timerDurationMs = null) {
     const savedMinimapPref = localStorage.getItem(MAP_VIEW_SHOW_MINIMAP_KEY);
@@ -3517,12 +3517,6 @@ function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = fa
         hideIntersectionPreviewMap();
         return;
     }
-    
-    const DISTANCE_BEFORE_MANEUVER_METERS = 75; 
-    const DISTANCE_AFTER_MANEUVER_METERS = 90;  
-    const CAR_POSITION_BEFORE_MANEUVER_METERS = 30; 
-    const PADDING_OPTIONS = { top: 25, bottom: 25, left: 25, right: 25 }; 
-    const MAX_ZOOM_LEVEL = 19;
 
     if (!previewWindow.querySelector('#intersection-preview-map-container')) {
         previewWindow.innerHTML = `<div id="intersection-preview-map-container"></div>`;
@@ -3558,8 +3552,8 @@ function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = fa
         const fullRouteLineString = turf.lineString(route.geometry.coordinates);
         const maneuverPointOnRoute = turf.nearestPointOnLine(fullRouteLineString, step.maneuver.location, { units: 'kilometers' });
         const maneuverDistanceKm = maneuverPointOnRoute.properties.location;
-        const startSliceDistanceKm = Math.max(0, maneuverDistanceKm - (DISTANCE_BEFORE_MANEUVER_METERS / 1000));
-        const endSliceDistanceKm = Math.min(turf.length(fullRouteLineString), maneuverDistanceKm + (DISTANCE_AFTER_MANEUVER_METERS / 1000));
+        const startSliceDistanceKm = Math.max(0, maneuverDistanceKm - (75 / 1000));
+        const endSliceDistanceKm = Math.min(turf.length(fullRouteLineString), maneuverDistanceKm + (90 / 1000));
         const startSlicePoint = turf.along(fullRouteLineString, startSliceDistanceKm);
         const endSlicePoint = turf.along(fullRouteLineString, endSliceDistanceKm);
         const routeSlice = turf.lineSlice(startSlicePoint, endSlicePoint, fullRouteLineString);
@@ -3570,7 +3564,50 @@ function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = fa
         const lookAheadPointTurf = turf.along(routeSlice, 5, { units: 'meters' });
         const segmentBearing = turf.bearing(startSlicePoint, lookAheadPointTurf);
 
-        // --- LÓGICA DE REUTILIZACIÓN MEJORADA ---
+        // --- INICIO DE LA LÓGICA DE ACTUALIZACIÓN (AHORA DENTRO DE ESTA FUNCIÓN) ---
+        const updateMapContent = () => {
+            if (!intersectionPreviewMap || !intersectionPreviewMap.isStyleLoaded()) {
+                console.warn("[Minimapa] Intento de actualizar mapa no cargado, reintentando...");
+                setTimeout(updateMapContent, 100);
+                return;
+            }
+
+            const source = intersectionPreviewMap.getSource('intersection-route');
+            if (source) source.setData(routeSlice.geometry);
+            
+            const carPositionPointTurf = turf.along(routeSlice, 30, { units: 'meters' });
+            if (intersectionPreviewCarMarker) intersectionPreviewCarMarker.setLngLat(carPositionPointTurf.geometry.coordinates);
+            
+            const maneuver = step.maneuver;
+            const iconFilename = getManeuverIconFilename(maneuver);
+            const maneuverPointTurf = turf.point(step.maneuver.location);
+            const lineStringToManeuver = turf.lineSlice(turf.point(routeSlice.geometry.coordinates[0]), maneuverPointTurf, routeSlice);
+            const distanceToManeuverOnSlice = turf.length(lineStringToManeuver, { units: 'meters' });
+            const iconPositionDistance = Math.max(0, distanceToManeuverOnSlice - 15);
+            const iconPositionPointTurf = turf.along(routeSlice, iconPositionDistance, { units: 'meters' });
+            if (intersectionPreviewManeuverMarker) {
+                const maneuverIconElement = intersectionPreviewManeuverMarker.getElement();
+                maneuverIconElement.style.backgroundImage = `url('https://boardinggate.github.io/Tesla/${iconFilename}')`;
+                intersectionPreviewManeuverMarker.setLngLat(iconPositionPointTurf.geometry.coordinates);
+            }
+
+            requestAnimationFrame(() => {
+                if (intersectionPreviewMap) {
+                    try {
+                        intersectionPreviewMap.resize();
+                        intersectionPreviewMap.fitBounds(bounds, {
+                            padding: { top: 25, bottom: 25, left: 25, right: 25 }, 
+                            maxZoom: 19, bearing: segmentBearing, pitch: 50, animate: false
+                        });
+                        intersectionPreviewMap.once('idle', () => {
+                            if (previewWindow) previewWindow.classList.remove('rendering');
+                        });
+                    } catch (e) { console.error("Error al ajustar la cámara del minimapa:", e); }
+                }
+            });
+        };
+
+        // --- LÓGICA DE INICIALIZACIÓN Y LLAMADA A LA ACTUALIZACIÓN ---
         if (!intersectionPreviewMap) {
             console.log("[Minimapa] Creando instancia única del mapa de intersección.");
             const savedLayerName = localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO";
@@ -3600,14 +3637,12 @@ function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = fa
                 maneuverIconEl.style.cssText = `width: 49px; height: 49px; background-size: contain; background-repeat: no-repeat; background-position: center;`;
                 intersectionPreviewManeuverMarker = new mapboxgl.Marker({ element: maneuverIconEl, anchor: 'center' }).addTo(intersectionPreviewMap);
                 
-                // Marcamos el mapa como listo y llamamos a la función de actualización
-                intersectionPreviewMap.isReady = true; 
-                updateIntersectionMapContent(routeSlice, step, bounds, segmentBearing);
+                // La primera actualización ocurre aquí, una vez que todo está listo
+                updateMapContent();
             });
-
         } else {
-            // Si el mapa ya existe, simplemente actualizamos su contenido.
-            updateIntersectionMapContent(routeSlice, step, bounds, segmentBearing);
+            // Si el mapa ya existe, simplemente llamamos a la función de actualización
+            updateMapContent();
         }
         
         if (timerDurationMs && timerDurationMs > 0) {
@@ -3618,61 +3653,7 @@ function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = fa
         hideIntersectionPreviewMap();
     }
 }
-
-// AÑADIDO: Nueva función auxiliar para actualizar el contenido del mapa reutilizado
-function updateIntersectionMapContent(routeSlice, step, bounds, segmentBearing) {
-    // CORRECCIÓN: Se añade una guarda para asegurar que el mapa está inicializado y listo.
-    if (!intersectionPreviewMap || !intersectionPreviewMap.isReady) {
-        console.log("[Minimapa] Reintentando actualización, el mapa aún no está listo...");
-        setTimeout(() => updateIntersectionMapContent(routeSlice, step, bounds, segmentBearing), 100);
-        return;
-    }
-
-    const source = intersectionPreviewMap.getSource('intersection-route');
-    if (source) {
-        source.setData(routeSlice.geometry);
-    }
-
-    const carPositionPointTurf = turf.along(routeSlice, 30, { units: 'meters' });
-    if (intersectionPreviewCarMarker) {
-        intersectionPreviewCarMarker.setLngLat(carPositionPointTurf.geometry.coordinates);
-    }
     
-    const maneuver = step.maneuver;
-    const iconFilename = getManeuverIconFilename(maneuver);
-    const maneuverPointTurf = turf.point(step.maneuver.location);
-    const lineStringToManeuver = turf.lineSlice(turf.point(routeSlice.geometry.coordinates[0]), maneuverPointTurf, routeSlice);
-    const distanceToManeuverOnSlice = turf.length(lineStringToManeuver, { units: 'meters' });
-    const iconPositionDistance = Math.max(0, distanceToManeuverOnSlice - 15);
-    const iconPositionPointTurf = turf.along(routeSlice, iconPositionDistance, { units: 'meters' });
-    if (intersectionPreviewManeuverMarker) {
-        const maneuverIconElement = intersectionPreviewManeuverMarker.getElement();
-        maneuverIconElement.style.backgroundImage = `url('https://boardinggate.github.io/Tesla/${iconFilename}')`;
-        intersectionPreviewManeuverMarker.setLngLat(iconPositionPointTurf.geometry.coordinates);
-    }
-    
-    requestAnimationFrame(() => {
-        if (intersectionPreviewMap) {
-            try {
-                intersectionPreviewMap.resize();
-                intersectionPreviewMap.fitBounds(bounds, {
-                    padding: { top: 25, bottom: 25, left: 25, right: 25 }, 
-                    maxZoom: 19, 
-                    bearing: segmentBearing,
-                    pitch: 50,
-                    animate: false
-                });
-                intersectionPreviewMap.once('idle', () => {
-                    const previewWindow = document.getElementById('intersection-preview-map-window');
-                    if (previewWindow) previewWindow.classList.remove('rendering');
-                });
-            } catch (e) {
-                console.error("Error al ajustar la cámara del minimapa:", e);
-            }
-        }
-    });
-}
-
     
 // ===================================================================
 // NOMBRE: showAllReminders 
