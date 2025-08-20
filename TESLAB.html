@@ -1,4 +1,4 @@
-mi021
+JU01
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -7244,8 +7244,12 @@ async function openNavigationMap(isRecovery = false) {
                         await loadAndAddMapImages(navigationMapInstance);
                         reAddCustomMapLayersAndSources(navigationMapInstance);
                         plotRemindersOnNavigationMap();
-                        processTrafficAlerts();
                         
+                        await processTrafficAlerts(); 
+
+                        if (alertRefreshInterval) clearInterval(alertRefreshInterval); 
+                        alertRefreshInterval = setInterval(processTrafficAlerts, ALERT_CHECK_INTERVAL);
+                                        
                         navigationMapInstance.on('pitch', updateLineWidthsOnPitchChange);
                         
                         mapPreviousZoomLevelForPDRs = navigationMapInstance.getZoom();
@@ -11561,10 +11565,12 @@ function sendTrafficAlert(alertCode, alertName) {
 }    
     
 // ===================================================================
-// NOMBRE: processTrafficAlerts
-// RESUMEN: Lógica principal que lee, limpia y actualiza las alertas desde Firebase.
+// NOMBRE: processTrafficAlerts (VERSIÓN OPTIMIZADA CON ÍNDICE ESPACIAL)
+// RESUMEN: Lógica principal que lee, limpia, actualiza las alertas desde Firebase y construye el índice.
+// ===================================================================
 async function processTrafficAlerts() {
     if (!window.db || !window.getDocs || !window.deleteDoc || !window.collection) {
+        console.warn("Funciones de Firebase no disponibles, no se pueden procesar alertas.");
         return;
     }
     
@@ -11582,6 +11588,7 @@ async function processTrafficAlerts() {
         const removals = allAlerts.filter(alert => alert.code === 9);
         let activeAlerts = allAlerts.filter(alert => alert.code !== 9);
 
+        // Limpia alertas cercanas a una alerta de "anulación" (código 9)
         for (const removal of removals) {
             const removalCoords = { lat: removal.latitude, lon: removal.longitude };
             const alertsToDelete = new Set();
@@ -11604,21 +11611,34 @@ async function processTrafficAlerts() {
             await window.deleteDoc(removalDocRef);
         }
 
+        // Limpia alertas con más de 24 horas y reconstruye la lista de activas
         activeAlerts = activeAlerts.filter(alert => {
             if (!alert.timestamp || new Date(alert.timestamp) < twentyFourHoursAgo) {
                 const docRef = window.doc(window.db, "users", "ALERTAS", "events", alert.id);
-                window.deleteDoc(docRef);
+                window.deleteDoc(docRef); // Borrado asíncrono, no esperamos
                 return false;
             }
             return true;
         });
         
+        // Actualiza la caché en memoria
         trafficAlertsCache = activeAlerts.filter(alert => alert.latitude && alert.longitude).map(alert => ({
             id: alert.id,
             code: alert.code,
             coordinates: { lat: alert.latitude, lon: alert.longitude }
         }));
         
+        trafficAlertsSpatialIndex = {};
+        trafficAlertsCache.forEach(alert => {
+            if (alert.coordinates && alert.coordinates.lat && alert.coordinates.lon) {
+                const cellId = getGridCellId(alert.coordinates.lat, alert.coordinates.lon);
+                if (!trafficAlertsSpatialIndex[cellId]) {
+                    trafficAlertsSpatialIndex[cellId] = [];
+                }
+                trafficAlertsSpatialIndex[cellId].push(alert);
+            }
+        });
+   
         displayAlertsOnMap(); 
         checkAlertsProximity();
       
@@ -11626,7 +11646,6 @@ async function processTrafficAlerts() {
         console.error("Error procesando alertas de tráfico: ", error);
     }
 }
-
 
 // ===================================================================
 // NOMBRE: eliminarTareasDeMapa (NUEVA FUNCIÓN)
@@ -11678,25 +11697,70 @@ function createRadarAlertIcon(currentZoomLevel = null, isFromTarea = false) {
     return container; 
 }
     
-    
 // ===================================================================
-// NOMBRE: checkAlertsProximity
-// RESUMEN: Comprueba la proximidad del vehículo a las alertas y muestra un aviso si es necesario.
+// NOMBRE: checkAlertsProximity (VERSIÓN OPTIMIZADA CON ÍNDICE Y LIMPIEZA)
+// RESUMEN: Comprueba la proximidad usando el índice espacial y limpia alertas ya vistas y lejanas.
+// ===================================================================
 function checkAlertsProximity() {
-    if (!navigationCurrentLocation || trafficAlertsCache.length === 0) {
+    if (!navigationCurrentLocation || Object.keys(trafficAlertsSpatialIndex).length === 0) {
         return;
     }
 
     const carLat = navigationCurrentLocation.latitude;
     const carLon = navigationCurrentLocation.longitude;
-    trafficAlertsCache.forEach(alert => {
+
+    // --- MEJORA 1: Búsqueda eficiente usando el índice espacial ---
+    const centerCellId = getGridCellId(carLat, carLon);
+    const [_, centerLatIndex, centerLonIndex] = centerCellId.split('_').map(Number);
+    const candidateAlerts = new Set(); 
+
+    // Recorre la cuadrícula 3x3 alrededor del coche
+    for (let i = -1; i <= 1; i++) {
+        for (let j = -1; j <= 1; j++) {
+            const cellId = `cell_${centerLatIndex + i}_${centerLonIndex + j}`;
+            if (trafficAlertsSpatialIndex[cellId]) {
+                trafficAlertsSpatialIndex[cellId].forEach(alert => candidateAlerts.add(alert));
+            }
+        }
+    }
+
+    // Bucle principal sobre los candidatos (una lista mucho más pequeña)
+    candidateAlerts.forEach(alert => {
         const distance = calculateDistance(carLat, carLon, alert.coordinates.lat, alert.coordinates.lon);
         if (distance <= 500 && !currentlyDisplayedProximityAlerts.has(alert.id)) {
             showProximityAlert(alert);
             currentlyDisplayedProximityAlerts.add(alert.id);
         }
     });
+
+    // --- MEJORA 2: Limpieza inteligente de alertas ya mostradas ---
+    const now = Date.now();
+    // Ejecutar la limpieza solo cada 30 segundos
+    if (now - lastAlertCleanupTimestamp > 30000) {
+        lastAlertCleanupTimestamp = now;
+
+        if (currentlyDisplayedProximityAlerts.size > 0) {
+            const CLEANUP_DISTANCE_THRESHOLD_METERS = 2000; // 2 km
+
+            const alertsToCheckForCleanup = new Set(currentlyDisplayedProximityAlerts);
+
+            alertsToCheckForCleanup.forEach(alertId => {
+                const alertData = trafficAlertsCache.find(a => a.id === alertId);
+                if (alertData) {
+                    const distanceToOldAlert = calculateDistance(carLat, carLon, alertData.coordinates.lat, alertData.coordinates.lon);
+                    if (distanceToOldAlert > CLEANUP_DISTANCE_THRESHOLD_METERS) {
+                        currentlyDisplayedProximityAlerts.delete(alertId);
+                    }
+                } else {
+                    // La alerta ya no existe en la caché principal, la eliminamos del historial
+                    currentlyDisplayedProximityAlerts.delete(alertId);
+                }
+            });
+        }
+    }
 }
+
+    
 // ===================================================================
 // NOMBRE: hideProximityAlert
 // RESUMEN: Oculta el modal de aviso de proximidad.
@@ -15892,6 +15956,11 @@ function closeNavigationMap(force = false) {
     clearRecoveryFlag();
     hideAddressSuggestionsModal();
     resetNavigationState(); 
+
+    if (alertRefreshInterval) {
+        clearInterval(alertRefreshInterval);
+        alertRefreshInterval = null;
+    }
     
     if (manualZoomTimeout) { clearTimeout(manualZoomTimeout); manualZoomTimeout = null; }
     isManualZoomActive = false;
