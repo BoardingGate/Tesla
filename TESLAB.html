@@ -1,4 +1,4 @@
-VI34
+S01
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -681,8 +681,18 @@ VI34
     let editingTargetElement = null; let draggedItem = null; let draggedItemIndex = null; let dragOverIndex = null;
     let touchStartX = 0; let touchStartY = 0; let currentTouchTarget = null;
     let isPasswordActive = false; let storedPin = null;
+    
     let reminderCheckIntervalId = null;
+    let remindersSpatialIndex = {}; // Índice espacial para búsquedas rápidas por ubicación.
+    let nonLocationRemindersCache = []; // Caché separada para recordatorios solo de tiempo.
+    let nextEventHorizon = { // Objeto que define el próximo evento relevante.
+        timestamp: Infinity, // Cuándo despertar. Infinity significa que no hay eventos pendientes.
+        type: null,          // 'location' o 'time'.
+        targetId: null       // El ID del recordatorio que esperamos.
+    };
+    let checkRemindersMode = 'active'; // Puede ser 'active' o 'idle'.
     let currentCheckIntervalDuration = 3000;
+
     let lastUpdatesCheckDate = localStorage.getItem('lastUpdatesCheckDate');
     let currentNotificationSlideIndex = 0;
     let isUnifiedWindowVisibleByLogic = false;
@@ -3117,15 +3127,20 @@ async function toggleTareasRuta(activo) {
         tareasRutaCheckbox.checked = activo;
     }
 }   
-    
+
 // ===================================================================
-// NOMBRE: checkReminders 
-// RESUMEN: Bucle optimizado que usa la caché, la ubicación GPS existente y filtra por relevancia de ruta.
+// NOMBRE: checkReminders (VERSIÓN OPTIMIZADA V4.0 - COMPLETA)
+// RESUMEN: Bucle optimizado que usa el sistema de "Próximo Evento Relevante".
+//          Permanece en modo de bajo consumo hasta que se acerca el
+//          próximo evento (sea por tiempo o por ubicación).
+//          También optimiza la actualización de la UI para que solo ocurra
+//          cuando los datos realmente cambian.
+// ===================================================================
 async function checkReminders() {
     const now = Date.now();
 
-    // TAREA 1: Sincronización Móvil (optimizado)
-    if (isMobileSession && (now - lastMobileSyncCheck > 6000)) {
+    // TAREA 1: Sincronización Móvil
+    if (isMobileSession && (now - lastMobileSyncCheck > 8000)) {
         lastMobileSyncCheck = now;
         const { primaryId } = parseUserId(localStorage.getItem('userData_userId'));
         const autoSyncEnabled = JSON.parse(localStorage.getItem('boardinggate_autoBackupOnLoad') || 'false');
@@ -3140,7 +3155,17 @@ async function checkReminders() {
         }
     }
 
-    // TAREA 2: Carga de Radares Dinámicos
+    // TAREA 2: Gestión de la Caché y Actualización de UI (Solo si es necesario)
+    // MEJORA: La actualización de la UI solo ocurre si la caché está sucia.
+    if (isCacheDirty) {
+        rebuildProcessedRemindersCache();
+        updateReminderCount();
+        updateButtonStyles();
+        // La comprobación continuará en el siguiente ciclo con la caché fresca.
+        return; 
+    }
+    
+    // TAREA 3: Actualización periódica de Radares Dinámicos
     if (!isNavigating) {
         const timeSinceLastCheck = now - lastDynamicRadarCheck;
         const hasExistingDynamicRadars = processedRemindersCache.some(r => r.isDynamicRadar === true);
@@ -3149,13 +3174,15 @@ async function checkReminders() {
         }
     }
     
-    // TAREA 4: Gestión de la Caché
-    if (isCacheDirty) {
-        rebuildProcessedRemindersCache();
-        return; 
+    // TAREA 4: Lógica de Comprobación de Alertas con "Sueño Inteligente"
+    // MEJORA: Si estamos "durmiendo" y no es hora de despertar, salimos inmediatamente.
+    if (checkRemindersMode === 'idle' && now < nextEventHorizon.timestamp) {
+        return;
     }
     
-    // TAREA 5: Bucle Principal de Comprobación
+    // Si despertamos, cambiamos a modo activo para una comprobación intensiva.
+    checkRemindersMode = 'active';
+
     const overdueReminders = [];
     let coords = navigationCurrentLocation;
 
@@ -3163,28 +3190,12 @@ async function checkReminders() {
         coords = await getCurrentLocationAsync().catch(() => null);
     }
     
-    const nowTime = now;
     let isNearActiveLocationPoint = false; 
-    let remindersToCheck = [];
 
-    // --- LÓGICA DE FILTRADO UNIFICADA ---
-    if (isNavigating) {
-        remindersToCheck = [...tareasEnRutaActual, ...radaresEnRutaActual];
-        processedRemindersCache.forEach(reminder => {
-            if (!reminder.isLocationEnabled) {
-                remindersToCheck.push(reminder);
-            }
-        });
-        remindersToCheck = remindersToCheck.filter((r, index, self) => 
-            index === self.findIndex(t => t.id === r.id)
-        );
-    } else {
-        remindersToCheck = processedRemindersCache;
-    }
-    
-    remindersToCheck.forEach(reminder => {
-        if (!reminder) return;
-        
+    processedRemindersCache.forEach(reminder => {
+        if (!reminder || reminder.managedByUser) return;
+
+        // Comprobación de proximidad para el ajuste de intervalo (independiente de si está vencido)
         if (coords && reminder.isLocationEnabled && reminder.locationCoordinates) {
             const distance = calculateDistance(coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude);
             if (distance <= (reminder.radiusMeters || DEFAULT_LOCATION_RADIUS)) {
@@ -3192,16 +3203,14 @@ async function checkReminders() {
             }
         }
 
-        if (reminder.managedByUser) return;
-
         let isOverdue = false;
         let locationConditionMet = true;
-
         const dueTime = reminder.dueTimeUTC;
 
-        if (dueTime && dueTime <= nowTime) {
+        if (dueTime && dueTime <= now) {
             if (reminder.isLocationEnabled && reminder.locationCoordinates) {
                 if (coords) {
+                    // Re-calculamos la distancia aquí para la condición de vencimiento
                     const distance = calculateDistance(coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude);
                     locationConditionMet = distance <= (reminder.radiusMeters || DEFAULT_LOCATION_RADIUS);
                 } else {
@@ -3223,27 +3232,34 @@ async function checkReminders() {
     } else if (isUnifiedWindowVisibleByLogic) {
         hideUnifiedReminderWindow();
     }
+    
+    // MEJORA: Después de una comprobación activa, recalculamos el próximo horizonte y volvemos a dormir.
+    recalculateNextEventHorizon();
+    checkRemindersMode = 'idle';
 
-    // TAREA 6: Actualizar UI y ajustar intervalo
-    updateReminderCount();
-    updateButtonStyles();
-
-     let newInterval;
-    const speed = window.currentSpeedKmh || 0;
-        if (isNearActiveLocationPoint) {
-        newInterval = 1000;
-    } else if (speed > 115) {
-        newInterval = 4000;
-    } else if (speed > 90) {
-        newInterval = 5000;
-    } else if (speed > 65) {
-        newInterval = 6000;
-    } else if (speed > 40) {
-        newInterval = 8000;
-    } else if (speed > 5) {
-        newInterval = 10000;
+    // TAREA 5: Ajuste Dinámico del Intervalo del Bucle
+    // MEJORA: Si estamos navegando, el intervalo de fondo es más largo.
+    // En modo 'idle', el intervalo es más largo para ahorrar recursos.
+    let newInterval;
+    if (isNavigating) {
+        newInterval = 20000; // Intervalo largo y fijo durante la navegación activa
     } else {
-        newInterval = 13000;
+        // La lógica original basada en velocidad y proximidad se mantiene para cuando no se navega
+        if (isNearActiveLocationPoint) {
+            newInterval = 1000;
+        } else if (speed > 115) {
+            newInterval = 4000;
+        } else if (speed > 90) {
+            newInterval = 5000;
+        } else if (speed > 65) {
+            newInterval = 6000;
+        } else if (speed > 40) {
+            newInterval = 8000;
+        } else if (speed > 5) {
+            newInterval = 10000;
+        } else {
+            newInterval = 13000;
+        }
     }
 
     if (newInterval !== currentCheckIntervalDuration) {
@@ -3252,45 +3268,146 @@ async function checkReminders() {
         reminderCheckIntervalId = setInterval(checkReminders, currentCheckIntervalDuration);
     }
 }
-
-
+    
 // ===================================================================
-// NOMBRE: rebuildProcessedRemindersCache 
-// RESUMEN: Procesa y cachea los recordatorios desde localStorage para optimizar las comprobaciones.
+// NOMBRE: recalculateNextEventHorizon (NUEVA FUNCIÓN DE OPTIMIZACIÓN)
+// RESUMEN: Calcula el próximo evento relevante (sea de tiempo o de ubicación)
+//          y establece el "horizonte de tiempo" hasta el cual el sistema
+//          puede permanecer en modo de bajo consumo.
+// ===================================================================
+function recalculateNextEventHorizon() {
+    const now = Date.now();
+    let nextTemporalEvent = { timestamp: Infinity, targetId: null };
+    let nextLocationEvent = { timestamp: Infinity, targetId: null };
+
+    // 1. Encontrar el próximo evento de TIEMPO
+    [...processedRemindersCache].forEach(reminder => {
+        // Se consideran todos los recordatorios para el evento temporal, incluso los de ubicación
+        if (reminder.dueTimeUTC && reminder.dueTimeUTC > now && reminder.dueTimeUTC < nextTemporalEvent.timestamp) {
+            nextTemporalEvent = { timestamp: reminder.dueTimeUTC, targetId: reminder.id };
+        }
+    });
+
+    // 2. Encontrar el próximo evento de UBICACIÓN
+    const coords = navigationCurrentLocation;
+    if (coords) {
+        // Usamos el índice espacial para una búsqueda ultra-rápida
+        const centerCellId = getGridCellId(coords.latitude, coords.longitude);
+        const [_, centerLatIndex, centerLonIndex] = centerCellId.split('_').map(Number);
+        const candidateReminders = new Set();
+        
+        for (let i = -1; i <= 1; i++) {
+            for (let j = -1; j <= 1; j++) {
+                const cellId = `cell_${centerLatIndex + i}_${centerLonIndex + j}`;
+                if (remindersSpatialIndex[cellId]) {
+                    remindersSpatialIndex[cellId].forEach(r => candidateReminders.add(r));
+                }
+            }
+        }
+        
+        let closestVigia = { distance: Infinity, reminder: null };
+        candidateReminders.forEach(reminder => {
+            const distance = calculateDistance(coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude);
+            if (distance < closestVigia.distance) {
+                closestVigia = { distance: distance, reminder: reminder };
+            }
+        });
+
+        if (closestVigia.reminder) {
+            const speedKmh = window.currentSpeedKmh > 10 ? window.currentSpeedKmh : 40; // Usar velocidad actual o una media urbana
+            const speedMps = speedKmh * 1000 / 3600;
+            const etaSeconds = closestVigia.distance / speedMps;
+            const MARGEN_SEGURIDAD_MS = 45 * 1000; // 45 segundos de margen
+
+            nextLocationEvent = {
+                timestamp: now + (etaSeconds * 1000) - MARGEN_SEGURIDAD_MS,
+                targetId: closestVigia.reminder.id
+            };
+        }
+    }
+
+    // 3. Comparar y decidir cuál es el próximo evento
+    if (nextTemporalEvent.timestamp < nextLocationEvent.timestamp) {
+        nextEventHorizon = {
+            timestamp: nextTemporalEvent.timestamp,
+            type: 'time',
+            targetId: nextTemporalEvent.targetId
+        };
+    } else if (nextLocationEvent.targetId) {
+        nextEventHorizon = {
+            timestamp: nextLocationEvent.timestamp,
+            type: 'location',
+            targetId: nextLocationEvent.targetId
+        };
+    } else {
+        // No hay eventos futuros, el sistema puede "dormir" indefinidamente
+        nextEventHorizon = { timestamp: Infinity, type: null, targetId: null };
+    }
+}
+// ===================================================================
+// NOMBRE: rebuildProcessedRemindersCache (VERSIÓN MODIFICADA CON ÍNDICE ESPACIAL)
+// RESUMEN: Procesa y cachea los recordatorios desde localStorage.
+//          AHORA TAMBIÉN CONSTRUYE UN ÍNDICE ESPACIAL para recordatorios con
+//          ubicación y los separa de los que son solo por tiempo.
+// ===================================================================
 function rebuildProcessedRemindersCache() {
     try {
         const allReminders = JSON.parse(localStorage.getItem('reminders') || '[]');
         const now = new Date();
-        processedRemindersCache = allReminders.map(reminder => {
+        
+        processedRemindersCache = [];
+        remindersSpatialIndex = {};
+        nonLocationRemindersCache = [];
+
+        allReminders.forEach(reminder => {
             let dueTimeUTC = null;
             if (reminder.date && reminder.time) {
                 try {
                     const [year, month, day] = reminder.date.split('-').map(Number);
                     const [hour, minute] = reminder.time.split(':').map(Number);
-                    
-                    const dueDate = new Date(year, month - 1, day, hour, minute);
-                 
+                    const dueDate = new Date(Date.UTC(year, month - 1, day, hour, minute));
                     if (!isNaN(dueDate.getTime())) {
                         dueTimeUTC = dueDate.getTime();
                     }
                 } catch (e) {
+                    console.warn(`Fecha/hora inválida para recordatorio ID ${reminder.id}:`, reminder.date, reminder.time);
                 }
             }
-            return { ...reminder, dueTimeUTC: dueTimeUTC };
+
+            const processedReminder = { ...reminder, dueTimeUTC: dueTimeUTC };
+            processedRemindersCache.push(processedReminder);
+
+            if (processedReminder.isLocationEnabled && processedReminder.locationCoordinates) {
+                const { latitude, longitude } = processedReminder.locationCoordinates;
+                if (typeof latitude === 'number' && typeof longitude === 'number') {
+                    const cellId = getGridCellId(latitude, longitude);
+                    if (!remindersSpatialIndex[cellId]) {
+                        remindersSpatialIndex[cellId] = [];
+                    }
+                    remindersSpatialIndex[cellId].push(processedReminder);
+                }
+            } else {
+                nonLocationRemindersCache.push(processedReminder);
+            }
         });
+
         isCacheDirty = false;
-        console.log(`[CACHE] Caché de recordatorios reconstruida con ${processedRemindersCache.length} elementos.`);
+        console.log(`[CACHE] Caché reconstruida: ${processedRemindersCache.length} en total, ${nonLocationRemindersCache.length} solo de tiempo, ${Object.keys(remindersSpatialIndex).length} celdas espaciales.`);
+        
+        recalculateNextEventHorizon();
+        
     } catch (e) {
         console.error("Error al reconstruir la caché de recordatorios:", e);
         processedRemindersCache = [];
+        remindersSpatialIndex = {};
+        nonLocationRemindersCache = [];
     }
 }
+    
 
-    // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+// =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 // NOMBRE: startDeviationChecker (VERSIÓN FINAL Y OPTIMIZADA)
 // RESUMEN: Inicia un temporizador que comprueba el desvío de ruta. Se desactiva
-//          automáticamente una vez que la secuencia de llegada ha comenzado.
-// =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 function startDeviationChecker() {
     stopDeviationChecker();
     
