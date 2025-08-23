@@ -1,4 +1,4 @@
-S15
+S17
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -564,7 +564,8 @@ S15
     targetMapOffsetX: 0,
     currentMapOffsetY: 0,
     targetMapOffsetY: 0,
-    lastTimestamp: null
+    lastTimestamp: null,
+    lastCameraTimestamp: null     
     };
     
     let nextManeuverStepForPreview = null;
@@ -880,6 +881,10 @@ S15
     const UMBRAL_AVISO_EVENTO_RUTA_METROS = 500; // Distancia (en metros) antes de un evento para empezar a mostrar la alerta.
 
     const GPS_BASE_FREQUENCY_HZ = 10; 
+
+    let lastMapUpdateTime = 0;
+    const MAP_UPDATE_INTERVAL_MS = 50; // 20 FPS
+    
     
     const navigationTasks = {
         CRITICAL_VISUALS: {
@@ -17036,6 +17041,111 @@ function animateMarkerAndMap(timestamp) {
                 markerAnimationState.currentMapOffsetX,
                 markerAnimationState.currentMapOffsetY
             );
+        }
+    }
+    
+    markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
+}
+
+// ===================================================================
+// NOMBRE: animateMarkerAndMap (VERSIÓN 13 FINAL - ENFOQUE HÍBRIDO TOTAL)
+// RESUMEN: Combina la reducción de FPS (throttling) con la comprobación
+//          de umbrales (thresholding) para un máximo rendimiento y fluidez.
+// ===================================================================
+function animateMarkerAndMap(timestamp) {
+    if (!initialUserLocationMarker || !navigationMapInstance) {
+        markerAnimationState.animationFrameId = null;
+        return;
+    }
+
+    if (!markerAnimationState.lastTimestamp) {
+        markerAnimationState.lastTimestamp = timestamp;
+        lastMapUpdateTime = timestamp;
+        markerAnimationState.lastCameraTimestamp = timestamp;
+        markerAnimationState.currentMapZoom = navigationMapInstance.getZoom();
+        markerAnimationState.currentMapPitch = navigationMapInstance.getPitch();
+        markerAnimationState.currentMapBearing = navigationMapInstance.getBearing();
+        markerAnimationState.currentMapCenter = navigationMapInstance.getCenter();
+        markerAnimationState.currentMapOffsetX = mapOffsetX;
+        markerAnimationState.currentMapOffsetY = mapOffsetY;
+        markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
+        return;
+    }
+
+    const deltaTime = timestamp - markerAnimationState.lastTimestamp;
+    markerAnimationState.lastTimestamp = timestamp;
+
+    const posLerpFactor = 1.0 - Math.exp(-deltaTime * lerpRatePosition);
+    const rotLerpFactor = 1.0 - Math.exp(-deltaTime * lerpRateRotation);
+    
+    // 1. El icono del coche se sigue animando a 60 FPS para máxima fluidez visual.
+    if (markerAnimationState.currentLngLat && markerAnimationState.targetLngLat) {
+        markerAnimationState.currentLngLat.lng += (markerAnimationState.targetLngLat.lng - markerAnimationState.currentLngLat.lng) * posLerpFactor;
+        markerAnimationState.currentLngLat.lat += (markerAnimationState.targetLngLat.lat - markerAnimationState.currentLngLat.lat) * posLerpFactor;
+        initialUserLocationMarker.setLngLat(markerAnimationState.currentLngLat);
+    }
+    let deltaIconRotation = markerAnimationState.targetIconRotation - markerAnimationState.currentIconRotation;
+    if (deltaIconRotation > 180) deltaIconRotation -= 360;
+    if (deltaIconRotation < -180) deltaIconRotation += 360;
+    markerAnimationState.currentIconRotation += deltaIconRotation * rotLerpFactor;
+    initialUserLocationMarker.setRotation(markerAnimationState.currentIconRotation);
+
+    // 2. La lógica de la CÁMARA (más pesada) solo se ejecuta a 20 FPS.
+    if (timestamp - lastMapUpdateTime > MAP_UPDATE_INTERVAL_MS) {
+        lastMapUpdateTime = timestamp;
+
+        const cameraDeltaTime = timestamp - (markerAnimationState.lastCameraTimestamp || timestamp);
+        markerAnimationState.lastCameraTimestamp = timestamp;
+        const zoomPitchLerpFactor = 1.0 - Math.exp(-cameraDeltaTime * lerpRateZoom);
+
+        if (shouldCenterOnUser || navigationFollowUser) {
+            
+            // 2a. Interpolar valores en memoria
+            if (markerAnimationState.currentMapCenter && markerAnimationState.targetLngLat) {
+                markerAnimationState.currentMapCenter.lng += (markerAnimationState.targetLngLat.lng - markerAnimationState.currentMapCenter.lng) * posLerpFactor;
+                markerAnimationState.currentMapCenter.lat += (markerAnimationState.targetLngLat.lat - markerAnimationState.currentMapCenter.lat) * posLerpFactor;
+            }
+            let deltaMapBearing = markerAnimationState.targetMapBearing - markerAnimationState.currentMapBearing;
+            if (deltaMapBearing > 180) deltaMapBearing -= 360;
+            if (deltaMapBearing < -180) deltaMapBearing += 360;
+            markerAnimationState.currentMapBearing += deltaMapBearing * rotLerpFactor;
+            markerAnimationState.currentMapZoom += (markerAnimationState.targetMapZoom - markerAnimationState.currentMapZoom) * zoomPitchLerpFactor;
+            markerAnimationState.currentMapPitch += (markerAnimationState.targetMapPitch - markerAnimationState.currentMapPitch) * zoomPitchLerpFactor;
+            markerAnimationState.currentMapOffsetX += (markerAnimationState.targetMapOffsetX - markerAnimationState.currentMapOffsetX) * zoomPitchLerpFactor;
+            markerAnimationState.currentMapOffsetY += (markerAnimationState.targetMapOffsetY - markerAnimationState.currentMapOffsetY) * zoomPitchLerpFactor;
+
+            // 2b. Llamar a los setters de Mapbox
+            
+            // --- Para MÁXIMA FLUIDEZ: Centro y Rotación se actualizan siempre (dentro del bucle de 20 FPS)
+            if (markerAnimationState.currentMapCenter) {
+                navigationMapInstance.setCenter(markerAnimationState.currentMapCenter);
+                navigationMapInstance.setBearing(markerAnimationState.currentMapBearing);
+            }
+            
+            // --- Para MÁXIMA OPTIMIZACIÓN: Zoom y Pitch solo se actualizan si han cambiado
+            const ZOOM_PITCH_THRESHOLD = 0.01;
+            
+            if (Math.abs(navigationMapInstance.getZoom() - markerAnimationState.currentMapZoom) > ZOOM_PITCH_THRESHOLD) {
+                navigationMapInstance.setZoom(markerAnimationState.currentMapZoom);
+            }
+            
+            if (Math.abs(navigationMapInstance.getPitch() - markerAnimationState.currentMapPitch) > ZOOM_PITCH_THRESHOLD) {
+                navigationMapInstance.setPitch(markerAnimationState.currentMapPitch);
+            }
+            
+            navigationMapInstance.setPadding({
+                top: markerAnimationState.currentMapOffsetY > 0 ? navigationMapInstance.getCanvas().clientHeight * Math.abs(markerAnimationState.currentMapOffsetY / 100) : 0,
+                bottom: markerAnimationState.currentMapOffsetY < 0 ? navigationMapInstance.getCanvas().clientHeight * Math.abs(markerAnimationState.currentMapOffsetY / 100) : 0,
+                left: markerAnimationState.currentMapOffsetX < 0 ? navigationMapInstance.getCanvas().clientWidth * Math.abs(markerAnimationState.currentMapOffsetX / 100) : 0,
+                right: markerAnimationState.currentMapOffsetX > 0 ? navigationMapInstance.getCanvas().clientWidth * Math.abs(markerAnimationState.currentMapOffsetX / 100) : 0
+            });
+                
+            if (window.mapCustomControlsInstance && typeof window.mapCustomControlsInstance.updateOffsetDisplay === 'function') {
+                window.mapCustomControlsInstance.updateOffsetDisplay(
+                    markerAnimationState.currentMapOffsetX,
+                    markerAnimationState.currentMapOffsetY
+                );
+            }
         }
     }
     
