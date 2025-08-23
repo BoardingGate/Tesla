@@ -1,4 +1,4 @@
-S23
+D001
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -3304,30 +3304,29 @@ async function checkReminders() {
 }
     
 // ===================================================================
-// NOMBRE: recalculateNextEventHorizon (NUEVA FUNCIÓN DE OPTIMIZACIÓN)
-// RESUMEN: Calcula el próximo evento relevante (sea de tiempo o de ubicación)
-//          y establece el "horizonte de tiempo" hasta el cual el sistema
-//          puede permanecer en modo de bajo consumo.
+// NOMBRE: recalculateNextEventHorizon (VERSIÓN CONSERVADORA Y DE ARRANQUE RÁPIDO)
+// RESUMEN: Utiliza una velocidad fija y alta al inicio del viaje, y luego la velocidad media 
+//          con un mínimo de seguridad para asegurar que el sistema despierte siempre a tiempo.
 function recalculateNextEventHorizon() {
     const now = Date.now();
     let nextTemporalEvent = { timestamp: Infinity, targetId: null };
-    let nextLocationEvent = { timestamp: Infinity, targetId: null };
 
-    // 1. Encontrar el próximo evento de TIEMPO
-    [...processedRemindersCache].forEach(reminder => {
-        // Se consideran todos los recordatorios para el evento temporal, incluso los de ubicación
-        if (reminder.dueTimeUTC && reminder.dueTimeUTC > now && reminder.dueTimeUTC < nextTemporalEvent.timestamp) {
+    // 1. Encontrar el próximo evento de TIEMPO (sin cambios)
+    processedRemindersCache.forEach(reminder => {
+        if (!reminder.managedByUser && reminder.dueTimeUTC && reminder.dueTimeUTC > now && reminder.dueTimeUTC < nextTemporalEvent.timestamp) {
             nextTemporalEvent = { timestamp: reminder.dueTimeUTC, targetId: reminder.id };
         }
     });
 
-    // 2. Encontrar el próximo evento de UBICACIÓN
+    // 2. Encontrar el próximo evento de UBICACIÓN (con lógica de velocidad conservadora)
+    let nextLocationEvent = { timestamp: Infinity, targetId: null };
     const coords = navigationCurrentLocation;
+    
     if (coords) {
-        // Usamos el índice espacial para una búsqueda ultra-rápida
+        // Búsqueda eficiente de candidatos cercanos con el índice espacial
+        const candidateReminders = new Set();
         const centerCellId = getGridCellId(coords.latitude, coords.longitude);
         const [_, centerLatIndex, centerLonIndex] = centerCellId.split('_').map(Number);
-        const candidateReminders = new Set();
         
         for (let i = -1; i <= 1; i++) {
             for (let j = -1; j <= 1; j++) {
@@ -3340,26 +3339,50 @@ function recalculateNextEventHorizon() {
         
         let closestVigia = { distance: Infinity, reminder: null };
         candidateReminders.forEach(reminder => {
-            const distance = calculateDistance(coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude);
-            if (distance < closestVigia.distance) {
-                closestVigia = { distance: distance, reminder: reminder };
+            if (!reminder.managedByUser && reminder.isLocationEnabled && reminder.locationCoordinates && reminder.dueTimeUTC <= now) {
+                const distance = calculateDistance(coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude);
+                if (distance < closestVigia.distance) {
+                    closestVigia = { distance: distance, reminder: reminder };
+                }
             }
         });
 
         if (closestVigia.reminder) {
-            const speedKmh = window.currentSpeedKmh > 10 ? window.currentSpeedKmh : 40; // Usar velocidad actual o una media urbana
-            const speedMps = speedKmh * 1000 / 3600;
-            const etaSeconds = closestVigia.distance / speedMps;
-            const MARGEN_SEGURIDAD_MS = 45 * 1000; // 45 segundos de margen
+            // --- INICIO DE LA NUEVA LÓGICA DE VELOCIDAD CONSERVADORA ---
+            let speedKmh;
+            const tripDurationMinutes = navigationStartTimeForStats ? (now - navigationStartTimeForStats.getTime()) / 60000 : 0;
 
+            if (tripDurationMinutes < 5) {
+                // Durante los primeros 5 minutos del viaje, somos agresivos/conservadores.
+                speedKmh = 90; 
+            } else {
+                // Después de 5 minutos, confiamos más en la media, pero con un suelo de seguridad.
+                const MINIMUM_AVERAGE_SPEED_FOR_CALC = 60;
+                speedKmh = Math.max(window.averageSpeedKmh, MINIMUM_AVERAGE_SPEED_FOR_CALC);
+            }
+            
+            // Fallback final si la velocidad media es 0 (coche parado).
+            if (speedKmh < 1) {
+                speedKmh = 40;
+            }
+            // --- FIN DE LA NUEVA LÓGICA ---
+            
+            const speedMps = speedKmh * 1000 / 3600;
+            const distanceToActivationZone = Math.max(0, closestVigia.distance - (closestVigia.reminder.radiusMeters || DEFAULT_LOCATION_RADIUS));
+            const etaSeconds = speedMps > 0 ? distanceToActivationZone / speedMps : Infinity;
+            
+            // Aumentamos el margen de seguridad a 60 segundos.
+            const MARGEN_SEGURIDAD_MS = 60 * 1000; 
+            const wakeUpTimestamp = now + (etaSeconds * 1000) - MARGEN_SEGURIDAD_MS;
+            
             nextLocationEvent = {
-                timestamp: now + (etaSeconds * 1000) - MARGEN_SEGURIDAD_MS,
+                timestamp: Math.max(now, wakeUpTimestamp),
                 targetId: closestVigia.reminder.id
             };
         }
     }
 
-    // 3. Comparar y decidir cuál es el próximo evento
+    // 3. Decisión final (sin cambios)
     if (nextTemporalEvent.timestamp < nextLocationEvent.timestamp) {
         nextEventHorizon = {
             timestamp: nextTemporalEvent.timestamp,
@@ -3373,10 +3396,10 @@ function recalculateNextEventHorizon() {
             targetId: nextLocationEvent.targetId
         };
     } else {
-        // No hay eventos futuros, el sistema puede "dormir" indefinidamente
         nextEventHorizon = { timestamp: Infinity, type: null, targetId: null };
     }
 }
+    
 // ===================================================================
 // NOMBRE: rebuildProcessedRemindersCache (VERSIÓN MODIFICADA CON ÍNDICE ESPACIAL)
 // RESUMEN: Procesa y cachea los recordatorios desde localStorage.
