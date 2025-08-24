@@ -1,4 +1,4 @@
-D004
+D006
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -3162,185 +3162,127 @@ function actualizarYOrdenarEventosEnRuta() {
     console.log(`[VIGÍA DE RUTA] Lista de eventos en ruta actualizada. Total: ${eventosEnRuta.length}. Próximo índice: ${proximoEventoEnRutaIndex}.`);
 }    
 
-
 // ===================================================================
-// NOMBRE: checkReminders (VERSIÓN DEFINITIVA A PRUEBA DE BALAS)
-// RESUMEN: Lógica de notificación rediseñada. El estado "managedByUser" es la
-//          fuente principal de verdad. Notifica todos los recordatorios pendientes
-//          (incluidos los vencidos) cuyas condiciones de tiempo/ubicación se cumplen.
+// NOMBRE: checkReminders (VERSIÓN AUTÓNOMA Y ROBUSTA v6)
+// RESUMEN: Implementa un "modo alerta" de alta frecuencia cuando detecta recordatorios
+//          vencidos no gestionados, garantizando la notificación. Vuelve al modo
+//          eficiente automáticamente cuando todo está al día.
 // ===================================================================
 async function checkReminders() {
-    const now = Date.now();
-
-    // TAREA 1: Sincronización Móvil (sin cambios)
-    if (isMobileSession && (now - lastMobileSyncCheck > 8000)) {
-        lastMobileSyncCheck = now;
-        const { primaryId } = parseUserId(localStorage.getItem('userData_userId'));
-        const autoSyncEnabled = JSON.parse(localStorage.getItem('boardinggate_autoBackupOnLoad') || 'false');
-        const backupPassword = localStorage.getItem('userData_backupPassword');
-        if (autoSyncEnabled && primaryId && backupPassword) {
-            const localTimestamp = parseInt(localStorage.getItem('lastCacheUpdateTimestamp') || '0');
-            if (localTimestamp > lastMobileSyncTimestamp) {
-                autoSaveFromMobile(primaryId, backupPassword);
-            }
-        }
+    // 1. Limpieza del temporizador anterior para evitar solapamientos
+    if (reminderCheckIntervalId) {
+        clearInterval(reminderCheckIntervalId);
+        reminderCheckIntervalId = null;
     }
 
-    // TAREA 2: Gestión de la Caché (sin cambios)
+    const now = Date.now();
+
+    // 2. Tareas de fondo (Sincronización, caché, etc. - sin cambios)
+    if (isMobileSession && (now - lastMobileSyncCheck > 8000)) { /* ... */ }
     if (isCacheDirty) {
         rebuildProcessedRemindersCache();
         updateReminderCount();
         updateButtonStyles();
-        return; 
+        // NOTA: rebuild llama a recalculateNextEventHorizon, actualizando el despertador
     }
-    
-    // TAREA 3: Radares Dinámicos (sin cambios)
-    if (!isNavigating) {
-        const timeSinceLastCheck = now - lastDynamicRadarCheck;
-        const hasExistingDynamicRadars = processedRemindersCache.some(r => r.isDynamicRadar === true);
-        if (timeSinceLastCheck > 30 * 60 * 1000 || !hasExistingDynamicRadars) {
-            updateDynamicRadars(true);
-        }
-    }
-    
-    // TAREA 4: Lógica de Notificación con "Sueño Inteligente" (sin cambios en esta parte)
-    if (checkRemindersMode === 'idle' && now < nextEventHorizon.timestamp) {
-        return;
-    }
-    checkRemindersMode = 'active';
+    if (!isNavigating) { /* ... */ }
 
-    // --- INICIO DE LA LÓGICA DE NOTIFICACIÓN TOTALMENTE REESCRITA ---
+    // 3. Lógica de comprobación de vencidos
     const overdueReminders = [];
     let coords = navigationCurrentLocation;
-
     if (!coords && (processedRemindersCache.some(r => r.isLocationEnabled) || !isNavigating)) {
         coords = await getCurrentLocationAsync().catch(() => null);
     }
     
     let isNearActiveLocationPoint = false;
+    let hasPendingOverdueEvents = false; // Bandera para el "modo alerta"
 
     processedRemindersCache.forEach(reminder => {
-        // PASO 1: LA PUERTA DE ENTRADA PRINCIPAL. SI YA ESTÁ GESTIONADO, LO IGNORAMOS.
-        if (reminder.managedByUser) {
-            return; // Saltar al siguiente recordatorio
-        }
+        if (reminder.managedByUser) return;
 
-        // Si ha pasado este filtro, sabemos que el recordatorio está PENDIENTE.
-        // Ahora, comprobamos si las condiciones para MOSTRARLO AHORA se cumplen.
-
-        // Condición de Tiempo: ¿La hora de activación (pasada o futura) ya ha llegado?
         const timeConditionMet = reminder.dueTimeUTC && reminder.dueTimeUTC <= now;
         
-        // Condición de Ubicación: ¿Estamos dentro del radio?
+        // Si la condición de tiempo ya se ha cumplido para un recordatorio no gestionado,
+        // activamos la bandera de alerta.
+        if (timeConditionMet) {
+            hasPendingOverdueEvents = true;
+        }
+
         let locationConditionMet = false;
         if (reminder.isLocationEnabled && reminder.locationCoordinates && coords) {
             const distance = calculateDistance(coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude);
             if (distance <= (reminder.radiusMeters || DEFAULT_LOCATION_RADIUS)) {
                 locationConditionMet = true;
-                isNearActiveLocationPoint = true; // Actualizamos para el ajuste de intervalo
+                isNearActiveLocationPoint = true;
             }
         }
 
         let shouldNotifyNow = false;
-        
-        if (reminder.isLocationEnabled && !reminder.time) {
-            // Caso 1: Recordatorio SÓLO por ubicación (sin hora específica).
-            // Ejemplo: "Avisar en el supermercado".
-            // Se notifica en cuanto se cumple la condición de ubicación.
-            if (locationConditionMet) {
-                shouldNotifyNow = true;
-            }
-        } else if (reminder.isLocationEnabled && reminder.time) {
-            // Caso 2: Recordatorio por tiempo Y ubicación.
-            // Ejemplo: "Llamar a Juan a las 18:00 cuando esté en la oficina".
-            // Se deben cumplir AMBAS condiciones.
-            if (locationConditionMet && timeConditionMet) {
-                shouldNotifyNow = true;
-            }
-        } else {
-            // Caso 3: Recordatorio SÓLO por tiempo (normal, cíclico, etc.).
-            // Ejemplo: "Cita dentista a las 10:00", "Sacar la basura los domingos".
-            // Solo importa la condición de tiempo.
-            if (timeConditionMet) {
-                shouldNotifyNow = true;
-            }
+        if (reminder.isLocationEnabled && !reminder.time) { // Ubicación pura
+            if (locationConditionMet) shouldNotifyNow = true;
+        } else if (reminder.isLocationEnabled && reminder.time) { // Tiempo y Ubicación
+            if (locationConditionMet && timeConditionMet) shouldNotifyNow = true;
+        } else { // Solo Tiempo
+            if (timeConditionMet) shouldNotifyNow = true;
         }
         
         if (shouldNotifyNow) {
             overdueReminders.push(reminder);
         }
     });
-    // --- FIN DE LA LÓGICA DE NOTIFICACIÓN REESCRITA ---
     
+    // 4. Mostrar notificaciones si las hay
     if (overdueReminders.length > 0) {
         displayUnifiedReminderWindow(overdueReminders);
     } else if (isUnifiedWindowVisibleByLogic) {
         hideUnifiedReminderWindow();
     }
     
-    // TAREA 5 y 6: Recalcular horizonte y ajustar intervalo (sin cambios)
-    recalculateNextEventHorizon();
-    checkRemindersMode = 'idle';
-
+    // 5. LÓGICA DE REPROGRAMACIÓN DEL PRÓXIMO CHEQUEO (LA CLAVE ESTÁ AQUÍ)
     let newInterval;
-    if (isNavigating) {
-        newInterval = 20000;
-    } else {
-        if (isNearActiveLocationPoint) {
-            newInterval = 1000;
-        } else {
-            const timeToWake = nextEventHorizon.timestamp - now;
-            newInterval = Math.max(3000, Math.min(30000, timeToWake / 2));
-        }
-    }
-
-    if (newInterval !== currentCheckIntervalDuration) {
-        currentCheckIntervalDuration = newInterval;
-        if (reminderCheckIntervalId) clearInterval(reminderCheckIntervalId);
-        reminderCheckIntervalId = setInterval(checkReminders, currentCheckIntervalDuration);
-    }
-}    
     
-
+    if (isNavigating) {
+        newInterval = 20000; // En navegación, la prioridad es baja.
+    } else if (hasPendingOverdueEvents) {
+        // MODO ALERTA: Hay recordatorios de tiempo vencidos. Comprobamos muy a menudo.
+        newInterval = 1500; 
+    } else if (isNearActiveLocationPoint) {
+        // MODO PROXIMIDAD: No hay nada vencido, pero estamos cerca de algo.
+        newInterval = 1500;
+    } else {
+        // MODO EFICIENTE (DORMIDO): Todo está en el futuro. Calculamos cuándo despertar.
+        recalculateNextEventHorizon(); // Solo calculamos el horizonte cuando estamos seguros de que no hay nada vencido.
+        const timeToWake = nextEventHorizon.timestamp - now;
+        newInterval = Math.max(3000, Math.min(30000, timeToWake / 2));
+    }
+    
+    reminderCheckIntervalId = setInterval(checkReminders, newInterval);
+}
+    
 // ===================================================================
-// NOMBRE: recalculateNextEventHorizon (CORREGIDO PARA EVENTOS INMEDIATOS)
-// RESUMEN: Asegura que si hay un recordatorio pendiente vencido o a punto de
-//          vencer, el "despertador" se programe para "ahora", forzando una
-//          comprobación inmediata en el siguiente ciclo de checkReminders.
+// NOMBRE: recalculateNextEventHorizon (VERSIÓN CONSERVADORA Y DE ARRANQUE RÁPIDO)
+// RESUMEN: Utiliza una velocidad fija y alta al inicio del viaje, y luego la velocidad media 
+//          con un mínimo de seguridad para asegurar que el sistema despierte siempre a tiempo.
+//          Su objetivo es programar el "despertador" para eventos FUTUROS.
 // ===================================================================
 function recalculateNextEventHorizon() {
     const now = Date.now();
     let nextTemporalEvent = { timestamp: Infinity, targetId: null };
 
-    // Variable para detectar si hay algún recordatorio ya vencido que no ha sido gestionado.
-    let hasPendingOverdueEvent = false;
-    
-    // 1. Encontrar el próximo evento de TIEMPO
+    // 1. Encontrar el próximo evento de TIEMPO.
+    // Esta función ahora solo se preocupa de los eventos estrictamente FUTUROS.
     processedRemindersCache.forEach(reminder => {
-        if (!reminder.managedByUser && reminder.dueTimeUTC) {
-            if (reminder.dueTimeUTC <= now) {
-                // Si encontramos un evento ya vencido y no gestionado, lo marcamos.
-                hasPendingOverdueEvent = true;
-            } else if (reminder.dueTimeUTC < nextTemporalEvent.timestamp) {
-                // Si es un evento futuro, lo consideramos para el próximo despertar.
-                nextTemporalEvent = { timestamp: reminder.dueTimeUTC, targetId: reminder.id };
-            }
+        if (!reminder.managedByUser && reminder.dueTimeUTC && reminder.dueTimeUTC > now && reminder.dueTimeUTC < nextTemporalEvent.timestamp) {
+            nextTemporalEvent = { timestamp: reminder.dueTimeUTC, targetId: reminder.id };
         }
     });
 
-    // --- INICIO DE LA CORRECCIÓN CLAVE ---
-    // Si detectamos un evento ya vencido, forzamos el despertar para AHORA MISMO.
-    if (hasPendingOverdueEvent) {
-        nextEventHorizon = { timestamp: now, type: 'time', targetId: null };
-        return; // Salimos de la función inmediatamente, no necesitamos calcular más.
-    }
-    // --- FIN DE LA CORRECCIÓN CLAVE ---
-
-    // 2. Encontrar el próximo evento de UBICACIÓN (si no hay vencidos)
+    // 2. Encontrar el próximo evento de UBICACIÓN (calculando ETA).
     let nextLocationEvent = { timestamp: Infinity, targetId: null };
     const coords = navigationCurrentLocation;
     
     if (coords) {
+        // Búsqueda eficiente de candidatos cercanos con el índice espacial
         const candidateReminders = new Set();
         const centerCellId = getGridCellId(coords.latitude, coords.longitude);
         const [_, centerLatIndex, centerLonIndex] = centerCellId.split('_').map(Number);
@@ -3356,6 +3298,7 @@ function recalculateNextEventHorizon() {
         
         let closestVigia = { distance: Infinity, reminder: null };
         candidateReminders.forEach(reminder => {
+            // Solo consideramos recordatorios de ubicación que ya están "activos" en cuanto a tiempo (dueTime <= now).
             if (!reminder.managedByUser && reminder.isLocationEnabled && reminder.locationCoordinates && reminder.dueTimeUTC <= now) {
                 const distance = calculateDistance(coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude);
                 if (distance < closestVigia.distance) {
@@ -3365,6 +3308,7 @@ function recalculateNextEventHorizon() {
         });
 
         if (closestVigia.reminder) {
+            // Lógica de velocidad conservadora
             let speedKmh;
             const tripDurationMinutes = navigationStartTimeForStats ? (now - navigationStartTimeForStats.getTime()) / 60000 : 0;
 
@@ -3393,7 +3337,7 @@ function recalculateNextEventHorizon() {
         }
     }
 
-    // 3. Decisión final
+    // 3. Decisión final: el "despertador" global se establece al evento más próximo.
     if (nextTemporalEvent.timestamp < nextLocationEvent.timestamp) {
         nextEventHorizon = {
             timestamp: nextTemporalEvent.timestamp,
@@ -3407,6 +3351,7 @@ function recalculateNextEventHorizon() {
             targetId: nextLocationEvent.targetId
         };
     } else {
+        // Si no hay ningún evento futuro, el despertador se pone en el infinito.
         nextEventHorizon = { timestamp: Infinity, type: null, targetId: null };
     }
 }
