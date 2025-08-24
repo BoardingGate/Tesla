@@ -878,7 +878,6 @@ D001
 
     let eventosEnRuta = []; // Array unificado y ordenado de radares y tareas en la ruta.
     let proximoEventoEnRutaIndex = 0; // Puntero al próximo evento a comprobar en el array 'eventosEnRuta'.
-    const UMBRAL_AVISO_EVENTO_RUTA_METROS = 500; // Distancia (en metros) antes de un evento para empezar a mostrar la alerta.
 
     const GPS_BASE_FREQUENCY_HZ = 10; 
 
@@ -3302,6 +3301,144 @@ async function checkReminders() {
         reminderCheckIntervalId = setInterval(checkReminders, currentCheckIntervalDuration);
     }
 }
+
+// ===================================================================
+// NOMBRE: checkReminders (VERSIÓN DEFINITIVA A PRUEBA DE BALAS)
+// RESUMEN: Lógica de notificación rediseñada. El estado "managedByUser" es la
+//          fuente principal de verdad. Notifica todos los recordatorios pendientes
+//          (incluidos los vencidos) cuyas condiciones de tiempo/ubicación se cumplen.
+// ===================================================================
+async function checkReminders() {
+    const now = Date.now();
+
+    // TAREA 1: Sincronización Móvil (sin cambios)
+    if (isMobileSession && (now - lastMobileSyncCheck > 8000)) {
+        lastMobileSyncCheck = now;
+        const { primaryId } = parseUserId(localStorage.getItem('userData_userId'));
+        const autoSyncEnabled = JSON.parse(localStorage.getItem('boardinggate_autoBackupOnLoad') || 'false');
+        const backupPassword = localStorage.getItem('userData_backupPassword');
+        if (autoSyncEnabled && primaryId && backupPassword) {
+            const localTimestamp = parseInt(localStorage.getItem('lastCacheUpdateTimestamp') || '0');
+            if (localTimestamp > lastMobileSyncTimestamp) {
+                autoSaveFromMobile(primaryId, backupPassword);
+            }
+        }
+    }
+
+    // TAREA 2: Gestión de la Caché (sin cambios)
+    if (isCacheDirty) {
+        rebuildProcessedRemindersCache();
+        updateReminderCount();
+        updateButtonStyles();
+        return; 
+    }
+    
+    // TAREA 3: Radares Dinámicos (sin cambios)
+    if (!isNavigating) {
+        const timeSinceLastCheck = now - lastDynamicRadarCheck;
+        const hasExistingDynamicRadars = processedRemindersCache.some(r => r.isDynamicRadar === true);
+        if (timeSinceLastCheck > 30 * 60 * 1000 || !hasExistingDynamicRadars) {
+            updateDynamicRadars(true);
+        }
+    }
+    
+    // TAREA 4: Lógica de Notificación con "Sueño Inteligente" (sin cambios en esta parte)
+    if (checkRemindersMode === 'idle' && now < nextEventHorizon.timestamp) {
+        return;
+    }
+    checkRemindersMode = 'active';
+
+    // --- INICIO DE LA LÓGICA DE NOTIFICACIÓN TOTALMENTE REESCRITA ---
+    const overdueReminders = [];
+    let coords = navigationCurrentLocation;
+
+    if (!coords && (processedRemindersCache.some(r => r.isLocationEnabled) || !isNavigating)) {
+        coords = await getCurrentLocationAsync().catch(() => null);
+    }
+    
+    let isNearActiveLocationPoint = false;
+
+    processedRemindersCache.forEach(reminder => {
+        // PASO 1: LA PUERTA DE ENTRADA PRINCIPAL. SI YA ESTÁ GESTIONADO, LO IGNORAMOS.
+        if (reminder.managedByUser) {
+            return; // Saltar al siguiente recordatorio
+        }
+
+        // Si ha pasado este filtro, sabemos que el recordatorio está PENDIENTE.
+        // Ahora, comprobamos si las condiciones para MOSTRARLO AHORA se cumplen.
+
+        // Condición de Tiempo: ¿La hora de activación (pasada o futura) ya ha llegado?
+        const timeConditionMet = reminder.dueTimeUTC && reminder.dueTimeUTC <= now;
+        
+        // Condición de Ubicación: ¿Estamos dentro del radio?
+        let locationConditionMet = false;
+        if (reminder.isLocationEnabled && reminder.locationCoordinates && coords) {
+            const distance = calculateDistance(coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude);
+            if (distance <= (reminder.radiusMeters || DEFAULT_LOCATION_RADIUS)) {
+                locationConditionMet = true;
+                isNearActiveLocationPoint = true; // Actualizamos para el ajuste de intervalo
+            }
+        }
+
+        let shouldNotifyNow = false;
+        
+        if (reminder.isLocationEnabled && !reminder.time) {
+            // Caso 1: Recordatorio SÓLO por ubicación (sin hora específica).
+            // Ejemplo: "Avisar en el supermercado".
+            // Se notifica en cuanto se cumple la condición de ubicación.
+            if (locationConditionMet) {
+                shouldNotifyNow = true;
+            }
+        } else if (reminder.isLocationEnabled && reminder.time) {
+            // Caso 2: Recordatorio por tiempo Y ubicación.
+            // Ejemplo: "Llamar a Juan a las 18:00 cuando esté en la oficina".
+            // Se deben cumplir AMBAS condiciones.
+            if (locationConditionMet && timeConditionMet) {
+                shouldNotifyNow = true;
+            }
+        } else {
+            // Caso 3: Recordatorio SÓLO por tiempo (normal, cíclico, etc.).
+            // Ejemplo: "Cita dentista a las 10:00", "Sacar la basura los domingos".
+            // Solo importa la condición de tiempo.
+            if (timeConditionMet) {
+                shouldNotifyNow = true;
+            }
+        }
+        
+        if (shouldNotifyNow) {
+            overdueReminders.push(reminder);
+        }
+    });
+    // --- FIN DE LA LÓGICA DE NOTIFICACIÓN REESCRITA ---
+    
+    if (overdueReminders.length > 0) {
+        displayUnifiedReminderWindow(overdueReminders);
+    } else if (isUnifiedWindowVisibleByLogic) {
+        hideUnifiedReminderWindow();
+    }
+    
+    // TAREA 5 y 6: Recalcular horizonte y ajustar intervalo (sin cambios)
+    recalculateNextEventHorizon();
+    checkRemindersMode = 'idle';
+
+    let newInterval;
+    if (isNavigating) {
+        newInterval = 20000;
+    } else {
+        if (isNearActiveLocationPoint) {
+            newInterval = 1000;
+        } else {
+            const timeToWake = nextEventHorizon.timestamp - now;
+            newInterval = Math.max(3000, Math.min(30000, timeToWake / 2));
+        }
+    }
+
+    if (newInterval !== currentCheckIntervalDuration) {
+        currentCheckIntervalDuration = newInterval;
+        if (reminderCheckIntervalId) clearInterval(reminderCheckIntervalId);
+        reminderCheckIntervalId = setInterval(checkReminders, currentCheckIntervalDuration);
+    }
+}    
     
 // ===================================================================
 // NOMBRE: recalculateNextEventHorizon (VERSIÓN CONSERVADORA Y DE ARRANQUE RÁPIDO)
@@ -5739,11 +5876,10 @@ function updateTripStatistics(coords) {
     }
 }
 
-
 // ===================================================================
-// NOMBRE: processRouteProgress (VERSIÓN OPTIMIZADA CON VIGÍA DE RUTA)
-// RESUMEN: Utiliza un método directo de Turf.js para encontrar la distancia a lo largo de la ruta,
-//          y AHORA comprueba de forma súper eficiente solo el próximo evento en ruta (vigía).
+// NOMBRE: processRouteProgress (VERSIÓN FINAL CON AVISO BASADO ÚNICAMENTE EN RADIO)
+// RESUMEN: Elimina el umbral de pre-vigilancia. La alerta se activa
+//          directamente cuando la distancia al evento es menor o igual a su radio específico.
 // ===================================================================
 function processRouteProgress(coords, mapInstanceToUse) {
     if (!isNavigating || !navigationCurrentRouteData?.routes?.[0]?._turfLineString || !coords) {
@@ -5760,8 +5896,7 @@ function processRouteProgress(coords, mapInstanceToUse) {
         const nearestPointOnRoute = turf.nearestPointOnLine(fullRouteLineString, _turfCurrentPoint, { units: 'meters' });
         carDistCalculated = nearestPointOnRoute.properties.location;
     } catch (e) {
-        console.warn("[OPTIMIZATION FALLBACK] El método directo de Turf falló. Usando método de respaldo.", e);
-        try {
+        try { // Fallback
             _turfCurrentPoint.geometry.coordinates[0] = coords.longitude;
             _turfCurrentPoint.geometry.coordinates[1] = coords.latitude;
             const carPointTurf = _turfCurrentPoint;
@@ -5770,7 +5905,6 @@ function processRouteProgress(coords, mapInstanceToUse) {
             const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
             carDistCalculated = turf.length(lineSliceToNearestTurf, { units: 'meters' });
         } catch (turfError) {
-            console.error("Fallo crítico: Incluso el método de respaldo de Turf falló.", turfError);
             carDistCalculated = lastCarDistanceAlongRouteForNavLogic;
         }
     }
@@ -5784,30 +5918,30 @@ function processRouteProgress(coords, mapInstanceToUse) {
         lastCarDistanceAlongRouteForNavLogic = totalRouteLength;
     }
 
-    // --- INICIO: MODIFICACIÓN PARA LA LÓGICA DEL VIGÍA DE RUTA ---
-    // En lugar de iterar sobre todos los radares/tareas, solo comprobamos el próximo.
+    // --- INICIO DE LA LÓGICA DE VIGÍA DE RUTA SIMPLIFICADA Y CORREGIDA ---
     if (eventosEnRuta.length > 0 && proximoEventoEnRutaIndex < eventosEnRuta.length) {
         const proximoEvento = eventosEnRuta[proximoEventoEnRutaIndex];
+        const distanciaAlEvento = proximoEvento.distanceOnRoute - lastCarDistanceAlongRouteForNavLogic;
         
-        // Comprobamos si estamos dentro del umbral de aviso del próximo evento.
-        if (lastCarDistanceAlongRouteForNavLogic >= (proximoEvento.distanceOnRoute - UMBRAL_AVISO_EVENTO_RUTA_METROS)) {
+        // Obtenemos el radio específico del evento. Si no tiene, usamos uno por defecto.
+        const radioDelEvento = proximoEvento.radiusMeters || DEFAULT_LOCATION_RADIUS;
+
+        // 1. CONDICIÓN ÚNICA Y DIRECTA: ¿Hemos entrado en el radio de acción del evento?
+        if (distanciaAlEvento <= radioDelEvento) {
             
-            // Comprobamos si el recordatorio ya ha vencido (en caso de que tenga un tiempo específico)
             const dueTime = proximoEvento.dueTimeUTC;
             const now = Date.now();
             
-            if (!dueTime || dueTime <= now) {
-                // Si el evento no ha sido gestionado por el usuario, lo mostramos.
-                if (!proximoEvento.managedByUser) {
-                    displayUnifiedReminderWindow([proximoEvento]);
-                }
+            // 2. ¿El evento está activo y no ha sido visto ya?
+            if ((!dueTime || dueTime <= now) && !proximoEvento.managedByUser) {
+                displayUnifiedReminderWindow([proximoEvento]);
             }
-            
-            // Una vez que pasamos la ubicación exacta del evento, avanzamos al siguiente.
-            if (lastCarDistanceAlongRouteForNavLogic >= proximoEvento.distanceOnRoute) {
-                proximoEventoEnRutaIndex++; 
-                console.log(`[VIGÍA DE RUTA] Evento superado. Próximo índice: ${proximoEventoEnRutaIndex}.`);
-            }
+        }
+        
+        // 3. ¿Hemos SUPERADO la ubicación del evento para pasar al siguiente?
+        // Se mantiene la lógica de avanzar el puntero solo cuando la distancia es negativa.
+        if (distanciaAlEvento < 0) {
+            proximoEventoEnRutaIndex++; 
         }
     }
    
@@ -5815,7 +5949,7 @@ function processRouteProgress(coords, mapInstanceToUse) {
     renderWaypointMarkers();
     updateTurnByTurnDisplay(route, lastCarDistanceAlongRouteForNavLogic);
     updateNavigationProgressDisplay(route, lastCarDistanceAlongRouteForNavLogic);
-}    
+}
     
 // ===================================================================
 // NOMBRE: startGpsWatching (VERSIÓN SIMPLIFICADA CON COPIA TEMPORAL)
