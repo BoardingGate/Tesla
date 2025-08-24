@@ -1,4 +1,4 @@
-D006
+D007
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -3258,6 +3258,96 @@ async function checkReminders() {
     
     reminderCheckIntervalId = setInterval(checkReminders, newInterval);
 }
+
+// ===================================================================
+// NOMBRE: checkReminders (CON LOGGING DE DEPURACIÓN)
+// ===================================================================
+async function checkReminders() {
+    if (reminderCheckIntervalId) {
+        clearInterval(reminderCheckIntervalId);
+        reminderCheckIntervalId = null;
+    }
+
+    console.log("--- CICLO CHECKREMINDERS INICIADO ---");
+    const now = Date.now();
+
+    if (isCacheDirty) {
+        console.log("%c[CACHE] La caché está sucia. Reconstruyendo...", "color: orange;");
+        rebuildProcessedRemindersCache();
+        updateReminderCount();
+        updateButtonStyles();
+    }
+    
+    const overdueReminders = [];
+    let coords = navigationCurrentLocation;
+    if (!coords && processedRemindersCache.some(r => r.isLocationEnabled)) {
+        coords = await getCurrentLocationAsync().catch(() => null);
+    }
+    
+    let isNearActiveLocationPoint = false;
+    let hasPendingOverdueEvents = false;
+
+    processedRemindersCache.forEach(reminder => {
+        if (reminder.managedByUser) return;
+
+        const timeConditionMet = reminder.dueTimeUTC && reminder.dueTimeUTC <= now;
+        if (timeConditionMet) {
+            hasPendingOverdueEvents = true;
+        }
+
+        let locationConditionMet = false;
+        if (reminder.isLocationEnabled && reminder.locationCoordinates && coords) {
+            const distance = calculateDistance(coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude);
+            if (distance <= (reminder.radiusMeters || DEFAULT_LOCATION_RADIUS)) {
+                locationConditionMet = true;
+                isNearActiveLocationPoint = true;
+            }
+        }
+
+        let shouldNotifyNow = false;
+        if (reminder.isLocationEnabled && !reminder.time) {
+            if (locationConditionMet) shouldNotifyNow = true;
+        } else if (reminder.isLocationEnabled && reminder.time) {
+            if (locationConditionMet && timeConditionMet) shouldNotifyNow = true;
+        } else {
+            if (timeConditionMet) shouldNotifyNow = true;
+        }
+        
+        if (shouldNotifyNow) {
+            console.log(`%c[NOTIFICAR!] Evento vencido: "${reminder.text.replace(/<[^>]*>/g, '')}". timeMet: ${timeConditionMet}, locationMet: ${locationConditionMet}`, 'color: #FF6347; font-weight: bold;');
+            overdueReminders.push(reminder);
+        }
+    });
+    
+    if (overdueReminders.length > 0) {
+        console.log(`%c[DISPLAY] Mostrando ${overdueReminders.length} notificaciones.`, 'background: #28a745; color: white;');
+        displayUnifiedReminderWindow(overdueReminders);
+    } else if (isUnifiedWindowVisibleByLogic) {
+        hideUnifiedReminderWindow();
+    }
+    
+    let newInterval;
+    let reason = "";
+    
+    if (isNavigating) {
+        newInterval = 20000;
+        reason = "Navegación activa";
+    } else if (hasPendingOverdueEvents) {
+        newInterval = 1500; 
+        reason = "MODO ALERTA (hay eventos vencidos)";
+    } else if (isNearActiveLocationPoint) {
+        newInterval = 1500;
+        reason = "MODO PROXIMIDAD (cerca de un punto)";
+    } else {
+        recalculateNextEventHorizon();
+        const timeToWake = nextEventHorizon.timestamp - now;
+        newInterval = timeToWake <= 0 ? 3000 : Math.max(3000, Math.min(30000, timeToWake / 2));
+        reason = `MODO EFICIENTE (próximo despertar en ${Math.round(timeToWake/1000)}s)`;
+    }
+    
+    console.log(`%c[INTERVALO] Próximo chequeo en ${newInterval / 1000} segundos. Razón: ${reason}.`, 'color: #BA55D3;');
+    reminderCheckIntervalId = setInterval(checkReminders, newInterval);
+}                                          
     
 // ===================================================================
 // NOMBRE: recalculateNextEventHorizon (VERSIÓN CONSERVADORA Y DE ARRANQUE RÁPIDO)
@@ -3355,6 +3445,70 @@ function recalculateNextEventHorizon() {
         nextEventHorizon = { timestamp: Infinity, type: null, targetId: null };
     }
 }
+
+// ===================================================================
+// NOMBRE: recalculateNextEventHorizon (CON LOGGING DE DEPURACIÓN)
+// ===================================================================
+function recalculateNextEventHorizon() {
+    const now = Date.now();
+    let nextTemporalEvent = { timestamp: Infinity, id: null, text: null };
+    let nextLocationEvent = { timestamp: Infinity, id: null, text: null };
+    
+    // 1. Encontrar próximo evento de TIEMPO
+    processedRemindersCache.forEach(reminder => {
+        if (!reminder.managedByUser && reminder.dueTimeUTC && reminder.dueTimeUTC > now && reminder.dueTimeUTC < nextTemporalEvent.timestamp) {
+            nextTemporalEvent = { timestamp: reminder.dueTimeUTC, id: reminder.id, text: reminder.text };
+        }
+    });
+
+    // 2. Encontrar próximo evento de UBICACIÓN
+    const coords = navigationCurrentLocation;
+    if (coords) {
+        const candidateReminders = new Set();
+        const centerCellId = getGridCellId(coords.latitude, coords.longitude);
+        const [_, centerLatIndex, centerLonIndex] = centerCellId.split('_').map(Number);
+        for (let i = -1; i <= 1; i++) { for (let j = -1; j <= 1; j++) { const cellId = `cell_${centerLatIndex + i}_${centerLonIndex + j}`; if (remindersSpatialIndex[cellId]) { remindersSpatialIndex[cellId].forEach(r => candidateReminders.add(r)); } } }
+        let closestVigia = { distance: Infinity, reminder: null };
+        candidateReminders.forEach(reminder => {
+            if (!reminder.managedByUser && reminder.isLocationEnabled && reminder.locationCoordinates && reminder.dueTimeUTC <= now) {
+                const distance = calculateDistance(coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude);
+                if (distance < closestVigia.distance) { closestVigia = { distance: distance, reminder: reminder }; }
+            }
+        });
+
+        if (closestVigia.reminder) {
+            let speedKmh;
+            const tripDurationMinutes = navigationStartTimeForStats ? (now - navigationStartTimeForStats.getTime()) / 60000 : 0;
+            if (tripDurationMinutes < 5) { speedKmh = 90; } 
+            else { const MINIMUM_AVERAGE_SPEED_FOR_CALC = 60; speedKmh = Math.max(window.averageSpeedKmh, MINIMUM_AVERAGE_SPEED_FOR_CALC); }
+            if (speedKmh < 1) { speedKmh = 40; }
+            
+            const speedMps = speedKmh * 1000 / 3600;
+            const distanceToActivationZone = Math.max(0, closestVigia.distance - (closestVigia.reminder.radiusMeters || DEFAULT_LOCATION_RADIUS));
+            const etaSeconds = speedMps > 0 ? distanceToActivationZone / speedMps : Infinity;
+            const MARGEN_SEGURIDAD_MS = 60 * 1000; 
+            const wakeUpTimestamp = now + (etaSeconds * 1000) - MARGEN_SEGURIDAD_MS;
+            
+            nextLocationEvent = {
+                timestamp: Math.max(now, wakeUpTimestamp),
+                id: closestVigia.reminder.id,
+                text: closestVigia.reminder.text
+            };
+        }
+    }
+
+    // 3. Decisión final y LOGGING
+    if (nextTemporalEvent.timestamp < nextLocationEvent.timestamp) {
+        nextEventHorizon = { timestamp: nextTemporalEvent.timestamp, type: 'time', targetId: nextTemporalEvent.id };
+        console.log(`%c[HORIZONTE] Próximo evento: TIEMPO. Despertar en ${Math.round((nextTemporalEvent.timestamp - now)/1000)}s para: "${nextTemporalEvent.text.replace(/<[^>]*>/g, '')}"`, 'color: #87CEEB;');
+    } else if (nextLocationEvent.id) {
+        nextEventHorizon = { timestamp: nextLocationEvent.timestamp, type: 'location', targetId: nextLocationEvent.id };
+        console.log(`%c[HORIZONTE] Próximo evento: UBICACIÓN. Despertar en ${Math.round((nextLocationEvent.timestamp - now)/1000)}s para: "${nextLocationEvent.text.replace(/<[^>]*>/g, '')}"`, 'color: #98FB98;');
+    } else {
+        nextEventHorizon = { timestamp: Infinity, type: null, targetId: null };
+        console.log('%c[HORIZONTE] No hay eventos futuros. Durmiendo indefinidamente.', 'color: #DDA0DD;');
+    }
+}    
     
 // ===================================================================
 // NOMBRE: rebuildProcessedRemindersCache (VERSIÓN MODIFICADA CON ÍNDICE ESPACIAL)
