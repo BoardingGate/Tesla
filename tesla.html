@@ -7,8 +7,7 @@
     <link rel="icon" href="https://boardinggate.github.io/Tesla/th.jpeg" type="image/jpeg">
     <script src="https://cdn.tailwindcss.com"></script>
     <script type="module">                                                                                                                                                                                                                                          import { initializeApp } from "https://www.gstatic.com/firebasejs/11.9.1/firebase-app.js";   import { getFirestore, doc, setDoc, getDoc, getDocs, deleteDoc, collection, serverTimestamp, where, query, orderBy, limit, addDoc, writeBatch, startAfter } from "https://www.gstatic.com/firebasejs/11.9.1/firebase-firestore.js"; console.log("Firebase Init Script: STARTING initialization.");   const firebaseConfig = {apiKey: "AIzaSyCEAWL1Pj1OMBrGnXLOS79W3iDjMkmTQGw",authDomain: "boardinggate-1df74.firebaseapp.com",databaseURL: "https://boardinggate-1df74-default-rtdb.europe-west1.firebaseio.com",projectId: "boardinggate-1df74",storageBucket: "boardinggate-1df74.appspot.com", messagingSenderId: "771541345352",appId: "1:771541345352:web:0447d72b3383875ac5a47d" };    try {    const app = initializeApp(firebaseConfig);     window.db = getFirestore(app);   window.doc = doc;  window.setDoc = setDoc;  window.getDoc = getDoc;  window.collection = collection; window.getDocs = getDocs;  window.deleteDoc = deleteDoc;  window.serverTimestamp = serverTimestamp;  window.where = where; window.query = query; window.orderBy = orderBy;window.limit = limit; window.addDoc = addDoc;  window.writeBatch = writeBatch; window.startAfter = startAfter; console.log("Firebase Init Script: SUCCESS Firestore initialized and functions exposed globally. window.db is:", window.db);  } catch (e) { console.error("Firebase Init Script: ERROR during initialization!", e); }  console.log("Firebase Init Script: END of initialization block.");</script>
-    
-    
+        
     <link rel="stylesheet" href="tesla.css">
      
     <link href='https://api.mapbox.com/mapbox-gl-js/v3.13.0/mapbox-gl.css' rel='stylesheet' />
@@ -539,8 +538,7 @@
         '3D': {pitch: 62, bearing: null, mode: 'perspective'}
     };
 
-    // ... Cerca de otras declaraciones de variables globales como markerAnimationState
-
+ 
     let lerpRatePosition = 0.004;
     let lerpRateRotation = 0.002;
     let lerpRateZoom = 0.001;
@@ -562,7 +560,8 @@
     targetMapOffsetX: 0,
     currentMapOffsetY: 0,
     targetMapOffsetY: 0,
-    lastTimestamp: null
+    lastTimestamp: null,
+    lastCameraTimestamp: null     
     };
     
     let nextManeuverStepForPreview = null;
@@ -875,9 +874,15 @@
 
     let eventosEnRuta = []; // Array unificado y ordenado de radares y tareas en la ruta.
     let proximoEventoEnRutaIndex = 0; // Puntero al próximo evento a comprobar en el array 'eventosEnRuta'.
-    const UMBRAL_AVISO_EVENTO_RUTA_METROS = 500; // Distancia (en metros) antes de un evento para empezar a mostrar la alerta.
 
     const GPS_BASE_FREQUENCY_HZ = 10; 
+
+
+    let lastMapUpdateTime = 0;
+    let MAP_UPDATE_INTERVAL_MS = 25; 
+    let lastGarbageCollectionYield = 0;
+    const PERFORMANCE_CAMERA_FPS_KEY = 'boardinggate_camera_fps'; 
+    
     
     const navigationTasks = {
         CRITICAL_VISUALS: {
@@ -956,7 +961,7 @@
         PERFORMANCE_RATIO_ROUTE_KEY, PERFORMANCE_RATIO_ALERTS_KEY, 
         PERFORMANCE_RATIO_STATS_KEY, PERFORMANCE_RATIO_GRAPH_KEY,
         'boardinggate_map_saturation', 'boardinggate_map_contrast', 
-        LERP_RATE_POS_KEY, LERP_RATE_ROT_KEY, LERP_RATE_ZOOM_KEY
+        LERP_RATE_POS_KEY, LERP_RATE_ROT_KEY, LERP_RATE_ZOOM_KEY, PERFORMANCE_CAMERA_FPS_KEY
      ];
 
     
@@ -990,6 +995,7 @@
             case LERP_RATE_POS_KEY: return 'Suavizado Posición';
             case LERP_RATE_ROT_KEY: return 'Suavizado Rotación';
             case LERP_RATE_ZOOM_KEY: return 'Suavizado Zoom';
+            case PERFORMANCE_CAMERA_FPS_KEY: return 'FPS Animación Cámara';     
             default:return k;
         }
     }).join(', ');   
@@ -1888,10 +1894,6 @@ async function initializeApp() {
     try { await loadNotices(); startNoticeRotation(); } catch (e) { }
     if (reminderCheckIntervalId) { clearInterval(reminderCheckIntervalId); }
     
-    checkReminders(); 
-
-    currentCheckIntervalDuration = 3000;
-    reminderCheckIntervalId = setInterval(checkReminders, currentCheckIntervalDuration);
     
     if (!termsAccepted) {
         showConfigModal();
@@ -2281,10 +2283,11 @@ function loadSavedSettings() {
     performanceRatios.tripStats = parseInt(localStorage.getItem(PERFORMANCE_RATIO_STATS_KEY)) || 32;
     performanceRatios.performanceGraph = parseInt(localStorage.getItem(PERFORMANCE_RATIO_GRAPH_KEY)) || 70;
 
-    // --- INICIO: MODIFICACIÓN PARA CARGAR VALORES LERP A MEMORIA ---
+    const savedCameraFps = parseInt(localStorage.getItem(PERFORMANCE_CAMERA_FPS_KEY)) || 40;
+    MAP_UPDATE_INTERVAL_MS = 1000 / savedCameraFps;
+    
     loadAndCacheLerpSettings();
-    // --- FIN: MODIFICACIÓN ---
-
+ 
     if (!localStorage.getItem('boardinggate_map_saturation')) localStorage.setItem('boardinggate_map_saturation', '1.6');
     if (!localStorage.getItem('boardinggate_map_contrast')) localStorage.setItem('boardinggate_map_contrast', '1.2');
     
@@ -2392,8 +2395,9 @@ function sanitizeWaypointsForStorage(waypoints) {
         };
     }).filter(Boolean); 
 }
+
 // ===================================================================
-// NOMBRE: showNavigationMapHelpModal 
+// NOMBRE: showNavigationMapHelpModal
 // RESUMEN: Muestra un modal de ayuda completo con todos los controles de
 function showNavigationMapHelpModal() {
     const existingHelpModal = document.getElementById('reminders-map-help-modal-instance');
@@ -2503,6 +2507,15 @@ function showNavigationMapHelpModal() {
                     <span id="gps-hz-display" class="value-display" style="text-align: left;">Calculando...</span>
                 </div>
                 <div class="slider-control">
+                    <label for="camera-fps-slider">Animación Cámara FPS:</label>
+                    <div class="slider-input-wrapper">
+                        <button type="button" class="slider-btn minus" data-target="camera-fps-slider">-</button>
+                        <button type="button" class="slider-btn plus" data-target="camera-fps-slider">+</button>
+                        <input type="range" id="camera-fps-slider" min="1" max="60" step="1">
+                    </div>
+                    <span id="camera-fps-value" class="value-display"></span>
+                </div>
+                <div class="slider-control">
                     <label for="ratio-critical-update-slider">Procesos Críticos:</label>
                     <div class="slider-input-wrapper">
                         <button type="button" class="slider-btn minus" data-target="ratio-critical-update-slider">-</button>
@@ -2609,7 +2622,6 @@ function showNavigationMapHelpModal() {
  
     document.body.appendChild(helpModal); 
     
-    // Lógica para el nuevo checkbox
     const directToNavCheckboxMapHelp = helpModal.querySelector('#direct-to-nav-checkbox-map-help');
     if (directToNavCheckboxMapHelp) {
         directToNavCheckboxMapHelp.checked = JSON.parse(localStorage.getItem(DIRECT_TO_NAVIGATION_KEY)) || false;
@@ -2630,7 +2642,7 @@ function showNavigationMapHelpModal() {
             const val = slider.value;
             valueDisplay.textContent = parseFloat(val).toFixed(4);
             localStorage.setItem(storageKey, val);
-            loadAndCacheLerpSettings(); // <-- MODIFICACIÓN: Actualiza la variable en memoria
+            loadAndCacheLerpSettings();
             markCacheAsDirty();
          });
     };
@@ -2688,6 +2700,22 @@ function showNavigationMapHelpModal() {
 
     const gpsHzDisplay = helpModal.querySelector('#gps-hz-display');
     let baseFrequency = 0;
+    
+    const cameraFpsSlider = helpModal.querySelector('#camera-fps-slider');
+    const cameraFpsValue = helpModal.querySelector('#camera-fps-value');
+    if (cameraFpsSlider && cameraFpsValue) {
+        const savedFps = parseInt(localStorage.getItem(PERFORMANCE_CAMERA_FPS_KEY)) || 40;
+        cameraFpsSlider.value = savedFps;
+        cameraFpsValue.textContent = `${savedFps} FPS`;
+
+        cameraFpsSlider.addEventListener('input', () => {
+            const fps = parseInt(cameraFpsSlider.value);
+            cameraFpsValue.textContent = `${fps} FPS`;
+            MAP_UPDATE_INTERVAL_MS = 1000 / fps;
+            localStorage.setItem(PERFORMANCE_CAMERA_FPS_KEY, fps);
+            markCacheAsDirty();
+        });
+    }
 
     const sliders = [
         { id: 'ratio-critical-update-slider', valueId: 'ratio-critical-update-value', key: PERFORMANCE_RATIO_CRITICAL_KEY, default: 3, name: 'criticalUpdate' },
@@ -2765,6 +2793,8 @@ function showNavigationMapHelpModal() {
             slider.value = config.default;
             slider.dispatchEvent(new Event('input'));
         });
+        if (cameraFpsSlider) cameraFpsSlider.value = 40;
+        if (cameraFpsSlider) cameraFpsSlider.dispatchEvent(new Event('input'));
         showToast('Ratios de rendimiento restaurados.', 'info');
     });
 
@@ -2824,9 +2854,10 @@ function showNavigationMapHelpModal() {
     addModalAutoCloseTimer(helpModal, closeButtonHelp, 'reminders-map-help-modal-instance', 90000);
 }
     
+
 // ===================================================================
 // NOMBRE: updateDynamicRadars 
-// RESUMEN: Carga radares dinámicos según el contexto (en ruta o en radio).
+// RESUMEN: Carga radares dinámicos en un radio cuando no se navega. SE HA ELIMINADO LA LÓGICA DE RUTA PARA EVITAR BUCLES.
 async function updateDynamicRadars(isInitialLoadCheck = false) {
     const nowDate = new Date();
     const now = nowDate.getTime();
@@ -2852,66 +2883,59 @@ async function updateDynamicRadars(isInitialLoadCheck = false) {
         
         const routeSource = navigationMapInstance?.getSource('route');
         if (routeSource && routeSource._data && routeSource._data.geometry && routeSource._data.geometry.coordinates.length > 1) {
-            const originalCheckboxState = document.getElementById('radares-ruta-checkbox').checked;
-            await toggleRadaresRuta(true); // Forzamos la carga de radares en ruta
-            newRadars = [...radaresEnRutaActual];
-            
-            if (!originalCheckboxState) {
-                document.getElementById('radares-ruta-checkbox').checked = false;
-                eliminarRadaresDeRuta(); 
-            }
+            return; 
+        } 
+        
+        let coords = null;
+        if (navigationCurrentLocation && (Date.now() - lastGpsUpdateTime < 30000)) {
+            coords = navigationCurrentLocation;
         } else {
-            let coords = null;
-            if (navigationCurrentLocation && (Date.now() - lastGpsUpdateTime < 30000)) {
-                coords = navigationCurrentLocation;
-            } else {
-                coords = await getCurrentLocationAsync();
-            }
-            if (!coords) throw new Error("Ubicación del vehículo no disponible.");
-
-            const DYNAMIC_RADAR_SEARCH_RADIUS_KM = 45;
-            const candidateRadars = new Set();
-            const R = 6371;
-            const rad = DYNAMIC_RADAR_SEARCH_RADIUS_KM / R;
-            const latRad = coords.latitude * Math.PI / 180;
-            const GRID_SIZE = 0.1;
-
-            const latMin = coords.latitude - (rad * 180 / Math.PI);
-            const latMax = coords.latitude + (rad * 180 / Math.PI);
-            const deltaLon = Math.asin(Math.sin(rad) / Math.cos(latRad));
-            const lonMin = coords.longitude - (deltaLon * 180 / Math.PI);
-            const lonMax = coords.longitude + (deltaLon * 180 / Math.PI);
-            
-            const latIndexMin = Math.floor(latMin / GRID_SIZE);
-            const latIndexMax = Math.floor(latMax / GRID_SIZE);
-            const lonIndexMin = Math.floor(lonMin / GRID_SIZE);
-            const lonIndexMax = Math.floor(lonMax / GRID_SIZE);
-            
-            for (let i = latIndexMin; i <= latIndexMax; i++) {
-                for (let j = lonIndexMin; j <= lonIndexMax; j++) {
-                    const cellId = `cell_${i}_${j}`;
-                    if (window.radarsSpatialIndex[cellId]) {
-                        window.radarsSpatialIndex[cellId].forEach(radar => candidateRadars.add(radar));
-                    }
-                }
-            }
-
-            candidateRadars.forEach(radar => {
-                const distance = calculateDistance(coords.latitude, coords.longitude, radar.lat, radar.lon);
-                if (distance <= (DYNAMIC_RADAR_SEARCH_RADIUS_KM * 1000)) {
-                    newRadars.push({
-                        id: Date.now() + Math.random() + newRadars.length,
-                        text: `<b>RADAR: ${radar.name}</b>`,
-                        type: 'simple', time: '00:01',
-                        date: `${nowDate.getFullYear()}-${(nowDate.getMonth() + 1).toString().padStart(2, '0')}-${nowDate.getDate().toString().padStart(2, '0')}`,
-                        createdAt: nowDate.toISOString(), managedByUser: false,
-                        isLocationEnabled: true, locationCoordinates: { latitude: radar.lat, longitude: radar.lon },
-                        radiusMeters: 400, excludeFromList: true,
-                        isDynamicRadar: true
-                    });
-                }
-            });
+            coords = await getCurrentLocationAsync();
         }
+        if (!coords) throw new Error("Ubicación del vehículo no disponible.");
+
+        const DYNAMIC_RADAR_SEARCH_RADIUS_KM = 45;
+        const candidateRadars = new Set();
+        const R = 6371;
+        const rad = DYNAMIC_RADAR_SEARCH_RADIUS_KM / R;
+        const latRad = coords.latitude * Math.PI / 180;
+        const GRID_SIZE = 0.1;
+
+        const latMin = coords.latitude - (rad * 180 / Math.PI);
+        const latMax = coords.latitude + (rad * 180 / Math.PI);
+        const deltaLon = Math.asin(Math.sin(rad) / Math.cos(latRad));
+        const lonMin = coords.longitude - (deltaLon * 180 / Math.PI);
+        const lonMax = coords.longitude + (deltaLon * 180 / Math.PI);
+        
+        const latIndexMin = Math.floor(latMin / GRID_SIZE);
+        const latIndexMax = Math.floor(latMax / GRID_SIZE);
+        const lonIndexMin = Math.floor(lonMin / GRID_SIZE);
+        const lonIndexMax = Math.floor(lonMax / GRID_SIZE);
+        
+        for (let i = latIndexMin; i <= latIndexMax; i++) {
+            for (let j = lonIndexMin; j <= lonIndexMax; j++) {
+                const cellId = `cell_${i}_${j}`;
+                if (window.radarsSpatialIndex[cellId]) {
+                    window.radarsSpatialIndex[cellId].forEach(radar => candidateRadars.add(radar));
+                }
+            }
+        }
+
+        candidateRadars.forEach(radar => {
+            const distance = calculateDistance(coords.latitude, coords.longitude, radar.lat, radar.lon);
+            if (distance <= (DYNAMIC_RADAR_SEARCH_RADIUS_KM * 1000)) {
+                newRadars.push({
+                    id: Date.now() + Math.random() + newRadars.length,
+                    text: `<b>RADAR: ${radar.name}</b>`,
+                    type: 'simple', time: '00:01',
+                    date: `${nowDate.getFullYear()}-${(nowDate.getMonth() + 1).toString().padStart(2, '0')}-${nowDate.getDate().toString().padStart(2, '0')}`,
+                    createdAt: nowDate.toISOString(), managedByUser: false,
+                    isLocationEnabled: true, locationCoordinates: { latitude: radar.lat, longitude: radar.lon },
+                    radiusMeters: 400, excludeFromList: true,
+                    isDynamicRadar: true
+                });
+            }
+        });
         
         reminders.push(...newRadars);
         localStorage.setItem('reminders', JSON.stringify(reminders));
@@ -2922,10 +2946,10 @@ async function updateDynamicRadars(isInitialLoadCheck = false) {
         }
         updateReminderCount();
         updateButtonStyles();
-
+     
     } catch (error) {
     }
-}
+}    
 
     
 // ===================================================================
@@ -2941,21 +2965,20 @@ function applyMainUISettings() {
 }    
 
 // ===================================================================
-// NOMBRE: toggleRadaresRuta (VERSIÓN MODIFICADA PARA VIGÍA DE RUTA)
+// NOMBRE: toggleRadaresRuta (VERSIÓN MODIFICADA PARA VIGÍA DE RUTA Y ANTI-DUPLICADOS)
 // RESUMEN: Identifica los radares en la ruta y actualiza la lista global de eventos.
-//          Ya no dibuja en el mapa directamente, delega esa tarea.
+//          Ahora comprueba si un radar ya existe para no añadir duplicados.
 async function toggleRadaresRuta(activo) {
     const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
     localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(activo));
 
-    // La lógica ahora se centra en recolectar los radares y luego llamar a la función central.
-    radaresEnRutaActual = []; // Todavía usamos esta variable para contener los radares, antes de unificarlos.
+    radaresEnRutaActual = [];
 
     if (activo) {
         const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
         if (actualWaypoints.length < 2) {
             if (activo) 
-                actualizarYOrdenarEventosEnRuta(); // Llama para limpiar y actualizar la UI
+                actualizarYOrdenarEventosEnRuta();
             return;
         }
         
@@ -2966,7 +2989,6 @@ async function toggleRadaresRuta(activo) {
 
                 const routeLineString = turf.lineString(navigationMapInstance.getSource('route')._data.geometry.coordinates);
                 
-                // Primero, procesamos los radares ya existentes en la caché de recordatorios del usuario
                 processedRemindersCache.forEach(reminder => {
                     const isRadarType = (reminder.text.toUpperCase().includes("RADAR") || reminder.excludeFromList);
                     if (isRadarType && reminder.isLocationEnabled && reminder.locationCoordinates) {
@@ -2983,7 +3005,6 @@ async function toggleRadaresRuta(activo) {
                     }
                 });
 
-                // Luego, buscamos en la base de datos de radares optimizada (índice espacial)
                 const intersectingCells = new Set();
                 const routeCoords = routeLineString.geometry.coordinates;
                 for (let i = 0; i < routeCoords.length; i++) {
@@ -3033,6 +3054,7 @@ async function toggleRadaresRuta(activo) {
     actualizarYOrdenarEventosEnRuta();
 }
 
+    
 // ===================================================================
 // NOMBRE: toggleTareasRuta (VERSIÓN MODIFICADA PARA VIGÍA DE RUTA)
 // RESUMEN: Identifica las tareas en la ruta y actualiza la lista global de eventos.
@@ -3082,16 +3104,12 @@ async function toggleTareasRuta(activo) {
         }
     }
 
-    // Llamamos a la función central para que actualice la lista de eventos unificada.
     actualizarYOrdenarEventosEnRuta();
 }   
 
 // ===================================================================
 // NOMBRE: actualizarYOrdenarEventosEnRuta (NUEVA FUNCIÓN DE OPTIMIZACIÓN)
 // RESUMEN: Unifica los arrays de radares y tareas en una sola lista,
-//          la ordena por distancia en la ruta, y resetea el puntero
-//          del "vigía" para empezar a comprobar desde el principio.
-//          También actualiza los contadores de la UI.
 function actualizarYOrdenarEventosEnRuta() {
     eventosEnRuta = [];
     proximoEventoEnRutaIndex = 0;
@@ -3110,116 +3128,68 @@ function actualizarYOrdenarEventosEnRuta() {
         });
     }
 
-    // Ordenamos la lista unificada por la distancia desde el inicio de la ruta.
-    // Esto es crucial para que la lógica del "vigía" funcione.
     eventosEnRuta.sort((a, b) => a.distanceOnRoute - b.distanceOnRoute);
     
-    // Actualizamos los contadores visuales en la UI.
     actualizarContadorRadares(radaresCheckbox && radaresCheckbox.checked ? radaresEnRutaActual.length : 0);
     actualizarContadorTareas(tareasCheckbox && tareasCheckbox.checked ? tareasEnRutaActual.length : 0);
     
-    // Redibujamos los marcadores estáticos en la barra de progreso.
     drawStaticMarkersOnProgressBar();
     
     console.log(`[VIGÍA DE RUTA] Lista de eventos en ruta actualizada. Total: ${eventosEnRuta.length}. Próximo índice: ${proximoEventoEnRutaIndex}.`);
 }    
 
 // ===================================================================
-// NOMBRE: checkReminders (VERSIÓN OPTIMIZADA V4.0 - COMPLETA)
-// RESUMEN: Bucle optimizado que usa el sistema de "Próximo Evento Relevante".
-//          Permanece en modo de bajo consumo hasta que se acerca el
-//          próximo evento (sea por tiempo o por ubicación).
-//          También optimiza la actualización de la UI para que solo ocurra
-//          cuando los datos realmente cambian.
+// NOMBRE: checkReminders (CON LOGGING DE INTERVALO SINCRONIZADO)
+// ===================================================================
 async function checkReminders() {
-    const now = Date.now();
-
-    // TAREA 1: Sincronización Móvil
-    if (isMobileSession && (now - lastMobileSyncCheck > 8000)) {
-        lastMobileSyncCheck = now;
-        const { primaryId } = parseUserId(localStorage.getItem('userData_userId'));
-        const autoSyncEnabled = JSON.parse(localStorage.getItem('boardinggate_autoBackupOnLoad') || 'false');
-        const backupPassword = localStorage.getItem('userData_backupPassword');
-
-        if (autoSyncEnabled && primaryId && backupPassword) {
-            const localTimestamp = parseInt(localStorage.getItem('lastCacheUpdateTimestamp') || '0');
-            if (localTimestamp > lastMobileSyncTimestamp) {
-                autoSaveFromMobile(primaryId, backupPassword);
-                lastMobileSyncTimestamp = localTimestamp;
-            }
-        }
+    if (reminderCheckIntervalId) {
+        clearInterval(reminderCheckIntervalId);
+        reminderCheckIntervalId = null;
     }
 
-    // TAREA 2: Gestión de la Caché y Actualización de UI (Solo si es necesario)
-    // MEJORA: La actualización de la UI solo ocurre si la caché está sucia.
+    const now = Date.now();
+ 
     if (isCacheDirty) {
         rebuildProcessedRemindersCache();
         updateReminderCount();
         updateButtonStyles();
-        // La comprobación continuará en el siguiente ciclo con la caché fresca.
-        return; 
     }
     
-    // TAREA 3: Actualización periódica de Radares Dinámicos
-    if (!isNavigating) {
-        const timeSinceLastCheck = now - lastDynamicRadarCheck;
-        const hasExistingDynamicRadars = processedRemindersCache.some(r => r.isDynamicRadar === true);
-        if (timeSinceLastCheck > 30 * 60 * 1000 || !hasExistingDynamicRadars) {
-            updateDynamicRadars(true);
-        }
-    }
-    
-    // TAREA 4: Lógica de Comprobación de Alertas con "Sueño Inteligente"
-    // MEJORA: Si estamos "durmiendo" y no es hora de despertar, salimos inmediatamente.
-    if (checkRemindersMode === 'idle' && now < nextEventHorizon.timestamp) {
-        return;
-    }
-    
-    // Si despertamos, cambiamos a modo activo para una comprobación intensiva.
-    checkRemindersMode = 'active';
-
     const overdueReminders = [];
     let coords = navigationCurrentLocation;
-
-    if (!coords && (processedRemindersCache.some(r => r.isLocationEnabled) || !isNavigating)) {
+    if (!coords && processedRemindersCache.some(r => r.isLocationEnabled)) {
         coords = await getCurrentLocationAsync().catch(() => null);
     }
     
-    let isNearActiveLocationPoint = false; 
+    let isNearActiveLocationPoint = false;
+    let hasPendingOverdueEvents = false;
+    let culpritFound = false;
 
     processedRemindersCache.forEach(reminder => {
-        if (!reminder || reminder.managedByUser) return;
-
-        // Comprobación de proximidad para el ajuste de intervalo (independiente de si está vencido)
-        if (coords && reminder.isLocationEnabled && reminder.locationCoordinates) {
+        if (reminder.managedByUser) return;
+        const timeConditionMet = reminder.dueTimeUTC && reminder.dueTimeUTC <= now;
+        const isTimeOnlyEvent = !reminder.isLocationEnabled;
+        if (timeConditionMet && isTimeOnlyEvent) {
+            hasPendingOverdueEvents = true;
+            if (!culpritFound) {
+                culpritFound = true;
+            }
+        }
+        let locationConditionMet = false;
+        if (reminder.isLocationEnabled && reminder.locationCoordinates && coords) {
             const distance = calculateDistance(coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude);
             if (distance <= (reminder.radiusMeters || DEFAULT_LOCATION_RADIUS)) {
-                isNearActiveLocationPoint = true;
+                locationConditionMet = true;
+                if (timeConditionMet) { isNearActiveLocationPoint = true; }
             }
         }
-
-        let isOverdue = false;
-        let locationConditionMet = true;
-        const dueTime = reminder.dueTimeUTC;
-
-        if (dueTime && dueTime <= now) {
-            if (reminder.isLocationEnabled && reminder.locationCoordinates) {
-                if (coords) {
-                    // Re-calculamos la distancia aquí para la condición de vencimiento
-                    const distance = calculateDistance(coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude);
-                    locationConditionMet = distance <= (reminder.radiusMeters || DEFAULT_LOCATION_RADIUS);
-                } else {
-                    locationConditionMet = false;
-                }
-            }
-            if (locationConditionMet) {
-                isOverdue = true;
-            }
+        let shouldNotifyNow = false;
+        if (reminder.isLocationEnabled) {
+            if (timeConditionMet && locationConditionMet) shouldNotifyNow = true;
+        } else {
+            if (timeConditionMet) shouldNotifyNow = true;
         }
-
-        if (isOverdue && !overdueReminders.some(r => r.id === reminder.id)) {
-            overdueReminders.push(reminder);
-        }
+        if (shouldNotifyNow) { overdueReminders.push(reminder); }
     });
     
     if (overdueReminders.length > 0) {
@@ -3228,125 +3198,110 @@ async function checkReminders() {
         hideUnifiedReminderWindow();
     }
     
-    // MEJORA: Después de una comprobación activa, recalculamos el próximo horizonte y volvemos a dormir.
-    recalculateNextEventHorizon();
-    checkRemindersMode = 'idle';
-
-    // TAREA 5: Ajuste Dinámico del Intervalo del Bucle
-    // MEJORA: Si estamos navegando, el intervalo de fondo es más largo.
-    // En modo 'idle', el intervalo es más largo para ahorrar recursos.
     let newInterval;
-    if (isNavigating) {
-        newInterval = 20000; // Intervalo largo y fijo durante la navegación activa
-    } else {
-        // La lógica original basada en velocidad y proximidad se mantiene para cuando no se navega
-        if (isNearActiveLocationPoint) {
-            newInterval = 1000;
-        } else if (speed > 115) {
-            newInterval = 4000;
-        } else if (speed > 90) {
-            newInterval = 5000;
-        } else if (speed > 65) {
-            newInterval = 6000;
-        } else if (speed > 40) {
-            newInterval = 8000;
-        } else if (speed > 5) {
-            newInterval = 10000;
-        } else {
-            newInterval = 13000;
-        }
-    }
-
-    if (newInterval !== currentCheckIntervalDuration) {
-        currentCheckIntervalDuration = newInterval;
-        if (reminderCheckIntervalId) clearInterval(reminderCheckIntervalId);
-        reminderCheckIntervalId = setInterval(checkReminders, currentCheckIntervalDuration);
-    }
-}
+    let reason = "";
     
+    if (isNavigating) {
+        newInterval = 20000;
+        reason = "Navegación activa";
+    } else if (hasPendingOverdueEvents) {
+        newInterval = 1500; 
+        reason = "MODO ALERTA (hay eventos DE TIEMPO vencidos)";
+    } else if (isNearActiveLocationPoint) {
+        newInterval = 1500;
+        reason = "MODO PROXIMIDAD (cerca de un punto ACTIVO)";
+    } else {
+        recalculateNextEventHorizon();
+        const timeToWake = nextEventHorizon.timestamp - now;
+        newInterval = timeToWake <= 0 ? 3000 : Math.max(3000, Math.min(30000, timeToWake / 2));
+        reason = `MODO EFICIENTE (próximo despertar en ${Math.round(timeToWake/1000)}s)`;
+    }
+    
+    const secondsToNextCheck = newInterval / 1000;
+    console.log(`%c[INTERVALO] Próximo chequeo en ${secondsToNextCheck} segundos. Razón: ${reason}.`, 'color: #BA55D3;');
+    
+    reminderCheckIntervalId = setInterval(checkReminders, newInterval);
+}    
 // ===================================================================
-// NOMBRE: recalculateNextEventHorizon (NUEVA FUNCIÓN DE OPTIMIZACIÓN)
-// RESUMEN: Calcula el próximo evento relevante (sea de tiempo o de ubicación)
-//          y establece el "horizonte de tiempo" hasta el cual el sistema
-//          puede permanecer en modo de bajo consumo.
+// NOMBRE: recalculateNextEventHorizon (CON LOGGING SIMPLIFICADO Y ROBUSTO)
+// ===================================================================
 function recalculateNextEventHorizon() {
     const now = Date.now();
-    let nextTemporalEvent = { timestamp: Infinity, targetId: null };
-    let nextLocationEvent = { timestamp: Infinity, targetId: null };
-
-    // 1. Encontrar el próximo evento de TIEMPO
-    [...processedRemindersCache].forEach(reminder => {
-        // Se consideran todos los recordatorios para el evento temporal, incluso los de ubicación
-        if (reminder.dueTimeUTC && reminder.dueTimeUTC > now && reminder.dueTimeUTC < nextTemporalEvent.timestamp) {
-            nextTemporalEvent = { timestamp: reminder.dueTimeUTC, targetId: reminder.id };
+    let nextTemporalEvent = { timestamp: Infinity, id: null, text: 'Ninguno' };
+    let nextLocationEvent = { timestamp: Infinity, id: null, text: 'Ninguno' };
+    
+    // 1. Encontrar próximo evento de TIEMPO
+    processedRemindersCache.forEach(reminder => {
+        if (!reminder.managedByUser && reminder.dueTimeUTC && reminder.dueTimeUTC > now && reminder.dueTimeUTC < nextTemporalEvent.timestamp) {
+            nextTemporalEvent = { timestamp: reminder.dueTimeUTC, id: reminder.id, text: reminder.text };
         }
     });
 
-    // 2. Encontrar el próximo evento de UBICACIÓN
+    // 2. Encontrar próximo evento de UBICACIÓN
     const coords = navigationCurrentLocation;
     if (coords) {
-        // Usamos el índice espacial para una búsqueda ultra-rápida
+        const candidateReminders = new Set();
         const centerCellId = getGridCellId(coords.latitude, coords.longitude);
         const [_, centerLatIndex, centerLonIndex] = centerCellId.split('_').map(Number);
-        const candidateReminders = new Set();
-        
-        for (let i = -1; i <= 1; i++) {
-            for (let j = -1; j <= 1; j++) {
-                const cellId = `cell_${centerLatIndex + i}_${centerLonIndex + j}`;
-                if (remindersSpatialIndex[cellId]) {
-                    remindersSpatialIndex[cellId].forEach(r => candidateReminders.add(r));
-                }
-            }
-        }
-        
+        for (let i = -1; i <= 1; i++) { for (let j = -1; j <= 1; j++) { const cellId = `cell_${centerLatIndex + i}_${centerLonIndex + j}`; if (remindersSpatialIndex[cellId]) { remindersSpatialIndex[cellId].forEach(r => candidateReminders.add(r)); } } }
         let closestVigia = { distance: Infinity, reminder: null };
         candidateReminders.forEach(reminder => {
-            const distance = calculateDistance(coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude);
-            if (distance < closestVigia.distance) {
-                closestVigia = { distance: distance, reminder: reminder };
+            if (!reminder.managedByUser && reminder.isLocationEnabled && reminder.locationCoordinates && reminder.dueTimeUTC <= now) {
+                const distance = calculateDistance(coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude);
+                if (distance < closestVigia.distance) { closestVigia = { distance: distance, reminder: reminder }; }
             }
         });
 
         if (closestVigia.reminder) {
-            const speedKmh = window.currentSpeedKmh > 10 ? window.currentSpeedKmh : 40; // Usar velocidad actual o una media urbana
+            let speedKmh;
+            if (isNavigating || isFreeDriveActive) {
+                const tripDurationMinutes = navigationStartTimeForStats ? (now - navigationStartTimeForStats.getTime()) / 60000 : 0;
+                if (tripDurationMinutes < 5) {
+                    speedKmh = 90; 
+                } else {
+                    const MINIMUM_AVERAGE_SPEED_FOR_CALC = 60;
+                    speedKmh = Math.max(window.averageSpeedKmh, MINIMUM_AVERAGE_SPEED_FOR_CALC);
+                }
+            } else {
+                speedKmh = (window.currentSpeedKmh || 0) > 10 ? window.currentSpeedKmh : 90;
+            }
+            
             const speedMps = speedKmh * 1000 / 3600;
-            const etaSeconds = closestVigia.distance / speedMps;
-            const MARGEN_SEGURIDAD_MS = 45 * 1000; // 45 segundos de margen
-
+            const distanceToActivationZone = Math.max(0, closestVigia.distance - (closestVigia.reminder.radiusMeters || DEFAULT_LOCATION_RADIUS));
+            const etaSeconds = speedMps > 0 ? distanceToActivationZone / speedMps : Infinity;
+            const MARGEN_SEGURIDAD_MS = 60 * 1000; 
+            const wakeUpTimestamp = now + (etaSeconds * 1000) - MARGEN_SEGURIDAD_MS;
+            
             nextLocationEvent = {
-                timestamp: now + (etaSeconds * 1000) - MARGEN_SEGURIDAD_MS,
-                targetId: closestVigia.reminder.id
+                timestamp: Math.max(now, wakeUpTimestamp),
+                id: closestVigia.reminder.id,
+                text: closestVigia.reminder.text
             };
         }
     }
 
-    // 3. Comparar y decidir cuál es el próximo evento
     if (nextTemporalEvent.timestamp < nextLocationEvent.timestamp) {
-        nextEventHorizon = {
-            timestamp: nextTemporalEvent.timestamp,
-            type: 'time',
-            targetId: nextTemporalEvent.targetId
-        };
-    } else if (nextLocationEvent.targetId) {
-        nextEventHorizon = {
-            timestamp: nextLocationEvent.timestamp,
-            type: 'location',
-            targetId: nextLocationEvent.targetId
-        };
+        nextEventHorizon = { timestamp: nextTemporalEvent.timestamp, type: 'time', targetId: nextTemporalEvent.id };
+        const secondsToWake = Math.round((nextEventHorizon.timestamp - now) / 1000);
+        const eventText = nextTemporalEvent.text.replace(/<[^>]*>/g, '').substring(0, 50);
+        console.log(`[HORIZONTE] Próximo evento: TIEMPO. Despertar en ${secondsToWake}s para: "${eventText}"`);
+    } else if (nextLocationEvent.id) {
+        nextEventHorizon = { timestamp: nextLocationEvent.timestamp, type: 'location', targetId: nextLocationEvent.id };
+        const secondsToWake = Math.round((nextEventHorizon.timestamp - now) / 1000);
+        const eventText = nextLocationEvent.text.replace(/<[^>]*>/g, '').substring(0, 50);
+        console.log(`[HORIZONTE] Próximo evento: UBICACION. Despertar en ${secondsToWake}s para: "${eventText}"`);
     } else {
-        // No hay eventos futuros, el sistema puede "dormir" indefinidamente
         nextEventHorizon = { timestamp: Infinity, type: null, targetId: null };
+        console.log('[HORIZONTE] No hay eventos futuros programados.');
     }
 }
+    
 // ===================================================================
-// NOMBRE: rebuildProcessedRemindersCache (VERSIÓN MODIFICADA CON ÍNDICE ESPACIAL)
-// RESUMEN: Procesa y cachea los recordatorios desde localStorage.
-//          AHORA TAMBIÉN CONSTRUYE UN ÍNDICE ESPACIAL para recordatorios con
-//          ubicación y los separa de los que son solo por tiempo.
+// NOMBRE: rebuildProcessedRemindersCache (CORREGIDO - GESTIÓN DE ZONA HORARIA)
+// RESUMEN: Parsea las fechas y horas en la zona horaria local del navegador,
 function rebuildProcessedRemindersCache() {
     try {
         const allReminders = JSON.parse(localStorage.getItem('reminders') || '[]');
-        const now = new Date();
         
         processedRemindersCache = [];
         remindersSpatialIndex = {};
@@ -3358,10 +3313,11 @@ function rebuildProcessedRemindersCache() {
                 try {
                     const [year, month, day] = reminder.date.split('-').map(Number);
                     const [hour, minute] = reminder.time.split(':').map(Number);
-                    const dueDate = new Date(Date.UTC(year, month - 1, day, hour, minute));
+                    
+                    const dueDate = new Date(year, month - 1, day, hour, minute);
+                 
                     if (!isNaN(dueDate.getTime())) {
-                        dueTimeUTC = dueDate.getTime();
-                    }
+                        dueTimeUTC = dueDate.getTime(); }
                 } catch (e) {
                     console.warn(`Fecha/hora inválida para recordatorio ID ${reminder.id}:`, reminder.date, reminder.time);
                 }
@@ -3542,7 +3498,7 @@ function saveCustomData() {
             }
         }
         localStorage.setItem('customGridData', JSON.stringify(customData));
-        markCacheAsDirty(); // <-- LÍNEA AÑADIDA
+        markCacheAsDirty(); 
     } catch (e) {
         showToast("Error al guardar personalización", "error");
     }
@@ -3891,7 +3847,7 @@ function setupReminderTableListeners(modalTable) {
                     showToast('Error: Recordatorio no encontrado para actualizar/borrar.', 'error');
                     if(row) row.remove();
                 }
-                updateReminderCount(); updateButtonStyles(); checkReminders();
+                updateReminderCount(); updateButtonStyles(); markCacheAsDirty();
             });
         });
         modalTable.querySelectorAll('.postpone').forEach(button => {
@@ -3946,7 +3902,7 @@ function setupReminderTableListeners(modalTable) {
                     if (tbody && tbody.rows.length === 0) {
                         tbody.innerHTML = `<tr><td colspan="8" style="text-align:center;padding:1rem;">No hay recordatorios.</td></tr>`;
                     }
-                    updateReminderCount(); updateButtonStyles(); checkReminders();
+                    updateReminderCount(); updateButtonStyles();
                 }
             });
         });
@@ -4451,7 +4407,7 @@ function showReminderModal(reminder = null, options = {}) {
             if (modal.parentNode) modal.parentNode.removeChild(modal);
             updateReminderCount(); 
             updateButtonStyles(); 
-            checkReminders();
+            
 
             if (mapShouldReopen && !document.getElementById('unified-reminder-window')?.classList.contains('visible') && !isNavigationMapActive) {
                 if (mapContextToReopen === 'navigation') openNavigationMap();
@@ -4718,7 +4674,7 @@ function showReminderModal(reminder = null, options = {}) {
         markCacheAsDirty();
         destroyMap();
         if (modal.parentNode) modal.parentNode.removeChild(modal);
-        updateReminderCount(); updateButtonStyles(); checkReminders();
+        updateReminderCount(); updateButtonStyles(); 
         if (!options.onTopOfMap) { const unifiedWindowIsVisible = document.getElementById('unified-reminder-window')?.classList.contains('visible'); if (mapShouldReopen && !unifiedWindowIsVisible && !isNavigationMapActive) { if (mapContextToReopen === 'navigation') openNavigationMap(); } else if (mapShouldReopen && unifiedWindowIsVisible) { sessionStorage.setItem('boardinggate_map_should_reopen_when_unified_closes', 'true'); if (mapContextToReopen) sessionStorage.setItem('mapContext', mapContextToReopen); } }
         sessionStorage.removeItem('boardinggate_map_should_reopen_after_form'); sessionStorage.removeItem('mapContext');
     });
@@ -4781,7 +4737,6 @@ function markReminderAsManaged(reminderId, managedState = true) {
     localStorage.removeItem('boardinggate_nav_recovery_flag');
 }
     
-    
 // ===================================================================
 // NOMBRE: addSlideButtonListeners 
 // RESUMEN: Añade listeners a los botones del slide y marca la caché como sucia en cada modificación.
@@ -4818,17 +4773,13 @@ function addSlideButtonListeners(slideElement, reminder) {
                     const radarEnRutaIndex = radaresEnRutaActual.findIndex(r => r.id === reminder.id);
                     if (radarEnRutaIndex !== -1) {
                         const newDueTime = new Date(`${newDateISO}T${newTime}:00Z`).getTime();
-                        console.log(`[POSTPONE] Antes: Radar en ruta ID ${reminder.id}, Vence: ${new Date(radaresEnRutaActual[radarEnRutaIndex].dueTimeUTC).toLocaleTimeString()}`);
-                        
                         radaresEnRutaActual[radarEnRutaIndex].date = newDateISO;
                         radaresEnRutaActual[radarEnRutaIndex].time = newTime;
-                        radaresEnRutaActual[radarEnRutaIndex].dueTimeUTC = newDueTime; // ¡Actualización crucial!
-                        
-                        console.log(`[POSTPONE] Después: Radar en ruta ID ${reminder.id}, Vence AHORA: ${new Date(radaresEnRutaActual[radarEnRutaIndex].dueTimeUTC).toLocaleTimeString()}`);
+                        radaresEnRutaActual[radarEnRutaIndex].dueTimeUTC = newDueTime;
                     }
 
                     markCacheAsDirty();
-                    showToast(`Radar pospuesto ${minutesToSnooze} minutos`, 'info');
+                    actualizarYOrdenarEventosEnRuta();
                 } else {
                     showToast("Error: No se pudo encontrar el radar para posponer.", "error");
                 }
@@ -4838,69 +4789,66 @@ function addSlideButtonListeners(slideElement, reminder) {
         }
         if (cancelButton) {
             cancelButton.addEventListener('click', () => { 
-                if (reminder.isFromRuta === true) { 
-                    showToast(`Radar en ruta "${reminder.text.replace(/<[^>]*>/g, '')}" marcado como visto para esta alerta.`, 'info');
-                    updateUnifiedWindowUI(reminder.id); 
-                    markReminderAsManaged(reminder.id, true); 
-                } else { 
-                    handleInteraction(() => { 
-                        let rems = JSON.parse(localStorage.getItem('reminders') || '[]');
-                        const index = rems.findIndex(r => r.id === processedReminderId); 
-                        if (index === -1) {
-                            showToast("Error: No se encontró el recordatorio en localStorage para actualizar.", "error");
+                handleInteraction(() => { 
+                    let rems = JSON.parse(localStorage.getItem('reminders') || '[]');
+                    const index = rems.findIndex(r => r.id === processedReminderId); 
+                    if (index === -1) {
+                        if (reminder.isFromRuta === true) {
+                            const eventoIndex = eventosEnRuta.findIndex(e => e.id === processedReminderId);
+                            if (eventoIndex !== -1) {
+                                eventosEnRuta[eventoIndex].managedByUser = true;
+                            }
+                            showToast(`Alerta de ruta marcada como vista.`, 'info');
+                            return; // Salimos aquí para no ejecutar la lógica de abajo
+                        } else {
+                            showToast("Error: No se encontró el recordatorio para actualizar.", "error");
                             return;
                         }
-                        const currentReminder = rems[index];
-                        let needsSave = false;
-                        const isRadarTypeStored = currentReminder.text.toUpperCase().includes("RADAR") || currentReminder.excludeFromList;
-                        if (isRadarTypeStored) { 
-                           const minutesToPostponeRadar = 15;
-                           const { newDateISO, newTime } = calculatePostponedDateTime(minutesToPostponeRadar);
-                           rems[index].date = newDateISO;
-                           rems[index].time = newTime;
-                           rems[index].managedByUser = false;
-                           needsSave = true;
-                           showToast(`Radar guardado pospuesto ${minutesToPostponeRadar} minutos`, 'info');
-                        } else if (currentReminder.isLocationEnabled && (currentReminder.type !== 'weekly' && currentReminder.type !== 'interval')) {
-                           const minutesToPostponeLocation = 15; 
-                           const { newDateISO, newTime } = calculatePostponedDateTime(minutesToPostponeLocation);
-                           rems[index].date = newDateISO;
-                           rems[index].time = newTime;
-                           rems[index].managedByUser = false;
-                           needsSave = true;
-                           showToast(`Recordatorio de ubicación pospuesto ${minutesToPostponeLocation} minutos`, 'info');
-                        } else if (currentReminder.type === 'weekly' || currentReminder.type === 'interval') {
-                            let referenceDateForNext = new Date();
-                            try {
-                                const [cy, cm, cd] = currentReminder.date.split('-').map(Number);
-                                const [ch, cmin] = (currentReminder.time || '00:01').split(':').map(Number);
-                                const reminderDateTime = new Date(Date.UTC(cy, cm - 1, cd, ch, cmin));
-                                if (!isNaN(reminderDateTime.getTime())) {
-                                    referenceDateForNext = new Date(reminderDateTime.getTime() + 60000); 
-                                }
-                            } catch(er) {  }
-                            const nextOcc = calculateNextOccurrence(currentReminder, referenceDateForNext);
-                            if (nextOcc) {
-                                rems[index].date = `${nextOcc.getUTCFullYear()}-${(nextOcc.getUTCMonth() + 1).toString().padStart(2, '0')}-${nextOcc.getUTCDate().toString().padStart(2, '0')}`;
-                                rems[index].time = `${nextOcc.getUTCHours().toString().padStart(2, '0')}:${nextOcc.getUTCMinutes().toString().padStart(2, '0')}`;
-                                rems[index].managedByUser = false;
-                                needsSave = true;
-                                showToast('Recordatorio actualizado al próximo ciclo', 'info');
-                            } else {
-                                rems.splice(index, 1); needsSave = true;
-                                showToast('Error calculando siguiente ciclo. Recordatorio eliminado.', 'error');
+                    }
+
+                    const currentReminder = rems[index];
+                    let needsSave = false;
+                    const isRadarTypeStored = currentReminder.text.toUpperCase().includes("RADAR") || currentReminder.excludeFromList;
+                    
+                    if (isRadarTypeStored || (currentReminder.isLocationEnabled && (currentReminder.type !== 'weekly' && currentReminder.type !== 'interval'))) { 
+                       const minutesToPostpone = 15;
+                       const { newDateISO, newTime } = calculatePostponedDateTime(minutesToPostpone);
+                       rems[index].date = newDateISO;
+                       rems[index].time = newTime;
+                       rems[index].managedByUser = false;
+                       needsSave = true;
+                       showToast(`Recordatorio pospuesto ${minutesToPostpone} minutos`, 'info');
+                    } else if (currentReminder.type === 'weekly' || currentReminder.type === 'interval') {
+                        let referenceDateForNext = new Date();
+                        try {
+                            const [cy, cm, cd] = currentReminder.date.split('-').map(Number);
+                            const [ch, cmin] = (currentReminder.time || '00:01').split(':').map(Number);
+                            const reminderDateTime = new Date(Date.UTC(cy, cm - 1, cd, ch, cmin));
+                            if (!isNaN(reminderDateTime.getTime())) {
+                                referenceDateForNext = new Date(reminderDateTime.getTime() + 60000); 
                             }
+                        } catch(er) {  }
+                        const nextOcc = calculateNextOccurrence(currentReminder, referenceDateForNext);
+                        if (nextOcc) {
+                            rems[index].date = `${nextOcc.getUTCFullYear()}-${(nextOcc.getUTCMonth() + 1).toString().padStart(2, '0')}-${nextOcc.getUTCDate().toString().padStart(2, '0')}`;
+                            rems[index].time = `${nextOcc.getUTCHours().toString().padStart(2, '0')}:${nextOcc.getUTCMinutes().toString().padStart(2, '0')}`;
+                            rems[index].managedByUser = false;
+                            needsSave = true;
                         } else {
-                           rems.splice(index, 1);
-                           needsSave = true;
-                           showToast('Recordatorio inmediato marcado como visto y eliminado.', 'info');
+                            rems.splice(index, 1); needsSave = true;
+                            showToast('Error calculando siguiente ciclo. Recordatorio eliminado.', 'error');
                         }
-                        if (needsSave) {
-                            localStorage.setItem('reminders', JSON.stringify(rems));
-                            markCacheAsDirty();
-                        }
-                    }); 
-                } 
+                    } else {
+                       rems.splice(index, 1);
+                       needsSave = true;
+                    }
+                    
+                    if (needsSave) {
+                        localStorage.setItem('reminders', JSON.stringify(rems));
+                        markCacheAsDirty();
+                        actualizarYOrdenarEventosEnRuta();
+                    }
+                }); 
             });
         }
         if (adjustTimeButton) {
@@ -4926,18 +4874,17 @@ function addSlideButtonListeners(slideElement, reminder) {
                         rems[index].time = '00:01';
                         rems[index].managedByUser = false;
                         needsSave = true;
-                        showToast('Recordatorio ajustado a 00:01 y actualizado', 'info');
                     } else {
                         rems.splice(index, 1); needsSave = true;
                         showToast('Error calculando siguiente ciclo (ajuste 00:01). Eliminado.', 'error');
                     }
                 } else { 
                     rems.splice(index, 1); needsSave = true;
-                    showToast('Recordatorio no cíclico eliminado (acción "Ajustar 00:01")', 'info');
                 }
                 if (needsSave) {
                     localStorage.setItem('reminders', JSON.stringify(rems));
                     markCacheAsDirty();
+                    actualizarYOrdenarEventosEnRuta();
                 }
             }));
         }
@@ -4950,6 +4897,7 @@ function addSlideButtonListeners(slideElement, reminder) {
                     if (rems.length < initialLength) {
                        localStorage.setItem('reminders', JSON.stringify(rems)); 
                        markCacheAsDirty();
+                       actualizarYOrdenarEventosEnRuta();
                        showToast('Ciclo de recordatorio anulado permanentemente', 'success');
                     } else {
                         showToast('Error: No se encontró el ciclo para anular.', 'warning');
@@ -5000,7 +4948,10 @@ function addSlideButtonListeners(slideElement, reminder) {
                 markReminderAsManaged(processedReminderId, true); 
                 let reminderToPostpone;
                 if (reminder.isFromRuta) {
-                    showToast(`Radar en ruta "${reminder.text.replace(/<[^>]*>/g, '')}" marcado como visto (acción Posponer).`, 'info');
+                    const eventoIndex = eventosEnRuta.findIndex(e => e.id === processedReminderId);
+                    if (eventoIndex !== -1) {
+                        eventosEnRuta[eventoIndex].managedByUser = true;
+                    }
                     updateUnifiedWindowUI(reminder.id);
                     return; 
                 } else {
@@ -5016,7 +4967,7 @@ function addSlideButtonListeners(slideElement, reminder) {
                 }
             });
         }
-    }
+    }    
 
  
 // ===================================================================
@@ -5682,11 +5633,10 @@ function updateTripStatistics(coords) {
     }
 }
 
-
 // ===================================================================
-// NOMBRE: processRouteProgress (VERSIÓN OPTIMIZADA CON VIGÍA DE RUTA)
-// RESUMEN: Utiliza un método directo de Turf.js para encontrar la distancia a lo largo de la ruta,
-//          y AHORA comprueba de forma súper eficiente solo el próximo evento en ruta (vigía).
+// NOMBRE: processRouteProgress (VERSIÓN FINAL CON AVISO BASADO ÚNICAMENTE EN RADIO)
+// RESUMEN: Elimina el umbral de pre-vigilancia. La alerta se activa
+//          directamente cuando la distancia al evento es menor o igual a su radio específico.
 // ===================================================================
 function processRouteProgress(coords, mapInstanceToUse) {
     if (!isNavigating || !navigationCurrentRouteData?.routes?.[0]?._turfLineString || !coords) {
@@ -5703,8 +5653,7 @@ function processRouteProgress(coords, mapInstanceToUse) {
         const nearestPointOnRoute = turf.nearestPointOnLine(fullRouteLineString, _turfCurrentPoint, { units: 'meters' });
         carDistCalculated = nearestPointOnRoute.properties.location;
     } catch (e) {
-        console.warn("[OPTIMIZATION FALLBACK] El método directo de Turf falló. Usando método de respaldo.", e);
-        try {
+        try { // Fallback
             _turfCurrentPoint.geometry.coordinates[0] = coords.longitude;
             _turfCurrentPoint.geometry.coordinates[1] = coords.latitude;
             const carPointTurf = _turfCurrentPoint;
@@ -5713,7 +5662,6 @@ function processRouteProgress(coords, mapInstanceToUse) {
             const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
             carDistCalculated = turf.length(lineSliceToNearestTurf, { units: 'meters' });
         } catch (turfError) {
-            console.error("Fallo crítico: Incluso el método de respaldo de Turf falló.", turfError);
             carDistCalculated = lastCarDistanceAlongRouteForNavLogic;
         }
     }
@@ -5727,30 +5675,30 @@ function processRouteProgress(coords, mapInstanceToUse) {
         lastCarDistanceAlongRouteForNavLogic = totalRouteLength;
     }
 
-    // --- INICIO: MODIFICACIÓN PARA LA LÓGICA DEL VIGÍA DE RUTA ---
-    // En lugar de iterar sobre todos los radares/tareas, solo comprobamos el próximo.
+    // --- INICIO DE LA LÓGICA DE VIGÍA DE RUTA SIMPLIFICADA Y CORREGIDA ---
     if (eventosEnRuta.length > 0 && proximoEventoEnRutaIndex < eventosEnRuta.length) {
         const proximoEvento = eventosEnRuta[proximoEventoEnRutaIndex];
+        const distanciaAlEvento = proximoEvento.distanceOnRoute - lastCarDistanceAlongRouteForNavLogic;
         
-        // Comprobamos si estamos dentro del umbral de aviso del próximo evento.
-        if (lastCarDistanceAlongRouteForNavLogic >= (proximoEvento.distanceOnRoute - UMBRAL_AVISO_EVENTO_RUTA_METROS)) {
+        // Obtenemos el radio específico del evento. Si no tiene, usamos uno por defecto.
+        const radioDelEvento = proximoEvento.radiusMeters || DEFAULT_LOCATION_RADIUS;
+
+        // 1. CONDICIÓN ÚNICA Y DIRECTA: ¿Hemos entrado en el radio de acción del evento?
+        if (distanciaAlEvento <= radioDelEvento) {
             
-            // Comprobamos si el recordatorio ya ha vencido (en caso de que tenga un tiempo específico)
             const dueTime = proximoEvento.dueTimeUTC;
             const now = Date.now();
             
-            if (!dueTime || dueTime <= now) {
-                // Si el evento no ha sido gestionado por el usuario, lo mostramos.
-                if (!proximoEvento.managedByUser) {
-                    displayUnifiedReminderWindow([proximoEvento]);
-                }
+            // 2. ¿El evento está activo y no ha sido visto ya?
+            if ((!dueTime || dueTime <= now) && !proximoEvento.managedByUser) {
+                displayUnifiedReminderWindow([proximoEvento]);
             }
-            
-            // Una vez que pasamos la ubicación exacta del evento, avanzamos al siguiente.
-            if (lastCarDistanceAlongRouteForNavLogic >= proximoEvento.distanceOnRoute) {
-                proximoEventoEnRutaIndex++; 
-                console.log(`[VIGÍA DE RUTA] Evento superado. Próximo índice: ${proximoEventoEnRutaIndex}.`);
-            }
+        }
+        
+        // 3. ¿Hemos SUPERADO la ubicación del evento para pasar al siguiente?
+        // Se mantiene la lógica de avanzar el puntero solo cuando la distancia es negativa.
+        if (distanciaAlEvento < 0) {
+            proximoEventoEnRutaIndex++; 
         }
     }
    
@@ -5758,7 +5706,7 @@ function processRouteProgress(coords, mapInstanceToUse) {
     renderWaypointMarkers();
     updateTurnByTurnDisplay(route, lastCarDistanceAlongRouteForNavLogic);
     updateNavigationProgressDisplay(route, lastCarDistanceAlongRouteForNavLogic);
-}    
+}
     
 // ===================================================================
 // NOMBRE: startGpsWatching (VERSIÓN SIMPLIFICADA CON COPIA TEMPORAL)
@@ -6702,7 +6650,7 @@ async function deleteFilteredRadars() {
         showToast(`${numDeleted} recordatorios eliminados`, 'success');
         updateReminderCount();
         updateButtonStyles();
-        checkReminders();
+        markCacheAsDirty();
     } catch (error) {
         statusMessage.textContent = `Error: ${error.message}`;
         statusMessage.style.color = 'red';
@@ -7064,7 +7012,7 @@ async function openNavigationMap(isRecovery = false) {
         if (navigationMapInstance) {
             handleLoadOrDeleteRouteClick(null);
             setNavigationMapClickHandler();
-            setTimeout(() => { if (navigationMapInstance) navigationMapInstance.resize(); }, 320);
+            setTimeout(() => { if (navigationMapInstance) navigationMapInstance.resize(); }, 520);
             resolve(); 
             
         } else {
@@ -13002,7 +12950,7 @@ function restoreBackup() {
             loadCustomData();
             loadSavedSettings();
             updateUserIdDisplay();
-            checkReminders();
+    
             markCacheAsDirty(); 
             statusEl.textContent = `Restauración completada. ${restoredCount} claves restauradas. ${incompatibleCount} claves ignoradas (incompatibles). La página se recargará.`;
             statusEl.style.color = '#28a745';
@@ -15096,7 +15044,7 @@ async function showVersionsModal() {
                 loadCustomData();
                 loadSavedSettings();
                 updateUserIdDisplay();
-                checkReminders();
+                markCacheAsDirty();
             }
         }
     }
@@ -16942,6 +16890,118 @@ function animateMarkerAndMap(timestamp) {
 
     markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
 }
+
+
+// ===================================================================
+// NOMBRE: animateMarkerAndMap (VERSIÓN 15 FINAL - CESIÓN CADA 10 SEGUNDOS)
+// RESUMEN: Mantiene un objetivo de 40 FPS y cede el control al navegador
+//          cada 10 segundos para facilitar la recolección de basura,
+//          logrando el máximo equilibrio entre fluidez y estabilidad.
+// ===================================================================
+function animateMarkerAndMap(timestamp) {
+    if (!initialUserLocationMarker || !navigationMapInstance) {
+        markerAnimationState.animationFrameId = null;
+        return;
+    }
+
+    if (!markerAnimationState.lastTimestamp) {
+        markerAnimationState.lastTimestamp = timestamp;
+        lastMapUpdateTime = timestamp;
+        markerAnimationState.lastCameraTimestamp = timestamp;
+        lastGarbageCollectionYield = timestamp; // Inicializa el temporizador de cesión
+        markerAnimationState.currentMapZoom = navigationMapInstance.getZoom();
+        markerAnimationState.currentMapPitch = navigationMapInstance.getPitch();
+        markerAnimationState.currentMapBearing = navigationMapInstance.getBearing();
+        markerAnimationState.currentMapCenter = navigationMapInstance.getCenter();
+        markerAnimationState.currentMapOffsetX = mapOffsetX;
+        markerAnimationState.currentMapOffsetY = mapOffsetY;
+        markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
+        return;
+    }
+
+    const deltaTime = timestamp - markerAnimationState.lastTimestamp;
+    markerAnimationState.lastTimestamp = timestamp;
+
+    const posLerpFactor = 1.0 - Math.exp(-deltaTime * lerpRatePosition);
+    const rotLerpFactor = 1.0 - Math.exp(-deltaTime * lerpRateRotation);
+    
+    // 1. El icono del coche se sigue animando a 60 FPS
+    if (markerAnimationState.currentLngLat && markerAnimationState.targetLngLat) {
+        markerAnimationState.currentLngLat.lng += (markerAnimationState.targetLngLat.lng - markerAnimationState.currentLngLat.lng) * posLerpFactor;
+        markerAnimationState.currentLngLat.lat += (markerAnimationState.targetLngLat.lat - markerAnimationState.currentLngLat.lat) * posLerpFactor;
+        initialUserLocationMarker.setLngLat(markerAnimationState.currentLngLat);
+    }
+    let deltaIconRotation = markerAnimationState.targetIconRotation - markerAnimationState.currentIconRotation;
+    if (deltaIconRotation > 180) deltaIconRotation -= 360;
+    if (deltaIconRotation < -180) deltaIconRotation += 360;
+    markerAnimationState.currentIconRotation += deltaIconRotation * rotLerpFactor;
+    initialUserLocationMarker.setRotation(markerAnimationState.currentIconRotation);
+
+    // --- LÓGICA DE CESIÓN DE CONTROL CADA 10 SEGUNDOS ---
+    if (timestamp - lastGarbageCollectionYield > 10000) { // <-- CAMBIO A 10000 ms
+        lastGarbageCollectionYield = timestamp;
+        lastMapUpdateTime = timestamp;
+        markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
+        return; // Salta UN ciclo de actualización de la cámara cada 10 segundos.
+    }
+
+    // 2. La lógica de la CÁMARA se ejecuta a 40 FPS (excepto en la pausa)
+    if (timestamp - lastMapUpdateTime > MAP_UPDATE_INTERVAL_MS) {
+        lastMapUpdateTime = timestamp;
+
+        const cameraDeltaTime = timestamp - (markerAnimationState.lastCameraTimestamp || timestamp);
+        markerAnimationState.lastCameraTimestamp = timestamp;
+        const zoomPitchLerpFactor = 1.0 - Math.exp(-cameraDeltaTime * lerpRateZoom);
+
+        if (shouldCenterOnUser || navigationFollowUser) {
+            
+            // 2a. Interpolar valores
+            if (markerAnimationState.currentMapCenter && markerAnimationState.targetLngLat) {
+                markerAnimationState.currentMapCenter.lng += (markerAnimationState.targetLngLat.lng - markerAnimationState.currentMapCenter.lng) * posLerpFactor;
+                markerAnimationState.currentMapCenter.lat += (markerAnimationState.targetLngLat.lat - markerAnimationState.currentMapCenter.lat) * posLerpFactor;
+            }
+            let deltaMapBearing = markerAnimationState.targetMapBearing - markerAnimationState.currentMapBearing;
+            if (deltaMapBearing > 180) deltaMapBearing -= 360;
+            if (deltaMapBearing < -180) deltaMapBearing += 360;
+            markerAnimationState.currentMapBearing += deltaMapBearing * rotLerpFactor;
+            markerAnimationState.currentMapZoom += (markerAnimationState.targetMapZoom - markerAnimationState.currentMapZoom) * zoomPitchLerpFactor;
+            markerAnimationState.currentMapPitch += (markerAnimationState.targetMapPitch - markerAnimationState.currentMapPitch) * zoomPitchLerpFactor;
+            markerAnimationState.currentMapOffsetX += (markerAnimationState.targetMapOffsetX - markerAnimationState.currentMapOffsetX) * zoomPitchLerpFactor;
+            markerAnimationState.currentMapOffsetY += (markerAnimationState.targetMapOffsetY - markerAnimationState.currentMapOffsetY) * zoomPitchLerpFactor;
+
+            // 2b. Llamar a los setters de Mapbox
+            if (markerAnimationState.currentMapCenter) {
+                navigationMapInstance.setCenter(markerAnimationState.currentMapCenter);
+                navigationMapInstance.setBearing(markerAnimationState.currentMapBearing);
+            }
+            
+            const ZOOM_PITCH_THRESHOLD = 0.01;
+            if (Math.abs(navigationMapInstance.getZoom() - markerAnimationState.currentMapZoom) > ZOOM_PITCH_THRESHOLD) {
+                navigationMapInstance.setZoom(markerAnimationState.currentMapZoom);
+            }
+            
+            if (Math.abs(navigationMapInstance.getPitch() - markerAnimationState.currentMapPitch) > ZOOM_PITCH_THRESHOLD) {
+                navigationMapInstance.setPitch(markerAnimationState.currentMapPitch);
+            }
+            
+            navigationMapInstance.setPadding({
+                top: markerAnimationState.currentMapOffsetY > 0 ? navigationMapInstance.getCanvas().clientHeight * Math.abs(markerAnimationState.currentMapOffsetY / 100) : 0,
+                bottom: markerAnimationState.currentMapOffsetY < 0 ? navigationMapInstance.getCanvas().clientHeight * Math.abs(markerAnimationState.currentMapOffsetY / 100) : 0,
+                left: markerAnimationState.currentMapOffsetX < 0 ? navigationMapInstance.getCanvas().clientWidth * Math.abs(markerAnimationState.currentMapOffsetX / 100) : 0,
+                right: markerAnimationState.currentMapOffsetX > 0 ? navigationMapInstance.getCanvas().clientWidth * Math.abs(markerAnimationState.currentMapOffsetX / 100) : 0
+            });
+                
+            if (window.mapCustomControlsInstance && typeof window.mapCustomControlsInstance.updateOffsetDisplay === 'function') {
+                window.mapCustomControlsInstance.updateOffsetDisplay(
+                    markerAnimationState.currentMapOffsetX,
+                    markerAnimationState.currentMapOffsetY
+                );
+            }
+        }
+    }
+    
+    markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
+}    
     
 // ===================================================================
 // NOMBRE: getRouteStyleProperties (VERSIÓN CORREGIDA)
@@ -19163,7 +19223,7 @@ async function importRadars() {
         showToast(`${newRadarsCount} nuevos radares/POIs añadidos.`, 'success');
         updateReminderCount();
         updateButtonStyles();
-        checkReminders();
+        markCacheAsDirty();
     } catch (error) {
         statusMessage.textContent = `Error general: ${error.message}`;
         statusMessage.style.color = 'red';
@@ -19530,7 +19590,7 @@ function showPostponeOptionsModal(reminder, source = 'unified') {
              if (modal.autoPostponeInterval) clearInterval(modal.autoPostponeInterval); modal.autoPostponeInterval = null;
              updateUnifiedWindowUI(reminder.id);
              let reminders = JSON.parse(localStorage.getItem('reminders') || '[]'); const index = reminders.findIndex(r => r.id === reminder.id);
-             if (index === -1) { showToast("Error: Recordatorio no encontrado", "error"); checkReminders(); if (modal.parentNode) document.body.removeChild(modal); return; }
+             if (index === -1) { showToast("Error: Recordatorio no encontrado", "error"); markCacheAsDirty(); if (modal.parentNode) document.body.removeChild(modal); return; }
              const { newDateISO, newTime } = calculatePostponedDateTime(minutes); reminders[index].date = newDateISO; reminders[index].time = newTime; reminders[index].managedByUser = false;
              if (!isCyclic) { reminders[index].type = 'daily'; reminders[index].repeatDays = []; reminders[index].intervalDays = null; }
              localStorage.setItem('reminders', JSON.stringify(reminders)); updateReminderCount(); updateButtonStyles(); 
@@ -20317,6 +20377,12 @@ document.addEventListener('DOMContentLoaded', async () => {
             openAlertModal();
         });
     }
+
+    if (reminderCheckIntervalId) {
+        clearInterval(reminderCheckIntervalId); // Doble seguridad por si acaso
+    }
+    checkReminders(); // Inicia el primer ciclo inmediatamente
+    
 
      window.addEventListener('beforeunload', () => {
          if (reminderCheckIntervalId) { clearInterval(reminderCheckIntervalId); }
