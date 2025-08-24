@@ -3301,27 +3301,46 @@ async function checkReminders() {
     }
 }    
     
+
 // ===================================================================
-// NOMBRE: recalculateNextEventHorizon (VERSIÓN CONSERVADORA Y DE ARRANQUE RÁPIDO)
-// RESUMEN: Utiliza una velocidad fija y alta al inicio del viaje, y luego la velocidad media 
-//          con un mínimo de seguridad para asegurar que el sistema despierte siempre a tiempo.
+// NOMBRE: recalculateNextEventHorizon (CORREGIDO PARA EVENTOS INMEDIATOS)
+// RESUMEN: Asegura que si hay un recordatorio pendiente vencido o a punto de
+//          vencer, el "despertador" se programe para "ahora", forzando una
+//          comprobación inmediata en el siguiente ciclo de checkReminders.
+// ===================================================================
 function recalculateNextEventHorizon() {
     const now = Date.now();
     let nextTemporalEvent = { timestamp: Infinity, targetId: null };
 
-    // 1. Encontrar el próximo evento de TIEMPO (sin cambios)
+    // Variable para detectar si hay algún recordatorio ya vencido que no ha sido gestionado.
+    let hasPendingOverdueEvent = false;
+    
+    // 1. Encontrar el próximo evento de TIEMPO
     processedRemindersCache.forEach(reminder => {
-        if (!reminder.managedByUser && reminder.dueTimeUTC && reminder.dueTimeUTC > now && reminder.dueTimeUTC < nextTemporalEvent.timestamp) {
-            nextTemporalEvent = { timestamp: reminder.dueTimeUTC, targetId: reminder.id };
+        if (!reminder.managedByUser && reminder.dueTimeUTC) {
+            if (reminder.dueTimeUTC <= now) {
+                // Si encontramos un evento ya vencido y no gestionado, lo marcamos.
+                hasPendingOverdueEvent = true;
+            } else if (reminder.dueTimeUTC < nextTemporalEvent.timestamp) {
+                // Si es un evento futuro, lo consideramos para el próximo despertar.
+                nextTemporalEvent = { timestamp: reminder.dueTimeUTC, targetId: reminder.id };
+            }
         }
     });
 
-    // 2. Encontrar el próximo evento de UBICACIÓN (con lógica de velocidad conservadora)
+    // --- INICIO DE LA CORRECCIÓN CLAVE ---
+    // Si detectamos un evento ya vencido, forzamos el despertar para AHORA MISMO.
+    if (hasPendingOverdueEvent) {
+        nextEventHorizon = { timestamp: now, type: 'time', targetId: null };
+        return; // Salimos de la función inmediatamente, no necesitamos calcular más.
+    }
+    // --- FIN DE LA CORRECCIÓN CLAVE ---
+
+    // 2. Encontrar el próximo evento de UBICACIÓN (si no hay vencidos)
     let nextLocationEvent = { timestamp: Infinity, targetId: null };
     const coords = navigationCurrentLocation;
     
     if (coords) {
-        // Búsqueda eficiente de candidatos cercanos con el índice espacial
         const candidateReminders = new Set();
         const centerCellId = getGridCellId(coords.latitude, coords.longitude);
         const [_, centerLatIndex, centerLonIndex] = centerCellId.split('_').map(Number);
@@ -3346,30 +3365,24 @@ function recalculateNextEventHorizon() {
         });
 
         if (closestVigia.reminder) {
-            // --- INICIO DE LA NUEVA LÓGICA DE VELOCIDAD CONSERVADORA ---
             let speedKmh;
             const tripDurationMinutes = navigationStartTimeForStats ? (now - navigationStartTimeForStats.getTime()) / 60000 : 0;
 
             if (tripDurationMinutes < 5) {
-                // Durante los primeros 5 minutos del viaje, somos agresivos/conservadores.
                 speedKmh = 90; 
             } else {
-                // Después de 5 minutos, confiamos más en la media, pero con un suelo de seguridad.
                 const MINIMUM_AVERAGE_SPEED_FOR_CALC = 60;
                 speedKmh = Math.max(window.averageSpeedKmh, MINIMUM_AVERAGE_SPEED_FOR_CALC);
             }
             
-            // Fallback final si la velocidad media es 0 (coche parado).
             if (speedKmh < 1) {
                 speedKmh = 40;
             }
-            // --- FIN DE LA NUEVA LÓGICA ---
             
             const speedMps = speedKmh * 1000 / 3600;
             const distanceToActivationZone = Math.max(0, closestVigia.distance - (closestVigia.reminder.radiusMeters || DEFAULT_LOCATION_RADIUS));
             const etaSeconds = speedMps > 0 ? distanceToActivationZone / speedMps : Infinity;
             
-            // Aumentamos el margen de seguridad a 60 segundos.
             const MARGEN_SEGURIDAD_MS = 60 * 1000; 
             const wakeUpTimestamp = now + (etaSeconds * 1000) - MARGEN_SEGURIDAD_MS;
             
@@ -3380,7 +3393,7 @@ function recalculateNextEventHorizon() {
         }
     }
 
-    // 3. Decisión final (sin cambios)
+    // 3. Decisión final
     if (nextTemporalEvent.timestamp < nextLocationEvent.timestamp) {
         nextEventHorizon = {
             timestamp: nextTemporalEvent.timestamp,
