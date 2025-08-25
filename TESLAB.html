@@ -1,4 +1,4 @@
-L03
+L04
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -3356,35 +3356,41 @@ function rebuildProcessedRemindersCache() {
         nonLocationRemindersCache = [];
     }
 }
-    
-
-// =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
-// NOMBRE: startDeviationChecker (VERSIÓN FINAL Y OPTIMIZADA)
-// RESUMEN: Inicia un temporizador que comprueba el desvío de ruta. Se desactiva
+// ===================================================================
+// NOMBRE: startDeviationChecker (VERSIÓN MODIFICADA CON INTERVALO DINÁMICO)
+// RESUMEN: Inicia un temporizador que comprueba el desvío de ruta. El intervalo
+//          es de 6 segundos por defecto, pero cambia a 1 segundo si el desvío
+//          supera los 15 metros para una reacción más rápida.
+// ===================================================================
 function startDeviationChecker() {
-    stopDeviationChecker();
+    stopDeviationChecker(); 
     
-    deviationCheckIntervalId = setInterval(() => {
-      
+    const NORMAL_CHECK_INTERVAL_MS = 6000;
+    const QUICK_CHECK_INTERVAL_MS = 1000;
+    const QUICK_CHECK_THRESHOLD_METERS = 15;
+  
+    const checkDeviationLoop = () => {
         if (isArrivalSequenceStarted) {
             stopDeviationChecker();
             return;
         }
-        
         if (Date.now() < deviationCheckGracePeriodUntil) {
+            deviationCheckIntervalId = setTimeout(checkDeviationLoop, NORMAL_CHECK_INTERVAL_MS);
             return;
         }
-   
         if (!isNavigating || !navigationCurrentLocation || isRecalculatingRoute || isDeviationModalActive || isAddReminderAtLocationModeActive) {
             deviationStartTime = 0;
+            deviationCheckIntervalId = setTimeout(checkDeviationLoop, NORMAL_CHECK_INTERVAL_MS);
             return;
         }
 
         const route = navigationCurrentRouteData?.routes?.[0];
         if (!route || !route.legs || !route.legs[currentLegIndexNav] || !route.legs[currentLegIndexNav].steps[currentStepIndexNav] || typeof turf === 'undefined') {
+            deviationCheckIntervalId = setTimeout(checkDeviationLoop, NORMAL_CHECK_INTERVAL_MS);
             return;
         }
         
+        let distanceToRoute = 0;
         try {
             const carPoint = turf.point([navigationCurrentLocation.longitude, navigationCurrentLocation.latitude]);
             
@@ -3411,43 +3417,47 @@ function startDeviationChecker() {
                     i--; 
                 }
             }
-
             if (searchWindowCoords.length < 2) {
-                deviationStartTime = 0;
-                return;
-            }
-
-            const routeWindowLineString = turf.lineString(searchWindowCoords);
-            const distanceToRoute = turf.pointToLineDistance(carPoint, routeWindowLineString, { units: 'meters' });
-
-            if (distanceToRoute > DEVIATION_THRESHOLD_METERS) {
-                if (deviationStartTime === 0) {
-                    deviationStartTime = Date.now();
-                } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
-                    showDeviationModal();
-                    deviationStartTime = 0;
-                }
+                distanceToRoute = 0;
             } else {
-                deviationStartTime = 0;
+                const routeWindowLineString = turf.lineString(searchWindowCoords);
+                distanceToRoute = turf.pointToLineDistance(carPoint, routeWindowLineString, { units: 'meters' });
             }
+
         } catch (e) {
-            console.error("[DESVÍO] Error en el cálculo de distancia optimizado:", e);
+             distanceToRoute = DEVIATION_THRESHOLD_METERS + 1; 
+        }
+
+        if (distanceToRoute > DEVIATION_THRESHOLD_METERS) {
             if (deviationStartTime === 0) {
                 deviationStartTime = Date.now();
             } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
                 showDeviationModal();
                 deviationStartTime = 0;
+                return;
             }
+        } else {
+            deviationStartTime = 0;
         }
-          }, 5000);
+        
+        let nextInterval = NORMAL_CHECK_INTERVAL_MS;
+        if (distanceToRoute > QUICK_CHECK_THRESHOLD_METERS) {
+            nextInterval = QUICK_CHECK_INTERVAL_MS;
+        }
+        
+        deviationCheckIntervalId = setTimeout(checkDeviationLoop, nextInterval);
+    };
+
+    checkDeviationLoop();
 }
 
+    
 // ===================================================================
 // NOMBRE: stopDeviationChecker 
 // RESUMEN: Detiene el temporizador de comprobación de desvío.
 function stopDeviationChecker() {
     if (deviationCheckIntervalId) {
-        clearInterval(deviationCheckIntervalId);
+        clearTimeout(deviationCheckIntervalId); 
         deviationCheckIntervalId = null;
         deviationStartTime = 0;
     }
@@ -5655,7 +5665,7 @@ function processRouteProgress(coords, mapInstanceToUse) {
         const nearestPointOnRoute = turf.nearestPointOnLine(fullRouteLineString, _turfCurrentPoint, { units: 'meters' });
         carDistCalculated = nearestPointOnRoute.properties.location;
     } catch (e) {
-        try { // Fallback
+        try { 
             _turfCurrentPoint.geometry.coordinates[0] = coords.longitude;
             _turfCurrentPoint.geometry.coordinates[1] = coords.latitude;
             const carPointTurf = _turfCurrentPoint;
@@ -5677,28 +5687,22 @@ function processRouteProgress(coords, mapInstanceToUse) {
         lastCarDistanceAlongRouteForNavLogic = totalRouteLength;
     }
 
-    // --- INICIO DE LA LÓGICA DE VIGÍA DE RUTA SIMPLIFICADA Y CORREGIDA ---
     if (eventosEnRuta.length > 0 && proximoEventoEnRutaIndex < eventosEnRuta.length) {
         const proximoEvento = eventosEnRuta[proximoEventoEnRutaIndex];
         const distanciaAlEvento = proximoEvento.distanceOnRoute - lastCarDistanceAlongRouteForNavLogic;
         
-        // Obtenemos el radio específico del evento. Si no tiene, usamos uno por defecto.
         const radioDelEvento = proximoEvento.radiusMeters || DEFAULT_LOCATION_RADIUS;
 
-        // 1. CONDICIÓN ÚNICA Y DIRECTA: ¿Hemos entrado en el radio de acción del evento?
         if (distanciaAlEvento <= radioDelEvento) {
             
             const dueTime = proximoEvento.dueTimeUTC;
             const now = Date.now();
             
-            // 2. ¿El evento está activo y no ha sido visto ya?
             if ((!dueTime || dueTime <= now) && !proximoEvento.managedByUser) {
                 displayUnifiedReminderWindow([proximoEvento]);
             }
         }
         
-        // 3. ¿Hemos SUPERADO la ubicación del evento para pasar al siguiente?
-        // Se mantiene la lógica de avanzar el puntero solo cuando la distancia es negativa.
         if (distanciaAlEvento < 0) {
             proximoEventoEnRutaIndex++; 
         }
@@ -5709,7 +5713,6 @@ function processRouteProgress(coords, mapInstanceToUse) {
     updateTurnByTurnDisplay(route, lastCarDistanceAlongRouteForNavLogic);
     updateNavigationProgressDisplay(route, lastCarDistanceAlongRouteForNavLogic);
 }
-    
     
 // ===================================================================
 // NOMBRE: startGpsWatching (VERSIÓN COMPLETA Y CORRECTA)
