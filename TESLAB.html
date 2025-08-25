@@ -1,4 +1,4 @@
-L05
+L01
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -3356,41 +3356,35 @@ function rebuildProcessedRemindersCache() {
         nonLocationRemindersCache = [];
     }
 }
-// ===================================================================
-// NOMBRE: startDeviationChecker (VERSIÓN MODIFICADA CON INTERVALO DINÁMICO)
-// RESUMEN: Inicia un temporizador que comprueba el desvío de ruta. El intervalo
-//          es de 6 segundos por defecto, pero cambia a 1 segundo si el desvío
-//          supera los 15 metros para una reacción más rápida.
-// ===================================================================
-function startDeviationChecker() {
-    stopDeviationChecker(); 
     
-    const NORMAL_CHECK_INTERVAL_MS = 6000;
-    const QUICK_CHECK_INTERVAL_MS = 1000;
-    const QUICK_CHECK_THRESHOLD_METERS = 15;
-  
-    const checkDeviationLoop = () => {
+
+// =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+// NOMBRE: startDeviationChecker (VERSIÓN FINAL Y OPTIMIZADA)
+// RESUMEN: Inicia un temporizador que comprueba el desvío de ruta. Se desactiva
+function startDeviationChecker() {
+    stopDeviationChecker();
+    
+    deviationCheckIntervalId = setInterval(() => {
+      
         if (isArrivalSequenceStarted) {
             stopDeviationChecker();
             return;
         }
+        
         if (Date.now() < deviationCheckGracePeriodUntil) {
-            deviationCheckIntervalId = setTimeout(checkDeviationLoop, NORMAL_CHECK_INTERVAL_MS);
             return;
         }
+   
         if (!isNavigating || !navigationCurrentLocation || isRecalculatingRoute || isDeviationModalActive || isAddReminderAtLocationModeActive) {
             deviationStartTime = 0;
-            deviationCheckIntervalId = setTimeout(checkDeviationLoop, NORMAL_CHECK_INTERVAL_MS);
             return;
         }
 
         const route = navigationCurrentRouteData?.routes?.[0];
         if (!route || !route.legs || !route.legs[currentLegIndexNav] || !route.legs[currentLegIndexNav].steps[currentStepIndexNav] || typeof turf === 'undefined') {
-            deviationCheckIntervalId = setTimeout(checkDeviationLoop, NORMAL_CHECK_INTERVAL_MS);
             return;
         }
         
-        let distanceToRoute = 0;
         try {
             const carPoint = turf.point([navigationCurrentLocation.longitude, navigationCurrentLocation.latitude]);
             
@@ -3417,47 +3411,43 @@ function startDeviationChecker() {
                     i--; 
                 }
             }
+
             if (searchWindowCoords.length < 2) {
-                distanceToRoute = 0;
-            } else {
-                const routeWindowLineString = turf.lineString(searchWindowCoords);
-                distanceToRoute = turf.pointToLineDistance(carPoint, routeWindowLineString, { units: 'meters' });
+                deviationStartTime = 0;
+                return;
             }
 
-        } catch (e) {
-             distanceToRoute = DEVIATION_THRESHOLD_METERS + 1; 
-        }
+            const routeWindowLineString = turf.lineString(searchWindowCoords);
+            const distanceToRoute = turf.pointToLineDistance(carPoint, routeWindowLineString, { units: 'meters' });
 
-        if (distanceToRoute > DEVIATION_THRESHOLD_METERS) {
+            if (distanceToRoute > DEVIATION_THRESHOLD_METERS) {
+                if (deviationStartTime === 0) {
+                    deviationStartTime = Date.now();
+                } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
+                    showDeviationModal();
+                    deviationStartTime = 0;
+                }
+            } else {
+                deviationStartTime = 0;
+            }
+        } catch (e) {
+            console.error("[DESVÍO] Error en el cálculo de distancia optimizado:", e);
             if (deviationStartTime === 0) {
                 deviationStartTime = Date.now();
             } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
                 showDeviationModal();
                 deviationStartTime = 0;
-                return;
             }
-        } else {
-            deviationStartTime = 0;
         }
-        
-        let nextInterval = NORMAL_CHECK_INTERVAL_MS;
-        if (distanceToRoute > QUICK_CHECK_THRESHOLD_METERS) {
-            nextInterval = QUICK_CHECK_INTERVAL_MS;
-        }
-        
-        deviationCheckIntervalId = setTimeout(checkDeviationLoop, nextInterval);
-    };
-
-    checkDeviationLoop();
+          }, 5000);
 }
 
-    
 // ===================================================================
 // NOMBRE: stopDeviationChecker 
 // RESUMEN: Detiene el temporizador de comprobación de desvío.
 function stopDeviationChecker() {
     if (deviationCheckIntervalId) {
-        clearTimeout(deviationCheckIntervalId); 
+        clearInterval(deviationCheckIntervalId);
         deviationCheckIntervalId = null;
         deviationStartTime = 0;
     }
@@ -5486,7 +5476,9 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
          criticalTask.handler(coords, mapInstanceToUse);
          criticalTask.lastRun = now;
     }
-}   
+}
+
+    
     
 // ===================================================================
 // NOMBRE: updateVehicleMarker (VERSIÓN FINAL CON OPTIMIZACIÓN DE DOM)
@@ -5665,7 +5657,7 @@ function processRouteProgress(coords, mapInstanceToUse) {
         const nearestPointOnRoute = turf.nearestPointOnLine(fullRouteLineString, _turfCurrentPoint, { units: 'meters' });
         carDistCalculated = nearestPointOnRoute.properties.location;
     } catch (e) {
-        try { 
+        try { // Fallback
             _turfCurrentPoint.geometry.coordinates[0] = coords.longitude;
             _turfCurrentPoint.geometry.coordinates[1] = coords.latitude;
             const carPointTurf = _turfCurrentPoint;
@@ -5687,22 +5679,28 @@ function processRouteProgress(coords, mapInstanceToUse) {
         lastCarDistanceAlongRouteForNavLogic = totalRouteLength;
     }
 
+    // --- INICIO DE LA LÓGICA DE VIGÍA DE RUTA SIMPLIFICADA Y CORREGIDA ---
     if (eventosEnRuta.length > 0 && proximoEventoEnRutaIndex < eventosEnRuta.length) {
         const proximoEvento = eventosEnRuta[proximoEventoEnRutaIndex];
         const distanciaAlEvento = proximoEvento.distanceOnRoute - lastCarDistanceAlongRouteForNavLogic;
         
+        // Obtenemos el radio específico del evento. Si no tiene, usamos uno por defecto.
         const radioDelEvento = proximoEvento.radiusMeters || DEFAULT_LOCATION_RADIUS;
 
+        // 1. CONDICIÓN ÚNICA Y DIRECTA: ¿Hemos entrado en el radio de acción del evento?
         if (distanciaAlEvento <= radioDelEvento) {
             
             const dueTime = proximoEvento.dueTimeUTC;
             const now = Date.now();
             
+            // 2. ¿El evento está activo y no ha sido visto ya?
             if ((!dueTime || dueTime <= now) && !proximoEvento.managedByUser) {
                 displayUnifiedReminderWindow([proximoEvento]);
             }
         }
         
+        // 3. ¿Hemos SUPERADO la ubicación del evento para pasar al siguiente?
+        // Se mantiene la lógica de avanzar el puntero solo cuando la distancia es negativa.
         if (distanciaAlEvento < 0) {
             proximoEventoEnRutaIndex++; 
         }
@@ -5715,8 +5713,8 @@ function processRouteProgress(coords, mapInstanceToUse) {
 }
     
 // ===================================================================
-// NOMBRE: startGpsWatching (VERSIÓN COMPLETA Y CORRECTA)
-// RESUMEN: Inicia el seguimiento GPS. Incluye tanto la lógica de inicio 
+// NOMBRE: startGpsWatching (VERSIÓN SIMPLIFICADA CON COPIA TEMPORAL)
+// RESUMEN: Inicia el seguimiento GPS, reintentando silenciosamente
 function startGpsWatching() {
     if (gpsRetryTimeoutId) {
         clearTimeout(gpsRetryTimeoutId);
@@ -5732,6 +5730,8 @@ function startGpsWatching() {
     }
     gpsRetryAttempt++;
     
+    const lastPositionBeforeUpdate = lastPositionForStats ? { ...lastPositionForStats } : null;
+
     locationWatchId = navigator.geolocation.watchPosition(
         (position) => {
             gpsHzMonitor.ticks++; 
@@ -5751,8 +5751,8 @@ function startGpsWatching() {
                 altitude: position.coords.altitude
             };
 
-            updateInitialUserPosition(coordsForUpdate, 
-            
+            updateInitialUserPosition(coordsForUpdate, navigationMapInstance);
+
             if (!isNavigating && navigationWaypoints.length >= 2) {
                 const isRouteDataFullyAvailable = navigationCurrentRouteData &&
                                                 navigationCurrentRouteData.routes &&
@@ -5770,22 +5770,22 @@ function startGpsWatching() {
 
                     if (!isRouteCompleted && distanceFromStart > START_TRIGGER_DISTANCE && distanceFromStart < RELEVANCE_DISTANCE) {
                         toggleNavigationState(); 
-                        return; 
-                    }
+                        return; }
                 }
             }
             
             if (!isNavigating && !isFreeDriveActive && navigationWaypoints.length === 0) {
-                
-                const speedKmh = position.coords.speed ? (position.coords.speed * 3.6) : 0;
-                const SPEED_TRIGGER_KMH = 20;
-
-                if (speedKmh > SPEED_TRIGGER_KMH) {
-                    startFreeDrive(coordsForUpdate);
-                    return; 
+                if (lastPositionBeforeUpdate) {
+                    const distanceMoved = calculateDistance(
+                        lastPositionBeforeUpdate.latitude, lastPositionBeforeUpdate.longitude,
+                        coordsForUpdate.latitude, coordsForUpdate.longitude
+                    );
+                    if (distanceMoved > 40) { 
+                        startFreeDrive(coordsForUpdate); 
+                        return; 
+                    }
                 }
             }
-            
            },
         (error) => {
             if (locationWatchId !== null) {
@@ -5797,7 +5797,6 @@ function startGpsWatching() {
         { enableHighAccuracy: true, timeout: 15000, maximumAge: 2000, distanceFilter: 3 }
     );
 }
-
     
 // ===================================================================
 // NOMBRE: processSimulatedGpsPosition 
@@ -8339,6 +8338,33 @@ async function fetchAndRenderChatMessages(loadMore = false) {
     }
 }    
     
+// ===================================================================
+// NOMBRE: handleProgressiveManeuverZoom (VERSIÓN FINAL CON CORRECCIÓN DE ÁMBITO)
+// RESUMEN: Incluye mejoras y corrección del bug de estado. Ahora recibe
+const easeInOutQuad = t => t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+function findNextValidStep(route, currentLeg, currentStep) {
+    let legIndex = currentLeg;
+    let stepIndex = currentStep + 1;
+    const waypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal);
+
+    while (legIndex < route.legs.length) {
+        const leg = route.legs[legIndex];
+        if (stepIndex >= leg.steps.length) {
+            legIndex++;
+            stepIndex = 0;
+            continue;
+        }
+        const candidateStep = leg.steps[stepIndex];
+        const isArrival = candidateStep.maneuver.type === 'arrive';
+        const arrivalWaypoint = isArrival ? waypoints[legIndex + 1] : null;
+        if (isArrival && arrivalWaypoint && arrivalWaypoint.isInternal) {
+            stepIndex++;
+            continue; 
+        }
+        return { step: candidateStep, legIndex: legIndex, stepIndex: stepIndex };
+    }
+    return null;
+}
 
 // ===================================================================
 // NOMBRE: handleProgressiveManeuverZoom (VERSIÓN OPTIMIZADA Y LÓGICA DE OFFSET CORREGIDA)
@@ -9423,11 +9449,12 @@ function showRadarSpeedModal(callbackOnSelect) {
         callbackOnSelect(null);
         closeHandler();
     });
-}    
+}
 
+    
 // ===================================================================
-// NOMBRE: checkForExcessiveRadars (MODIFICADA - PRESERVA RADARES MANUALES)
-// RESUMEN: Comprueba si el usuario tiene demasiados radares importados. Al limpiar,
+// NOMBRE: checkForExcessiveRadars
+// RESUMEN: Comprueba si el usuario tiene demasiados radares importados y ofrece limpiarlos y hacer backup.
 function checkForExcessiveRadars() {
     const reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
     const manualRadarReminders = reminders.filter(r => r && (r.text.toUpperCase().includes('RADAR') || r.excludeFromList === true) && !r.isDynamicRadar);
@@ -9442,8 +9469,8 @@ function checkForExcessiveRadars() {
         modal.className = 'choice-modal';
         modal.innerHTML = `
             <h2>Optimización de Radares</h2>
-            <p style="margin-bottom: 1rem;">Hemos detectado que tienes <strong>${manualRadarReminders.length} radares</strong> importados. Un nuevo sistema carga automáticamente los radares cercanos para mejorar el rendimiento.</p>
-            <p style="margin-bottom: 1.5rem; font-weight: bold;">¿Deseas eliminar los radares importados (excepto los creados manualmente con radio de 350m) y activar el nuevo sistema dinámico?</p>
+            <p style="margin-bottom: 1rem;">Hemos detectado que tienes <strong>${manualRadarReminders.length} radares</strong> importados manualmente. Un nuevo sistema carga automáticamente los radares cercanos (80 km) para mejorar el rendimiento.</p>
+            <p style="margin-bottom: 1.5rem; font-weight: bold;">¿Deseas eliminar los radares importados y activar el nuevo sistema dinámico?</p>
             <div class="modal-top-buttons">
                 <button id="confirm-radar-cleanup" class="choice-edit" style="background-color: #28a745; color: white;">Sí, limpiar y optimizar</button>
                 <button id="cancel-radar-cleanup" class="choice-cancel">No, mantener mis radares</button>
@@ -9461,21 +9488,7 @@ function checkForExcessiveRadars() {
         
         confirmBtn.addEventListener('click', async () => {
             showToast("Limpiando radares manuales antiguos...", "info", 0, false, "radar-cleanup-toast");
-            
-            const remindersToKeep = reminders.filter(r => {
-                const isCandidateForDeletion = (r.text.toUpperCase().includes('RADAR') || r.excludeFromList === true) && !r.isDynamicRadar;
-                
-                if (!isCandidateForDeletion) {
-                    return true;
-                }
-                
-                if (r.radiusMeters === 350) {
-                    return true;
-                }
-                
-                return false;
-            });
-          
+            const remindersToKeep = reminders.filter(r => !((r.text.toUpperCase().includes('RADAR') || r.excludeFromList === true) && !r.isDynamicRadar));
             localStorage.setItem('reminders', JSON.stringify(remindersToKeep));
             
             showToast("Guardando copia de seguridad en la nube...", "info", 0, false, "radar-cleanup-toast");
@@ -9496,8 +9509,7 @@ function checkForExcessiveRadars() {
         
         addModalAutoCloseTimer(modal, confirmBtn, modalId, 60000);
     }
-}
-    
+}    
     
 // ===================================================================
 // NOMBRE: toggleMapControls
@@ -10593,6 +10605,9 @@ async function sendMessage() {
         sendButton.disabled = false;
     }
 }    
+
+
+
     
 // ===================================================================
 // NOMBRE: handleDragEnd
@@ -11702,7 +11717,9 @@ function drawStaticMarkersOnProgressBar() {
         });
     }
 }
-  
+
+
+    
 // ===================================================================
 // NOMBRE: getAddressForWaypoint 
 // RESUMEN: Obtiene la dirección o solo la calle de un punto de ruta.
@@ -11725,7 +11742,9 @@ async function getAddressForWaypoint(lat, lng, streetOnly = false) {
         return streetOnly ? "Calle desconocida" : `Etapa (${lat.toFixed(3)}, ${lng.toFixed(3)})`;
     }
 }
-  
+
+
+    
 // ===================================================================
 // NOMBRE: openAlertModal
 // RESUMEN: Abre el modal para que el usuario seleccione una incidencia de tráfico.
@@ -12773,6 +12792,8 @@ async function restoreBackupFromFirebase(isAutoLoad = false) {
         }
         return Math.random() * (max - min) + min;
     }
+
+
     
 // ===================================================================
 // NOMBRE: addRouteToRecents 
@@ -14867,7 +14888,9 @@ function createOtherButtons() {
     }
     
     // ===================================================================
-     function removePinSettings() { const pinStatus = document.getElementById('config-pin-status'); if (confirm('¿Estás seguro de que deseas eliminar la clave de acceso? Ya no se solicitará al inicio.')) { try { localStorage.removeItem('password_pin'); localStorage.setItem('password_active', 'false'); storedPin = null; isPasswordActive = false; pinStatus.textContent = 'Clave eliminada.'; pinStatus.style.color = '#17a2b8'; document.getElementById('config-pin-set').value = ''; document.getElementById('config-pin-confirm').value = ''; updatePasswordToggleIcon(); saveSettings(); showToast('Clave eliminada.', 'info'); } catch (e) { pinStatus.textContent = 'Error al eliminar la clave.'; pinStatus.style.color = '#EF4444'; showToast('Error al eliminar la clave.', 'error'); } } }
+    // NOMBRE: removePinSettings
+    // RESUMEN: Elimina la configuración de PIN de acceso.
+    function removePinSettings() { const pinStatus = document.getElementById('config-pin-status'); if (confirm('¿Estás seguro de que deseas eliminar la clave de acceso? Ya no se solicitará al inicio.')) { try { localStorage.removeItem('password_pin'); localStorage.setItem('password_active', 'false'); storedPin = null; isPasswordActive = false; pinStatus.textContent = 'Clave eliminada.'; pinStatus.style.color = '#17a2b8'; document.getElementById('config-pin-set').value = ''; document.getElementById('config-pin-confirm').value = ''; updatePasswordToggleIcon(); saveSettings(); showToast('Clave eliminada.', 'info'); } catch (e) { pinStatus.textContent = 'Error al eliminar la clave.'; pinStatus.style.color = '#EF4444'; showToast('Error al eliminar la clave.', 'error'); } } }
     
     // ===================================================================
     // NOMBRE: getRemoteUpdatesDate
@@ -16794,91 +16817,9 @@ function reactivateRealGpsAfterSimulation() {
 }
 
 // ===================================================================
-// NOMBRE: animateMarkerAndMap 
-// RESUMEN: Bucle de animación que usa setters individuales y ratios LERP
-function animateMarkerAndMap(timestamp) {
-    if (!initialUserLocationMarker || !navigationMapInstance) {
-        markerAnimationState.animationFrameId = null;
-        return;
-    }
-
-    if (!markerAnimationState.lastTimestamp) {
-        markerAnimationState.lastTimestamp = timestamp;
-        markerAnimationState.currentMapZoom = navigationMapInstance.getZoom();
-        markerAnimationState.currentMapPitch = navigationMapInstance.getPitch();
-        markerAnimationState.currentMapBearing = navigationMapInstance.getBearing();
-        markerAnimationState.currentMapCenter = navigationMapInstance.getCenter();
-        markerAnimationState.currentMapOffsetX = mapOffsetX;
-        markerAnimationState.currentMapOffsetY = mapOffsetY;
-        markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
-        return;
-    }
-
-    const deltaTime = timestamp - markerAnimationState.lastTimestamp;
-    markerAnimationState.lastTimestamp = timestamp;
-
-    const posLerpFactor = 1.0 - Math.exp(-deltaTime * lerpRatePosition);
-    const rotLerpFactor = 1.0 - Math.exp(-deltaTime * lerpRateRotation);
-    const zoomPitchLerpFactor = 1.0 - Math.exp(-deltaTime * lerpRateZoom);
- 
-    if (markerAnimationState.currentLngLat && markerAnimationState.targetLngLat) {
-        markerAnimationState.currentLngLat.lng += (markerAnimationState.targetLngLat.lng - markerAnimationState.currentLngLat.lng) * posLerpFactor;
-        markerAnimationState.currentLngLat.lat += (markerAnimationState.targetLngLat.lat - markerAnimationState.currentLngLat.lat) * posLerpFactor;
-        initialUserLocationMarker.setLngLat(markerAnimationState.currentLngLat);
-    }
-    let deltaIconRotation = markerAnimationState.targetIconRotation - markerAnimationState.currentIconRotation;
-    if (deltaIconRotation > 180) deltaIconRotation -= 360;
-    if (deltaIconRotation < -180) deltaIconRotation += 360;
-    markerAnimationState.currentIconRotation += deltaIconRotation * rotLerpFactor;
-    initialUserLocationMarker.setRotation(markerAnimationState.currentIconRotation);
-
-    if (shouldCenterOnUser || navigationFollowUser) {
-        if (markerAnimationState.currentMapCenter && markerAnimationState.targetLngLat) {
-            markerAnimationState.currentMapCenter.lng += (markerAnimationState.targetLngLat.lng - markerAnimationState.currentMapCenter.lng) * posLerpFactor;
-            markerAnimationState.currentMapCenter.lat += (markerAnimationState.targetLngLat.lat - markerAnimationState.currentMapCenter.lat) * posLerpFactor;
-        }
-
-        let deltaMapBearing = markerAnimationState.targetMapBearing - markerAnimationState.currentMapBearing;
-        if (deltaMapBearing > 180) deltaMapBearing -= 360;
-        if (deltaMapBearing < -180) deltaMapBearing += 360;
-        markerAnimationState.currentMapBearing += deltaMapBearing * rotLerpFactor;
-
-        markerAnimationState.currentMapZoom += (markerAnimationState.targetMapZoom - markerAnimationState.currentMapZoom) * zoomPitchLerpFactor;
-        markerAnimationState.currentMapPitch += (markerAnimationState.targetMapPitch - markerAnimationState.currentMapPitch) * zoomPitchLerpFactor;
-        markerAnimationState.currentMapOffsetX += (markerAnimationState.targetMapOffsetX - markerAnimationState.currentMapOffsetX) * zoomPitchLerpFactor;
-        markerAnimationState.currentMapOffsetY += (markerAnimationState.targetMapOffsetY - markerAnimationState.currentMapOffsetY) * zoomPitchLerpFactor;
-
-        if (markerAnimationState.currentMapCenter) {
-            navigationMapInstance.setCenter(markerAnimationState.currentMapCenter);
-            navigationMapInstance.setBearing(markerAnimationState.currentMapBearing);
-            navigationMapInstance.setZoom(markerAnimationState.currentMapZoom);
-            navigationMapInstance.setPitch(markerAnimationState.currentMapPitch);
-            navigationMapInstance.setPadding({
-                top: markerAnimationState.currentMapOffsetY > 0 ? navigationMapInstance.getCanvas().clientHeight * Math.abs(markerAnimationState.currentMapOffsetY / 100) : 0,
-                bottom: markerAnimationState.currentMapOffsetY < 0 ? navigationMapInstance.getCanvas().clientHeight * Math.abs(markerAnimationState.currentMapOffsetY / 100) : 0,
-                left: markerAnimationState.currentMapOffsetX < 0 ? navigationMapInstance.getCanvas().clientWidth * Math.abs(markerAnimationState.currentMapOffsetX / 100) : 0,
-                right: markerAnimationState.currentMapOffsetX > 0 ? navigationMapInstance.getCanvas().clientWidth * Math.abs(markerAnimationState.currentMapOffsetX / 100) : 0
-            });
-            
-            if (window.mapCustomControlsInstance && typeof window.mapCustomControlsInstance.updateOffsetDisplay === 'function') {
-                window.mapCustomControlsInstance.updateOffsetDisplay(
-                    markerAnimationState.currentMapOffsetX,
-                    markerAnimationState.currentMapOffsetY
-                );
-            }
-        }
-      }
-
-    markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
-}
-
-
-// ===================================================================
 // NOMBRE: animateMarkerAndMap (VERSIÓN 15 FINAL - CESIÓN CADA 10 SEGUNDOS)
 // RESUMEN: Mantiene un objetivo de 40 FPS y cede el control al navegador
 //          cada 10 segundos para facilitar la recolección de basura,
-//          logrando el máximo equilibrio entre fluidez y estabilidad.
-// ===================================================================
 function animateMarkerAndMap(timestamp) {
     if (!initialUserLocationMarker || !navigationMapInstance) {
         markerAnimationState.animationFrameId = null;
@@ -16906,7 +16847,6 @@ function animateMarkerAndMap(timestamp) {
     const posLerpFactor = 1.0 - Math.exp(-deltaTime * lerpRatePosition);
     const rotLerpFactor = 1.0 - Math.exp(-deltaTime * lerpRateRotation);
     
-    // 1. El icono del coche se sigue animando a 60 FPS
     if (markerAnimationState.currentLngLat && markerAnimationState.targetLngLat) {
         markerAnimationState.currentLngLat.lng += (markerAnimationState.targetLngLat.lng - markerAnimationState.currentLngLat.lng) * posLerpFactor;
         markerAnimationState.currentLngLat.lat += (markerAnimationState.targetLngLat.lat - markerAnimationState.currentLngLat.lat) * posLerpFactor;
@@ -16918,15 +16858,13 @@ function animateMarkerAndMap(timestamp) {
     markerAnimationState.currentIconRotation += deltaIconRotation * rotLerpFactor;
     initialUserLocationMarker.setRotation(markerAnimationState.currentIconRotation);
 
-    // --- LÓGICA DE CESIÓN DE CONTROL CADA 10 SEGUNDOS ---
-    if (timestamp - lastGarbageCollectionYield > 8000) { // <-- CAMBIO A 10000 ms
+    if (timestamp - lastGarbageCollectionYield > 8000) { 
         lastGarbageCollectionYield = timestamp;
         lastMapUpdateTime = timestamp;
         markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
-        return; // Salta UN ciclo de actualización de la cámara cada 10 segundos.
+        return; // Salta UN ciclo de actualización de la cámara cada 8 segundos.
     }
 
-    // 2. La lógica de la CÁMARA se ejecuta a 40 FPS (excepto en la pausa)
     if (timestamp - lastMapUpdateTime > MAP_UPDATE_INTERVAL_MS) {
         lastMapUpdateTime = timestamp;
 
@@ -16936,7 +16874,6 @@ function animateMarkerAndMap(timestamp) {
 
         if (shouldCenterOnUser || navigationFollowUser) {
             
-            // 2a. Interpolar valores
             if (markerAnimationState.currentMapCenter && markerAnimationState.targetLngLat) {
                 markerAnimationState.currentMapCenter.lng += (markerAnimationState.targetLngLat.lng - markerAnimationState.currentMapCenter.lng) * posLerpFactor;
                 markerAnimationState.currentMapCenter.lat += (markerAnimationState.targetLngLat.lat - markerAnimationState.currentMapCenter.lat) * posLerpFactor;
@@ -16950,7 +16887,6 @@ function animateMarkerAndMap(timestamp) {
             markerAnimationState.currentMapOffsetX += (markerAnimationState.targetMapOffsetX - markerAnimationState.currentMapOffsetX) * zoomPitchLerpFactor;
             markerAnimationState.currentMapOffsetY += (markerAnimationState.targetMapOffsetY - markerAnimationState.currentMapOffsetY) * zoomPitchLerpFactor;
 
-            // 2b. Llamar a los setters de Mapbox
             if (markerAnimationState.currentMapCenter) {
                 navigationMapInstance.setCenter(markerAnimationState.currentMapCenter);
                 navigationMapInstance.setBearing(markerAnimationState.currentMapBearing);
@@ -18303,7 +18239,7 @@ function renderWaypointMarkers() {
                 markerElement.addEventListener('mousedown', onPointerDown);
                 markerElement.addEventListener('touchstart', onPointerDown, { passive: false });
             })(wp, wp.marker); // Pasamos el waypoint y el marcador actual a la función
-            
+            // --- FIN DE LA CORRECCIÓN ---
 
         } else {
             // Si el marcador ya existe, solo actualizamos su estilo (lógica sin cambios)
@@ -18807,6 +18743,9 @@ function resetNavigationState() {
             features: [] 
         });
     }
+
+// Estado de la UI
+isArrivalSequenceStarted = false;
 
     // Estado de la UI
     isArrivalSequenceStarted = false;
