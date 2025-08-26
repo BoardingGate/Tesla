@@ -1,4 +1,4 @@
-M01
+M02
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -3094,6 +3094,93 @@ async function toggleRadaresRuta(activo) {
     actualizarYOrdenarEventosEnRuta();
 }
 
+// ===================================================================
+// NOMBRE: toggleRadaresRuta (VERSIÓN CON LLAMADA A PLOT)
+// ===================================================================
+async function toggleRadaresRuta(activo) {
+    const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+    localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(activo));
+
+    radaresEnRutaActual = [];
+
+    if (activo) {
+        const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
+        if (actualWaypoints.length < 2) {
+            actualizarYOrdenarEventosEnRuta();
+            plotRemindersOnNavigationMap(); // Aseguramos que se limpie el mapa si no hay ruta
+            return;
+        }
+        
+        if (navigationMapInstance && navigationMapInstance.getSource('route') && navigationMapInstance.getSource('route')._data) {
+            try {
+                if (!window.radarsCache) await initializeRadarCache();
+                if (!window.radarsCache) throw new Error("Base de datos de radares no disponible.");
+
+                const routeLineString = turf.lineString(navigationMapInstance.getSource('route')._data.geometry.coordinates);
+                
+                processedRemindersCache.forEach(reminder => {
+                    const isRadarType = (reminder.text.toUpperCase().includes("RADAR") || reminder.excludeFromList);
+                    if (isRadarType && reminder.isLocationEnabled && reminder.locationCoordinates) {
+                        const radarPoint = turf.point([reminder.locationCoordinates.longitude, reminder.locationCoordinates.latitude]);
+                        const nearestPointOnRoute = turf.nearestPointOnLine(routeLineString, radarPoint, { units: 'meters' });
+
+                        if (nearestPointOnRoute.properties.dist <= RUTA_RADAR_PROXIMITY_THRESHOLD) {
+                            radaresEnRutaActual.push({
+                                ...reminder, isFromRuta: true, distanceOnRoute: nearestPointOnRoute.properties.location
+                            });
+                        }
+                    }
+                });
+
+                const intersectingCells = new Set();
+                const routeCoords = routeLineString.geometry.coordinates;
+                for (let i = 0; i < routeCoords.length; i++) {
+                    intersectingCells.add(getGridCellId(routeCoords[i][1], routeCoords[i][0]));
+                }
+                const cellsToSearch = new Set(intersectingCells);
+                intersectingCells.forEach(cellId => {
+                    const [_, latIdx, lonIdx] = cellId.split('_').map(Number);
+                    for (let i = -1; i <= 1; i++) { for (let j = -1; j <= 1; j++) { cellsToSearch.add(`cell_${latIdx + i}_${lonIdx + j}`); } }
+                });
+
+                const candidateRadars = [];
+                cellsToSearch.forEach(cellId => { if (window.radarsSpatialIndex[cellId]) candidateRadars.push(...window.radarsSpatialIndex[cellId]); });
+                const uniqueCandidates = [...new Set(candidateRadars)];
+                
+                uniqueCandidates.forEach(radar => {
+                    const radarPoint = turf.point([radar.lon, radar.lat]);
+                    const nearestPointOnRoute = turf.nearestPointOnLine(routeLineString, radarPoint, { units: 'meters' });
+
+                    if (nearestPointOnRoute.properties.dist <= RUTA_RADAR_PROXIMITY_THRESHOLD) {
+                        const radarYaExiste = radaresEnRutaActual.some(rem => 
+                            rem.locationCoordinates &&
+                            Math.abs(rem.locationCoordinates.latitude - radar.lat) < COORD_EPSILON &&
+                            Math.abs(rem.locationCoordinates.longitude - radar.lon) < COORD_EPSILON
+                        );
+                        if (!radarYaExiste) {
+                            const now = new Date();
+                            const radarData = {
+                                id: Date.now() + Math.random() + radaresEnRutaActual.length,
+                                text: `<b>RADAR RUTA: ${radar.name}</b>`, type: 'simple', time: '00:01',
+                                date: `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`,
+                                createdAt: now.toISOString(), managedByUser: false, isLocationEnabled: true,
+                                locationCoordinates: { latitude: radar.lat, longitude: radar.lon },
+                                radiusMeters: 350, excludeFromList: true, isFromRuta: true,
+                                distanceOnRoute: nearestPointOnRoute.properties.location
+                            };
+                            radaresEnRutaActual.push(radarData);
+                        }
+                    }
+                });
+            } catch (error) {
+                showToast(`Error al procesar radares en ruta: ${error.message}`, "error");
+            }
+        }
+    }
+    
+    actualizarYOrdenarEventosEnRuta();
+    plotRemindersOnNavigationMap(); 
+}
     
 // ===================================================================
 // NOMBRE: toggleTareasRuta (VERSIÓN MODIFICADA PARA VIGÍA DE RUTA)
@@ -3147,6 +3234,60 @@ async function toggleTareasRuta(activo) {
     actualizarYOrdenarEventosEnRuta();
 }   
 
+// ===================================================================
+// NOMBRE: toggleTareasRuta (VERSIÓN CON LLAMADA A PLOT)
+// ===================================================================
+async function toggleTareasRuta(activo) {
+    const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox');
+    localStorage.setItem(TAREAS_RUTA_CHECKED_KEY, String(activo));
+    
+    tareasEnRutaActual = [];
+
+    if (activo) {
+        const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
+        if (actualWaypoints.length < 2) {
+            actualizarYOrdenarEventosEnRuta();
+            plotRemindersOnNavigationMap(); // Aseguramos que se limpie el mapa si no hay ruta
+            return;
+        }
+
+        if (navigationMapInstance) {
+            const routeSource = navigationMapInstance.getSource('route');
+            if (!routeSource || !routeSource._data || !routeSource._data.geometry || routeSource._data.geometry.coordinates.length < 2) {
+                if (activo) showToast("Geometría de ruta no disponible para buscar tareas.", "warning");
+                actualizarYOrdenarEventosEnRuta();
+                plotRemindersOnNavigationMap();
+                return;
+            }
+
+            try {
+                const routeLineString = turf.lineString(routeSource._data.geometry.coordinates);
+                const locationReminders = processedRemindersCache.filter(r => {
+                    if (!r.isLocationEnabled || !r.locationCoordinates) return false;
+                    const isRadarType = r.text.toUpperCase().includes("RADAR") || r.excludeFromList;
+                    return !isRadarType;
+                });
+            
+                locationReminders.forEach(reminder => {
+                    const taskPoint = turf.point([reminder.locationCoordinates.longitude, reminder.locationCoordinates.latitude]);
+                    const nearestPointOnRoute = turf.nearestPointOnLine(routeLineString, taskPoint, { units: 'meters' });
+                    const radius = reminder.radiusMeters || DEFAULT_LOCATION_RADIUS;
+                    
+                    if (nearestPointOnRoute && nearestPointOnRoute.properties.dist !== undefined && nearestPointOnRoute.properties.dist <= radius) {
+                        const taskData = { ...reminder, isFromTarea: true, distanceOnRoute: nearestPointOnRoute.properties.location };
+                        tareasEnRutaActual.push(taskData);
+                    }
+                });
+            } catch (error) {
+                 showToast("Error al procesar tareas en ruta: " + error.message, "error");
+            }
+        }
+    }
+
+    actualizarYOrdenarEventosEnRuta();
+    plotRemindersOnNavigationMap();
+}   
+    
 // ===================================================================
 // NOMBRE: actualizarYOrdenarEventosEnRuta (NUEVA FUNCIÓN DE OPTIMIZACIÓN)
 // RESUMEN: Unifica los arrays de radares y tareas en una sola lista,
@@ -17766,18 +17907,47 @@ function plotRemindersOnNavigationMap() {
     navigationMapInstance.on('mouseleave', interactiveLayers, () => { if(navigationMapInstance) navigationMapInstance.getCanvas().style.cursor = ''; });
 }
 
-// Código Modificado para plotRemindersOnNavigationMap
+// ===================================================================
+// NOMBRE: plotRemindersOnNavigationMap 
+// RESUMEN: Dibuja TODOS los recordatorios visibles (generales + de ruta) en el mapa
+//          de forma eficiente, actualizando la fuente GeoJSON en lugar de recrearla.
+// ===================================================================
 function plotRemindersOnNavigationMap() {
     if (!navigationMapInstance || !navigationMapInstance.isStyleLoaded()) {
+        console.warn("plotRemindersOnNavigationMap llamado pero el mapa no está listo.");
         return;
     }
 
     const sourceId = 'reminders-geojson-source';
-    
-    const reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
-    const remindersWithLocation = reminders.filter(r => r.isLocationEnabled && r.locationCoordinates?.latitude && r.locationCoordinates?.longitude && !r.isFromRuta);
+    const plottedRemindersMap = new Map();
 
-    const geojsonFeatures = remindersWithLocation.map(reminder => {
+    const reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
+    const generalRemindersWithLocation = reminders.filter(r => 
+        r.isLocationEnabled && 
+        r.locationCoordinates?.latitude && 
+        r.locationCoordinates?.longitude &&
+        !r.isFromRuta 
+    );
+    generalRemindersWithLocation.forEach(reminder => {
+        plottedRemindersMap.set(reminder.id, reminder);
+    });
+
+    const radaresCheckbox = document.getElementById('radares-ruta-checkbox');
+    if (radaresCheckbox && radaresCheckbox.checked && radaresEnRutaActual.length > 0) {
+        radaresEnRutaActual.forEach(radar => {
+            plottedRemindersMap.set(radar.id, radar);
+        });
+    }
+
+    const tareasCheckbox = document.getElementById('tareas-ruta-checkbox');
+    if (tareasCheckbox && tareasCheckbox.checked && tareasEnRutaActual.length > 0) {
+        tareasEnRutaActual.forEach(tarea => {
+            plottedRemindersMap.set(tarea.id, tarea);
+        });
+    }
+
+    const locationsToPlot = Array.from(plottedRemindersMap.values());
+    const geojsonFeatures = locationsToPlot.map(reminder => {
         const isRadar = reminder.text.toUpperCase().includes("RADAR") || reminder.excludeFromList;
         const speed = isRadar ? extractSpeedFromRadarText(reminder.text) : null;
         const properties = {
@@ -17795,10 +17965,8 @@ function plotRemindersOnNavigationMap() {
     
     const source = navigationMapInstance.getSource(sourceId);
     if (source) {
-        // La fuente ya existe, solo actualizamos los datos. ¡Esto es mucho más rápido!
         source.setData(geojsonData);
     } else {
-        // La fuente no existe, es la primera ejecución. La creamos junto con las capas.
         try {
             navigationMapInstance.addSource(sourceId, { type: 'geojson', data: geojsonData });
             
@@ -17824,8 +17992,7 @@ function plotRemindersOnNavigationMap() {
             console.error("Error al añadir la fuente/capas de recordatorios por primera vez:", e);
         }
     }
-}
-    
+}    
     
 // ===================================================================
 // NOMBRE: updateLocateMeButtonsUI (NUEVA FUNCIÓN)
