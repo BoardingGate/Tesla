@@ -39,7 +39,8 @@
     <link rel="icon" href="https://boardinggate.github.io/Tesla/th.jpeg" type="image/jpeg">
     <script src="https://cdn.tailwindcss.com"></script>
     <script type="module">                                                                                                                                                                                                                                          import { initializeApp } from "https://www.gstatic.com/firebasejs/11.9.1/firebase-app.js";   import { getFirestore, doc, setDoc, getDoc, getDocs, deleteDoc, collection, serverTimestamp, where, query, orderBy, limit, addDoc, writeBatch, startAfter } from "https://www.gstatic.com/firebasejs/11.9.1/firebase-firestore.js"; console.log("Firebase Init Script: STARTING initialization.");   const firebaseConfig = {apiKey: "AIzaSyCEAWL1Pj1OMBrGnXLOS79W3iDjMkmTQGw",authDomain: "boardinggate-1df74.firebaseapp.com",databaseURL: "https://boardinggate-1df74-default-rtdb.europe-west1.firebaseio.com",projectId: "boardinggate-1df74",storageBucket: "boardinggate-1df74.appspot.com", messagingSenderId: "771541345352",appId: "1:771541345352:web:0447d72b3383875ac5a47d" };    try {    const app = initializeApp(firebaseConfig);     window.db = getFirestore(app);   window.doc = doc;  window.setDoc = setDoc;  window.getDoc = getDoc;  window.collection = collection; window.getDocs = getDocs;  window.deleteDoc = deleteDoc;  window.serverTimestamp = serverTimestamp;  window.where = where; window.query = query; window.orderBy = orderBy;window.limit = limit; window.addDoc = addDoc;  window.writeBatch = writeBatch; window.startAfter = startAfter; console.log("Firebase Init Script: SUCCESS Firestore initialized and functions exposed globally. window.db is:", window.db);  } catch (e) { console.error("Firebase Init Script: ERROR during initialization!", e); }  console.log("Firebase Init Script: END of initialization block.");</script>
-        
+    
+    
     <link rel="stylesheet" href="tesla.css">
      
     <link href='https://api.mapbox.com/mapbox-gl-js/v3.13.0/mapbox-gl.css' rel='stylesheet' />
@@ -502,6 +503,8 @@
 
 <div id="flashing-border-overlay" class="hidden"></div>
 
+<div id="maneuver-flashing-border-overlay" class="hidden"></div>    
+
 <div id="chat-modal-overlay" class="hidden">
     <div id="chat-modal-content">
         <div id="chat-left-column">
@@ -569,7 +572,7 @@
         'NORTE': { pitch: 0, bearing: 0, mode: 'static', terrain: false },
         'AVANCE': { pitch: 0, bearing: null, mode: 'heading', terrain: false },
         '3D': { pitch: 62, bearing: null, mode: 'perspective', terrain: false },
-        '3D RELIEVE': { pitch: 68, bearing: null, mode: 'relief', terrain: true }
+        '3D RELIEVE': { pitch: 66, bearing: null, mode: 'relief', terrain: true }
     };
  
     let lerpRatePosition = 0.004;
@@ -593,9 +596,16 @@
     targetMapOffsetX: 0,
     currentMapOffsetY: 0,
     targetMapOffsetY: 0,
+    currentMapAltitude: null, 
+    targetMapAltitude: null,    
     lastTimestamp: null,
     lastCameraTimestamp: null  
     };
+    
+    let smoothedGpsAltitude = 0;
+    const ALTITUDE_HISTORY = [];
+    const MAX_ALTITUDE_SAMPLES = 10;
+
     
     let nextManeuverStepForPreview = null;
     let isMobileSession = false;
@@ -971,6 +981,9 @@
 
      const TASKS_BY_PRIORITY = Object.values(navigationTasks)
         .sort((a, b) => a.priority - b.priority);
+
+    let announceManeuverWithFlash = true; 
+    let maneuverFlashTriggeredId = null; 
    
     const managedKeys = [ 
         'reminders','darkMode','toggleStates','zoomState','onOffState','noticesActive', 
@@ -987,7 +1000,7 @@
         PERFORMANCE_RATIO_ROUTE_KEY, PERFORMANCE_RATIO_ALERTS_KEY, 
         PERFORMANCE_RATIO_STATS_KEY, PERFORMANCE_RATIO_GRAPH_KEY,
         'boardinggate_map_saturation', 'boardinggate_map_contrast', 
-        LERP_RATE_POS_KEY, LERP_RATE_ROT_KEY, LERP_RATE_ZOOM_KEY, PERFORMANCE_CAMERA_FPS_KEY, MAP_TERRAIN_EXAGGERATION_KEY
+        LERP_RATE_POS_KEY, LERP_RATE_ROT_KEY, LERP_RATE_ZOOM_KEY, PERFORMANCE_CAMERA_FPS_KEY, MAP_TERRAIN_EXAGGERATION_KEY, 'boardinggate_announce_maneuver_flash'
      ];
 
     
@@ -1023,6 +1036,7 @@
             case LERP_RATE_ZOOM_KEY: return 'Suavizado Zoom';
             case PERFORMANCE_CAMERA_FPS_KEY: return 'FPS Animación Cámara';  
             case MAP_TERRAIN_EXAGGERATION_KEY: return 'Exageración 3D';  
+            case 'boardinggate_announce_maneuver_flash': return 'Anunciar Maniobra Destello';    
             default:return k;
         }
     }).join(', ');   
@@ -1120,7 +1134,7 @@ class MapLayerAndViewController {
             'NORTE': { pitch: 0, bearing: 0, mode: 'static', terrain: false },
             'AVANCE': { pitch: 0, bearing: null, mode: 'heading', terrain: false },
             '3D': { pitch: 62, bearing: null, mode: 'perspective', terrain: false },
-            '3D RELIEVE': { pitch: 68, bearing: null, mode: 'relief', terrain: true }
+            '3D RELIEVE': { pitch: 66, bearing: null, mode: 'relief', terrain: true }
         };
 
         const savedViewMode = localStorage.getItem(MAP_VIEW_MODE_KEY) || 'relief';
@@ -1145,7 +1159,6 @@ class MapLayerAndViewController {
                 const newModeName = Object.keys(viewModes).find(key => viewModes[key].mode === selectedModeValue);
 
                 if (newModeDetails) {
-                    // 1. Actualizamos el estado global del modo de vista.
                     mapViewMode = newModeDetails.mode;
                     localStorage.setItem(MAP_VIEW_MODE_KEY, mapViewMode);
                     markCacheAsDirty();
@@ -1513,7 +1526,7 @@ class CustomMapControlsGroup {
                 'NORTE': { pitch: 0, bearing: 0, mode: 'static', terrain: false },
                 'AVANCE': { pitch: 0, bearing: null, mode: 'heading', terrain: false },
                 '3D': { pitch: 62, bearing: null, mode: 'perspective', terrain: false },
-                '3D RELIEVE': { pitch: 68, bearing: null, mode: 'relief', terrain: true }
+                '3D RELIEVE': { pitch: 66, bearing: null, mode: 'relief', terrain: true }
             };
 
             const currentModeDetails = Object.values(viewModes).find(m => m.mode === mapViewMode);
@@ -1901,7 +1914,7 @@ class MapSettingsPanel {
                             'NORTE': { pitch: 0, bearing: 0, mode: 'static', terrain: false },
                             'AVANCE': { pitch: 0, bearing: null, mode: 'heading', terrain: false },
                             '3D': { pitch: 62, bearing: null, mode: 'perspective', terrain: false },
-                            '3D RELIEVE': { pitch: 68, bearing: null, mode: 'relief', terrain: true }
+                            '3D RELIEVE': { pitch: 66, bearing: null, mode: 'relief', terrain: true }
                         };
                         const currentModeDetails = Object.values(viewModes).find(m => m.mode === currentModeKey);
                         if (currentModeDetails) {
@@ -1939,7 +1952,7 @@ class MapSettingsPanel {
             'NORTE': { pitch: 0, bearing: 0, mode: 'static', terrain: false },
             'AVANCE': { pitch: 0, bearing: null, mode: 'heading', terrain: false },
             '3D': { pitch: 62, bearing: null, mode: 'perspective', terrain: false },
-            '3D RELIEVE': { pitch: 68, bearing: null, mode: 'relief', terrain: true }
+            '3D RELIEVE': { pitch: 66, bearing: null, mode: 'relief', terrain: true }
         };
 
         const savedViewMode = localStorage.getItem(MAP_VIEW_MODE_KEY) || 'relief';
@@ -2319,6 +2332,17 @@ async function initializeApp() {
      });
 }    
 
+//=============================================================
+function updateSmoothedGpsAltitude(newAltitude) {
+    if (typeof newAltitude !== 'number' || isNaN(newAltitude)) return;
+    ALTITUDE_HISTORY.push(newAltitude);
+    if (ALTITUDE_HISTORY.length > MAX_ALTITUDE_SAMPLES) {
+        ALTITUDE_HISTORY.shift();
+    }
+    smoothedGpsAltitude = ALTITUDE_HISTORY.reduce((a, b) => a + b, 0) / ALTITUDE_HISTORY.length;
+}
+    
+
 // ===================================================================
 // NOMBRE: checkAndMarkWaypointsAsVisited 
 // RESUMEN: Marca la etapa como visitada a 70m y muestra el modal de llegada solo a 20m.
@@ -2445,6 +2469,9 @@ function loadSavedSettings() {
     showMinimapPreference = savedMinimapPref === null ? true : JSON.parse(savedMinimapPref);
     mapPitchValue = parseInt(localStorage.getItem(MAP_VIEW_PITCH_KEY)) || 62;
     mapTerrainExaggeration = parseFloat(localStorage.getItem(MAP_TERRAIN_EXAGGERATION_KEY)) || 1.0; // <-- AÑADIR ESTA LÍNEA
+
+    const savedAnnounceFlash = localStorage.getItem('boardinggate_announce_maneuver_flash');
+    announceManeuverWithFlash = savedAnnounceFlash === null ? true : JSON.parse(savedAnnounceFlash);
     
     performanceRatios.criticalUpdate = parseInt(localStorage.getItem(PERFORMANCE_RATIO_CRITICAL_KEY)) || 3;
     performanceRatios.routeProgress = parseInt(localStorage.getItem(PERFORMANCE_RATIO_ROUTE_KEY)) || 30;
@@ -2565,7 +2592,6 @@ function sanitizeWaypointsForStorage(waypoints) {
         };
     }).filter(Boolean); 
 }
-
 // ===================================================================
 // NOMBRE: showNavigationMapHelpModal
 // RESUMEN: Muestra un modal de ayuda completo con todos los controles de
@@ -2615,6 +2641,9 @@ function showNavigationMapHelpModal() {
             .lerp-help-text { font-size: 0.8rem; color: #b0b0b0; margin-top: 10px; text-align: center; font-style: italic; }
             .two-column-layout { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1rem; }
             .two-column-layout > div { display: flex; flex-direction: column; }
+            .settings-checkbox-label {display: flex; align-items: center; cursor: pointer; font-size: 1rem; user-select: none;}
+            .settings-checkbox-label input {width: 1.2rem; height: 1.2rem; margin-right: 10px; flex-shrink: 0;}
+            .settings-checkbox-label span {font-weight: bold; color: #a0a0a0;}
         </style>
 
         <h2 class="text-xl font-bold mb-4">Ayuda del Mapa de Navegación</h2>
@@ -2644,10 +2673,20 @@ function showNavigationMapHelpModal() {
                         </div>
                         <button id="map-visuals-reset-btn" class="reset-visuals-btn">Restaurar por defecto</button>
                         <div class="visual-settings-container" style="margin-top: 10px; padding: 10px; text-align: left;">
-                             <label for="direct-to-nav-checkbox-map-help" style="display: flex; align-items: center; cursor: pointer; font-size: 1rem; user-select: none;">
-                                 <input type="checkbox" id="direct-to-nav-checkbox-map-help" style="width: 1.2rem; height: 1.2rem; margin-right: 10px; flex-shrink: 0;">
-                                 <span style="font-weight: bold; color: #a0a0a0;">Entrar directamente al Navegador</span>
+                             <label for="direct-to-nav-checkbox-map-help" class="settings-checkbox-label">
+                                 <input type="checkbox" id="direct-to-nav-checkbox-map-help">
+                                 <span>Entrar directamente al Navegador</span>
                              </label>
+                             <!-- ============================================= -->
+                             <!-- =      NUEVO BLOQUE PARA EL DESTELLO        = -->
+                             <!-- ============================================= -->
+                             <label for="announce-maneuver-flash-checkbox" class="settings-checkbox-label" style="margin-top: 10px;">
+                                 <input type="checkbox" id="announce-maneuver-flash-checkbox">
+                                 <span>Anunciar maniobra con destello</span>
+                             </label>
+                             <!-- ============================================= -->
+                             <!-- =          FIN DEL NUEVO BLOQUE             = -->
+                             <!-- ============================================= -->
                         </div>
                     </div>
                 </div>
@@ -2737,9 +2776,9 @@ function showNavigationMapHelpModal() {
                 </div>
                 <button id="perf-ratios-reset-btn" class="reset-visuals-btn">Restaurar por defecto</button>
                 <div class="visual-settings-container" style="margin-top: 10px; text-align: left;">
-                    <label for="monitor-resources-checkbox-map" style="display: flex; align-items: center; cursor: pointer; font-size: 1rem; user-select: none;">
-                        <input type="checkbox" id="monitor-resources-checkbox-map" style="width: 1.2rem; height: 1.2rem; margin-right: 10px; flex-shrink: 0;">
-                        <span style="font-weight: bold; color: #a0a0a0;">Activar Monitor de Recursos (Memoria/FPS)</span>
+                    <label for="monitor-resources-checkbox-map" class="settings-checkbox-label">
+                        <input type="checkbox" id="monitor-resources-checkbox-map">
+                        <span>Activar Monitor de Recursos (Memoria/FPS)</span>
                     </label>
                     <p style="font-size: 0.8rem; margin-left: 32px; color: #ff9500;">No dejar activado permanentemente, consume recursos adicionales.</p>
                 </div>
@@ -2797,6 +2836,19 @@ function showNavigationMapHelpModal() {
  
     document.body.appendChild(helpModal); 
     
+    // <-- NUEVO BLOQUE INICIA: Lógica para la nueva casilla de destello -->
+    const announceFlashCheckbox = helpModal.querySelector('#announce-maneuver-flash-checkbox');
+    if (announceFlashCheckbox) {
+        announceFlashCheckbox.checked = announceManeuverWithFlash;
+        announceFlashCheckbox.addEventListener('change', () => {
+            announceManeuverWithFlash = announceFlashCheckbox.checked;
+            localStorage.setItem('boardinggate_announce_maneuver_flash', JSON.stringify(announceManeuverWithFlash));
+            markCacheAsDirty();
+            showToast(`Anuncio de maniobra por destello ${announceManeuverWithFlash ? 'ACTIVADO' : 'DESACTIVADO'}.`, 'info');
+        });
+    }
+    // <-- NUEVO BLOQUE TERMINA -->
+
     const directToNavCheckboxMapHelp = helpModal.querySelector('#direct-to-nav-checkbox-map-help');
     if (directToNavCheckboxMapHelp) {
         directToNavCheckboxMapHelp.checked = JSON.parse(localStorage.getItem(DIRECT_TO_NAVIGATION_KEY)) || false;
@@ -5666,16 +5718,17 @@ function updateVehicleMarker(coords, mapInstanceToUse) {
     if (compassAndModeControl) {
         compassAndModeControl.updateOrientation(validatedHeading);
     }
-}
-
+}   
 
 // ===================================================================
-// NOMBRE: updateMapCamera 
-// RESUMEN: Calcula todos los objetivos de la cámara, incluyendo los offsets
+// NOMBRE: updateMapCamera (VERSIÓN CON queryTerrainElevation)
+// RESUMEN: Calcula todos los objetivos de la cámara, priorizando la altitud del terreno.
 function updateMapCamera(coords, mapInstanceToUse) {
     if (!shouldCenterOnUser && !navigationFollowUser) {
         return;
     }
+    
+    updateSmoothedGpsAltitude(coords.altitude); 
 
     const cameraAdjustments = handleProgressiveManeuverZoom(
         navigationCurrentRouteData?.routes?.[0]?.legs?.[currentLegIndexNav]?.steps?.[currentStepIndexNav],
@@ -5694,15 +5747,22 @@ function updateMapCamera(coords, mapInstanceToUse) {
         markerAnimationState.targetMapZoom = navigationMapInstance.getZoom();
     }
     
-    const targetPitch = cameraAdjustments?.pitch ?? ((mapViewMode === 'perspective' || mapViewMode === 'relief') ? mapPitchValue : 0);
+    const terrainElevation = mapInstanceToUse.queryTerrainElevation({ lng: coords.longitude, lat: coords.latitude });
     
+    const baseAltitude = terrainElevation !== null ? terrainElevation : smoothedGpsAltitude;
+    
+    const cameraAltitudeOffset = 150; // Ajusta este valor para una vista más alta o más baja
+    markerAnimationState.targetMapAltitude = baseAltitude + cameraAltitudeOffset;
+
+    const targetPitch = cameraAdjustments?.pitch ?? ((mapViewMode === 'perspective' || mapViewMode === 'relief') ? mapPitchValue : 0);
+    markerAnimationState.targetMapPitch = targetPitch;
+
     const targetOffsetX = cameraAdjustments?.offsetX ?? mapOffsetX;
     const targetOffsetY = cameraAdjustments?.offsetY ?? mapOffsetY;
 
-    markerAnimationState.targetMapPitch = targetPitch;
     markerAnimationState.targetMapOffsetX = targetOffsetX;
     markerAnimationState.targetMapOffsetY = targetOffsetY;
-
+    
     let targetBearing = markerAnimationState.currentMapBearing; 
     if (mapViewMode === 'heading' || mapViewMode === 'perspective' || mapViewMode === 'relief') {
         let validatedHeading = null;
@@ -5726,7 +5786,6 @@ function updateMapCamera(coords, mapInstanceToUse) {
     }
     markerAnimationState.targetMapBearing = targetBearing;
 }    
-    
     
 // NOMBRE: updateTripStatistics 
 // RESUMEN: Gestiona los cálculos y la actualización de la UI de estadísticas de viaje.
@@ -5775,6 +5834,10 @@ function updateTripStatistics(coords) {
         compassAndModeControl.updateCurrentSpeed(window.currentSpeedKmh);
         compassAndModeControl.updateAverageSpeed(window.averageSpeedKmh);
         compassAndModeControl.updateMaxSpeed(maxSpeedDuringTrip);
+ 
+        if (isFreeDriveActive) {
+            updateNavigationProgressDisplay(); 
+        }
     }
 }
 
@@ -5838,8 +5901,6 @@ function processRouteProgress(coords, mapInstanceToUse) {
             }
         }
         
-        // 3. ¿Hemos SUPERADO la ubicación del evento para pasar al siguiente?
-        // Se mantiene la lógica de avanzar el puntero solo cuando la distancia es negativa.
         if (distanciaAlEvento < 0) {
             proximoEventoEnRutaIndex++; 
         }
@@ -7072,11 +7133,7 @@ async function getInitialGpsPositionForMap() {
     }
 }
 
-
-
-
-    
- // ===================================================================
+// ===================================================================
 // NOMBRE: updateTurnByTurnDisplay (VERSIÓN FINAL Y COMPLETA)
 // RESUMEN: Utiliza la función formatDeviation que devuelve HTML para asegurar
 //          que la mini-tarjeta se muestre correctamente.
@@ -7189,6 +7246,20 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     const infoOverlay = document.getElementById('map-info-overlay');
     const progressBar = document.getElementById('navigation-bottom-progress-bar');
     
+    // <-- NUEVO BLOQUE INICIA: Lógica para el destello -->
+    const uniqueManeuverId = `${currentLegIndex}_${currentStepIndex}_${nextStepToDisplay.name}`;
+    if (announceManeuverWithFlash && distanceToNextManeuver < 220 && maneuverFlashTriggeredId !== uniqueManeuverId) {
+        maneuverFlashTriggeredId = uniqueManeuverId;
+        const borderOverlay = document.getElementById('maneuver-flashing-border-overlay');
+        if (borderOverlay) {
+            borderOverlay.classList.remove('hidden');
+            setTimeout(() => {
+                borderOverlay.classList.add('hidden');
+            }, 3000); // El destello dura 3 segundos
+        }
+    }
+    // <-- NUEVO BLOQUE TERMINA -->
+
     if (!isProgressBarLocked && !isMapImmersiveModeActive && now > progressBarForceShowUntil) {
         const shouldHide = distanceToNextManeuver > 1000 && distanceIntoCurrentStep > 100;
         progressBar.classList.toggle('progress-bar-auto-hidden', shouldHide);
@@ -7207,7 +7278,7 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
                     const etaText = currentFinalEta.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
                     const finalDeviationMs = currentFinalEta.getTime() - tripInitialOverallEtaTime.getTime();
                     const deviationHtml = formatDeviationForMiniCard(finalDeviationMs);
-                    etaHtml = `<div style="font-size: 0.80em; margin-top: 2px; text-align: center; "><span>${etaText}</span><span style="margin-left: 8px;">${deviationHtml}</span></div>`;
+                    etaHtml = `<div style="font-size: 0.90em; margin-top: 2px; text-align: center; "><span>${etaText}</span><span style="margin-left: 8px;">${deviationHtml}</span></div>`;
                 }
                 const newMiniCardHtml = `<div>${distanceText}</div>${etaHtml}`;
                 if (miniNavCard.innerHTML !== newMiniCardHtml) {
@@ -7294,7 +7365,8 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
         if (miniNavCard) miniNavCard.style.display = 'none';
         if (intersectionPreviewWindow && !intersectionPreviewWindow.classList.contains('hidden') && intersectionPreviewWindow.dataset.source !== 'click') hideIntersectionPreviewMap();
     }
-}   
+}
+
 
 // ===================================================================
 // NOMBRE: updateNavigationProgressDisplay
@@ -16464,7 +16536,8 @@ async function configureMapAtmosphere() {
                     'type': 'raster-dem',
                     'url': 'mapbox://mapbox.terrain-rgb',
                     'tileSize': 512,
-                    'maxzoom': 14
+                    'maxzoom': 14,
+                    'overdraw': 2 // EN PRUEBA CARGA 2 TESELAS MAS
                 });
                 await new Promise(resolve => {
                     const onSourceData = (e) => {
@@ -16641,6 +16714,15 @@ function animateMarkerAndMap(timestamp) {
 
     const deltaTime = timestamp - markerAnimationState.lastTimestamp;
     markerAnimationState.lastTimestamp = timestamp;
+
+    if (timestamp - lastGarbageCollectionYield > 8000) {
+        lastGarbageCollectionYield = timestamp;
+        
+        requestAnimationFrame(() => {
+            markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
+        });
+        return; // <-- ¡Esta es la línea que "salta" la ejecución!
+    }
 
     // 1. Lógica de suavizado (LERP) para el ICONO del coche (esto no cambia)
     const posLerpFactor = 1.0 - Math.exp(-deltaTime * (parseFloat(localStorage.getItem(LERP_RATE_POS_KEY)) || 0.004));
