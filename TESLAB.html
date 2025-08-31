@@ -1,4 +1,4 @@
-D11 mini
+D12 mini
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -1883,7 +1883,6 @@ async function getGooglePlaceDetails(placeId) {
     }
 }
 
-
 // ===================================================================
 // FUNCIÓN 2 (VERSIÓN FINAL): Clase 
 // ===================================================================
@@ -1912,18 +1911,23 @@ class MapSettingsPanel {
             input.value = baseMaps[name];
             if (name === savedLayerName) input.checked = true;
             input.onchange = () => {
-                this._map.setStyle(input.value);
+                const newStyleUrl = input.value;
+                
+                // Cambia el estilo del mapa principal
+                this._map.setStyle(newStyleUrl);
                 localStorage.setItem(ACTIVE_MAP_LAYER_KEY, name);
-           
-                this._map.once('style.load', () => {
-                    this._map.once('idle', async () => {
-                        await loadAndAddMapImages(this._map);
-                        await reAddCustomMapLayersAndSources(this._map);
 
-                        // ¡CLAVE! Al cambiar el estilo, se debe reconfigurar el terreno y la atmósfera.
+                // --- MODIFICADO: También cambia el estilo del minimapa si existe ---
+                if (intersectionPreviewMap) {
+                    intersectionPreviewMap.setStyle(newStyleUrl);
+                }
+         
+                const reapplyLayers = async (mapInstance) => {
+                    await loadAndAddMapImages(mapInstance);
+                    if (mapInstance === this._map) {
+                        await reAddCustomMapLayersAndSources(this._map);
                         await configureMapAtmosphere();
                         
-                        // Se mantiene el resto de la lógica para mover la cámara a la posición correcta.
                         const currentModeKey = localStorage.getItem(MAP_VIEW_MODE_KEY) || 'relief';
                         const viewModes = {
                             'NORTE': { pitch: 0, bearing: 0, mode: 'static', terrain: false },
@@ -1952,8 +1956,32 @@ class MapSettingsPanel {
                         displayAlertsOnMap();
                         renderWaypointMarkers();
                         updateRouteAndCarIconStyle();
-                    });
+                    } else {
+                        // Re-añadir capas y fuentes básicas al minimapa
+                        mapInstance.addSource('intersection-route', {
+                            type: 'geojson',
+                            data: { type: 'Feature', geometry: { type: 'LineString', coordinates: [] } }
+                        });
+                        mapInstance.addLayer({
+                            id: 'intersection-route-layer',
+                            type: 'line', source: 'intersection-route',
+                            layout: { 'line-join': 'round', 'line-cap': 'round' },
+                            paint: { 'line-color': '#ACD10F', 'line-width': 13 }
+                        });
+                        if (intersectionPreviewCarMarker) intersectionPreviewCarMarker.addTo(mapInstance);
+                        if (intersectionPreviewManeuverMarker) intersectionPreviewManeuverMarker.addTo(mapInstance);
+                    }
+                };
+           
+                this._map.once('style.load', () => {
+                    this._map.once('idle', () => reapplyLayers(this._map));
                 });
+                
+                if (intersectionPreviewMap) {
+                    intersectionPreviewMap.once('style.load', () => {
+                        intersectionPreviewMap.once('idle', () => reapplyLayers(intersectionPreviewMap));
+                    });
+                }
             };
             label.appendChild(input);
             label.appendChild(document.createTextNode(` ${name}`));
@@ -1989,16 +2017,13 @@ class MapSettingsPanel {
                 const newModeName = Object.keys(viewModes).find(key => viewModes[key].mode === selectedModeValue);
 
                 if (newModeDetails) {
-                    // 1. Actualizamos el estado global del modo de vista.
                     mapViewMode = newModeDetails.mode;
                     localStorage.setItem(MAP_VIEW_MODE_KEY, mapViewMode);
                     markCacheAsDirty();
                     showToast(`Modo Vista: ${newModeName}`, 'info');
                    
-                    // 2. Llamamos a la función maestra para que gestione terreno y niebla.
                     await configureMapAtmosphere();
                     
-                    // 3. Movemos la cámara a la posición correcta para el nuevo modo.
                     const easeOptions = {
                         bearing: newModeDetails.bearing
                     };
@@ -2012,7 +2037,6 @@ class MapSettingsPanel {
                     }
                     this._map.easeTo(easeOptions);
                     
-                    // 4. Actualizamos la posición del coche por si acaso.
                     if (navigationCurrentLocation) {
                         updateInitialUserPosition(navigationCurrentLocation, this._map);
                     }
@@ -2032,7 +2056,7 @@ class MapSettingsPanel {
 
         return fragment;
     }
-}    
+}
     
 // ===================================================================
 // NOMBRE: initializeApp 
@@ -3753,169 +3777,6 @@ function saveCustomData() {
         markCacheAsDirty(); 
     } catch (e) {
         showToast("Error al guardar personalización", "error");
-    }
-}
-
-// ===================================================================
-// NOMBRE: showIntersectionPreviewMap (VERSIÓN FINAL Y FIABLE)
-// RESUMEN: Vuelve al patrón fiable de crear/destruir el mapa del minimapa,
-// ===================================================================
-function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = false, timerDurationMs = null) {
-    const savedMinimapPref = localStorage.getItem(MAP_VIEW_SHOW_MINIMAP_KEY);
-    const showMinimapPreference = savedMinimapPref === null ? true : JSON.parse(savedMinimapPref);
-    if (!showMinimapPreference) {
-        hideIntersectionPreviewMap();
-        return;
-    }
-  
-    const previewWindow = document.getElementById('intersection-preview-map-window');
-    if (!previewWindow || !step || !step.geometry || !route || !navigationMapInstance) {
-        hideIntersectionPreviewMap();
-        return;
-    }
-    
-    if (!previewWindow.querySelector('#intersection-preview-map-container')) {
-        previewWindow.innerHTML = `<div id="intersection-preview-map-container"></div>`;
-    }
-    const mapContainerEl = previewWindow.querySelector('#intersection-preview-map-container');
-    const progressBarEl = document.getElementById('navigation-bottom-progress-bar');
-    const isProgressBarVisible = progressBarEl && progressBarEl.offsetParent !== null;
-
-    if (isProgressBarVisible) {
-        const progressBarRect = progressBarEl.getBoundingClientRect();
-        previewWindow.style.width = `${progressBarRect.width}px`;
-        previewWindow.style.top = `${progressBarRect.top}px`;
-        previewWindow.style.left = `${progressBarRect.left}px`;
-        previewWindow.style.bottom = 'auto';
-        previewWindow.style.transform = 'none';
-    } else if (isSimulationContextOrClick) {
-        previewWindow.style.width = '90%'; previewWindow.style.maxWidth = '500px';
-        previewWindow.style.left = '50%'; previewWindow.style.top = '50%';
-        previewWindow.style.transform = 'translate(-50%, -50%)';
-    } else {
-        hideIntersectionPreviewMap();
-        return;
-    }
-    
-    previewWindow.classList.add('rendering'); 
-    previewWindow.classList.remove('hidden');
-    
-    previewWindow.dataset.source = isSimulationContextOrClick ? 'click' : 'auto';
-    if (intersectionPreviewTimer) clearTimeout(intersectionPreviewTimer);
-
-    try {
-        if (intersectionPreviewMap) {
-            try { intersectionPreviewMap.remove(); } catch(e) {}
-            intersectionPreviewMap = null;
-        }
-
-        const savedLayerName = localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO";
-        const finalLayerName = MAP_LEGACY_NAME_MAP[savedLayerName] || savedLayerName;
-        const currentMapStyle = MAP_STYLES[finalLayerName] || MAP_STYLES["HÍBRIDO"];
-        
-        const fullRouteLineString = turf.lineString(route.geometry.coordinates);
-        const maneuverPointOnRoute = turf.nearestPointOnLine(fullRouteLineString, step.maneuver.location, { units: 'kilometers' });
-        const maneuverDistanceKm = maneuverPointOnRoute.properties.location;
-        const startSliceDistanceKm = Math.max(0, maneuverDistanceKm - (75 / 1000));
-        const endSliceDistanceKm = Math.min(turf.length(fullRouteLineString), maneuverDistanceKm + (90 / 1000));
-        const startSlicePoint = turf.along(fullRouteLineString, startSliceDistanceKm);
-        const endSlicePoint = turf.along(fullRouteLineString, endSliceDistanceKm);
-        const routeSlice = turf.lineSlice(startSlicePoint, endSlicePoint, fullRouteLineString);
-        
-        const bounds = new mapboxgl.LngLatBounds();
-        routeSlice.geometry.coordinates.forEach(coord => bounds.extend(coord));
-
-        const lookAheadPointTurf = turf.along(routeSlice, Math.min(5, turf.length(routeSlice, {units: 'meters'})), { units: 'meters' });
-        const segmentBearing = turf.bearing(startSlicePoint, lookAheadPointTurf);
-        
-        intersectionPreviewMap = new mapboxgl.Map({
-            container: mapContainerEl,
-            style: currentMapStyle,
-            interactive: false,
-            attributionControl: false
-        });
-
-        intersectionPreviewMap.on('load', () => {
-            if (!routeSlice || !routeSlice.geometry || routeSlice.geometry.coordinates.length < 2) {
-                hideIntersectionPreviewMap(); 
-                return;
-            }
-
-            intersectionPreviewMap.addSource('intersection-route', { type: 'geojson', data: routeSlice.geometry });
-            intersectionPreviewMap.addLayer({
-                id: 'intersection-route-layer', type: 'line', source: 'intersection-route',
-                layout: { 'line-join': 'round', 'line-cap': 'round' },
-                paint: { 'line-color': '#ACD10F', 'line-width': 13 }
-            });
-            
-            const carPositionPointTurf = turf.along(routeSlice, 30, { units: 'meters' });
-            const vehicleEl = document.createElement('div');
-            vehicleEl.className = 'vehicle-icon-minimap';
-            vehicleEl.innerHTML = `<img src="PNG/AVANCE.PNG" alt="Coche Mini">`;
-            
-            new mapboxgl.Marker({ element: vehicleEl, anchor: 'center', rotationAlignment: 'viewport', rotation: -90 })
-                .setLngLat(carPositionPointTurf.geometry.coordinates)
-                .addTo(intersectionPreviewMap);
-
-            const maneuver = step.maneuver;
-            const iconFilename = getManeuverIconFilename(maneuver);
-            const maneuverIconEl = document.createElement('div');
-            maneuverIconEl.style.cssText = `width: 49px; height: 49px; background-image: url('https://boardinggate.github.io/Tesla/${iconFilename}'); background-size: contain; background-repeat: no-repeat; background-position: center;`;
-            
-            const maneuverPointTurf = turf.point(step.maneuver.location);
-            const lineStringToManeuver = turf.lineSlice(turf.point(routeSlice.geometry.coordinates[0]), maneuverPointTurf, routeSlice);
-            const iconPositionPointTurf = turf.along(routeSlice, Math.max(0, turf.length(lineStringToManeuver, { units: 'meters' }) - 15), { units: 'meters' });
-            
-            new mapboxgl.Marker({ element: maneuverIconEl, anchor: 'center' })
-                .setLngLat(iconPositionPointTurf.geometry.coordinates)
-                .addTo(intersectionPreviewMap);
-            
-            requestAnimationFrame(() => {
-                if (intersectionPreviewMap && document.body.contains(mapContainerEl)) {
-                    intersectionPreviewMap.resize();
-                    if (routeSlice.geometry.coordinates.length > 1 && !bounds.isEmpty()) {
-                        intersectionPreviewMap.fitBounds(bounds, {
-                            padding: 25, maxZoom: 19, bearing: segmentBearing, pitch: 50, animate: false
-                        });
-                    } else {
-                        intersectionPreviewMap.flyTo({
-                            center: step.maneuver.location, zoom: 18,
-                            bearing: segmentBearing, pitch: 50, animate: false
-                        });
-                    }
-                    
-                    intersectionPreviewMap.once('idle', () => {
-                        if (previewWindow) previewWindow.classList.remove('rendering');
-                    });
-                }
-            });
-        });
-        
-        if (timerDurationMs && timerDurationMs > 0) {
-            intersectionPreviewTimer = setTimeout(hideIntersectionPreviewMap, timerDurationMs);
-        }
-    } catch (error) {
-        console.error("Error al mostrar el minimapa de intersección:", error);
-        hideIntersectionPreviewMap();
-    }
-}
-
-// ===================================================================
-// NOMBRE: hideIntersectionPreviewMap (VERSIÓN FINAL)
-function hideIntersectionPreviewMap() {
-    const card = document.getElementById('intersection-preview-map-window');
-    if (card) {
-        card.classList.add('hidden');
-    }
-    if (intersectionPreviewTimer) {
-        clearTimeout(intersectionPreviewTimer);
-        intersectionPreviewTimer = null;
-    }
-    if (intersectionPreviewMap) {
-        try {
-            intersectionPreviewMap.remove();
-        } catch(e) {}
-        intersectionPreviewMap = null;
     }
 }
 
@@ -20027,53 +19888,57 @@ async function openNavigationMap(isRecovery = false) {
                 navigationMapInstance.on('load', async function() {
                     try {
 
-
 // --- INICIO DEL NUEVO BLOQUE: Inicialización del minimapa persistente ---
-if (!intersectionPreviewMap) {
-    const previewContainer = document.getElementById('intersection-preview-map-container');
-    if (previewContainer) {
-        intersectionPreviewMap = new mapboxgl.Map({
-            container: previewContainer,
-            style: navigationMapInstance.getStyle().url, // Usa el mismo estilo que el mapa principal
-            interactive: false,
-            attributionControl: false,
-            zoom: 16, // Zoom inicial por defecto
-            pitch: 50,
-        });
-
-        intersectionPreviewMap.on('load', () => {
-            // Crear fuentes con datos vacíos, listas para ser actualizadas
-            intersectionPreviewMap.addSource('intersection-route', {
-                type: 'geojson',
-                data: { type: 'Feature', geometry: { type: 'LineString', coordinates: [] } }
-            });
-
-            // Añadir la capa de la ruta
-            intersectionPreviewMap.addLayer({
-                id: 'intersection-route-layer',
-                type: 'line',
-                source: 'intersection-route',
-                layout: { 'line-join': 'round', 'line-cap': 'round' },
-                paint: { 'line-color': '#ACD10F', 'line-width': 13 }
-            });
-
-            // Crear los marcadores una sola vez
-            const carEl = document.createElement('div');
-            carEl.className = 'vehicle-icon-minimap';
-            carEl.innerHTML = `<img src="PNG/AVANCE.PNG" alt="Coche Mini">`;
-            intersectionPreviewCarMarker = new mapboxgl.Marker({ element: carEl, anchor: 'center', rotationAlignment: 'viewport', rotation: -90 })
-                .setLngLat([0, 0]) // Posición inicial irrelevante
-                .addTo(intersectionPreviewMap);
-
-            const maneuverEl = document.createElement('div');
-            maneuverEl.style.cssText = `width: 49px; height: 49px; background-size: contain; background-repeat: no-repeat; background-position: center;`;
-            intersectionPreviewManeuverMarker = new mapboxgl.Marker({ element: maneuverEl, anchor: 'center' })
-                .setLngLat([0, 0]) // Posición inicial irrelevante
-                .addTo(intersectionPreviewMap);
-        });
-    }
-}
-// --- FIN DEL NUEVO BLOQUE ---
+                            if (!intersectionPreviewMap) {
+                                const previewContainer = document.getElementById('intersection-preview-map-container');
+                                if (previewContainer) {
+                                    
+                                    const savedLayerName = localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO";
+                                    const finalLayerName = MAP_LEGACY_NAME_MAP[savedLayerName] || savedLayerName;
+                                    const initialMinimapStyle = MAP_STYLES[finalLayerName] || MAP_STYLES["HÍBRIDO"];
+                            
+                                    intersectionPreviewMap = new mapboxgl.Map({
+                                        container: previewContainer,
+                                        style: initialMinimapStyle, // Usa el estilo correcto
+                                        interactive: false,
+                                        attributionControl: false,
+                                        zoom: 16,
+                                        pitch: 50,
+                                    });
+                            
+                                    intersectionPreviewMap.on('load', () => {
+                                        // Crear fuentes con datos vacíos, listas para ser actualizadas
+                                        intersectionPreviewMap.addSource('intersection-route', {
+                                            type: 'geojson',
+                                            data: { type: 'Feature', geometry: { type: 'LineString', coordinates: [] } }
+                                        });
+                            
+                                        // Añadir la capa de la ruta
+                                        intersectionPreviewMap.addLayer({
+                                            id: 'intersection-route-layer',
+                                            type: 'line',
+                                            source: 'intersection-route',
+                                            layout: { 'line-join': 'round', 'line-cap': 'round' },
+                                            paint: { 'line-color': '#ACD10F', 'line-width': 13 }
+                                        });
+                            
+                                        // Crear los marcadores una sola vez
+                                        const carEl = document.createElement('div');
+                                        carEl.className = 'vehicle-icon-minimap';
+                                        carEl.innerHTML = `<img src="PNG/AVANCE.PNG" alt="Coche Mini">`;
+                                        intersectionPreviewCarMarker = new mapboxgl.Marker({ element: carEl, anchor: 'center', rotationAlignment: 'viewport', rotation: -90 })
+                                            .setLngLat([0, 0])
+                                            .addTo(intersectionPreviewMap);
+                            
+                                        const maneuverEl = document.createElement('div');
+                                        maneuverEl.style.cssText = `width: 49px; height: 49px; background-size: contain; background-repeat: no-repeat; background-position: center;`;
+                                        intersectionPreviewManeuverMarker = new mapboxgl.Marker({ element: maneuverEl, anchor: 'center' })
+                                            .setLngLat([0, 0])
+                                            .addTo(intersectionPreviewMap);
+                                    });
+                                }
+                            }
+        // --- FIN DEL NUEVO BLOQUE ---
 
                         const lockButton = document.getElementById('toggle-progress-bar-lock');
                         if (lockButton && !lockButton.dataset.listenerAttached) {
