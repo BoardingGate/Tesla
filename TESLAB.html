@@ -1,4 +1,4 @@
-D10
+D11 mini
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -603,7 +603,7 @@ D10
     lastTimestamp: null,
     lastCameraTimestamp: null  
     };
-    
+ 
     let manualZoomLevelMemory = null;
     let smoothedGpsAltitude = 0;
     const ALTITUDE_HISTORY = [];
@@ -3919,6 +3919,126 @@ function hideIntersectionPreviewMap() {
     }
 }
 
+// ===================================================================
+// NOMBRE: showIntersectionPreviewMap (VERSIÓN REUTILIZABLE)
+// RESUMEN: Muestra y actualiza el minimapa existente en lugar de crearlo de nuevo.
+// ===================================================================
+function showIntersectionPreviewMap(step, route, isSimulationContextOrClick = false, timerDurationMs = null) {
+    const savedMinimapPref = localStorage.getItem(MAP_VIEW_SHOW_MINIMAP_KEY);
+    const showMinimapPreference = savedMinimapPref === null ? true : JSON.parse(savedMinimapPref);
+
+    // Si el mapa no se ha creado aún o la preferencia está desactivada, no hacemos nada.
+    if (!intersectionPreviewMap || !showMinimapPreference) {
+        hideIntersectionPreviewMap();
+        return;
+    }
+  
+    const previewWindow = document.getElementById('intersection-preview-map-window');
+    if (!previewWindow || !step || !step.geometry || !route || !navigationMapInstance) {
+        hideIntersectionPreviewMap();
+        return;
+    }
+    
+    // Configurar la posición y tamaño de la ventana
+    const progressBarEl = document.getElementById('navigation-bottom-progress-bar');
+    const isProgressBarVisible = progressBarEl && progressBarEl.offsetParent !== null;
+
+    if (isProgressBarVisible) {
+        const progressBarRect = progressBarEl.getBoundingClientRect();
+        previewWindow.style.width = `${progressBarRect.width}px`;
+        previewWindow.style.top = `${progressBarRect.top}px`;
+        previewWindow.style.left = `${progressBarRect.left}px`;
+        previewWindow.style.bottom = 'auto';
+        previewWindow.style.transform = 'none';
+    } else if (isSimulationContextOrClick) {
+        previewWindow.style.width = '90%'; previewWindow.style.maxWidth = '500px';
+        previewWindow.style.left = '50%'; previewWindow.style.top = '50%';
+        previewWindow.style.transform = 'translate(-50%, -50%)';
+    } else {
+        hideIntersectionPreviewMap();
+        return;
+    }
+    
+    previewWindow.classList.remove('hidden');
+    previewWindow.dataset.source = isSimulationContextOrClick ? 'click' : 'auto';
+    if (intersectionPreviewTimer) clearTimeout(intersectionPreviewTimer);
+
+    try {
+        // Detener cualquier animación de cámara anterior
+        if (intersectionPreviewMap.isMoving()) {
+            intersectionPreviewMap.stop();
+        }
+
+        // 1. Calcular la nueva geometría y vista
+        const fullRouteLineString = turf.lineString(route.geometry.coordinates);
+        const maneuverPointOnRoute = turf.nearestPointOnLine(fullRouteLineString, step.maneuver.location, { units: 'kilometers' });
+        const maneuverDistanceKm = maneuverPointOnRoute.properties.location;
+        const startSliceDistanceKm = Math.max(0, maneuverDistanceKm - (75 / 1000));
+        const endSliceDistanceKm = Math.min(turf.length(fullRouteLineString), maneuverDistanceKm + (90 / 1000));
+        const startSlicePoint = turf.along(fullRouteLineString, startSliceDistanceKm);
+        const endSlicePoint = turf.along(fullRouteLineString, endSliceDistanceKm);
+        const routeSlice = turf.lineSlice(startSlicePoint, endSlicePoint, fullRouteLineString);
+        
+        const bounds = new mapboxgl.LngLatBounds();
+        routeSlice.geometry.coordinates.forEach(coord => bounds.extend(coord));
+        const lookAheadPointTurf = turf.along(routeSlice, Math.min(5, turf.length(routeSlice, {units: 'meters'})), { units: 'meters' });
+        const segmentBearing = turf.bearing(startSlicePoint, lookAheadPointTurf);
+
+        // 2. Actualizar la fuente de datos de la ruta
+        if (intersectionPreviewMap.getSource('intersection-route')) {
+            intersectionPreviewMap.getSource('intersection-route').setData(routeSlice.geometry);
+        }
+
+        // 3. Mover los marcadores
+        const carPositionPointTurf = turf.along(routeSlice, 30, { units: 'meters' });
+        intersectionPreviewCarMarker.setLngLat(carPositionPointTurf.geometry.coordinates);
+
+        const maneuver = step.maneuver;
+        const iconFilename = getManeuverIconFilename(maneuver);
+        const maneuverPointTurf = turf.point(step.maneuver.location);
+        const lineStringToManeuver = turf.lineSlice(turf.point(routeSlice.geometry.coordinates[0]), maneuverPointTurf, routeSlice);
+        const iconPositionPointTurf = turf.along(routeSlice, Math.max(0, turf.length(lineStringToManeuver, { units: 'meters' }) - 15), { units: 'meters' });
+        
+        intersectionPreviewManeuverMarker.getElement().style.backgroundImage = `url('https://boardinggate.github.io/Tesla/${iconFilename}')`;
+        intersectionPreviewManeuverMarker.setLngLat(iconPositionPointTurf.geometry.coordinates);
+        
+        // 4. Mover la cámara a la nueva vista
+        requestAnimationFrame(() => {
+            if (intersectionPreviewMap) {
+                intersectionPreviewMap.resize();
+                intersectionPreviewMap.fitBounds(bounds, {
+                    padding: 25, maxZoom: 19, bearing: segmentBearing, pitch: 50, duration: 800 // Animación suave
+                });
+            }
+        });
+
+        // 5. Configurar el temporizador para ocultar
+        if (timerDurationMs && timerDurationMs > 0) {
+            intersectionPreviewTimer = setTimeout(hideIntersectionPreviewMap, timerDurationMs);
+        }
+    } catch (error) {
+        console.error("Error al actualizar el minimapa de intersección:", error);
+        hideIntersectionPreviewMap();
+    }
+}
+
+// ===================================================================
+// NOMBRE: hideIntersectionPreviewMap (VERSIÓN SIMPLIFICADA)
+// RESUMEN: Solo oculta el contenedor, no destruye el mapa.
+// ===================================================================
+function hideIntersectionPreviewMap() {
+    const card = document.getElementById('intersection-preview-map-window');
+    if (card) {
+        card.classList.add('hidden');
+    }
+    if (intersectionPreviewTimer) {
+        clearTimeout(intersectionPreviewTimer);
+        intersectionPreviewTimer = null;
+    }
+    // Ya no se llama a intersectionPreviewMap.remove()
+}
+
+    
     
 // ===================================================================
 // NOMBRE: showAllReminders 
@@ -19906,6 +20026,55 @@ async function openNavigationMap(isRecovery = false) {
                 
                 navigationMapInstance.on('load', async function() {
                     try {
+
+
+// --- INICIO DEL NUEVO BLOQUE: Inicialización del minimapa persistente ---
+if (!intersectionPreviewMap) {
+    const previewContainer = document.getElementById('intersection-preview-map-container');
+    if (previewContainer) {
+        intersectionPreviewMap = new mapboxgl.Map({
+            container: previewContainer,
+            style: navigationMapInstance.getStyle().url, // Usa el mismo estilo que el mapa principal
+            interactive: false,
+            attributionControl: false,
+            zoom: 16, // Zoom inicial por defecto
+            pitch: 50,
+        });
+
+        intersectionPreviewMap.on('load', () => {
+            // Crear fuentes con datos vacíos, listas para ser actualizadas
+            intersectionPreviewMap.addSource('intersection-route', {
+                type: 'geojson',
+                data: { type: 'Feature', geometry: { type: 'LineString', coordinates: [] } }
+            });
+
+            // Añadir la capa de la ruta
+            intersectionPreviewMap.addLayer({
+                id: 'intersection-route-layer',
+                type: 'line',
+                source: 'intersection-route',
+                layout: { 'line-join': 'round', 'line-cap': 'round' },
+                paint: { 'line-color': '#ACD10F', 'line-width': 13 }
+            });
+
+            // Crear los marcadores una sola vez
+            const carEl = document.createElement('div');
+            carEl.className = 'vehicle-icon-minimap';
+            carEl.innerHTML = `<img src="PNG/AVANCE.PNG" alt="Coche Mini">`;
+            intersectionPreviewCarMarker = new mapboxgl.Marker({ element: carEl, anchor: 'center', rotationAlignment: 'viewport', rotation: -90 })
+                .setLngLat([0, 0]) // Posición inicial irrelevante
+                .addTo(intersectionPreviewMap);
+
+            const maneuverEl = document.createElement('div');
+            maneuverEl.style.cssText = `width: 49px; height: 49px; background-size: contain; background-repeat: no-repeat; background-position: center;`;
+            intersectionPreviewManeuverMarker = new mapboxgl.Marker({ element: maneuverEl, anchor: 'center' })
+                .setLngLat([0, 0]) // Posición inicial irrelevante
+                .addTo(intersectionPreviewMap);
+        });
+    }
+}
+// --- FIN DEL NUEVO BLOQUE ---
+
                         const lockButton = document.getElementById('toggle-progress-bar-lock');
                         if (lockButton && !lockButton.dataset.listenerAttached) {
                             lockButton.addEventListener('click', (e) => {
