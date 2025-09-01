@@ -1,4 +1,4 @@
-L05
+L06
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -7917,6 +7917,112 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
     }
 }    
 
+// ===================================================================
+// NOMBRE: loadRouteFromObject 
+// RESUMEN: Acepta recoveryInfo y pasa la bandera 'isRecovery' a toggleNavigationState.
+// ===================================================================
+async function loadRouteFromObject(routeObject, autoStartNavigation = false, forceImmediateStart = false, recoveryInfo = null) {
+    if (isRecalculatingRoute) {
+        showToast("Procesando otra ruta, por favor espere.", "warning");
+        return;
+    }
+    
+    if (!routeObject || !routeObject.waypoints || routeObject.waypoints.length === 0) {
+        showToast("Error: El objeto de la ruta es inválido.", "error");
+        return;
+    }
+
+    isRecalculatingRoute = true;
+    try {
+        if (isFreeDriveActive) {
+            isFreeDrivePaused = true;
+            isFreeDriveActive = false;
+            showToast("Modo Conducción Libre en pausa.", "info");
+            updateStartNavigationButtonState();
+            updateNavigationButtonColor();
+            clearNavigationGraph();
+        }
+
+        const startLocation = navigationCurrentLocation ? { ...navigationCurrentLocation } : null;
+        resetNavigationState();
+        currentRouteNameForSaving = routeObject.name;
+        const waypointsFromLoadedRoute = routeObject.waypoints;
+        
+        if (waypointsFromLoadedRoute.length === 1) {
+            if (startLocation) {
+                const startPoint = { id: Date.now() - 1, lat: startLocation.latitude, lng: startLocation.longitude, type: 'S', marker: null, label: 'S', address: 'Posición Actual (GPS)', visited: true, isCriticalForRecalc: true, isInternal: false, isRecalculatedStart: false };
+                const destinationWp = sanitizeWaypointsForStorage(waypointsFromLoadedRoute)[0];
+                navigationWaypoints = [startPoint, destinationWp];
+            } else {
+                showToast("Señal GPS no disponible. No se puede iniciar ruta a un único destino.", "error");
+                return;
+            }
+        } else {
+            if (startLocation) {
+                const startPoint = { id: Date.now() - 1, lat: startLocation.latitude, lng: startLocation.longitude, type: 'S', marker: null, label: 'S', address: 'Posición Actual (GPS)', visited: true, isCriticalForRecalc: true, isInternal: false, isRecalculatedStart: false };
+                navigationWaypoints = [startPoint, ...sanitizeWaypointsForStorage(waypointsFromLoadedRoute.slice(1))];
+            } else {
+                showToast("Señal GPS no disponible. Cargando ruta original...", "warning");
+                navigationWaypoints = sanitizeWaypointsForStorage(waypointsFromLoadedRoute);
+            }
+        }
+        
+        await updateWaypointTypesAndLabels();
+        renderWaypointMarkers();
+
+        if (navigationWaypoints.filter(wp => wp && !wp.isInternal).length >= 2) {
+            // -- INICIO DE LA CORRECCIÓN --
+            // Se ha eliminado el "wrapper" de `navigationMapInstance.once('idle', ...)` que causaba la condición de carrera.
+            // Ahora se llama directamente al recálculo y luego se fuerza un redibujado.
+            try {
+                await recalculateAndDrawRoute(false);
+                
+                // Forzamos un redibujado del mapa para asegurar que el trazado de la ruta sea visible inmediatamente.
+                setTimeout(() => {
+                    if (navigationMapInstance) {
+                        try {
+                            navigationMapInstance.resize();
+                        } catch(e) {}
+                    }
+                }, 50);
+
+                if (recoveryInfo) {
+                    await restoreTripProgress(recoveryInfo);
+                }
+                
+                if (autoStartNavigation) {
+                    if (forceImmediateStart) {
+                        toggleNavigationState(false, !!recoveryInfo); 
+                    } else {
+                        const routeGeoJSON = navigationMapInstance.getSource('route')._data;
+                        if (routeGeoJSON.geometry && routeGeoJSON.geometry.coordinates.length > 1) {
+                            const bounds = new mapboxgl.LngLatBounds();
+                            routeGeoJSON.geometry.coordinates.forEach(coord => bounds.extend(coord));
+                            if (!bounds.isEmpty()) {
+                                navigationMapInstance.fitBounds(bounds, { padding: 80, animate: true, duration: 1500 });
+                            }
+                        }
+                        const firstDestination = navigationWaypoints.find(wp => wp && !wp.isInternal && wp.type !== 'S' && !wp.visited);
+                        if (firstDestination) { fetchAndDisplayAlternativeRoutes(firstDestination.id); }
+                        showAutoStartNavigationModal();
+                    }
+                }
+            } catch (error) {
+                showToast("No se pudo trazar la ruta. Comprueba la conexión o intenta mover un punto.", "error", 8000);
+                const fallbackCoords = navigationWaypoints.map(wp => [wp.lng, wp.lat]);
+                await drawRouteOnMap({ geometry: { type: 'LineString', coordinates: fallbackCoords } });
+            }
+            // -- FIN DE LA CORRECCIÓN --
+        }
+    } catch (error) {
+        console.error("Error al cargar la ruta desde el objeto:", error);
+    } finally {
+        isRecalculatingRoute = false;
+        updateStartNavigationButtonState();
+        updateNavigationButtonColor();
+    }
+}    
+    
 // ===================================================================
 // NOMBRE: restoreTripProgress (NUEVA FUNCIÓN)
 // RESUMEN: Restaura el estado de un viaje (distancia, tiempo, stats) tras una recuperación.
