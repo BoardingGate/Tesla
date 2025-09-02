@@ -1,4 +1,4 @@
-M06
+mm01
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -201,7 +201,8 @@ M06
              <div class="button-row" id="search-row-map-header">
                 <button id="reorder-route-stages-button" title="Ordenar Etapas de Ruta"><img src="./PNG/MOVER.PNG" alt="Ordenar Etapas"></button>
                 <button id="map-location-search-button" class="reminders-map-button-action"><img src="./PNG/ANADIRPUNTO.PNG" alt="Añadir Punto Ruta"></button>
-                <button id="clear-map-search-input-button" title="Limpiar búsqueda">X</button>
+                <button id="radar-search-button" class="reminders-map-button-action" title="Buscar Puntos de Interés cercanos"> <img src="PNG/RADAR.PNG" alt="Buscar POI"> </button>
+                 <button id="clear-map-search-input-button" title="Limpiar búsqueda">X</button>
                 </button>
                 <input type="text" id="map-location-search-input" placeholder="Dirección,sitio,zona /Negocio /Ciudad /CP+Provincia (28001 Madrid /Lidl Lugo)">
                 <input type="text" id="filter-input" placeholder="Filtro"> 
@@ -993,7 +994,10 @@ M06
     let announceManeuverWithFlash = true; 
     let maneuverFlashTriggeredId = null; 
     let lastAutoBackupTimestamp = 0;
-   
+
+    let isPoiSelectionModeActive = false; 
+    let activeSearchMarkers = []; 
+    
     const managedKeys = [ 
         'reminders','darkMode','toggleStates','zoomState','onOffState','noticesActive', 
         'footerVisible','teslaHtmlLastModified','teslaHtmlLastModifiedTimestamp', 
@@ -2428,7 +2432,192 @@ function updateSmoothedGpsAltitude(newAltitude) {
     smoothedGpsAltitude = ALTITUDE_HISTORY.reduce((a, b) => a + b, 0) / ALTITUDE_HISTORY.length;
 }
     
+// ===================================================================
+// === INICIO: LÓGICA DE BÚSQUEDA DE POIS CERCANOS (RADAR) ===
+// ===================================================================
+/**
+ * Gestiona el clic en el botón Radar, activando o desactivando el modo.
+ */
+function onRadarButtonClick() {
+    if (isPoiSelectionModeActive) {
+        desactivarModoSeleccion();
+    } else {
+        showPoiCategoryMenu(); 
+    }
+}
 
+/**
+ * Muestra el menú desplegable con las categorías de POIs.
+ */
+function showPoiCategoryMenu() {
+    // Si ya existe un menú, lo borramos
+    const existingMenu = document.getElementById('poi-category-menu');
+    if (existingMenu) existingMenu.remove();
+
+    const menuContainer = document.createElement('div');
+    menuContainer.id = 'poi-category-menu';
+    
+    // Lista de categorías de POIs para Mapbox
+    const poiCategories = [
+        { name: 'Restaurantes', id: 'restaurant' },
+        { name: 'Bares y Cafeterías', id: 'bar,cafe' },
+        { name: 'Supermercados', id: 'supermarket,grocery' },
+        { name: 'Gasolineras', id: 'gas_station' },
+        { name: 'Estaciones Carga (VE)', id: 'electric_vehicle_charger' },
+        { name: 'Farmacias', id: 'pharmacy' },
+        { name: 'Hospitales y C. Salud', id: 'hospital,clinic' },
+        { name: 'Aparcamientos', id: 'parking' },
+        { name: 'Cajeros Automáticos', id: 'atm' },
+        { name: 'Hoteles', id: 'hotel,lodging' },
+        { name: 'Playas', id: 'beach' },
+        { name: 'Museos', id: 'museum' },
+        { name: 'Atracciones Turísticas', id: 'tourist_attraction' },
+    ];
+
+    const list = document.createElement('ul');
+    poiCategories.forEach(category => {
+        const item = document.createElement('li');
+        item.textContent = category.name;
+        item.dataset.categoryId = category.id;
+        item.addEventListener('click', () => {
+            buscarYActivarModoSeleccion(category.id);
+            menuContainer.remove(); // Cierra el menú al seleccionar
+        });
+        list.appendChild(item);
+    });
+    
+    menuContainer.appendChild(list);
+    document.body.appendChild(menuContainer);
+
+    // Cierra el menú si se hace clic fuera de él
+    setTimeout(() => {
+        document.addEventListener('click', function closeMenu(event) {
+            if (!menuContainer.contains(event.target) && event.target.id !== 'radar-search-button') {
+                menuContainer.remove();
+                document.removeEventListener('click', closeMenu);
+            }
+        });
+    }, 0);
+}
+
+
+/**
+ * Activa el modo, busca POIs en Mapbox, los contabiliza y los pinta.
+ * @param {string} categoria - La categoría de POI a buscar (ej. 'restaurant').
+ */
+async function buscarYActivarModoSeleccion(categoria) {
+    // Activar estado visual y lógico
+    isPoiSelectionModeActive = true;
+    document.getElementById('radar-search-button').classList.add('active');
+    limpiarMarcadoresNumerados();
+    
+    // Contabilizar la petición de búsqueda de Mapbox
+    const user = auth.currentUser;
+    if (user) {
+        const userDocRef = doc(db, "usuarios", user.uid);
+        await updateDoc(userDocRef, {
+            sesiones: increment(1),
+            total: increment(1)
+        });
+    }
+
+    let url;
+    const accessToken = mapboxgl.accessToken;
+
+    if (navigationFollowUser) {
+        // Modo seguimiento: Buscar en el área visible del mapa
+        const bounds = navigationMapInstance.getBounds();
+        const bbox = `${bounds.getWest()},${bounds.getSouth()},${bounds.getEast()},${bounds.getNorth()}`;
+        url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(categoria)}.json?bbox=${bbox}&limit=20&access_token=${accessToken}`;
+    } else {
+        // Modo sin seguimiento: Buscar en un radio de 10km desde el centro del mapa
+        const center = navigationMapInstance.getCenter();
+        const proximity = `${center.lng},${center.lat}`;
+        // Mapbox no tiene un parámetro de 'radio' estricto, pero 'proximity' prioriza los resultados cercanos.
+        url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(categoria)}.json?proximity=${proximity}&limit=20&access_token=${accessToken}`;
+    }
+    
+    showToast(`Buscando ${categoria}...`, 'info');
+    try {
+        const response = await fetch(url);
+        const data = await response.json();
+        
+        if (data.features && data.features.length > 0) {
+            pintarResultadosEnMapa(data.features);
+        } else {
+            showToast("No se encontraron resultados para esta categoría.", "warning");
+            desactivarModoSeleccion();
+        }
+    } catch (error) {
+        showToast("Ocurrió un error al buscar. Inténtalo de nuevo.", "error");
+        desactivarModoSeleccion();
+    }
+}
+
+/**
+ * Pinta los marcadores numerados en el mapa.
+ * @param {Array} features - El array de resultados de Mapbox.
+ */
+function pintarResultadosEnMapa(features) {
+    features.forEach((feature, index) => {
+        const el = document.createElement('div');
+        el.className = 'custom-marker';
+        el.innerText = index + 1;
+
+        const marker = new mapboxgl.Marker(el)
+            .setLngLat(feature.center)
+            .addTo(navigationMapInstance);
+        
+        el.addEventListener('click', (e) => {
+            e.stopPropagation();
+            obtenerDetallesGoogleYContabilizar(feature);
+        });
+        activeSearchMarkers.push(marker);
+    });
+}
+
+/**
+ * Obtiene detalles de Google, los contabiliza y muestra el modal.
+ * @param {object} mapboxFeature - El objeto 'feature' devuelto por Mapbox.
+ */
+async function obtenerDetallesGoogleYContabilizar(mapboxFeature) {
+    // 1. Contabilizar la petición de detalles a Google en Firebase (¡Solo se hace aquí!)
+    const user = auth.currentUser;
+    if (user) {
+        const userDocRef = doc(db, "usuarios", user.uid);
+        await updateDoc(userDocRef, {
+            poi: increment(1),
+            total: increment(1)
+        });
+    }
+
+    // 2. Llamar al modal, indicando que el conteo ya está hecho.
+    showPoiInfoModal(mapboxFeature, true); // <--- PARÁMETRO CLAVE AÑADIDO
+}
+/**
+ * Desactiva el modo de selección y limpia el mapa.
+ */
+function desactivarModoSeleccion() {
+    isPoiSelectionModeActive = false;
+    document.getElementById('radar-search-button').classList.remove('active');
+    limpiarMarcadoresNumerados();
+    // Ocultar el menú si todavía está visible
+    const existingMenu = document.getElementById('poi-category-menu');
+    if (existingMenu) existingMenu.remove();
+}
+
+/**
+ * Elimina todos los marcadores de la búsqueda actual del mapa.
+ */
+function limpiarMarcadoresNumerados() {
+    activeSearchMarkers.forEach(marker => marker.remove());
+    activeSearchMarkers = [];
+}
+// ===================================================================
+// === FIN: LÓGICA DE BÚSQUEDA DE POIS CERCANOS (RADAR) ===
+// ===================================================================
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 
 // ===================================================================
 // NOMBRE: checkAndMarkWaypointsAsVisited 
 // RESUMEN: Marca la etapa como visitada a 70m y muestra el modal de llegada solo a 20m.
@@ -3355,9 +3544,9 @@ function applyMainUISettings() {
 }    
 
 // ===================================================================
-// NOMBRE: showPoiInfoModal (VERSIÓN CON GOOGLE PLACES Y FALLBACK IMG CORREGIDO)
-// RESUMEN: Muestra un modal enriquecido con datos de Google Places.
-async function showPoiInfoModal(feature) {
+// NOMBRE: showPoiInfoModal (VERSIÓN HÍBRIDA FINAL CON CONTEO CONDICIONAL)
+// RESUMEN: Muestra un modal enriquecido con datos de Google. Realiza el conteo
+async function showPoiInfoModal(feature, conteoYaRealizado = false) {
     const existingModal = document.querySelector('.poi-modal-overlay');
     if (existingModal) existingModal.remove();
 
@@ -3367,28 +3556,35 @@ async function showPoiInfoModal(feature) {
     overlay.innerHTML = `
         <div class="poi-modal-content">
             <div class="poi-modal-body" style="text-align: center; padding: 3rem;">
-                <p>Obteniendo información del lugar...</p>
+                <p>Obteniendo información detallada del lugar...</p>
             </div>
         </div>
     `;
     document.body.appendChild(overlay);
 
     try {
-        const canProceed = await checkAndIncrementPoiCount();
-        if (!canProceed) {
-            if (overlay.parentNode) overlay.remove();
-            return;
+        if (!conteoYaRealizado) {
+            const user = auth.currentUser;
+            if (user) {
+                const userDocRef = doc(db, "usuarios", user.uid);
+                await updateDoc(userDocRef, {
+                    poi: increment(1),
+                    total: increment(1)
+                });
+            }
         }
-
+   
         const mapboxProperties = feature.properties || {};
-        const coordinates = feature.geometry.coordinates.slice();
-        const mapboxName = mapboxProperties.name || 'Punto de Interés';
+        const coordinates = feature.geometry.coordinates;
+        const mapboxName = feature.place_name || mapboxProperties.name || 'Punto de Interés';
         
-        const placeId = await findGooglePlaceId(mapboxName, coordinates[1], coordinates[0]);
-        
-        let name, address, phone, website, imageUrl, saveName, photosHtml = '', commentsHtml = '', detailsHtml = '';
         const lat = coordinates[1];
         const lng = coordinates[0];
+
+        
+        const placeId = await findGooglePlaceId(mapboxName, lat, lng);
+        
+        let name, address, phone, website, imageUrl, saveName, photosHtml = '', commentsHtml = '', detailsHtml = '';
 
         if (placeId) {
             const googleDetails = await getGooglePlaceDetails(placeId);
@@ -3400,7 +3596,7 @@ async function showPoiInfoModal(feature) {
                 website = googleDetails.websiteURI;
                 imageUrl = (googleDetails.photos && googleDetails.photos.length > 0) 
                     ? googleDetails.photos[0].getURI({ maxWidth: 600, maxHeight: 400 }) 
-                    : 'PNG/modalrutas.png'; // <-- CAMBIO APLICADO AQUÍ
+                    : 'PNG/modalrutas.png';
                 saveName = name;
 
                 detailsHtml += '<h4>Valoración</h4>';
@@ -3418,7 +3614,7 @@ async function showPoiInfoModal(feature) {
                 }
                 
                 detailsHtml += '<h4>Contacto</h4>';
-                if(phone) detailsHtml += `<p><strong>Teléfono:</strong> <a href="tel:${phone}">${phone}</a></p>`;
+                if(phone) detailsHtml += `<p><strong>Teléfono:</strong> <a href="tel:${phone}" target="_blank">${phone}</a></p>`;
                 if(website) detailsHtml += `<p><strong>Web:</strong> <a href="${website}" target="_blank">${website}</a></p>`;
                 if(googleDetails.googleMapsURI) detailsHtml += `<p><strong>En Google Maps:</strong> <a href="${googleDetails.googleMapsURI}" target="_blank">Abrir</a></p>`;
 
@@ -3447,17 +3643,20 @@ async function showPoiInfoModal(feature) {
             } else {
                 throw new Error("Google Place Details falló después de encontrar un ID.");
             }
+
         } else {
+            // ... (resto de la lógica de fallback de Mapbox sin cambios)
             name = mapboxName;
             address = `(${lat.toFixed(4)}, ${lng.toFixed(4)})`;
-            category = translatePoiCategory(mapboxProperties.categories || []);
-            imageUrl = 'PNG/modalrutas.png'; // <-- CAMBIO APLICADO AQUÍ
+            const category = translatePoiCategory(mapboxProperties.categories || []);
+            imageUrl = 'PNG/modalrutas.png';
             saveName = name;
             detailsHtml = `<h4>Categoría</h4><p>${category}</p><p>No se encontraron detalles adicionales en Google.</p>`;
             photosHtml = '<p>No disponible.</p>';
             commentsHtml = '<p>No disponible.</p>';
         }
         
+        // ... (resto del renderizado del modal y los listeners de botones sin cambios)
         const existingWaypoint = findExistingWaypointAtCoords(lat, lng);
         let buttonsHtml = `
             <button id="poi-add-btn" class="btn-modal-action-primary">Añadir a Ruta</button>
@@ -3467,7 +3666,7 @@ async function showPoiInfoModal(feature) {
         if (existingWaypoint) {
             buttonsHtml += `<button id="poi-delete-btn" class="btn-modal-danger" data-waypoint-id="${existingWaypoint.id}">Eliminar Etapa</button>`;
         } else {
-             buttonsHtml += `<button id="poi-close-btn" class="btn-modal-action-secondary">Cerrar <span class="button-countdown-timer"></span></button>`;
+             buttonsHtml += `<button id="poi-close-btn" class="btn-modal-action-secondary">Cerrar <span class="button-countdown-timer unified-countdown-style"></span></button>`;
         }
         
         overlay.querySelector('.poi-modal-content').innerHTML = `
@@ -3498,7 +3697,7 @@ async function showPoiInfoModal(feature) {
         
         overlay.querySelector('#poi-add-btn').addEventListener('click', async () => {
             const snapped = await snapCoordsToRoad(lat, lng);
-            addWaypoint({ lat: snapped.lat, lng: snapped.lng }, address);
+            addWaypoint(snapped, address);
             closeHandler();
         });
 
@@ -3535,13 +3734,10 @@ async function showPoiInfoModal(feature) {
         addModalAutoCloseTimer(overlay, overlay.querySelector('#poi-close-btn, #poi-delete-btn'), 'poi-modal', 45000);
 
     } catch (error) {
-        console.error("Error al mostrar el modal del POI:", error);
         showToast("Error al mostrar información del POI.", 'error');
         if (overlay.parentNode) overlay.remove();
     }
-}    
-    
-
+}
 // ===================================================================
 // NOMBRE: toggleRadaresRuta 
 // ===================================================================
@@ -20526,6 +20722,10 @@ async function openNavigationMap(isRecovery = false) {
                         toggleMapHeaderRowsVisibility(mapHeaderButtonsVisible);
 
                         navigationMapInstance.on('click', async (e) => {
+                            if (isPoiSelectionModeActive) {
+                                return; // No hacer nada si estamos en modo selección
+                            }
+                            
                             if (isAddReminderAtLocationModeActive) { handleMapClickToAddReminder(e); return; }
                             if (isSimulatingGpsLocation) { handleSimulateGpsPositionClick(e); return; }
                             if (isNavigating) { return; }
@@ -20583,10 +20783,12 @@ async function openNavigationMap(isRecovery = false) {
                                 else if (properties.maki) { categories = [properties.maki]; }
                                 
                                 const featureForModal = { properties: { name: poiName, categories: categories }, geometry: validPoiFeature.geometry };
-                                showPoiInfoModal(featureForModal);
+                                showPoiInfoModal(featureForModal); // O showPoiInfoModal(featureForModal, false);
+                            
                             } else {
                                 addWaypoint(lngLat);
                             }
+
                         });
                         
                         enablePoiInteractivity(navigationMapInstance);
@@ -20928,6 +21130,16 @@ document.addEventListener('DOMContentLoaded', async () => {
      }
 
     assignMapButtonListeners();
+    
+    const radarSearchButton = document.getElementById('radar-search-button');
+    if (radarSearchButton) {
+        document.body.addEventListener('click', function(event) {
+            if (event.target.id === 'radar-search-button' || event.target.closest('#radar-search-button')) {
+                onRadarButtonClick();
+            }
+        });
+    }
+    
     document.body.addEventListener('click', function(event) {
         const target = event.target;
         const targetId = target.id || (target.closest('[id]') ? target.closest('[id]').id : null);
