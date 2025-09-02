@@ -1,4 +1,4 @@
-MI03
+MI05
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -8232,6 +8232,8 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
     }
 }    
     
+
+
 // ===================================================================
 // NOMBRE: restoreTripProgress (NUEVA FUNCIÓN)
 // RESUMEN: Restaura el estado de un viaje (distancia, tiempo, stats) tras una recuperación.
@@ -8242,33 +8244,72 @@ async function restoreTripProgress(recoveryInfo) {
 
     try {
         const route = navigationCurrentRouteData.routes[0];
-        const currentCoords = await getCurrentLocationAsync();
-
-        navigationStartTimeForStats = new Date(recoveryInfo.tripStartTime);
         
+        // 1. Restaurar datos de tiempo
+        navigationStartTimeForStats = new Date(recoveryInfo.tripStartTime);
         if (recoveryInfo.originalTripEtaTime) {
             originalTripEtaTime = new Date(recoveryInfo.originalTripEtaTime);
         }
         
-        if (recoveryInfo.stats) {
-            totalDistanceTravelledForStats = recoveryInfo.stats.totalDistance || 0;
-            maxSpeedDuringTrip = recoveryInfo.stats.maxSpeed || 0;
-            maxAltitudeDuringTrip = recoveryInfo.stats.maxAltitude || -Infinity;
-            minAltitudeDuringTrip = recoveryInfo.stats.minAltitude || Infinity;
-        }
+        // 2. Obtener punto de partida original y ubicación actual
+        const originalStartWaypoint = recoveryInfo.route?.waypoints?.[0];
+        const currentCoords = await getCurrentLocationAsync();
+        
+        let recoveredDistance = 0;
 
+        if (!originalStartWaypoint) {
+            showToast("Punto de inicio no encontrado en recuperación. Estadísticas reiniciadas.", "warning");
+            totalDistanceTravelledForStats = 0;
+            accumulatedDistanceBeforeCurrentSegment = 0;
+        } else {
+            // 3. CALCULAR DISTANCIA REAL RECORRIDA
+            try {
+                // 3a. INTENTO 1: Calcular la distancia real por carretera llamando a la API
+                showToast("Calculando distancia recorrida...", "info", 2000);
+                const coordsStringForDistance = `${originalStartWaypoint.lng},${originalStartWaypoint.lat};${currentCoords.longitude},${currentCoords.latitude}`;
+                const distanceResult = await fetchRouteData(coordsStringForDistance);
+                
+                if (distanceResult.routeData && distanceResult.routeData.routes[0]) {
+                    recoveredDistance = distanceResult.routeData.routes[0].distance; // Distancia en metros
+                    console.log(`[RECOVERY] Distancia real por carretera recuperada: ${(recoveredDistance / 1000).toFixed(2)} km.`);
+                } else {
+                    throw new Error("La API no devolvió una ruta para el cálculo de distancia.");
+                }
+
+            } catch (apiError) {
+                // 3b. FALLBACK: Si la API falla, calcular distancia en línea recta como emergencia
+                console.warn("[RECOVERY] Falló la API para calcular distancia recorrida, usando fallback de línea recta.", apiError);
+                showToast("No se pudo calcular la distancia exacta, se usará una estimación.", "warning");
+                recoveredDistance = calculateDistance(
+                    originalStartWaypoint.lat, 
+                    originalStartWaypoint.lng, 
+                    currentCoords.latitude, 
+                    currentCoords.longitude
+                );
+            }
+            
+            // 4. Restaurar las estadísticas con el valor calculado
+            totalDistanceTravelledForStats = recoveredDistance;
+            accumulatedDistanceBeforeCurrentSegment = recoveredDistance; // CRUCIAL para la barra de progreso
+
+            if (recoveryInfo.stats) {
+                maxSpeedDuringTrip = recoveryInfo.stats.maxSpeed || 0;
+                maxAltitudeDuringTrip = recoveryInfo.stats.maxAltitude || -Infinity;
+                minAltitudeDuringTrip = recoveryInfo.stats.minAltitude || Infinity;
+            }
+            lastPositionForStats = { ...currentCoords };
+        }
+        
+        // 5. Recalcular la posición en la nueva ruta y actualizar la UI
         const carPoint = turf.point([currentCoords.longitude, currentCoords.latitude]);
         const routeLine = turf.lineString(route.geometry.coordinates);
         const nearestPointOnRoute = turf.nearestPointOnLine(routeLine, carPoint, { units: 'meters' });
         const carDistanceAlongRoute = nearestPointOnRoute.properties.location;
         
-        lastPositionForStats = { ...currentCoords };
-        
         const timeElapsedS = (Date.now() - recoveryInfo.tripStartTime) / 1000;
         if (timeElapsedS > 0 && totalDistanceTravelledForStats > 0) {
             window.averageSpeedKmh = (totalDistanceTravelledForStats / timeElapsedS) * 3.6;
         }
-
         lastCarDistanceAlongRouteForNavLogic = carDistanceAlongRoute;
         
         let cumulativeDistance = 0;
@@ -8303,9 +8344,10 @@ async function restoreTripProgress(recoveryInfo) {
         showToast(`Error al restaurar progreso: ${error.message}. Se continuará desde el inicio.`, "error");
         navigationStartTimeForStats = new Date();
         totalDistanceTravelledForStats = 0;
+        accumulatedDistanceBeforeCurrentSegment = 0; // Asegurarse de resetear en caso de error
     }
 }
-
+    
 // ===================================================================
 // NOMBRE: fetchAndRenderChatUsers 
 // ===================================================================
