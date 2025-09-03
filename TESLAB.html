@@ -1,4 +1,4 @@
-MI34
+MI35
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -2282,6 +2282,98 @@ async function searchPoisByCategory(query, osmKey) {
         clearPoiSearchResults();
     }
 }
+
+// ===================================================================
+// NOMBRE: searchPoisByCategory (VERSIÓN CON DEPURACIÓN)
+// ===================================================================
+async function searchPoisByCategory(query, osmKey) {
+    if (!query || query.trim() === '') {
+        console.log("[DEBUG] searchPoisByCategory: La query está vacía. Abortando.");
+        return;
+    }
+    
+    console.log(`[DEBUG] searchPoisByCategory: Recibida query="${query}", osmKey="${osmKey}"`);
+    showToast(`Buscando "${query}"...`, "info");
+    const searchButton = document.getElementById('map-location-search-button');
+
+    // Petición a Photon
+    let photonUrl = `https://photon.komoot.io/api/?q=${encodeURIComponent(query)}&limit=50`;
+    const bounds = navigationMapInstance.getBounds();
+    photonUrl += `&bbox=${bounds.getWest()},${bounds.getSouth()},${bounds.getEast()},${bounds.getNorth()}`;
+    if (osmKey) {
+        photonUrl += `&osm_tag=${osmKey}`;
+    }
+    console.log("[DEBUG] Photon URL:", photonUrl);
+    const photonPromise = fetch(photonUrl).then(res => res.json()).catch(err => {
+        console.error("[DEBUG] Error en fetch de Photon:", err);
+        return { features: [] };
+    });
+
+    // Petición a Overpass
+    let overpassQuery;
+    if (osmKey) {
+        overpassQuery = buildOverpassQuery(osmKey);
+    } else {
+        const escapedQuery = query.replace(/"/g, '\\"');
+        overpassQuery = `
+            [out:json][timeout:25];
+            (
+              node[~"name"~"${escapedQuery}",i](${bounds.getSouth()},${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()});
+              way[~"name"~"${escapedQuery}",i](${bounds.getSouth()},${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()});
+              relation[~"name"~"${escapedQuery}",i](${bounds.getSouth()},${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()});
+            );
+            out center;
+        `;
+    }
+    console.log("[DEBUG] Overpass Query:", overpassQuery.trim());
+    const overpassPromise = fetchOverpassData(overpassQuery).catch(err => {
+        console.error("[DEBUG] Error en fetch de Overpass:", err);
+        return [];
+    });
+
+    try {
+        const [photonResponse, overpassResponse] = await Promise.all([photonPromise, overpassPromise]);
+
+        const photonFeatures = (photonResponse.features || []);
+        const overpassFeaturesRaw = (overpassResponse || []);
+        console.log(`[DEBUG] Photon devolvió ${photonFeatures.length} resultados.`);
+        console.log(`[DEBUG] Overpass devolvió ${overpassFeaturesRaw.length} resultados.`);
+
+        const normalizedPhoton = photonFeatures.map(f => ({ ...f, properties: { ...f.properties, source: 'Photon' } }));
+        const normalizedOverpass = overpassFeaturesRaw.map(normalizeOverpassResult).filter(Boolean);
+        
+        let combinedFeatures = [...normalizedPhoton, ...normalizedOverpass];
+        console.log(`[DEBUG] Total de resultados combinados (antes de deduplicar): ${combinedFeatures.length}`);
+
+        // Deduplicación
+        const uniqueFeatures = [];
+        const proximityThreshold = 20;
+        for (const feature of combinedFeatures) {
+            if (!uniqueFeatures.some(unique => turf.distance(turf.point(feature.geometry.coordinates), turf.point(unique.geometry.coordinates), { units: 'meters' }) < proximityThreshold)) {
+                uniqueFeatures.push(feature);
+            }
+        }
+        console.log(`[DEBUG] Total de resultados únicos (después de deduplicar): ${uniqueFeatures.length}`);
+        
+        displayPoiSearchResults(uniqueFeatures, navigationMapInstance);
+        
+        if (uniqueFeatures.length > 0) {
+            isPoiSearchActive = true;
+            if (searchButton) searchButton.style.setProperty('background-color', '#FFD700', 'important');
+            console.log("[DEBUG] Estado 'isPoiSearchActive' establecido a TRUE y botón iluminado.");
+        } else {
+            isPoiSearchActive = false;
+            if (searchButton) searchButton.style.removeProperty('background-color');
+            console.log("[DEBUG] Sin resultados, estado 'isPoiSearchActive' establecido a FALSE.");
+        }
+
+    } catch (error) {
+        showToast(`Error en la búsqueda de POIs: ${error.message}`, "error");
+        clearPoiSearchResults();
+    }
+}
+
+    
 // ===================================================================
 // NOMBRE: togglePoiCategorySearch (CON LÓGICA DE LIMPIEZA)
 // RESUMEN: Si está activo, limpia los resultados. Si no, muestra el modal de categorías.
@@ -19346,7 +19438,58 @@ async function searchAndAddWaypoint(addressQuery = null) {
     await searchPoisByCategory(address, null);
 }
 
+// ===================================================================
+// NOMBRE: searchAndAddWaypoint (VERSIÓN CON DEPURACIÓN)
+// ===================================================================
+async function searchAndAddWaypoint(addressQuery = null) {
+    const searchInput = document.getElementById('map-location-search-input');
+    const address = addressQuery || searchInput.value.trim();
+    if (!address) {
+        showToast("Por favor, introduce una dirección o lugar para buscar.", "warning");
+        return;
+    }
 
+    const searchButton = document.getElementById('map-location-search-button');
+    if (searchButton) {
+        searchButton.disabled = true;
+        searchButton.innerHTML = `<img src="PNG/BUSCANDO.PNG" alt="Buscando...">`;
+    }
+
+    console.log(`[DEBUG] searchAndAddWaypoint: Iniciando búsqueda para "${address}"`);
+
+    // --- BÚSQUEDA DE DIRECCIONES (Nominatim) ---
+    try {
+        const queryToSearch = address.replace(/,/g, '');
+        const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(queryToSearch)}&limit=60&accept-language=es&addressdetails=1`;
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`Error de red: ${response.status}`);
+        const data = await response.json();
+        
+        const results = (data || []).reduce((acc, item) => {
+            if (item && item.lat && item.lon) {
+                acc.push({ display_name: item.display_name, lat: parseFloat(item.lat), lon: parseFloat(item.lon) });
+            }
+            return acc;
+        }, []);
+        
+        console.log(`[DEBUG] Nominatim encontró ${results.length} sugerencias de dirección.`);
+        if (results.length > 0) {
+            displayAddressSuggestionsModal(results);
+        }
+
+    } catch (error) {
+        console.warn(`[DEBUG] Error en la búsqueda de Nominatim: ${error.message}`);
+    } finally {
+        if (searchButton) {
+            searchButton.disabled = false;
+            searchButton.innerHTML = `<img src="PNG/ANADIRPUNTO.jpg" alt="Añadir Punto Ruta">`;
+        }
+    }
+
+    // --- LLAMADA A LA BÚSQUEDA DE POIs (Photon + Overpass) ---
+    console.log(`[DEBUG] searchAndAddWaypoint: Delegando la búsqueda de POIs a searchPoisByCategory con la query: "${address}"`);
+    await searchPoisByCategory(address, null);
+}
 
     
     // ===================================================================
