@@ -1,4 +1,4 @@
-MI25
+MI26
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -2141,42 +2141,151 @@ function displayPoiSearchResults(features, map) {
 }
 
 // ===================================================================
-// NOMBRE: searchPoisByCategory (VERSIÓN FINAL Y CORREGIDA)
-// RESUMEN: Construye la URL de búsqueda de forma robusta, usando siempre el query de texto
+// NOMBRE: normalizeOverpassResult (NUEVA FUNCIÓN)
+// RESUMEN: Convierte un resultado de Overpass al formato GeoJSON estándar de la app.
+// ===================================================================
+function normalizeOverpassResult(overpassElement) {
+    if (!overpassElement || !overpassElement.lat || !overpassElement.lon) {
+        return null;
+    }
+    
+    const tags = overpassElement.tags || {};
+    const name = tags.name || tags['addr:street'] || "Punto de Interés";
+    
+    return {
+        type: 'Feature',
+        geometry: {
+            type: 'Point',
+            coordinates: [parseFloat(overpassElement.lon), parseFloat(overpassElement.lat)]
+        },
+        properties: {
+            name: name,
+            osm_key: `${overpassElement.type}:${tags.amenity || tags.shop || tags.tourism || 'generic'}`,
+            source: 'Overpass'
+        }
+    };
+}
+
+// ===================================================================
+// NOMBRE: buildOverpassQuery (NUEVA FUNCIÓN)
+// RESUMEN: Construye la consulta en lenguaje QL para la API Overpass.
+function buildOverpassQuery(osmTag) {
+    if (!osmTag) return null;
+
+    const bounds = navigationMapInstance.getBounds();
+    const bbox = `${bounds.getSouth()},${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()}`;
+    
+    const [key, value] = osmTag.split(':');
+    if (!key || !value) return null;
+
+    const query = `
+        [out:json][timeout:25];
+        (
+          node["${key}"="${value}"](${bbox});
+          way["${key}"="${value}"](${bbox});
+          relation["${key}"="${value}"](${bbox});
+        );
+        out center;
+    `;
+    return query.trim();
+}
+
+// ===================================================================
+// NOMBRE: fetchOverpassData (NUEVA FUNCIÓN)
+// RESUMEN: Realiza la petición a la API de Overpass y devuelve los resultados.
+async function fetchOverpassData(query) {
+    const overpassUrl = 'https://overpass-api.de/api/interpreter';
+    try {
+        const response = await fetch(overpassUrl, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8'
+            },
+            body: `data=${encodeURIComponent(query)}`
+        });
+        if (!response.ok) {
+            throw new Error(`Overpass API respondió con estado: ${response.status}`);
+        }
+        const data = await response.json();
+        return data.elements || [];
+    } catch (error) {
+        console.error("Error al contactar con la API Overpass:", error);
+        return [];
+    }
+}
+    
+// ===================================================================
+// NOMBRE: searchPoisByCategory (VERSIÓN FINAL CON BÚSQUEDA DUAL PHOTON + OVERPASS)
+// RESUMEN: Busca en Photon y Overpass simultáneamente, combina y deduplica los resultados.
+// ===================================================================
 async function searchPoisByCategory(query, osmKey) {
     if (!query || query.trim() === '') {
         showToast("El término de búsqueda no puede estar vacío.", "warning");
         return;
     }
     
-    showToast(`Buscando "${query}"...`, "info");
-    
-    let url = `https://photon.komoot.io/api/?q=${encodeURIComponent(query)}&limit=50`;
+    showToast(`Buscando "${query}" en todas las fuentes...`, "info");
 
+    // --- Petición a Photon ---
+    let photonUrl = `https://photon.komoot.io/api/?q=${encodeURIComponent(query)}&limit=50`;
     if (isNavigating && navigationCurrentLocation) {
-        const { latitude, longitude } = navigationCurrentLocation;
-        url += `&lat=${latitude}&lon=${longitude}&radius=15`;
+        photonUrl += `&lat=${navigationCurrentLocation.latitude}&lon=${navigationCurrentLocation.longitude}&radius=15`;
     } else {
         const bounds = navigationMapInstance.getBounds();
-        const bbox = `${bounds.getWest()},${bounds.getSouth()},${bounds.getEast()},${bounds.getNorth()}`;
-        url += `&bbox=${bbox}`;
+        photonUrl += `&bbox=${bounds.getWest()},${bounds.getSouth()},${bounds.getEast()},${bounds.getNorth()}`;
     }
-    
     if (osmKey) {
-        url += `&osm_tag=${osmKey}`;
+        photonUrl += `&osm_tag=${osmKey}`;
     }
+    const photonPromise = fetch(photonUrl).then(res => res.json()).catch(err => {
+        console.warn("La búsqueda en Photon falló:", err);
+        return { features: [] }; // Devuelve un resultado vacío en caso de error de red
+    });
+
+    const overpassQuery = buildOverpassQuery(osmKey);
+    const overpassPromise = overpassQuery 
+        ? fetchOverpassData(overpassQuery).catch(err => {
+            console.warn("La búsqueda en Overpass falló:", err);
+            return []; // Devuelve un resultado vacío en caso de error de red
+          })
+        : Promise.resolve([]); // Si no hay osmKey, no se hace la petición
 
     try {
-        const response = await fetch(url);
-        if (!response.ok) throw new Error("La búsqueda de lugares falló.");
-        const data = await response.json();
-        displayPoiSearchResults(data.features, navigationMapInstance);
+        const [photonResponse, overpassResponse] = await Promise.all([photonPromise, overpassPromise]);
+
+        const photonFeatures = (photonResponse.features || []).map(f => ({ ...f, properties: { ...f.properties, source: 'Photon' } }));
+        const overpassFeatures = (overpassResponse || []).map(normalizeOverpassResult).filter(Boolean);
+        
+        let combinedFeatures = [...photonFeatures, ...overpassFeatures];
+
+        const uniqueFeatures = [];
+        const proximityThreshold = 20; // 20 metros, como acordamos.
+
+        for (const feature of combinedFeatures) {
+            const isDuplicate = uniqueFeatures.some(uniqueFeature => {
+                const distance = turf.distance(
+                    turf.point(feature.geometry.coordinates),
+                    turf.point(uniqueFeature.geometry.coordinates),
+                    { units: 'meters' }
+                );
+                return distance < proximityThreshold;
+            });
+
+            if (!isDuplicate) {
+                uniqueFeatures.push(feature);
+            }
+        }
+        
+        displayPoiSearchResults(uniqueFeatures, navigationMapInstance);
+
     } catch (error) {
         showToast(`Error en la búsqueda: ${error.message}`, "error");
         clearPoiSearchResults();
     }
-}    
+}
 
+
+    
 // ===================================================================
 // NOMBRE: togglePoiCategorySearch (VERSIÓN FINAL CON ESTADO VISUAL CORREGIDO)
 // RESUMEN: Gestiona el estado del modo de búsqueda de POIs y el color del botón.
