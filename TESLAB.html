@@ -1,4 +1,4 @@
-MI12
+MI14
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -989,6 +989,9 @@ MI12
     let announceManeuverWithFlash = true; 
     let maneuverFlashTriggeredId = null; 
     let lastAutoBackupTimestamp = 0;
+
+    let isPoiSearchActive = false;
+    let poiSearchResultMarkers = [];
    
     const managedKeys = [ 
         'reminders','darkMode','toggleStates','zoomState','onOffState','noticesActive', 
@@ -2050,6 +2053,123 @@ class MapSettingsPanel {
         return fragment;
     }
 }
+
+// ===================================================================
+// NOMBRE: clearPoiSearchResults (NUEVA FUNCIÓN)
+// RESUMEN: Limpia los marcadores de la búsqueda de POIs del mapa.
+function clearPoiSearchResults() {
+    if (poiSearchResultMarkers.length > 0) {
+        poiSearchResultMarkers.forEach(marker => marker.remove());
+        poiSearchResultMarkers = [];
+    }
+}
+
+// ===================================================================
+// NOMBRE: displayPoiSearchResults (NUEVA FUNCIÓN)
+// RESUMEN: Muestra los resultados de Photon en el mapa con marcadores numerados.
+function displayPoiSearchResults(features, map) {
+    clearPoiSearchResults();
+
+    if (!features || features.length === 0) {
+        showToast("No se encontraron resultados para esa categoría en esta zona.", "info");
+        return;
+    }
+
+    const bounds = new mapboxgl.LngLatBounds();
+
+    features.forEach((feature, index) => {
+        const coords = feature.geometry.coordinates;
+        const props = feature.properties;
+
+        const el = document.createElement('div');
+        el.className = 'numbered-poi-marker';
+        el.textContent = index + 1; // Numeración
+
+        const marker = new mapboxgl.Marker(el)
+            .setLngLat(coords)
+            .addTo(map);
+
+        marker.getElement().addEventListener('click', (e) => {
+            e.stopPropagation();
+            // Creamos un objeto 'feature' falso que imita el formato que espera showPoiInfoModal
+            const fakeMapboxFeature = {
+                properties: {
+                    name: props.name || `${props.street || ''} ${props.housenumber || ''}`.trim(),
+                    categories: [props.osm_key || ''] // Pasamos la clave de OSM como categoría
+                },
+                geometry: {
+                    coordinates: coords
+                }
+            };
+            showPoiInfoModal(fakeMapboxFeature);
+        });
+
+        poiSearchResultMarkers.push(marker);
+        bounds.extend(coords);
+    });
+
+    if (!bounds.isEmpty()) {
+        map.fitBounds(bounds, { padding: 80, maxZoom: 16 });
+    }
+}
+
+// ===================================================================
+// NOMBRE: searchPoisByCategory (NUEVA FUNCIÓN)
+// RESUMEN: Busca POIs con Photon según la categoría seleccionada y el contexto (navegando o no).
+async function searchPoisByCategory(query, osmKey) {
+    showToast(`Buscando "${query}"...`, "info");
+    
+    let url;
+    if (isNavigating && navigationCurrentLocation) {
+        // Si se está navegando, busca en un radio de 15km
+        const { latitude, longitude } = navigationCurrentLocation;
+        url = `https://photon.komoot.io/api/?q=${encodeURIComponent(query)}&lat=${latitude}&lon=${longitude}&radius=15&limit=50`;
+    } else {
+        // Si no, busca en los límites visibles del mapa
+        const bounds = navigationMapInstance.getBounds();
+        const bbox = `${bounds.getWest()},${bounds.getSouth()},${bounds.getEast()},${bounds.getNorth()}`;
+        url = `https://photon.komoot.io/api/?q=${encodeURIComponent(query)}&bbox=${bbox}&limit=50`;
+    }
+    
+    // Añadimos un filtro por etiqueta de OSM para mayor precisión
+    if (osmKey) {
+        url += `&osm_tag=${osmKey}`;
+    }
+
+    try {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error("La búsqueda de lugares falló.");
+        const data = await response.json();
+        displayPoiSearchResults(data.features, navigationMapInstance);
+    } catch (error) {
+        showToast(`Error en la búsqueda: ${error.message}`, "error");
+        clearPoiSearchResults();
+    }
+}
+
+
+// ===================================================================
+// NOMBRE: togglePoiCategorySearch (NUEVA FUNCIÓN)
+// RESUMEN: Gestiona el estado del modo de búsqueda de POIs.
+function togglePoiCategorySearch() {
+    const searchButton = document.getElementById('map-location-search-button');
+    if (!searchButton) return;
+
+    if (isPoiSearchActive) {
+        // Si está activo, lo desactivamos y limpiamos todo
+        clearPoiSearchResults();
+        const existingModal = document.getElementById('poi-category-modal');
+        if (existingModal) existingModal.remove();
+        isPoiSearchActive = false;
+        searchButton.style.backgroundColor = ''; // Vuelve al color original
+    } else {
+        // Si está inactivo, lo activamos y mostramos el modal
+        isPoiSearchActive = true;
+        searchButton.style.backgroundColor = '#FFD700'; // Color amarillo
+        showPoiCategoryModal();
+    }
+}
+
     
 // ===================================================================
 // NOMBRE: initializeApp 
@@ -2406,6 +2526,112 @@ function updateSmoothedGpsAltitude(newAltitude) {
         ALTITUDE_HISTORY.shift();
     }
     smoothedGpsAltitude = ALTITUDE_HISTORY.reduce((a, b) => a + b, 0) / ALTITUDE_HISTORY.length;
+}
+
+// ===================================================================
+// NOMBRE: showPoiCategoryModal (VERSIÓN AMPLIADA Y ORGANIZADA)
+// RESUMEN: Muestra el modal con las nuevas categorías de POIs, agrupadas por temas.
+function showPoiCategoryModal() {
+    closeOtherModals('poi-category-modal');
+
+    const groups = {
+        "Vehículo y Carretera": [
+            { icon: '🔋', label: 'P. Recarga VE', query: 'estacion de carga', key: 'amenity:charging_station' },
+            { icon: '🅿️', label: 'Parking', query: 'parking', key: 'amenity:parking' },
+            { icon: '🔧', label: 'Talleres', query: 'taller mecanico', key: 'shop:car_repair' },
+            { icon: '🧼', label: 'Lavado Coches', query: 'lavado de coches', key: 'amenity:car_wash' }
+            { icon: '⛽', label: 'Gasolineras', query: 'gasolinera', key: 'amenity:fuel' },
+           
+        ],
+        "Comer y Beber": [
+            { icon: '🍽️', label: 'Restaurantes', query: 'restaurante', key: 'amenity:restaurant' },
+            { icon: '☕', label: 'Cafeterías', query: 'cafeteria', key: 'amenity:cafe' },
+            { icon: '🍺', label: 'Bares', query: 'bar', key: 'amenity:bar' },
+            { icon: '🍔', label: 'Comida Rápida', query: 'comida rapida', key: 'amenity:fast_food' },
+            { icon: '🥐', label: 'Panaderías', query: 'panaderia', key: 'shop:bakery' }
+        ],
+        "Servicios y Compras": [
+            { icon: '🛒', label: 'Supermercados', query: 'supermercado', key: 'shop:supermarket' },
+            { icon: '🛍️', label: 'Centro C.', query: 'centro comercial', key: 'shop:mall' },
+            { icon: '💊', label: 'Farmacias', query: 'farmacia', key: 'amenity:pharmacy' },
+            { icon: '🏧', label: 'Cajeros', query: 'cajero automatico', key: 'amenity:atm' },
+            { icon: '🏨', label: 'Hoteles', query: 'hotel', key: 'tourism:hotel' },
+            { icon: '🏥', label: 'Hospitales', query: 'hospital', key: 'amenity:hospital' },
+            { icon: '🩺', label: 'Centro Salud', query: 'centro de salud', key: 'amenity:clinic' } // <-- NUEVA CATEGORÍA AÑADIDA AQUÍ
+        ],
+        "Ocio y Turismo": [
+            { icon: '🏞️', label: 'Parques', query: 'parque', key: 'leisure:park' },
+            { icon: '🏖️', label: 'Playas', query: 'playa', key: 'natural:beach' },
+            { icon: '🏛️', label: 'Museos', query: 'museo', key: 'tourism:museum' },
+            { icon: '🏰', label: 'Monumentos', query: 'monumento', key: 'historic:monument' },
+            { icon: '🍿', label: 'Cines', query: 'cine', key: 'amenity:cinema' }
+        ]
+    };
+
+    const modalOverlay = document.createElement('div');
+    modalOverlay.id = 'poi-category-modal';
+    modalOverlay.className = 'poi-category-modal-overlay';
+    
+    let groupsHtml = '';
+    for (const groupName in groups) {
+        let buttonsHtml = '';
+        groups[groupName].forEach(cat => {
+            buttonsHtml += `
+                <button class="poi-category-button" data-query="${cat.query}" data-key="${cat.key}">
+                    <span class="icon">${cat.icon}</span>
+                    <span>${cat.label}</span>
+                </button>
+            `;
+        });
+        groupsHtml += `
+            <h3 class="poi-group-title">${groupName}</h3>
+            <div class="poi-category-grid">${buttonsHtml}</div>
+        `;
+    }
+
+    modalOverlay.innerHTML = `
+        <style>
+            .poi-category-modal-content { max-height: 90vh; overflow-y: auto; }
+            .poi-group-title {
+                color: #ff9500; /* Naranja Tesla */
+                font-size: 1.1rem;
+                font-weight: bold;
+                margin-top: 20px;
+                margin-bottom: 10px;
+                padding-bottom: 5px;
+                border-bottom: 1px solid #444;
+            }
+            .poi-group-title:first-of-type {
+                margin-top: 0;
+            }
+        </style>
+        <div class="poi-category-modal-content">
+            <h2>Buscar Puntos de Interés Cercanos</h2>
+            ${groupsHtml}
+        </div>
+    `;
+
+    document.body.appendChild(modalOverlay);
+
+    const closeModal = () => {
+        if (modalOverlay.parentNode) modalOverlay.remove();
+    };
+
+    modalOverlay.addEventListener('click', (e) => {
+        if (e.target === modalOverlay) {
+            togglePoiCategorySearch();
+        }
+    });
+
+    modalOverlay.querySelector('.poi-category-modal-content').addEventListener('click', (e) => {
+        const button = e.target.closest('.poi-category-button');
+        if (button) {
+            const query = button.dataset.query;
+            const key = button.dataset.key;
+            searchPoisByCategory(query, key);
+            closeModal();
+        }
+    });
 }
 
 // ===================================================================
