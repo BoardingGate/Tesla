@@ -1,4 +1,3 @@
-
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -188,7 +187,7 @@
              </div>
              <div class="button-row" id="search-row-map-header">
                 <button id="reorder-route-stages-button" title="Ordenar Etapas de Ruta"><img src="./PNG/MOVER.PNG" alt="Ordenar Etapas"></button>
-                <button id="map-location-search-button" class="reminders-map-button-action"><img src="./PNG/ANADIRPUNTO.PNG" alt="Añadir Punto Ruta"></button>
+                <button id="map-location-search-button" class="reminders-map-button-action"><img src="./PNG/ANADIRPUNTO.jpg" alt="Añadir Punto Ruta"></button>
                 <button id="clear-map-search-input-button" title="Limpiar búsqueda">X</button>
                 </button>
                 <input type="text" id="map-location-search-input" placeholder="Dirección,sitio,zona /Negocio /Ciudad /CP+Provincia (28001 Madrid /Lidl Lugo)">
@@ -981,6 +980,10 @@
     let announceManeuverWithFlash = true; 
     let maneuverFlashTriggeredId = null; 
     let lastAutoBackupTimestamp = 0;
+
+    let isPoiSearchActive = false;
+    let poiSearchResultMarkers = [];
+    let isPitchManuallyFlattened = false; 
    
     const managedKeys = [ 
         'reminders','darkMode','toggleStates','zoomState','onOffState','noticesActive', 
@@ -1651,6 +1654,29 @@ class ZoomControl {
         levelDisplay.style.cssText = 'color: white; font-weight: bold; text-shadow: 1px 1px 2px black; min-width: 40px; text-align: center;';
         levelDisplay.textContent = map.getZoom().toFixed(1);
 
+        levelDisplay.style.cursor = 'pointer';
+        levelDisplay.title = 'Alternar inclinación (pitch) a 0° / por defecto';
+
+        levelDisplay.addEventListener('click', (e) => {
+            e.stopPropagation();
+            triggerManualMapInteraction();
+
+            if (isPitchManuallyFlattened) {
+                // Restaurar al valor por defecto del modo actual
+                const currentModeDetails = Object.values(MAP_VIEW_MODES).find(m => m.mode === mapViewMode);
+                const defaultPitch = currentModeDetails ? currentModeDetails.pitch : 0;
+                const modeName = Object.keys(MAP_VIEW_MODES).find(key => MAP_VIEW_MODES[key].mode === mapViewMode) || "Desconocido";
+                
+                map.easeTo({ pitch: defaultPitch });
+                showToast(`Pitch restaurado al valor por defecto del modo (${modeName})`, 'info');
+                isPitchManuallyFlattened = false;
+            } else {
+                map.easeTo({ pitch: 0 });
+                showToast('Pitch ajustado a 0° (vista cenital)', 'info');
+                isPitchManuallyFlattened = true;
+            }
+        });
+       
         const autoBtn = document.createElement('div');
         autoBtn.id = 'zoom-auto-button';
         autoBtn.className = 'zoom-control-button';
@@ -1688,6 +1714,8 @@ class ZoomControl {
         this._container.appendChild(offsetBtn);
         
         map.on('zoom', () => { levelDisplay.textContent = map.getZoom().toFixed(1); });
+        
+       
         
         const ZOOM_INCREMENT = 0.3;
         
@@ -1996,6 +2024,7 @@ class MapSettingsPanel {
             
             input.onchange = async () => {
                 if (!input.checked) return;
+                isPitchManuallyFlattened = false; 
 
                 const selectedModeValue = input.value;
                 const newModeDetails = Object.values(viewModes).find(m => m.mode === selectedModeValue);
@@ -2040,6 +2069,122 @@ class MapSettingsPanel {
         fragment.appendChild(viewSelector);
 
         return fragment;
+    }
+}
+
+// ===================================================================
+// NOMBRE: clearPoiSearchResults (NUEVA FUNCIÓN)
+// RESUMEN: Limpia los marcadores de la búsqueda de POIs del mapa.
+function clearPoiSearchResults() {
+    if (poiSearchResultMarkers.length > 0) {
+        poiSearchResultMarkers.forEach(marker => marker.remove());
+        poiSearchResultMarkers = [];
+    }
+}
+
+// ===================================================================
+// NOMBRE: displayPoiSearchResults (NUEVA FUNCIÓN)
+// RESUMEN: Muestra los resultados de Photon en el mapa con marcadores numerados.
+function displayPoiSearchResults(features, map) {
+    clearPoiSearchResults();
+
+    if (!features || features.length === 0) {
+        showToast("No se encontraron resultados para esa categoría en esta zona.", "info");
+        return;
+    }
+
+    const bounds = new mapboxgl.LngLatBounds();
+
+    features.forEach((feature, index) => {
+        const coords = feature.geometry.coordinates;
+        const props = feature.properties;
+
+        const el = document.createElement('div');
+        el.className = 'numbered-poi-marker';
+        el.textContent = index + 1; // Numeración
+
+        const marker = new mapboxgl.Marker(el)
+            .setLngLat(coords)
+            .addTo(map);
+
+        marker.getElement().addEventListener('click', (e) => {
+            e.stopPropagation();
+            // Creamos un objeto 'feature' falso que imita el formato que espera showPoiInfoModal
+            const fakeMapboxFeature = {
+                properties: {
+                    name: props.name || `${props.street || ''} ${props.housenumber || ''}`.trim(),
+                    categories: [props.osm_key || ''] // Pasamos la clave de OSM como categoría
+                },
+                geometry: {
+                    coordinates: coords
+                }
+            };
+            showPoiInfoModal(fakeMapboxFeature);
+        });
+
+        poiSearchResultMarkers.push(marker);
+        bounds.extend(coords);
+    });
+
+    if (!bounds.isEmpty()) {
+        map.fitBounds(bounds, { padding: 80, maxZoom: 16 });
+    }
+}
+
+// ===================================================================
+// NOMBRE: searchPoisByCategory (VERSIÓN FINAL Y CORREGIDA)
+// RESUMEN: Construye la URL de búsqueda de forma robusta, usando siempre el query de texto
+async function searchPoisByCategory(query, osmKey) {
+    if (!query || query.trim() === '') {
+        showToast("El término de búsqueda no puede estar vacío.", "warning");
+        return;
+    }
+    
+    showToast(`Buscando "${query}"...`, "info");
+    
+    let url = `https://photon.komoot.io/api/?q=${encodeURIComponent(query)}&limit=50`;
+
+    if (isNavigating && navigationCurrentLocation) {
+        const { latitude, longitude } = navigationCurrentLocation;
+        url += `&lat=${latitude}&lon=${longitude}&radius=15`;
+    } else {
+        const bounds = navigationMapInstance.getBounds();
+        const bbox = `${bounds.getWest()},${bounds.getSouth()},${bounds.getEast()},${bounds.getNorth()}`;
+        url += `&bbox=${bbox}`;
+    }
+    
+    if (osmKey) {
+        url += `&osm_tag=${osmKey}`;
+    }
+
+    try {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error("La búsqueda de lugares falló.");
+        const data = await response.json();
+        displayPoiSearchResults(data.features, navigationMapInstance);
+    } catch (error) {
+        showToast(`Error en la búsqueda: ${error.message}`, "error");
+        clearPoiSearchResults();
+    }
+}    
+
+// ===================================================================
+// NOMBRE: togglePoiCategorySearch (VERSIÓN FINAL CON ESTADO VISUAL CORREGIDO)
+// RESUMEN: Gestiona el estado del modo de búsqueda de POIs y el color del botón.
+function togglePoiCategorySearch() {
+    const searchButton = document.getElementById('map-location-search-button');
+    if (!searchButton) return;
+
+    if (isPoiSearchActive) {
+        clearPoiSearchResults();
+        const existingModal = document.getElementById('poi-category-modal');
+        if (existingModal) existingModal.remove();
+        isPoiSearchActive = false;
+        searchButton.style.removeProperty('background-color');
+    } else {
+        isPoiSearchActive = true;
+        searchButton.style.setProperty('background-color', '#FFD700', 'important');
+        showPoiCategoryModal();
     }
 }
     
@@ -2400,6 +2545,170 @@ function updateSmoothedGpsAltitude(newAltitude) {
     smoothedGpsAltitude = ALTITUDE_HISTORY.reduce((a, b) => a + b, 0) / ALTITUDE_HISTORY.length;
 }
 
+// ===================================================================
+// NOMBRE: showPoiCategoryModal (VERSIÓN FINAL CON BÚSQUEDA PERSONALIZADA)
+// RESUMEN: Muestra el modal con categorías y un botón dinámico para buscar el texto tecleado.
+// ===================================================================
+function showPoiCategoryModal() {
+    closeOtherModals('poi-category-modal');
+
+    const searchInput = document.getElementById('map-location-search-input');
+    const customSearchQuery = searchInput ? searchInput.value.trim() : '';
+
+    const groups = {
+        "Vehículo y Carretera": [
+            { icon: '🔋', label: 'P. Recarga VE', query: 'estacion de carga', key: 'amenity:charging_station' },
+            { icon: '🚗', label: 'Tesla', query: 'tesla', key: 'shop:car' },
+            { icon: '🅿️', label: 'Parking', query: 'parking', key: 'amenity:parking' },
+            { icon: '🔧', label: 'Talleres', query: 'taller mecanico', key: 'shop:car_repair' },
+            { icon: '🧼', label: 'Lavado Coches', query: 'lavado de coches', key: 'amenity:car_wash' },
+            { icon: '⛽', label: 'Gasolineras :-))', query: 'gasolinera', key: 'amenity:fuel' }
+        ],
+        "Comer y Beber": [
+            { icon: '🍽️', label: 'Restaurantes', query: 'restaurante', key: 'amenity:restaurant' },
+            { icon: '☕', label: 'Cafeterías', query: 'cafeteria', key: 'amenity:cafe' },
+            { icon: '🍺', label: 'Bares', query: 'bar', key: 'amenity:bar' },
+            { icon: '🍔', label: 'Comida Rápida', query: 'comida rapida', key: 'amenity:fast_food' },
+            { icon: '🥐', label: 'Panaderías', query: 'panaderia', key: 'shop:bakery' }
+        ],
+        "Servicios y Compras": [
+            { icon: '🛒', label: 'Supermercados', query: 'supermercado', key: 'shop:supermarket' },
+            { icon: '🛍️', label: 'Centro C.', query: 'centro comercial', key: 'shop:mall' },
+            { icon: '💊', label: 'Farmacias', query: 'farmacia', key: 'amenity:pharmacy' },
+            { icon: '🏧', label: 'Cajeros', query: 'cajero automatico', key: 'amenity:atm' },
+            { icon: '🏨', label: 'Hoteles', query: 'hotel', key: 'tourism:hotel' },
+            { icon: '🏥', label: 'Hospitales', query: 'hospital', key: 'amenity:hospital' },
+            { icon: '🩺', label: 'Centro Salud', query: 'centro de salud', key: 'amenity:clinic' }
+        ],
+        "Ocio y Turismo": [
+            { icon: '🏞️', label: 'Parques', query: 'parque', key: 'leisure:park' },
+            { icon: '🏖️', label: 'Playas', query: 'playa', key: 'natural:beach' },
+            { icon: '🏛️', label: 'Museos', query: 'museo', key: 'tourism:museum' },
+            { icon: '🏰', label: 'Monumentos', query: 'monumento', key: 'historic:monument' },
+            { icon: '🍿', label: 'Cines', query: 'cine', key: 'amenity:cinema' }
+        ]
+    };
+
+    const modalOverlay = document.createElement('div');
+    modalOverlay.id = 'poi-category-modal';
+    modalOverlay.className = 'poi-category-modal-overlay';
+    modalOverlay.style.position = 'absolute'; 
+    
+    let customSearchHtml = '';
+    if (customSearchQuery) {
+        const truncatedQuery = customSearchQuery.length > 20 ? customSearchQuery.substring(0, 17) + '...' : customSearchQuery;
+        customSearchHtml = `
+            <h3 class="poi-group-title custom-search-title">Búsqueda Personalizada</h3>
+            <div class="poi-category-grid custom-search-grid">
+                <button id="custom-poi-search-button" class="poi-category-button custom-search-button" data-query="${customSearchQuery}">
+                    <span class="icon">🔍</span>
+                    <span style="font-style: italic;">"${truncatedQuery}"</span>
+                </button>
+            </div>
+        `;
+    }
+
+    let groupsHtml = '';
+    for (const groupName in groups) {
+        let buttonsHtml = '';
+        groups[groupName].forEach(cat => {
+            buttonsHtml += `
+                <button class="poi-category-button" data-query="${cat.query}" data-key="${cat.key}">
+                    <span class="icon">${cat.icon}</span>
+                    <span>${cat.label}</span>
+                </button>
+            `;
+        });
+        groupsHtml += `
+            <h3 class="poi-group-title">${groupName}</h3>
+            <div class="poi-category-grid">${buttonsHtml}</div>
+        `;
+    }
+
+    modalOverlay.innerHTML = `
+        <style>
+            .poi-category-modal-content { max-height: 90vh; overflow-y: auto; }
+            .poi-group-title {
+                color: #ffffff;
+                font-size: 1.1rem;
+                font-weight: bold;
+                margin-top: 20px;
+                margin-bottom: 10px;
+                padding-bottom: 5px;
+                border-bottom: 1px solid #444;
+            }
+            .poi-group-title:first-of-type {
+                margin-top: 0;
+            }
+            .poi-search-info-note {
+                font-size: 0.8rem;
+                color: #b0b0b0;
+                text-align: center;
+                margin-top: 20px;
+                padding-top: 10px;
+                border-top: 1px solid #444;
+            }
+            /* Estilos para la nueva sección de búsqueda personalizada */
+            .custom-search-title {
+                color: #50E3C2; /* Un verde cian para distinguirlo */
+            }
+            .custom-search-grid {
+                grid-template-columns: 1fr; /* Ocupa todo el ancho */
+            }
+            .custom-search-button {
+                background-color: #1c1c1e; /* Un fondo más oscuro para que destaque */
+                border-color: #50E3C2;
+                flex-direction: row; /* Icono y texto en línea */
+                justify-content: center;
+            }
+        </style>
+        <div class="poi-category-modal-content">
+            <div class="poi-category-modal-header">
+                <h2>Buscar Puntos de Interés</h2>
+                <button class="poi-category-close-btn" title="Salir de la búsqueda de POIs">&times;</button>
+            </div>
+            ${customSearchHtml}
+            ${groupsHtml}
+            <p class="poi-search-info-note">(*) Si está en ruta se busca en un radio 15 Km, sino, en la zona del mapa que esté viendo.</p>
+        </div>
+    `;
+
+    const mapModalContainer = document.getElementById('reminders-location-map-modal');
+    if (mapModalContainer) {
+        mapModalContainer.appendChild(modalOverlay);
+    } else {
+        document.body.appendChild(modalOverlay);
+    }
+
+    const closeModalAndDeactivate = () => {
+        if (modalOverlay.parentNode) modalOverlay.remove();
+        if (isPoiSearchActive) {
+            togglePoiCategorySearch();
+        }
+    };
+
+    modalOverlay.querySelector('.poi-category-close-btn').addEventListener('click', closeModalAndDeactivate);
+
+    if (customSearchQuery) {
+        modalOverlay.querySelector('#custom-poi-search-button').addEventListener('click', (e) => {
+            const button = e.currentTarget;
+            const query = button.dataset.query;
+            searchPoisByCategory(query, null); 
+            if (modalOverlay.parentNode) modalOverlay.remove();
+        });
+    }
+
+    modalOverlay.querySelector('.poi-category-modal-content').addEventListener('click', (e) => {
+        const button = e.target.closest('.poi-category-button:not(#custom-poi-search-button)'); // Excluimos el botón personalizado
+        if (button) {
+            const query = button.dataset.query;
+            const key = button.dataset.key;
+            searchPoisByCategory(query, key);
+            if (modalOverlay.parentNode) modalOverlay.remove();
+        }
+    });
+}    
+    
 // ===================================================================
 // NOMBRE: checkAndMarkWaypointsAsVisited 
 // RESUMEN: Marca la etapa como visitada a 70m y muestra el modal de llegada solo a 20m.
@@ -2857,9 +3166,9 @@ function showNavigationMapHelpModal() {
                 <li><strong>Zoom <img src="PNG/ZOOM+.PNG" class="icon-in-text"> / <img src="PNG/ZOOM-.PNG" class="icon-in-text">:</strong> Alterna entre una vista general de toda la ruta y un zoom cercano a tu vehículo.</li>
             </ul>
 
-            <h3><img src="./PNG/ANADIRPUNTO.PNG" class="icon-in-text"> Planificación de Ruta</h3>
+            <h3><img src="./PNG/ANADIRPUNTO.jpg" class="icon-in-text"> Planificación de Ruta</h3>
             <ul class="list-disc space-y-2">
-                <li><strong>Añadir Puntos:</strong> Simplemente <strong>pulsa en cualquier lugar del mapa</strong> para añadir una etapa. También puedes usar el <strong>buscador de texto</strong> para encontrar direcciones o lugares y añadirlos con el botón <img src="./PNG/ANADIRPUNTO.PNG" class="icon-in-text">.</li>
+                <li><strong>Añadir Puntos:</strong> Simplemente <strong>pulsa en cualquier lugar del mapa</strong> para añadir una etapa. También puedes usar el <strong>buscador de texto</strong> para encontrar direcciones o lugares y añadirlos con el botón <img src="./PNG/ANADIRPUNTO.jpg" class="icon-in-text">.</li>
                 <li><strong>Eliminar Puntos:</strong> Pulsa la <strong>'X' roja</strong> sobre cualquier marcador de etapa.</li>
                 <li><strong>Reordenar Etapas <img src="./PNG/MOVER.PNG" class="icon-in-text">:</strong> Abre un menú para arrastrar y cambiar el orden de las etapas de tu ruta.</li>
                 <li><strong>Guardar y Cargar Rutas <img src="PNG/GUARDARRUTA.PNG" class="icon-in-text"> <img src="PNG/CARGARRUTA.PNG" class="icon-in-text">:</strong> Guarda la ruta actual para usarla en el futuro o carga una ya existente.</li>
@@ -18187,8 +18496,8 @@ function assignMapButtonListeners() {
                  case 'simulate-route-button': showSimulationModal(); break;
                  case 'reorder-route-stages-button': showReorderStagesModal(); break;
                  case 'navigation-map-help-button': showNavigationMapHelpModal(); break;
-                 case 'map-location-search-button':
-                    const currentSearchInput = document.getElementById('map-location-search-input');
+                 case 'map-location-search-button': togglePoiCategorySearch();
+                    break;
                     const currentFilterInput = document.getElementById('filter-input');
                     const mainTerm = currentSearchInput?.value.trim() || '';
                     if (!mainTerm) { showToast("El campo de búsqueda principal no puede estar vacío.", "warning"); return; }
@@ -18217,7 +18526,7 @@ function assignMapButtonListeners() {
         const hasMainText = newMapLocationSearchInput.value.trim() !== '';
         const searchBtn = document.getElementById('map-location-search-button');
         const clearBtn = document.getElementById('clear-map-search-input-button');
-        if(searchBtn) searchBtn.style.display = hasMainText ? 'inline-flex' : 'none';
+      //  if(searchBtn) searchBtn.style.display = hasMainText ? 'inline-flex' : 'none';
         if(clearBtn) clearBtn.style.display = hasMainText ? 'inline-flex' : 'none';
         
         clearTimeout(searchDebounceTimer);
@@ -18903,9 +19212,9 @@ async function searchAndAddWaypoint(addressQuery = null) {
     } finally {
         if (searchButton) {
             searchButton.disabled = false;
-            searchButton.innerHTML = `<img src="PNG/ANADIRPUNTO.PNG" alt="Añadir Punto Ruta">`;
+            searchButton.innerHTML = `<img src="PNG/ANADIRPUNTO.jpg" alt="Añadir Punto Ruta">`;
             if (searchInput && searchInput.value.trim() === '') {
-                searchButton.style.display = 'none';
+             //   searchButton.style.display = 'none';
                 const clearMapSearchBtn = document.getElementById('clear-map-search-input-button');
                 if (clearMapSearchBtn) clearMapSearchBtn.style.display = 'none';
             }
