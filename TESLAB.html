@@ -1,4 +1,4 @@
-MI32
+MI33
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -2217,7 +2217,6 @@ async function fetchOverpassData(query) {
 // ===================================================================
 // NOMBRE: searchPoisByCategory (VERSIÓN FINAL CON BÚSQUEDA DUAL PHOTON + OVERPASS)
 // RESUMEN: Busca en Photon y Overpass simultáneamente, combina y deduplica los resultados.
-// ===================================================================
 async function searchPoisByCategory(query, osmKey) {
     if (!query || query.trim() === '') {
         showToast("El término de búsqueda no puede estar vacío.", "warning");
@@ -19293,10 +19292,10 @@ async function snapCoordsToRoad(lat, lon) {
     }
 }
 
+
 // ===================================================================
-// NOMBRE: searchAndAddWaypoint (VERSIÓN FINAL CON BÚSQUEDA TRIPLE SIMULTÁNEA)
-// RESUMEN: Lanza la misma búsqueda de texto en Nominatim, Photon y Overpass.
-// ===================================================================
+// NOMBRE: searchAndAddWaypoint (VERSIÓN FINAL SIMPLIFICADA Y DIRECTA)
+// RESUMEN: Busca direcciones (Nominatim) y DELEGA la búsqueda de POIs a la función existente.
 async function searchAndAddWaypoint(addressQuery = null) {
     const searchInput = document.getElementById('map-location-search-input');
     const address = addressQuery || searchInput.value.trim();
@@ -19311,120 +19310,45 @@ async function searchAndAddWaypoint(addressQuery = null) {
         searchButton.innerHTML = `<img src="PNG/BUSCANDO.PNG" alt="Buscando...">`;
     }
 
-    showToast("Buscando en todas las fuentes...", "info", 3000);
+    showToast("Buscando dirección...", "info", 3000);
 
-    const bounds = navigationMapInstance.getBounds();
-    const bbox = `${bounds.getSouth()},${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()}`;
-    const escapedQuery = address.replace(/"/g, '\\"'); // Escapar comillas para Overpass
-
-    // --- 1. Petición para Sugerencias de Dirección (Nominatim) ---
-    const fetchSuggestionsPromise = (async () => {
-        try {
-            const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address)}&format=jsonv2&limit=60&accept-language=es&addressdetails=1&viewbox=${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()},${bounds.getSouth()}&bounded=1`;
-            const response = await fetch(url, { headers: { 'User-Agent': 'BoardingGate_Tesla_Launcher/1.0' } });
-            if (!response.ok) return [];
-            const data = await response.json();
-            return (data || []).map(normalizeNominatimResult).filter(Boolean);
-        } catch (error) {
-            console.warn("La búsqueda en Nominatim falló:", error);
-            return [];
-        }
-    })();
-
-    // --- 2. Petición para POIs (Photon) ---
-    const fetchPhotonPromise = (async () => {
-        try {
-            let url = `https://photon.komoot.io/api/?q=${encodeURIComponent(address)}&limit=50&bbox=${bounds.getWest()},${bounds.getSouth()},${bounds.getEast()},${bounds.getNorth()}`;
-            const response = await fetch(url);
-            if (!response.ok) return [];
-            const data = await response.json();
-            return (data.features || []).map(f => ({ ...f, properties: { ...f.properties, source: 'Photon' } }));
-        } catch (error) {
-            console.warn("La búsqueda en Photon falló:", error);
-            return [];
-        }
-    })();
-
-    // --- 3. Petición para POIs (Overpass) ---
-    const fetchOverpassPromise = (async () => {
-        try {
-            // Consulta Overpass que busca por el nombre exacto (insensible a mayúsculas/minúsculas)
-            const query = `
-                [out:json][timeout:25];
-                (
-                  node[~"name"~"${escapedQuery}",i](${bbox});
-                  way[~"name"~"${escapedQuery}",i](${bbox});
-                  relation[~"name"~"${escapedQuery}",i](${bbox});
-                );
-                out center;
-            `;
-            return await fetchOverpassData(query.trim());
-        } catch (error) {
-            console.warn("La búsqueda en Overpass falló:", error);
-            return [];
-        }
-    })();
-
-    // --- 4. Ejecutar todo y procesar los resultados ---
     try {
-        const [nominatimResults, photonResults, overpassRawResults] = await Promise.all([
-            fetchSuggestionsPromise,
-            fetchPhotonPromise,
-            fetchOverpassPromise
-        ]);
+        const queryToSearch = address.replace(/,/g, '');
+        const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(queryToSearch)}&limit=60&accept-language=es&addressdetails=1`;
+        const response = await fetch(url);
+        if (!response.ok) throw new Error(`Error de red: ${response.status}`);
         
-        const overpassResults = (overpassRawResults || []).map(normalizeOverpassResult).filter(Boolean);
+        const data = await response.json();
         
-        // Unimos los resultados de POI (Photon + Overpass)
-        let combinedPoiFeatures = [...photonResults, ...overpassResults];
-        
-        // Deduplicamos la lista de POIs
-        const uniquePoiFeatures = [];
-        const proximityThreshold = 20;
-        for (const feature of combinedPoiFeatures) {
-            const isDuplicate = uniquePoiFeatures.some(uniqueFeature =>
-                turf.distance(turf.point(feature.geometry.coordinates), turf.point(uniqueFeature.geometry.coordinates), { units: 'meters' }) < proximityThreshold
-            );
-            if (!isDuplicate) {
-                uniquePoiFeatures.push(feature);
+        if (data && data.length > 0) {
+            const results = data.reduce((acc, item) => {
+                if (item && typeof item.lat === 'string' && item.lat.trim() !== '' && typeof item.lon === 'string' && item.lon.trim() !== '') {
+                    acc.push({
+                        display_name: item.display_name || "Ubicación desconocida",
+                        lat: parseFloat(item.lat),
+                        lon: parseFloat(item.lon)
+                    });
+                }
+                return acc;
+            }, []);
+            if (results.length > 0) {
+                 displayAddressSuggestionsModal(results);
             }
         }
-        
-        // Procesamos los resultados
-        if (uniquePoiFeatures.length > 0) {
-            displayPoiSearchResults(uniquePoiFeatures, navigationMapInstance);
-            isPoiSearchActive = true;
-            if (searchButton) searchButton.style.setProperty('background-color', '#FFD700', 'important');
-            showToast(`Se encontraron ${uniquePoiFeatures.length} POIs relacionados.`, "success");
-        } else {
-            clearPoiSearchResults();
-            isPoiSearchActive = false;
-            if (searchButton) searchButton.style.removeProperty('background-color');
-        }
-
-        if (nominatimResults.length > 0) {
-            // Nominatim devuelve un GeoJSON, necesitamos el 'display_name' para el modal
-            const suggestionsForModal = nominatimResults.map(feature => ({
-                display_name: feature.properties.name, // El nombre normalizado es el display_name
-                lat: feature.geometry.coordinates[1],
-                lon: feature.geometry.coordinates[0]
-            }));
-            displayAddressSuggestionsModal(suggestionsForModal);
-        } else if (uniquePoiFeatures.length === 0) {
-            showToast("No se encontraron ni direcciones ni POIs para tu búsqueda.", "warning");
-        }
-
     } catch (error) {
-        showToast(`Error general durante la búsqueda: ${error.message}`, "error", 4000, true);
+        showToast(`Error buscando sugerencias: ${error.message}`, "error");
     } finally {
         if (searchButton) {
             searchButton.disabled = false;
-            if (!isPoiSearchActive) {
-                searchButton.style.removeProperty('background-color');
-            }
+            searchButton.innerHTML = `<img src="PNG/ANADIRPUNTO.jpg" alt="Añadir Punto Ruta">`;
         }
     }
-}    
+
+    await searchPoisByCategory(address, null);
+}
+
+
+
     
     // ===================================================================
     // NOMBRE: hideAddressSuggestionsModal
