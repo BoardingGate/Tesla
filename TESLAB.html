@@ -1,4 +1,4 @@
-MI31
+MI32
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -19294,8 +19294,8 @@ async function snapCoordsToRoad(lat, lon) {
 }
 
 // ===================================================================
-// NOMBRE: searchAndAddWaypoint (VERSIÓN FINAL CON ESTADO Y LIMPIEZA)
-// RESUMEN: Busca direcciones (Nominatim) y POIs (Photon), muestra ambos, y activa el estado del botón de POIs.
+// NOMBRE: searchAndAddWaypoint (VERSIÓN FINAL CON BÚSQUEDA TRIPLE SIMULTÁNEA)
+// RESUMEN: Lanza la misma búsqueda de texto en Nominatim, Photon y Overpass.
 // ===================================================================
 async function searchAndAddWaypoint(addressQuery = null) {
     const searchInput = document.getElementById('map-location-search-input');
@@ -19311,62 +19311,106 @@ async function searchAndAddWaypoint(addressQuery = null) {
         searchButton.innerHTML = `<img src="PNG/BUSCANDO.PNG" alt="Buscando...">`;
     }
 
-    showToast("Buscando dirección y POIs cercanos...", "info", 3000);
-    
-    // Petición para Sugerencias de Dirección (Nominatim)
+    showToast("Buscando en todas las fuentes...", "info", 3000);
+
+    const bounds = navigationMapInstance.getBounds();
+    const bbox = `${bounds.getSouth()},${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()}`;
+    const escapedQuery = address.replace(/"/g, '\\"'); // Escapar comillas para Overpass
+
+    // --- 1. Petición para Sugerencias de Dirección (Nominatim) ---
     const fetchSuggestionsPromise = (async () => {
         try {
-            const queryToSearch = address.replace(/,/g, '');
-            const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(queryToSearch)}&limit=60&accept-language=es&addressdetails=1`;
+            const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address)}&format=jsonv2&limit=60&accept-language=es&addressdetails=1&viewbox=${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()},${bounds.getSouth()}&bounded=1`;
+            const response = await fetch(url, { headers: { 'User-Agent': 'BoardingGate_Tesla_Launcher/1.0' } });
+            if (!response.ok) return [];
+            const data = await response.json();
+            return (data || []).map(normalizeNominatimResult).filter(Boolean);
+        } catch (error) {
+            console.warn("La búsqueda en Nominatim falló:", error);
+            return [];
+        }
+    })();
+
+    // --- 2. Petición para POIs (Photon) ---
+    const fetchPhotonPromise = (async () => {
+        try {
+            let url = `https://photon.komoot.io/api/?q=${encodeURIComponent(address)}&limit=50&bbox=${bounds.getWest()},${bounds.getSouth()},${bounds.getEast()},${bounds.getNorth()}`;
             const response = await fetch(url);
             if (!response.ok) return [];
             const data = await response.json();
-            if (data && data.length > 0) {
-                return data.reduce((acc, item) => {
-                    if (item && typeof item.lat === 'string' && item.lat.trim() !== '' && typeof item.lon === 'string' && item.lon.trim() !== '') {
-                        acc.push({ display_name: item.display_name, lat: parseFloat(item.lat), lon: parseFloat(item.lon) });
-                    }
-                    return acc;
-                }, []);
-            }
-            return [];
+            return (data.features || []).map(f => ({ ...f, properties: { ...f.properties, source: 'Photon' } }));
         } catch (error) {
-            console.warn("La búsqueda de direcciones (Nominatim) falló:", error);
+            console.warn("La búsqueda en Photon falló:", error);
             return [];
         }
     })();
 
-    // Petición para Puntos de Interés (Photon)
-    const fetchPoisPromise = (async () => {
-        let photonUrl = `https://photon.komoot.io/api/?q=${encodeURIComponent(address)}&limit=50`;
-        const bounds = navigationMapInstance.getBounds();
-        photonUrl += `&bbox=${bounds.getWest()},${bounds.getSouth()},${bounds.getEast()},${bounds.getNorth()}`;
+    // --- 3. Petición para POIs (Overpass) ---
+    const fetchOverpassPromise = (async () => {
         try {
-            const response = await fetch(photonUrl);
-            const data = await response.json();
-            return data.features || [];
+            // Consulta Overpass que busca por el nombre exacto (insensible a mayúsculas/minúsculas)
+            const query = `
+                [out:json][timeout:25];
+                (
+                  node[~"name"~"${escapedQuery}",i](${bbox});
+                  way[~"name"~"${escapedQuery}",i](${bbox});
+                  relation[~"name"~"${escapedQuery}",i](${bbox});
+                );
+                out center;
+            `;
+            return await fetchOverpassData(query.trim());
         } catch (error) {
-            console.warn("La búsqueda de POIs (Photon) falló:", error);
+            console.warn("La búsqueda en Overpass falló:", error);
             return [];
         }
     })();
 
-    // Ejecutar ambas búsquedas y procesar los resultados
+    // --- 4. Ejecutar todo y procesar los resultados ---
     try {
-        const [suggestions, poiFeatures] = await Promise.all([fetchSuggestionsPromise, fetchPoisPromise]);
-
-        if (poiFeatures.length > 0) {
-            displayPoiSearchResults(poiFeatures, navigationMapInstance);
-            isPoiSearchActive = true; // <-- Importante: Activamos el estado
-            if (searchButton) searchButton.style.setProperty('background-color', '#FFD700', 'important'); // <-- Iluminamos el botón
-            showToast(`Se encontraron ${poiFeatures.length} POIs relacionados.`, "success");
+        const [nominatimResults, photonResults, overpassRawResults] = await Promise.all([
+            fetchSuggestionsPromise,
+            fetchPhotonPromise,
+            fetchOverpassPromise
+        ]);
+        
+        const overpassResults = (overpassRawResults || []).map(normalizeOverpassResult).filter(Boolean);
+        
+        // Unimos los resultados de POI (Photon + Overpass)
+        let combinedPoiFeatures = [...photonResults, ...overpassResults];
+        
+        // Deduplicamos la lista de POIs
+        const uniquePoiFeatures = [];
+        const proximityThreshold = 20;
+        for (const feature of combinedPoiFeatures) {
+            const isDuplicate = uniquePoiFeatures.some(uniqueFeature =>
+                turf.distance(turf.point(feature.geometry.coordinates), turf.point(uniqueFeature.geometry.coordinates), { units: 'meters' }) < proximityThreshold
+            );
+            if (!isDuplicate) {
+                uniquePoiFeatures.push(feature);
+            }
+        }
+        
+        // Procesamos los resultados
+        if (uniquePoiFeatures.length > 0) {
+            displayPoiSearchResults(uniquePoiFeatures, navigationMapInstance);
+            isPoiSearchActive = true;
+            if (searchButton) searchButton.style.setProperty('background-color', '#FFD700', 'important');
+            showToast(`Se encontraron ${uniquePoiFeatures.length} POIs relacionados.`, "success");
         } else {
             clearPoiSearchResults();
+            isPoiSearchActive = false;
+            if (searchButton) searchButton.style.removeProperty('background-color');
         }
 
-        if (suggestions.length > 0) {
-            displayAddressSuggestionsModal(suggestions);
-        } else if (poiFeatures.length === 0) {
+        if (nominatimResults.length > 0) {
+            // Nominatim devuelve un GeoJSON, necesitamos el 'display_name' para el modal
+            const suggestionsForModal = nominatimResults.map(feature => ({
+                display_name: feature.properties.name, // El nombre normalizado es el display_name
+                lat: feature.geometry.coordinates[1],
+                lon: feature.geometry.coordinates[0]
+            }));
+            displayAddressSuggestionsModal(suggestionsForModal);
+        } else if (uniquePoiFeatures.length === 0) {
             showToast("No se encontraron ni direcciones ni POIs para tu búsqueda.", "warning");
         }
 
@@ -19375,14 +19419,12 @@ async function searchAndAddWaypoint(addressQuery = null) {
     } finally {
         if (searchButton) {
             searchButton.disabled = false;
-            // El color del botón se gestionará ahora por el estado isPoiSearchActive
             if (!isPoiSearchActive) {
                 searchButton.style.removeProperty('background-color');
             }
         }
     }
-}
-    
+}    
     
     // ===================================================================
     // NOMBRE: hideAddressSuggestionsModal
