@@ -60,6 +60,41 @@ V01
 </head>
 
 <style>
+
+    /* Estilo para el overlay de reconstrucción de mapa */
+.map-rebuild-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background-color: rgba(0, 0, 0, 0.75);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 9999;
+    color: white;
+    font-size: 1.5rem;
+    font-weight: bold;
+    backdrop-filter: blur(5px);
+}
+
+.map-rebuild-overlay span::after {
+    content: '';
+    display: inline-block;
+    width: 20px;
+    height: 20px;
+    border: 3px solid rgba(255, 255, 255, 0.3);
+    border-radius: 50%;
+    border-top-color: #fff;
+    animation: spin 1s ease-in-out infinite;
+    margin-left: 15px;
+    vertical-align: middle;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
   
 </style>
     
@@ -997,6 +1032,10 @@ V01
     let isPoiSearchActive = false;
     let poiSearchResultMarkers = [];
     let isPitchManuallyFlattened = false; 
+
+    let mapRebuildInterval = null;
+    let isRebuildingMap = false;
+    const MAP_REBUILD_INTERVAL_MS = 1 * 60 * 1000; // 20 minutos
    
     const managedKeys = [ 
         'reminders','darkMode','toggleStates','zoomState','onOffState','noticesActive', 
@@ -2107,7 +2146,7 @@ function clearPoiSearchResults() {
         searchButton.style.removeProperty('background-color');
     }
 }
-    
+
 // ===================================================================
 // NOMBRE: displayPoiSearchResults (NUEVA FUNCIÓN)
 // RESUMEN: Muestra los resultados de Photon en el mapa con marcadores numerados.
@@ -2157,6 +2196,210 @@ function displayPoiSearchResults(features, map) {
     }
 }
 
+
+// ===================================================================
+// INICIO: LÓGICA DE RECONSTRUCCIÓN EN CALIENTE DEL MAPA
+// ===================================================================
+
+/**
+ * Inicia el temporizador que reconstruirá periódicamente el mapa durante la navegación.
+ */
+function startMapRebuildTimer() {
+    stopMapRebuildTimer(); // Nos aseguramos de que no haya timers duplicados
+    console.log(`[MAP REBUILD] Temporizador de reconstrucción iniciado. Se ejecutará cada ${MAP_REBUILD_INTERVAL_MS / 60000} minutos.`);
+    mapRebuildInterval = setInterval(hotReloadMapInstance, MAP_REBUILD_INTERVAL_MS);
+}
+
+/**
+ * Detiene el temporizador de reconstrucción del mapa.
+ */
+function stopMapRebuildTimer() {
+    if (mapRebuildInterval) {
+        clearInterval(mapRebuildInterval);
+        mapRebuildInterval = null;
+        console.log("[MAP REBUILD] Temporizador de reconstrucción detenido.");
+    }
+}
+
+/**
+ * Captura el estado visual esencial de la instancia de Mapbox antes de su destrucción.
+ * @returns {object|null} Un objeto con el estado visual del mapa, o null si no hay mapa.
+ */
+function captureMapVisualState() {
+    if (!navigationMapInstance) return null;
+    return {
+        center: navigationMapInstance.getCenter(),
+        zoom: navigationMapInstance.getZoom(),
+        pitch: navigationMapInstance.getPitch(),
+        bearing: navigationMapInstance.getBearing(),
+        style: navigationMapInstance.getStyle().sprite.replace(/\/sprites\/.*/, '') // Obtiene la URL base del estilo
+    };
+}
+
+/**
+ * Re-engancha todos los listeners de eventos necesarios a la nueva instancia del mapa.
+ * @param {mapboxgl.Map} mapInstance La nueva instancia del mapa.
+ */
+function reAttachMapEventListeners(mapInstance) {
+    if (!mapInstance || mapInstance._interactionListenersAttached) return;
+
+    mapInstance.on('pitch', updateLineWidthsOnPitchChange);
+    mapInstance.on('zoomend', updateAllIconSizes);
+
+    // Lógica de clic principal (replicada de openNavigationMap)
+    mapInstance.on('click', async (e) => {
+        if (isAddReminderAtLocationModeActive) { handleMapClickToAddReminder(e); return; }
+        if (isSimulatingGpsLocation) { handleSimulateGpsPositionClick(e); return; }
+        if (isNavigating) { return; }
+
+        const point = e.point;
+        const lngLat = e.lngLat;
+        
+        const pdrLayers = ['pdr-simple-circle-layer', 'pdr-cards-layer-bg-halo', 'pdr-cards-layer-bg'];
+        const pdrFeatures = mapInstance.queryRenderedFeatures(point, { layers: pdrLayers });
+        if (pdrFeatures.length > 0) {
+            const fullPdrData = window.lastOcmApiResponse.find(p => p.ID === pdrFeatures[0].properties.ocmId);
+            if (fullPdrData) showChargingPointModal(fullPdrData, pdrFeatures[0].properties.index);
+            return;
+        }
+
+        const alertLayers = ['traffic-alerts-layer'];
+        const alertFeatures = mapInstance.queryRenderedFeatures(point, { layers: alertLayers });
+        if (alertFeatures.length > 0) {
+            const alertCode = alertFeatures[0].properties.code;
+            const alertDetailsMap = {
+                1: 'Accidente de tráfico', 2: 'Coche averiado', 3: 'Control de tráfico / Radar',
+                4: 'Atasco', 5: 'Peligro indeterminado', 6: 'Carretera en mal estado',
+                7: 'Obras', 8: 'Vía / Carretera cerrada'
+            };
+            const alertText = alertDetailsMap[alertCode] || 'Alerta de tráfico';
+            showToast(alertText, 'warning', 4000);
+            return;
+        }
+        
+        const reminderLayers = ['reminders-icons-layer', 'radar-circles-layer'];
+        const reminderFeatures = mapInstance.queryRenderedFeatures(point, { layers: reminderLayers });
+        if (reminderFeatures.length > 0) {
+            showReminderActionModal(reminderFeatures[0].properties.reminderId);
+            return;
+        }
+
+        const mapboxPoiLayers = ['poi-label'];
+        const features = mapInstance.queryRenderedFeatures(point, { layers: mapboxPoiLayers });
+        
+        const validPoiFeature = features.find(f => f.layer.id === 'poi-label' && (f.properties?.name || f.properties?.name_en || f.properties?.text));
+
+        if (validPoiFeature) {
+            const properties = validPoiFeature.properties;
+            const poiName = properties.name || properties.name_en || properties.text;
+            let categories = [];
+            if (properties.poi_category) categories = properties.poi_category; 
+            else if (properties.category) categories = properties.category.split(',').map(c => c.trim()); 
+            else if (properties.maki) categories = [properties.maki];
+            
+            showPoiInfoModal({ properties: { name: poiName, categories }, geometry: validPoiFeature.geometry });
+        } else {
+            addWaypoint(lngLat);
+        }
+    });
+
+    // Lógica de interacción manual
+    const mapCanvas = mapInstance.getCanvasContainer();
+    let touchStartPos = null;
+    let hasMovedEnoughToDrag = false;
+    const DRAG_THRESHOLD = 10;
+    const onTouchStart = (e) => { if (e.touches && e.touches.length > 1) { handleManualMapInteraction(); return; } const touch = e.touches ? e.touches[0] : e; touchStartPos = { x: touch.clientX, y: touch.clientY }; hasMovedEnoughToDrag = false; };
+    const onTouchMove = (e) => { if (hasMovedEnoughToDrag || !touchStartPos || (e.touches && e.touches.length > 1)) return; const touch = e.touches ? e.touches[0] : e; if (Math.abs(touch.clientX - touchStartPos.x) > DRAG_THRESHOLD || Math.abs(touch.clientY - touchStartPos.y) > DRAG_THRESHOLD) { hasMovedEnoughToDrag = true; handleManualMapInteraction(); } };
+    const onTouchEnd = () => { touchStartPos = null; hasMovedEnoughToDrag = false; };
+    mapCanvas.addEventListener('touchstart', onTouchStart, { passive: true });
+    mapCanvas.addEventListener('touchmove', onTouchMove, { passive: true });
+    mapCanvas.addEventListener('touchend', onTouchEnd, { passive: true });
+
+    mapInstance._interactionListenersAttached = true;
+    enablePoiInteractivity(mapInstance);
+}
+
+/**
+ * El proceso principal que orquesta la destrucción y reconstrucción del mapa.
+ */
+async function hotReloadMapInstance() {
+    if (isRebuildingMap || !isNavigating || !navigationMapInstance) {
+        console.log("[MAP REBUILD] Reconstrucción omitida (no navegando, o ya en proceso).");
+        return;
+    }
+
+    console.log("[MAP REBUILD] Iniciando ciclo de reconstrucción en caliente...");
+    isRebuildingMap = true;
+    
+    const mapContainer = document.getElementById('reminders-location-map-modal');
+    const overlay = document.createElement('div');
+    overlay.className = 'map-rebuild-overlay';
+    overlay.innerHTML = '<span>Optimizando mapa...</span>';
+    if(mapContainer) mapContainer.appendChild(overlay);
+
+    if(markerAnimationState.animationFrameId) cancelAnimationFrame(markerAnimationState.animationFrameId);
+    const capturedState = captureMapVisualState();
+
+    if (compassAndModeControl) navigationMapInstance.removeControl(compassAndModeControl);
+    if (window.mapCustomControlsInstance) navigationMapInstance.removeControl(window.mapCustomControlsInstance);
+    
+    navigationMapInstance.remove();
+    navigationMapInstance = null;
+    initialUserLocationMarker = null;
+    navigationWaypoints.forEach(wp => { if (wp) wp.marker = null; });
+    reminderMapObjects = [];
+
+    await new Promise(resolve => setTimeout(resolve, 250));
+
+    try {
+        navigationMapInstance = new mapboxgl.Map({
+            container: 'mapbox-map-actual-container',
+            style: capturedState.style,
+            center: capturedState.center,
+            zoom: capturedState.zoom,
+            pitch: capturedState.pitch,
+            bearing: capturedState.bearing,
+            attributionControl: false,
+            accessToken: mapboxgl.accessToken
+        });
+
+        navigationMapInstance.on('load', async () => {
+            console.log("[MAP REBUILD] Nueva instancia de mapa cargada. Restaurando estado...");
+            
+            await loadAndAddMapImages(navigationMapInstance);
+            reAddCustomMapLayersAndSources(navigationMapInstance);
+            
+            updateInitialUserPosition(navigationCurrentLocation, navigationMapInstance);
+            renderWaypointMarkers();
+            
+            plotRemindersOnNavigationMap();
+            displayChargingPointsOnMap();
+            displayAlertsOnMap();
+            
+            navigationMapInstance.addControl(compassAndModeControl, 'bottom-left');
+            navigationMapInstance.addControl(window.mapCustomControlsInstance, 'bottom-right');
+            
+            reAttachMapEventListeners(navigationMapInstance);
+
+            await configureMapAtmosphere();
+            updateLineWidthsOnPitchChange();
+
+            overlay.remove();
+            markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
+            isRebuildingMap = false;
+            console.log("[MAP REBUILD] Proceso completado con éxito.");
+        });
+
+    } catch (error) {
+        console.error("[MAP REBUILD] Error crítico durante la reconstrucción:", error);
+        showToast("Error al optimizar el mapa. Se recomienda recargar.", "error");
+        overlay.innerHTML = '<span>Error de optimización.</span>';
+        isRebuildingMap = false;
+    }
+}
+    
+
+    
 // ===================================================================
 // NOMBRE: normalizeOverpassResult (NUEVA FUNCIÓN)
 // RESUMEN: Convierte un resultado de Overpass al formato GeoJSON estándar de la app.
@@ -8538,7 +8781,6 @@ function updateNavigationProgressDisplay(route, carDistanceAlongTheRoute = 0) {
     }
 }
   
-
 // ===================================================================
 // NOMBRE: toggleNavigationState 
 // RESUMEN: Añade el parámetro 'isRecovery' para evitar resetear las estadísticas en una sesión restaurada.
@@ -8548,25 +8790,25 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
     const mapContainer = document.getElementById('reminders-location-map-div');
     
     if (isNavigating) {
+         // DETENER NAVEGACIÓN
+         stopMapRebuildTimer(); // <--- MODIFICACIÓN AQUÍ
 
          if (navigationMapInstance && navigationCurrentLocation) {
             isFlying = true;
-            navigationFollowUser = false; // Desactivamos el seguimiento ANTES de volar
+            navigationFollowUser = false;
             shouldCenterOnUser = false;
             
             const targetZoom = 16;
             const targetPitch = 0;
             const targetBearing = 0;
 
-            // 1. Forzamos el estado de la animación a los nuevos valores objetivo
             markerAnimationState.targetMapZoom = targetZoom;
             markerAnimationState.targetMapPitch = targetPitch;
             markerAnimationState.targetMapBearing = targetBearing;
-            markerAnimationState.currentMapZoom = navigationMapInstance.getZoom(); // Empezamos desde el zoom actual
+            markerAnimationState.currentMapZoom = navigationMapInstance.getZoom();
             markerAnimationState.currentMapPitch = navigationMapInstance.getPitch();
             markerAnimationState.currentMapBearing = navigationMapInstance.getBearing();
 
-            // 2. Ejecutamos la animación visual
             navigationMapInstance.flyTo({
                 center: [navigationCurrentLocation.longitude, navigationCurrentLocation.latitude],
                 zoom: targetZoom,
@@ -8587,11 +8829,11 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
             }
         }
         isNavigating = false;
-        navigationFollowUser = false;
-        ; 
+        navigationFollowUser = false; 
     } else if (isFreeDriveActive) {
         stopFreeDrive();
     } else {
+        // INICIAR NAVEGACIÓN
         const hasEnoughWaypointsForRoute = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart).length >= 2;
         const hasRouteData = navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0];
         if (hasEnoughWaypointsForRoute && hasRouteData) {
@@ -8667,6 +8909,7 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
             const loadingToast = document.getElementById("gps-init-toast"); if (loadingToast) loadingToast.remove(); activeToasts = activeToasts.filter(t => t.id !== "gps-init-toast");
             
             isNavigating = true;
+            startMapRebuildTimer(); // <--- MODIFICACIÓN AQUÍ
             startDeviationChecker(); 
             mapHeaderButtonsVisible = false;
             toggleMapHeaderRowsVisibility(false);
@@ -12261,7 +12504,6 @@ function showPhotoModal(imageUrl) {
     });
 }
 
-
 // ===================================================================
 // NOMBRE: startFreeDrive 
 // RESUMEN: Inicia el modo de conducción libre, limpiando marcadores de velocidad anteriores.
@@ -12269,11 +12511,12 @@ function startFreeDrive(initialCoords) {
     if (isFreeDriveActive || isNavigating) return;
 
     isFreeDriveActive = true;
+    startMapRebuildTimer(); // <--- MODIFICACIÓN AQUÍ
     isFreeDrivePaused = false;
     
-    navigationStartTimeForStats = new Date(); // Hora de inicio actual
+    navigationStartTimeForStats = new Date();
     freeDriveStats = {
-        startTime: navigationStartTimeForStats, // Usamos la misma hora para consistencia
+        startTime: navigationStartTimeForStats,
         totalDistance: 0,
         lastPosition: { ...initialCoords },
     };
@@ -12283,7 +12526,7 @@ function startFreeDrive(initialCoords) {
     maxSpeedCoordinates = null;
     maxAltitudeDuringTrip = -Infinity;
     minAltitudeDuringTrip = Infinity;
-    window.averageSpeedKmh = 0; // Muy importante resetear la velocidad media
+    window.averageSpeedKmh = 0;
     lastPositionForStats = { ...initialCoords };
     
     showToast("Viaje en modo libre iniciado", "success");
@@ -12304,13 +12547,14 @@ function startFreeDrive(initialCoords) {
     currentGraphMode = localStorage.getItem(GRAPH_STATE_KEY) || 'Desviación ETA'; 
     initializeNavigationGraph();
     updateNavigationProgressDisplay();
-}
-    
+}    
+
 // ===================================================================
 // NOMBRE: stopFreeDrive
 // RESUMEN: Detiene el modo de conducción libre y muestra el modal de estadísticas.
 function stopFreeDrive() {
     if (!isFreeDriveActive) return;
+    stopMapRebuildTimer(); // <--- MODIFICACIÓN AQUÍ
     clearRecoveryFlag();
     const statsToSend = { ...freeDriveStats };
     showArrivalStatsModal(statsToSend);
@@ -16934,6 +17178,7 @@ function showLoadRouteModal() {
 // NOMBRE: closeNavigationMap (MODIFICADA - USA RESET CENTRAL)
 // RESUMEN: Llama a la función de reseteo al cerrar el mapa para asegurar limpieza.
 function closeNavigationMap(force = false) {
+    stopMapRebuildTimer(); // <--- MODIFICACIÓN AQUÍ
     clearRecoveryFlag();
     hideAddressSuggestionsModal();
     resetNavigationState(); 
