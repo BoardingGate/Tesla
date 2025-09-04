@@ -1,4 +1,4 @@
-J21
+J22
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -8548,6 +8548,11 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
     
     if (isNavigating) {
 
+         if (memoryResetInterval) {
+            clearInterval(memoryResetInterval);
+            memoryResetInterval = null;
+         }   
+
          if (navigationMapInstance && navigationCurrentLocation) {
             isFlying = true;
             navigationFollowUser = false; // Desactivamos el seguimiento ANTES de volar
@@ -8591,6 +8596,12 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
     } else if (isFreeDriveActive) {
         stopFreeDrive();
     } else {
+
+        if (memoryResetInterval) clearInterval(memoryResetInterval);
+        const RESET_INTERVAL_MS = 1000; // 10 minutos
+        memoryResetInterval = setInterval(performMemoryHardReset, RESET_INTERVAL_MS);
+        }
+    
         const hasEnoughWaypointsForRoute = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart).length >= 2;
         const hasRouteData = navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0];
         if (hasEnoughWaypointsForRoute && hasRouteData) {
@@ -17619,6 +17630,71 @@ function resumeAnimation() {
     markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
 }
 
+// ===================================================================
+// NOMBRE: performMemoryHardReset (NUEVA FUNCIÓN DE OPTIMIZACIÓN)
+// RESUMEN: Destruye y recrea la instancia del mapa para forzar una
+//          liberación completa de memoria en entornos restrictivos.
+// ===================================================================
+async function performMemoryHardReset() {
+    // Solo se ejecuta si estamos navegando o en modo libre, que es cuando más memoria se consume.
+    if (!isNavigating && !isFreeDriveActive) {
+        return;
+    }
+
+    console.log(`%c[MEMORY] Iniciando Hard Reset para liberar memoria...`, 'color: orange; font-weight: bold;');
+    showToast("Optimizando mapa...", "info", 2000);
+
+    // 1. Guardar el estado actual de la cámara
+    const currentState = {
+        center: navigationMapInstance.getCenter(),
+        zoom: navigationMapInstance.getZoom(),
+        pitch: navigationMapInstance.getPitch(),
+        bearing: navigationMapInstance.getBearing()
+    };
+
+    // 2. Destruir la instancia actual del mapa. ¡Este es el paso clave!
+    navigationMapInstance.remove();
+    navigationMapInstance = null;
+
+    // 3. Pequeña pausa para dar tiempo al navegador a ejecutar el GC
+    await new Promise(resolve => setTimeout(resolve, 250));
+
+    // 4. Recrear la instancia del mapa con la misma configuración
+    const mapActualContainer = document.getElementById('mapbox-map-actual-container');
+    const savedLayerName = localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO";
+    const finalLayerName = MAP_LEGACY_NAME_MAP[savedLayerName] || savedLayerName;
+    const initialStyle = MAP_STYLES[finalLayerName] || MAP_STYLES["HÍBRIDO"];
+
+    navigationMapInstance = new mapboxgl.Map({
+        container: mapActualContainer,
+        style: initialStyle,
+        center: currentState.center,
+        zoom: currentState.zoom,
+        pitch: currentState.pitch,
+        bearing: currentState.bearing,
+        attributionControl: false,
+        accessToken: mapboxgl.accessToken
+    });
+
+    // 5. Esperar a que el nuevo mapa se cargue y restaurar todo
+    navigationMapInstance.on('load', async () => {
+        // Restaurar todos los elementos visuales y lógicos
+        await loadAndAddMapImages(navigationMapInstance);
+        reAddCustomMapLayersAndSources(navigationMapInstance);
+        plotRemindersOnNavigationMap();
+        displayChargingPointsOnMap();
+        renderWaypointMarkers();
+        displayAlertsOnMap();
+        await configureMapAtmosphere();
+
+        // Re-asignar listeners de eventos al nuevo mapa
+        navigationMapInstance.on('pitch', updateLineWidthsOnPitchChange);
+        navigationMapInstance.on('zoomend', updateAllIconSizes);
+        // ... (re-asigna aquí cualquier otro listener directo del mapa si lo hubiera)
+
+        console.log(`%c[MEMORY] Hard Reset completado. Mapa restaurado.`, 'color: green; font-weight: bold;');
+    });
+}    
     
 // =================================================================
 // REEMPLAZA TU FUNCIÓN animateMarkerAndMap CON ESTA VERSIÓN FINAL Y ROBUSTA
@@ -17636,13 +17712,13 @@ function animateMarkerAndMap(timestamp) {
 
     const deltaTime = timestamp - markerAnimationState.lastTimestamp;
    
-    if (timestamp - lastGarbageCollectionYield > 6000) { // 12000ms = 12 segundos
+    if (timestamp - lastGarbageCollectionYield > 12000) { // 12000ms = 12 segundos
         lastGarbageCollectionYield = timestamp;
         isAnimationPaused = true; // Activamos la bandera de pausa
 
         // Detenemos el bucle actual y programamos su reanudación en 250ms.
         // Durante estos 250ms, el navegador tiene total libertad para el GC.
-        setTimeout(resumeAnimation, 3250); 
+       // setTimeout(resumeAnimation, 3250); 
         
         return; // Salimos de la función para efectuar la pausa.
     }
