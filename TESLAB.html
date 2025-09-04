@@ -1,4 +1,4 @@
-J10
+J11
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -13385,6 +13385,65 @@ async function renameUser(oldUsername, newUsername, pin, newPin = null) {
         return { success: false, message: `Error de red: ${error.message}` };
     }
 }
+
+// ===================================================================
+// NOMBRE: renameUser (NUEVA FUNCIÓN)
+// RESUMEN: "Renombra" un usuario en Firebase de forma segura usando una escritura por lotes.
+// ===================================================================
+async function renameUser(oldUsername, newUsername, pin) {
+    if (!oldUsername || !newUsername || !pin) {
+        return { success: false, message: "Faltan datos para el renombrado." };
+    }
+    if (oldUsername === newUsername) {
+        return { success: true, message: "El nombre de usuario no ha cambiado." };
+    }
+    try {
+        const oldDocRef = window.doc(window.db, "user_data", oldUsername);
+        const newDocRef = window.doc(window.db, "user_data", newUsername);
+        const newDocSnap = await window.getDoc(newDocRef);
+        if (newDocSnap.exists()) {
+            return { success: false, message: `El nombre de usuario "${newUsername}" ya está en uso.` };
+        }
+        const oldDocSnap = await window.getDoc(oldDocRef);
+        if (!oldDocSnap.exists()) {
+            return { success: false, message: `No se encontró el usuario original "${oldUsername}".` };
+        }
+        const userData = oldDocSnap.data();
+        if (userData.backupPassword !== pin) {
+            return { success: false, message: "El PIN del usuario original es incorrecto." };
+        }
+        const dataToMove = { ...userData, usuario: newUsername }; // Actualiza el campo 'usuario' interno
+        const batch = window.writeBatch(window.db);
+        batch.set(newDocRef, dataToMove);
+        batch.delete(oldDocRef);
+        await batch.commit();
+        localStorage.setItem('userData_userId', newUsername);
+        return { success: true, message: `Usuario renombrado de "${oldUsername}" a "${newUsername}" con éxito.` };
+    } catch (error) {
+        return { success: false, message: `Error de red: ${error.message}` };
+    }
+}
+
+// ===================================================================
+// NOMBRE: incrementUserCount (NUEVA FUNCIÓN)
+// RESUMEN: Incrementa de forma atómica el contador de usuarios en Firebase.
+// ===================================================================
+async function incrementUserCount() {
+    try {
+        const counterRef = window.doc(window.db, "stats", "user_count");
+        await window.updateDoc(counterRef, {
+            total: window.FieldValue.increment(1)
+        });
+    } catch (error) {
+        // Si falla, es posible que el documento no exista. Lo creamos.
+        try {
+            const counterRef = window.doc(window.db, "stats", "user_count");
+            await window.setDoc(counterRef, { total: 1 });
+        } catch (initError) {
+            console.error("No se pudo inicializar el contador de usuarios:", initError);
+        }
+    }
+}
     
 // ===================================================================
 // NOMBRE: validateAndSaveUserToFirebase (VERSIÓN CON LÓGICA DE RENOMBRADO)
@@ -13504,6 +13563,111 @@ async function validateAndSaveUserToFirebase() {
     }
 }
 
+ // ===================================================================
+// NOMBRE: validateAndSaveUserToFirebase (VERSIÓN CORREGIDA CON FLUJO DE ALTA)
+// RESUMEN: Gestiona el guardado, la creación y el renombrado de usuarios,
+//          solicitando un PIN de seguridad en la creación de una nueva cuenta.
+// ===================================================================
+async function validateAndSaveUserToFirebase() {
+    const statusEl = document.getElementById('config-user-status');
+    const userIdInput = document.getElementById('user-id');
+    const { primaryId: newUsername, originalId: newOriginalId } = parseUserId(userIdInput.value);
+
+    if (!newUsername) {
+        statusEl.textContent = 'El ID de Usuario es obligatorio.';
+        statusEl.style.color = '#EF4444';
+        return;
+    }
+
+    const currentLocalUserId = localStorage.getItem('userData_userId');
+    const { primaryId: oldUsername } = parseUserId(currentLocalUserId);
+    const hasChangedUser = newUsername.toLowerCase() !== (oldUsername || '').toLowerCase();
+
+    // --- FUNCIÓN INTERNA PARA EL PROCESO DE GUARDADO/ACTUALIZACIÓN ---
+    const finalSaveProcess = async (username, pin) => {
+        statusEl.textContent = 'Guardando datos en la nube...';
+        statusEl.style.color = '#17a2b8';
+
+        localStorage.setItem('userData_userId', newOriginalId);
+        localStorage.setItem('userData_teslaModel', document.getElementById('tesla-model').value.trim());
+        localStorage.setItem('userData_teslaYear', document.getElementById('tesla-year').value.trim());
+        localStorage.setItem('userData_teslaProvince', document.getElementById('tesla-province').value.trim());
+        localStorage.setItem('userData_allowDMs', JSON.stringify(document.getElementById('allow-dms').checked));
+        localStorage.setItem('boardinggate_autoBackupOnLoad', JSON.stringify(document.getElementById('config-auto-backup-on-load').checked));
+        localStorage.setItem('userData_backupPassword', pin); // Guardar el PIN localmente
+        updateUserIdDisplay();
+
+        const result = await autoSaveToFirebase(username, pin); // Reutilizamos la función de guardado automático
+
+        if (result.status === 'success') {
+            statusEl.textContent = `Datos para "${username}" guardados correctamente.`;
+            statusEl.style.color = '#28a745';
+            showToast('Datos guardados en la nube y localmente.', 'success');
+        } else {
+            statusEl.textContent = `Error al guardar: ${result.message}`;
+            statusEl.style.color = '#EF4444';
+            showToast(`Error al guardar: ${result.message}`, 'error');
+        }
+    };
+
+    // --- LÓGICA DE DECISIÓN: ¿CREAR, GUARDAR O RENOMBRAR? ---
+    if (!oldUsername) {
+        // --- FLUJO DE CREACIÓN DE NUEVO USUARIO ---
+        statusEl.textContent = `Verificando disponibilidad de "${newUsername}"...`;
+        const checkResult = await callFirebase('checkUserExists', { userId: newUsername });
+
+        if (checkResult.exists) {
+            statusEl.textContent = `El nombre de usuario "${newUsername}" ya está en uso. Por favor, elige otro.`;
+            statusEl.style.color = '#EF4444';
+            return;
+        }
+
+        promptForBackupPassword(
+            `Crea un PIN de 6 dígitos para tu nueva cuenta "${newUsername}". Será tu clave para recuperar datos.`,
+            async (newPin) => {
+                await finalSaveProcess(newUsername, newPin);
+                await incrementUserCount(); // Incrementa el contador global de usuarios
+            },
+            () => {
+                statusEl.textContent = 'Creación de usuario cancelada.';
+                statusEl.style.color = '#6c757d';
+            },
+            true // isSettingPassword = true, para pedir confirmación
+        );
+
+    } else if (hasChangedUser) {
+        // --- FLUJO DE RENOMBRADO DE USUARIO ---
+        promptForBackupPassword(
+            `Introduce el PIN de tu cuenta anterior ("${oldUsername}") para autorizar el cambio de nombre:`,
+            async (enteredPin) => {
+                const renameResult = await renameUser(oldUsername, newUsername, enteredPin);
+                if (renameResult.success) {
+                    await finalSaveProcess(newUsername, enteredPin); // Guardamos cambios adicionales
+                    statusEl.textContent = renameResult.message;
+                    statusEl.style.color = '#28a745';
+                } else {
+                    statusEl.textContent = `Error: ${renameResult.message}`;
+                    statusEl.style.color = '#EF4444';
+                }
+            },
+            () => {
+                statusEl.textContent = 'Cambio de nombre cancelado.';
+                statusEl.style.color = '#6c757d';
+                userIdInput.value = currentLocalUserId || '';
+            }
+        );
+
+    } else {
+        // --- FLUJO DE ACTUALIZACIÓN NORMAL (SIN CAMBIO DE NOMBRE) ---
+        const localPin = localStorage.getItem('userData_backupPassword');
+        if (!localPin) {
+             statusEl.textContent = 'Error: No se encontró PIN de seguridad local. No se puede guardar.';
+             statusEl.style.color = '#EF4444';
+             return;
+        }
+        await finalSaveProcess(newUsername, localPin);
+    }
+}   
     
 // ===================================================================
 // NOMBRE: restoreBackupFromFirebase
