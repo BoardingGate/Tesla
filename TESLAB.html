@@ -1,4 +1,4 @@
- ME29
+ ME30
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -19100,6 +19100,202 @@ function renderWaypointMarkers() {
     });
 }    
 
+const easeInOutQuad = t => t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+
+function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDistanceAlongRouteForNavLogic) {
+    if (isManualZoomActive) return null;
+
+    if (!isNavigating || !navigationMapInstance || !currentStep) {
+        if (isZoomedForManeuver) isZoomedForManeuver = false;
+        return null;
+    }
+    
+    let ANIMATION_START_DISTANCE = 210;
+    if (navigationMapInstance.getZoom() < 16) {
+        ANIMATION_START_DISTANCE = 250;
+    }
+
+    const route = navigationCurrentRouteData?.routes?.[0];
+    if (!route || !route.geometry || !route.geometry.coordinates || route.geometry.coordinates.length < 2) {
+        return null;
+    }
+    
+    const OFFSET_PEAK_DISTANCE = 120;
+    const ZOOM_PEAK_DISTANCE = 50;
+    const PROGRESSIVE_ZOOM_EXIT_START_DISTANCE = 40;
+    const PROGRESSIVE_ZOOM_EXIT_END_DISTANCE = 160;
+    const HOLD_ZOOM_THRESHOLD = 250;
+    const maxZoomForMap = navigationMapInstance.getMaxZoom() || 21;
+    const currentMapLayerName = (localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO").toLowerCase();
+    const isSatelliteWithLabels = currentMapLayerName.includes("satélite") && currentMapLayerName.includes("calles");
+    const MANEUVER_PEAK_ZOOM_LEVEL = Math.min(isSatelliteWithLabels ? 17.5 : 18.5, 19.5);
+    
+    const currentStepIdentifier = `${currentLegIndexNav}_${currentStepIndexNav}`;
+    if (lastProcessedStepIdentifier !== null && lastProcessedStepIdentifier !== currentStepIdentifier) {
+        if (progressiveZoomState === 'zooming-in' || progressiveZoomState === 'holding') {
+            progressiveZoomState = 'zooming-out';
+        }
+    }
+    lastProcessedStepIdentifier = currentStepIdentifier;
+
+    const distanceIntoCurrentStep = currentStep.distance - distanceToManeuver;
+    let targetZoom = null, targetPitch = null, targetOffsetX = null, targetOffsetY = null;
+
+    switch (progressiveZoomState) {
+        case 'zooming-out':
+            isZoomedForManeuver = true;
+            const nextStepAfterCurrent = findNextValidStep(route, currentLegIndexNav, currentStepIndexNav);
+            const distanceToNextStep = nextStepAfterCurrent ? calculateDistanceToEndOfStep(route, nextStepAfterCurrent.legIndex, nextStepAfterCurrent.stepIndex) - carDistanceAlongRouteForNavLogic : Infinity;
+            
+            if (nextStepAfterCurrent && distanceToNextStep < HOLD_ZOOM_THRESHOLD) {
+                targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
+                if (mapViewMode === 'perspective' || mapViewMode === 'relief') targetPitch = window.pitchBeforeManeuver * 0.75; else targetPitch = 45;
+                targetOffsetY = window.offsetYBeforeManeuver;
+                targetOffsetX = window.maneuverHorizontalTarget;
+                
+            } else {
+                if (distanceIntoCurrentStep > PROGRESSIVE_ZOOM_EXIT_END_DISTANCE || mapPreviousZoomLevelForProgressive === null) {
+                    const currentAutoZoomMode = localStorage.getItem(AUTO_ZOOM_MODE_KEY) || 'off';
+                    if (currentAutoZoomMode === 'off' && manualZoomLevelMemory !== null) {
+                        targetZoom = manualZoomLevelMemory; 
+                    } else {
+                        targetZoom = mapPreviousZoomLevelForProgressive; 
+                    }
+                    targetPitch = window.pitchBeforeManeuver;
+                    targetOffsetY = window.offsetYBeforeManeuver;
+                    targetOffsetX = window.offsetXBeforeManeuver;
+
+                    progressiveZoomState = 'none';
+                    isZoomedForManeuver = false;
+                    MAP_UPDATE_INTERVAL_MS = originalMapUpdateIntervalMs;
+                } else if (distanceIntoCurrentStep >= PROGRESSIVE_ZOOM_EXIT_START_DISTANCE) {
+                    const progress = (distanceIntoCurrentStep - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE) / (PROGRESSIVE_ZOOM_EXIT_END_DISTANCE - PROGRESSIVE_ZOOM_EXIT_START_DISTANCE);
+                    const offsetReturnProgress = Math.min(1, progress * 1.5);
+                    const currentAutoZoomMode = localStorage.getItem(AUTO_ZOOM_MODE_KEY) || 'off';
+                    const zoomToReturnTo = (currentAutoZoomMode === 'off' && manualZoomLevelMemory !== null) ? manualZoomLevelMemory : mapPreviousZoomLevelForProgressive;
+                    targetZoom = MANEUVER_PEAK_ZOOM_LEVEL - (MANEUVER_PEAK_ZOOM_LEVEL - zoomToReturnTo) * Math.min(1, progress);
+                    
+                    let maneuverMinPitch = (mapViewMode === 'perspective' || mapViewMode === 'relief') ? window.pitchBeforeManeuver * 0.75 : 35;
+                    targetPitch = maneuverMinPitch + (window.pitchBeforeManeuver - maneuverMinPitch) * progress;
+                    
+                    targetOffsetY = window.offsetYBeforeManeuver;
+                    targetOffsetX = window.maneuverHorizontalTarget + (window.offsetXBeforeManeuver - window.maneuverHorizontalTarget) * offsetReturnProgress;
+
+                } else {
+                    targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
+                    if (mapViewMode === 'perspective' || mapViewMode === 'relief') targetPitch = window.pitchBeforeManeuver * 0.75; else targetPitch = 45;
+                    targetOffsetY = window.offsetYBeforeManeuver;
+                    targetOffsetX = window.maneuverHorizontalTarget;
+                }
+            }
+            break;
+
+        default: 
+            if (progressiveZoomState === 'zooming-out') {
+                const currentAutoZoomMode = localStorage.getItem(AUTO_ZOOM_MODE_KEY) || 'off';
+                if (currentAutoZoomMode === 'off' && manualZoomLevelMemory !== null) {
+                    targetZoom = manualZoomLevelMemory;
+                } else {
+                    targetZoom = mapPreviousZoomLevelForProgressive;
+                }
+                targetPitch = window.pitchBeforeManeuver;
+                targetOffsetY = window.offsetYBeforeManeuver;
+                targetOffsetX = window.offsetXBeforeManeuver;
+            }
+
+            if (distanceToManeuver <= ANIMATION_START_DISTANCE) {
+                if (progressiveZoomState === 'none') {
+                    originalMapUpdateIntervalMs = MAP_UPDATE_INTERVAL_MS;
+                    MAP_UPDATE_INTERVAL_MS = 1000 / 60;
+                    const currentAutoZoomMode = localStorage.getItem(AUTO_ZOOM_MODE_KEY) || 'off';
+                    if (currentAutoZoomMode === 'off' && manualZoomLevelMemory !== null) {
+                        mapPreviousZoomLevelForProgressive = manualZoomLevelMemory;
+                    } else {
+                        mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
+                    }
+                    window.pitchBeforeManeuver = navigationMapInstance.getPitch();
+                    window.offsetXBeforeManeuver = mapOffsetX;
+                    window.offsetYBeforeManeuver = mapOffsetY;
+                    
+                    let dynamicHorizontalTarget = 0;
+                    const maneuver = currentStep.maneuver;
+                    const instructionText = getManeuverInstructionText(maneuver).toLowerCase();
+
+                    // --- INICIO DE LA MODIFICACIÓN ---
+
+                    // // if (instructionText.includes('derecha')) {
+                    // //     dynamicHorizontalTarget = -40;
+                    // // } else if (instructionText.includes('izquierda')) {
+                    // //     dynamicHorizontalTarget = 40;
+                    // // } else {
+                    // //     dynamicHorizontalTarget = 0;
+                    // // }
+                    
+                    // CORREGIDO: Se reduce el valor del offset horizontal a la mitad para compensar
+                    // el efecto de la perspectiva con pitch alto.
+                    if (instructionText.includes('derecha')) {
+                        dynamicHorizontalTarget = -20; // Se reduce de -40 a -20
+                    } else if (instructionText.includes('izquierda')) {
+                        dynamicHorizontalTarget = 20;  // Se reduce de 40 a 20
+                    } else {
+                        dynamicHorizontalTarget = 0;
+                    }
+
+                    // --- FIN DE LA MODIFICACIÓN ---
+                    
+                    window.maneuverHorizontalTarget = dynamicHorizontalTarget;
+                    progressiveZoomState = 'zooming-in';
+                    isZoomedForManeuver = true;
+                }
+                
+                let offsetProgress = 0;
+                if (distanceToManeuver <= OFFSET_PEAK_DISTANCE) offsetProgress = 1;
+                else if (distanceToManeuver < ANIMATION_START_DISTANCE) offsetProgress = (ANIMATION_START_DISTANCE - distanceToManeuver) / (ANIMATION_START_DISTANCE - OFFSET_PEAK_DISTANCE);
+
+                let zoomProgress = 0;
+                if (distanceToManeuver <= ZOOM_PEAK_DISTANCE) zoomProgress = 1;
+                else if (distanceToManeuver < ANIMATION_START_DISTANCE) zoomProgress = (ANIMATION_START_DISTANCE - distanceToManeuver) / (ANIMATION_START_DISTANCE - ZOOM_PEAK_DISTANCE);
+                
+                const easedZoomProgress = easeInOutQuad(Math.max(0, Math.min(1, zoomProgress)));
+                targetZoom = mapPreviousZoomLevelForProgressive + (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * easedZoomProgress;
+                
+                if (mapViewMode === 'perspective' || mapViewMode === 'relief') {
+                    const pitchReduction = window.pitchBeforeManeuver * 0.25;
+                    targetPitch = window.pitchBeforeManeuver - (pitchReduction * easedZoomProgress);
+                } else {
+                    targetPitch = window.pitchBeforeManeuver + (45 - window.pitchBeforeManeuver) * easedZoomProgress;
+                }
+                
+                const easedOffsetProgress = easeInOutQuad(Math.min(1, offsetProgress));
+                
+                targetOffsetY = window.offsetYBeforeManeuver;
+                targetOffsetX = window.offsetXBeforeManeuver + (window.maneuverHorizontalTarget - window.offsetXBeforeManeuver) * easedOffsetProgress;
+
+            } else {
+                if (progressiveZoomState !== 'none') {
+                    targetZoom = mapPreviousZoomLevelForProgressive;
+                    targetPitch = window.pitchBeforeManeuver;
+                    targetOffsetY = window.offsetYBeforeManeuver;
+                    targetOffsetX = window.offsetXBeforeManeuver;
+                }
+                progressiveZoomState = 'none';
+                isZoomedForManeuver = false;
+                MAP_UPDATE_INTERVAL_MS = originalMapUpdateIntervalMs;
+              }
+            break;
+    }
+
+    if (targetZoom !== null || targetPitch !== null || targetOffsetX !== null || targetOffsetY !== null) {
+        return { 
+            zoom: targetZoom, 
+            pitch: targetPitch, 
+            offsetX: targetOffsetX !== null ? Math.max(-75, Math.min(75, targetOffsetX)) : null,
+            offsetY: targetOffsetY !== null ? Math.max(-75, Math.min(75, targetOffsetY)) : null
+        };
+    }
+    return null;
+}
+ 
 //=============================================================
 function calculateCompensatedCenter(offsetY, offsetX, pitch, bearing) {
     if (!navigationCurrentLocation) return null;
@@ -19165,36 +19361,6 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
     const distanceIntoCurrentStep = currentStep.distance - distanceToManeuver;
     let targetZoom = null, targetPitch = null, targetOffsetX = null, targetOffsetY = null;
 
-    // --- INICIO DE LA MODIFICACIÓN ---
-    // AÑADIDO: Función auxiliar para interpolar el offset horizontal según el pitch.
-    const getPitchCorrectedOffsetX = (baseOffsetX, currentPitch) => {
-        // Mapeo de Pitch a Offset Máximo:
-        // Pitch 0° (cenital) -> Offset 40%
-        // Pitch 45° -> Offset 30%
-        // Pitch 75° (muy inclinado) -> Offset 15%
-        const pitchPoints = [0, 45, 75];
-        const offsetPoints = [40, 30, 15];
-
-        let maxOffset;
-        if (currentPitch <= pitchPoints[0]) {
-            maxOffset = offsetPoints[0];
-        } else if (currentPitch >= pitchPoints[2]) {
-            maxOffset = offsetPoints[2];
-        } else {
-            // Interpolación lineal entre los puntos
-            const upperIndex = pitchPoints.findIndex(p => p >= currentPitch);
-            const lowerIndex = upperIndex - 1;
-            const pitchRange = pitchPoints[upperIndex] - pitchPoints[lowerIndex];
-            const offsetRange = offsetPoints[upperIndex] - offsetPoints[lowerIndex];
-            const progress = (currentPitch - pitchPoints[lowerIndex]) / pitchRange;
-            maxOffset = offsetPoints[lowerIndex] + (offsetRange * progress);
-        }
-        
-        // Devolvemos el valor con el signo correcto (+/-)
-        return baseOffsetX > 0 ? maxOffset : -maxOffset;
-    };
-    // --- FIN DE LA MODIFICACIÓN ---
-
     switch (progressiveZoomState) {
         case 'zooming-out':
             isZoomedForManeuver = true;
@@ -19203,12 +19369,10 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
             
             if (nextStepAfterCurrent && distanceToNextStep < HOLD_ZOOM_THRESHOLD) {
                 targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
-                targetPitch = (mapViewMode === 'perspective' || mapViewMode === 'relief') ? window.pitchBeforeManeuver * 0.75 : 45;
+                if (mapViewMode === 'perspective' || mapViewMode === 'relief') targetPitch = window.pitchBeforeManeuver * 0.75; else targetPitch = 45;
                 targetOffsetY = window.offsetYBeforeManeuver;
+                targetOffsetX = window.maneuverHorizontalTarget;
                 
-                // AÑADIDO: Se usa la nueva función de interpolación.
-                targetOffsetX = getPitchCorrectedOffsetX(window.maneuverHorizontalTarget, targetPitch);
-
             } else {
                 if (distanceIntoCurrentStep > PROGRESSIVE_ZOOM_EXIT_END_DISTANCE || mapPreviousZoomLevelForProgressive === null) {
                     const currentAutoZoomMode = localStorage.getItem(AUTO_ZOOM_MODE_KEY) || 'off';
@@ -19235,18 +19399,13 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
                     targetPitch = maneuverMinPitch + (window.pitchBeforeManeuver - maneuverMinPitch) * progress;
                     
                     targetOffsetY = window.offsetYBeforeManeuver;
-                    
-                    // AÑADIDO: Se calcula el offset corregido por pitch y luego se interpola para la salida.
-                    const correctedManeuverTargetX = getPitchCorrectedOffsetX(window.maneuverHorizontalTarget, targetPitch);
-                    targetOffsetX = correctedManeuverTargetX + (window.offsetXBeforeManeuver - correctedManeuverTargetX) * offsetReturnProgress;
+                    targetOffsetX = window.maneuverHorizontalTarget + (window.offsetXBeforeManeuver - window.maneuverHorizontalTarget) * offsetReturnProgress;
 
                 } else {
                     targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
-                    targetPitch = (mapViewMode === 'perspective' || mapViewMode === 'relief') ? window.pitchBeforeManeuver * 0.75 : 45;
+                    if (mapViewMode === 'perspective' || mapViewMode === 'relief') targetPitch = window.pitchBeforeManeuver * 0.75; else targetPitch = 45;
                     targetOffsetY = window.offsetYBeforeManeuver;
-
-                    // AÑADIDO: Se usa la nueva función de interpolación.
-                    targetOffsetX = getPitchCorrectedOffsetX(window.maneuverHorizontalTarget, targetPitch);
+                    targetOffsetX = window.maneuverHorizontalTarget;
                 }
             }
             break;
@@ -19278,20 +19437,33 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
                     window.offsetXBeforeManeuver = mapOffsetX;
                     window.offsetYBeforeManeuver = mapOffsetY;
                     
-                    // // let dynamicHorizontalTarget = 0; // Se elimina esta variable temporal
-                    
+                    let dynamicHorizontalTarget = 0;
                     const maneuver = currentStep.maneuver;
                     const instructionText = getManeuverInstructionText(maneuver).toLowerCase();
 
-                    // AÑADIDO: Se guarda el signo del offset, no el valor completo.
-                    if (instructionText.includes('derecha')) {
-                        window.maneuverHorizontalTarget = -40; // Se mantiene el valor base para indicar la dirección
-                    } else if (instructionText.includes('izquierda')) {
-                        window.maneuverHorizontalTarget = 40;
-                    } else {
-                        window.maneuverHorizontalTarget = 0;
-                    }
+                    // --- INICIO DE LA MODIFICACIÓN ---
+
+                    // // if (instructionText.includes('derecha')) {
+                    // //     dynamicHorizontalTarget = -40;
+                    // // } else if (instructionText.includes('izquierda')) {
+                    // //     dynamicHorizontalTarget = 40;
+                    // // } else {
+                    // //     dynamicHorizontalTarget = 0;
+                    // // }
                     
+                    // CORREGIDO: Se reduce el valor del offset horizontal a la mitad para compensar
+                    // el efecto de la perspectiva con pitch alto.
+                    if (instructionText.includes('derecha')) {
+                        dynamicHorizontalTarget = -20; // Se reduce de -40 a -20
+                    } else if (instructionText.includes('izquierda')) {
+                        dynamicHorizontalTarget = 20;  // Se reduce de 40 a 20
+                    } else {
+                        dynamicHorizontalTarget = 0;
+                    }
+
+                    // --- FIN DE LA MODIFICACIÓN ---
+                    
+                    window.maneuverHorizontalTarget = dynamicHorizontalTarget;
                     progressiveZoomState = 'zooming-in';
                     isZoomedForManeuver = true;
                 }
@@ -19317,10 +19489,7 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
                 const easedOffsetProgress = easeInOutQuad(Math.min(1, offsetProgress));
                 
                 targetOffsetY = window.offsetYBeforeManeuver;
-
-                // AÑADIDO: Se calcula el offset corregido por el pitch y se interpola hacia él.
-                const correctedManeuverTargetX = getPitchCorrectedOffsetX(window.maneuverHorizontalTarget, targetPitch);
-                targetOffsetX = window.offsetXBeforeManeuver + (correctedManeuverTargetX - window.offsetXBeforeManeuver) * easedOffsetProgress;
+                targetOffsetX = window.offsetXBeforeManeuver + (window.maneuverHorizontalTarget - window.offsetXBeforeManeuver) * easedOffsetProgress;
 
             } else {
                 if (progressiveZoomState !== 'none') {
@@ -19346,6 +19515,7 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
     }
     return null;
 }
+
  
 // ===================================================================
 // NOMBRE: handleProgressBarLockToggle (CORREGIDA)
