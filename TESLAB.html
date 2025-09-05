@@ -1,4 +1,4 @@
-ME02
+ME03
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -17626,7 +17626,109 @@ function animateMarkerAndMap(timestamp) {
     markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
 }
 
+function animateMarkerAndMap(timestamp) {
+    if (!initialUserLocationMarker || !navigationMapInstance || isFlying) {
+        markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
+        return;
+    }
+
+    if (!markerAnimationState.lastTimestamp) {
+        markerAnimationState.lastTimestamp = timestamp;
+        markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
+        return;
+    }
+
+    const deltaTime = timestamp - markerAnimationState.lastTimestamp;
+    markerAnimationState.lastTimestamp = timestamp;
+    const clampedDeltaTime = Math.min(deltaTime, 33);
+
+    const posLerpFactor = 1.0 - Math.exp(-clampedDeltaTime * lerpRatePosition);
+    const rotLerpFactor = 1.0 - Math.exp(-clampedDeltaTime * lerpRateRotation);
+    const zoomPitchLerpFactor = 1.0 - Math.exp(-clampedDeltaTime * lerpRateZoom);
+
+    if (markerAnimationState.currentLngLat && markerAnimationState.targetLngLat) {
+        markerAnimationState.currentLngLat.lng += (markerAnimationState.targetLngLat.lng - markerAnimationState.currentLngLat.lng) * posLerpFactor;
+        markerAnimationState.currentLngLat.lat += (markerAnimationState.targetLngLat.lat - markerAnimationState.currentLngLat.lat) * posLerpFactor;
+        initialUserLocationMarker.setLngLat(markerAnimationState.currentLngLat);
+    }
+    let deltaIconRotation = markerAnimationState.targetIconRotation - markerAnimationState.currentIconRotation;
+    if (deltaIconRotation > 180) deltaIconRotation -= 360;
+    if (deltaIconRotation < -180) deltaIconRotation += 360;
+    markerAnimationState.currentIconRotation += deltaIconRotation * rotLerpFactor;
+    initialUserLocationMarker.setRotation(markerAnimationState.currentIconRotation);
+
+    if (shouldCenterOnUser || navigationFollowUser) {
+        
+        // MODIFICACIÓN: En lugar de interpolar directamente el centro, interpolamos la posición del coche
+        // para luego calcular un centro de cámara compensado.
+        if (markerAnimationState.currentMapCenter && markerAnimationState.targetLngLat) {
+            markerAnimationState.currentMapCenter.lng += (markerAnimationState.targetLngLat.lng - markerAnimationState.currentMapCenter.lng) * posLerpFactor;
+            markerAnimationState.currentMapCenter.lat += (markerAnimationState.targetLngLat.lat - markerAnimationState.currentMapCenter.lat) * posLerpFactor;
+        }
+
+        if (markerAnimationState.currentMapAltitude !== null && markerAnimationState.targetMapAltitude !== null) {
+            markerAnimationState.currentMapAltitude += (markerAnimationState.targetMapAltitude - markerAnimationState.currentMapAltitude) * posLerpFactor;
+        } else {
+             markerAnimationState.currentMapAltitude = markerAnimationState.targetMapAltitude;
+        }
+        
+        let deltaMapBearing = markerAnimationState.targetMapBearing - markerAnimationState.currentMapBearing;
+        if (deltaMapBearing > 180) deltaMapBearing -= 360;
+        if (deltaMapBearing < -180) deltaMapBearing += 360;
+        markerAnimationState.currentMapBearing += deltaMapBearing * rotLerpFactor;
+        
+        markerAnimationState.currentMapZoom += (markerAnimationState.targetMapZoom - markerAnimationState.currentMapZoom) * zoomPitchLerpFactor;
+        markerAnimationState.currentMapPitch += (markerAnimationState.targetMapPitch - markerAnimationState.currentMapPitch) * zoomPitchLerpFactor;
+        
+        // --- INICIO DE LA MODIFICACIÓN ---
+        // Se elimina la interpolación del offset 2D y se calcula un centro geográfico compensado.
+        
+        // // markerAnimationState.currentMapOffsetX += (markerAnimationState.targetMapOffsetX - markerAnimationState.currentMapOffsetX) * zoomPitchLerpFactor;
+        // // markerAnimationState.currentMapOffsetY += (markerAnimationState.targetMapOffsetY - markerAnimationState.currentMapOffsetY) * zoomPitchLerpFactor;
+        // // const canvas = navigationMapInstance.getCanvas();
+        // // const pixelOffsetX = canvas.clientWidth * (markerAnimationState.currentMapOffsetX / 100);
+        // // const pixelOffsetY = canvas.clientHeight * (markerAnimationState.currentMapOffsetY / 100);
+
+        // AÑADIDO: Se calcula una distancia de desplazamiento geográfico basada en el pitch y el zoom.
+        // Esto mueve el punto de anclaje de la cámara "detrás" del coche.
+        const pitchInRadians = (markerAnimationState.currentMapPitch * Math.PI) / 180;
+        const verticalOffsetFactor = markerAnimationState.currentMapOffsetY / 100;
+        // La distancia hacia atrás depende de la altura de la cámara y el ángulo de inclinación.
+        // Usamos una aproximación trigonométrica simple que funciona bien.
+        const cameraHeightAboveCar = 150; // El mismo offset de altitud
+        const groundDistanceOffset = (cameraHeightAboveCar * Math.tan(pitchInRadians)) * verticalOffsetFactor * -1; // -1 para ir hacia atrás
+
+        // AÑADIDO: Se crea el punto geográfico del coche.
+        const carPoint = turf.point([markerAnimationState.currentMapCenter.lng, markerAnimationState.currentMapCenter.lat]);
+        
+        // AÑADIDO: Se calcula el nuevo punto central para la cámara, desplazado hacia atrás.
+        const cameraAnchorPoint = turf.destination(carPoint, groundDistanceOffset, markerAnimationState.currentMapBearing - 180, { units: 'meters' });
+        
+        // AÑADIDO: El centro final de la cámara es este nuevo punto de anclaje.
+        const finalCameraCenter = cameraAnchorPoint.geometry.coordinates;
+
+        const cameraOptions = {
+            // // center: markerAnimationState.currentMapCenter,
+            // AÑADIDO: Usamos el nuevo centro geográfico compensado.
+            center: finalCameraCenter,
+            zoom: markerAnimationState.currentMapZoom,
+            bearing: markerAnimationState.currentMapBearing,
+            pitch: markerAnimationState.currentMapPitch,
+            // // offset: [pixelOffsetX, pixelOffsetY]
+            // AÑADIDO: Usamos el offset X para giros, pero el Y ya está compensado geográficamente.
+            offset: [navigationMapInstance.getCanvas().clientWidth * (markerAnimationState.currentMapOffsetX / 100), 0]
+        };
+        
+        if (markerAnimationState.currentMapAltitude !== null && !isNaN(markerAnimationState.currentMapAltitude)) {
+            cameraOptions.altitude = markerAnimationState.currentMapAltitude;
+        }
+
+        navigationMapInstance.jumpTo(cameraOptions);
+        // --- FIN DE LA MODIFICACIÓN ---
+    }
     
+    markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
+}    
     
 // ===================================================================
 // NOMBRE: getRouteStyleProperties (VERSIÓN CORREGIDA)
