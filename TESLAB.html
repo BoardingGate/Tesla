@@ -1,4 +1,4 @@
-ME10
+ME11
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -19198,12 +19198,46 @@ function renderWaypointMarkers() {
     });
 }    
 
+
 // ===================================================================
-// NOMBRE: handleProgressiveManeuverZoom (VERSIÓN SIMPLIFICADA - SOLO TEXTO)
+// NOMBRE: calculateCompensatedCenter (NUEVA FUNCIÓN AUXILIAR)
+// RESUMEN: Calcula el punto geográfico en el que la cámara debe centrarse
+//          para que el coche aparezca en la posición deseada en pantalla (con offset).
+// ===================================================================
+function calculateCompensatedCenter(offsetY, offsetX, pitch, bearing) {
+    if (!navigationCurrentLocation) return null;
+
+    const pitchInRadians = (pitch * Math.PI) / 180;
+    const cameraHeightAboveCar = 150; // Constante de altura de cámara
+    
+    // 1. Calcular desplazamientos en metros
+    const verticalOffsetFactor = offsetY / 100;
+    const groundDistanceOffset = (cameraHeightAboveCar * Math.tan(pitchInRadians)) * verticalOffsetFactor * -1; // Hacia atrás
+
+    const metersPerPixel = 156543.03 * Math.cos(navigationCurrentLocation.latitude * Math.PI / 180) / Math.pow(2, navigationMapInstance.getZoom());
+    const pixelOffsetX = navigationMapInstance.getCanvas().clientWidth * (offsetX / 100);
+    const horizontalDistanceOffset = metersPerPixel * pixelOffsetX * -1;
+
+    // 2. Calcular el vector de desplazamiento total
+    const totalDistance = Math.sqrt(Math.pow(groundDistanceOffset, 2) + Math.pow(horizontalDistanceOffset, 2));
+    const angleAdjustment = Math.atan2(horizontalDistanceOffset, groundDistanceOffset) * (180 / Math.PI);
+
+    // 3. Calcular el punto de anclaje final
+    const carPoint = turf.point([navigationCurrentLocation.longitude, navigationCurrentLocation.latitude]);
+    const finalBearingForOffset = bearing - 180 + angleAdjustment;
+    const cameraAnchorPoint = turf.destination(carPoint, totalDistance / 1000, finalBearingForOffset, { units: 'kilometers' });
+    
+    return cameraAnchorPoint.geometry.coordinates;
+}
+    
+
+// AÑADIDO: Se mueve la función easeInOutQuad aquí para que esté disponible en el ámbito
+const easeInOutQuad = t => t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+
 function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDistanceAlongRouteForNavLogic) {
     if (isManualZoomActive) return null;
 
-    if (!isNavigating || !navigationMapInstance || !currentStep) {
+    if (!isNavigating || !navigationMapInstance || !currentStep || !navigationCurrentLocation) { // AÑADIDO: Se comprueba que exista navigationCurrentLocation
         if (isZoomedForManeuver) isZoomedForManeuver = false;
         return null;
     }
@@ -19237,7 +19271,10 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
     lastProcessedStepIdentifier = currentStepIdentifier;
 
     const distanceIntoCurrentStep = currentStep.distance - distanceToManeuver;
-    let targetZoom = null, targetPitch = null, targetOffsetX = null, targetOffsetY = null;
+    
+    // MODIFICADO: Las variables de offset se eliminan y se reemplazan por targetCenter
+    // // let targetZoom = null, targetPitch = null, targetOffsetX = null, targetOffsetY = null;
+    let targetZoom = null, targetPitch = null, targetCenter = null;
 
     switch (progressiveZoomState) {
         case 'zooming-out':
@@ -19248,9 +19285,9 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
             if (nextStepAfterCurrent && distanceToNextStep < HOLD_ZOOM_THRESHOLD) {
                 targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
                 if (mapViewMode === 'perspective' || mapViewMode === 'relief') targetPitch = window.pitchBeforeManeuver * 0.75; else targetPitch = 45;
-                targetOffsetY = 35;
-                targetOffsetX = window.maneuverHorizontalTarget;
-                
+                // AÑADIDO: Se calcula el centro compensado en lugar del offset
+                targetCenter = calculateCompensatedCenter(35, window.maneuverHorizontalTarget, targetPitch, navigationMapInstance.getBearing());
+
             } else {
                 if (distanceIntoCurrentStep > PROGRESSIVE_ZOOM_EXIT_END_DISTANCE || mapPreviousZoomLevelForProgressive === null) {
                     const currentAutoZoomMode = localStorage.getItem(AUTO_ZOOM_MODE_KEY) || 'off';
@@ -19260,8 +19297,9 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
                         targetZoom = mapPreviousZoomLevelForProgressive; 
                     }
                     targetPitch = window.pitchBeforeManeuver;
-                    targetOffsetY = window.offsetYBeforeManeuver;
-                    targetOffsetX = window.offsetXBeforeManeuver;
+                    // AÑADIDO: Se calcula el centro compensado para volver al estado original del usuario
+                    targetCenter = calculateCompensatedCenter(window.offsetYBeforeManeuver, window.offsetXBeforeManeuver, targetPitch, navigationMapInstance.getBearing());
+
                     progressiveZoomState = 'none';
                     isZoomedForManeuver = false;
                     MAP_UPDATE_INTERVAL_MS = originalMapUpdateIntervalMs;
@@ -19279,14 +19317,16 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
                     }
                     targetPitch = maneuverMinPitch + (window.pitchBeforeManeuver - maneuverMinPitch) * progress;
                     
-                    targetOffsetY = 35 + (window.offsetYBeforeManeuver - 35) * offsetReturnProgress;
-                    targetOffsetX = window.maneuverHorizontalTarget + (window.offsetXBeforeManeuver - window.maneuverHorizontalTarget) * offsetReturnProgress;
+                    // AÑADIDO: Se interpola el offset y luego se calcula el centro compensado
+                    const interpolatedOffsetY = 35 + (window.offsetYBeforeManeuver - 35) * offsetReturnProgress;
+                    const interpolatedOffsetX = window.maneuverHorizontalTarget + (window.offsetXBeforeManeuver - window.maneuverHorizontalTarget) * offsetReturnProgress;
+                    targetCenter = calculateCompensatedCenter(interpolatedOffsetY, interpolatedOffsetX, targetPitch, navigationMapInstance.getBearing());
 
                 } else {
                     targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
                     if (mapViewMode === 'perspective' || mapViewMode === 'relief') targetPitch = window.pitchBeforeManeuver * 0.75; else targetPitch = 45;
-                    targetOffsetY = 35;
-                    targetOffsetX = window.maneuverHorizontalTarget;
+                    // AÑADIDO: Se calcula el centro compensado para la maniobra
+                    targetCenter = calculateCompensatedCenter(35, window.maneuverHorizontalTarget, targetPitch, navigationMapInstance.getBearing());
                 }
             }
             break;
@@ -19300,8 +19340,8 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
                     targetZoom = mapPreviousZoomLevelForProgressive;
                 }
                 targetPitch = window.pitchBeforeManeuver;
-                targetOffsetY = window.offsetYBeforeManeuver;
-                targetOffsetX = window.offsetXBeforeManeuver;
+                // AÑADIDO: Se calcula el centro compensado para la vuelta al estado normal
+                targetCenter = calculateCompensatedCenter(window.offsetYBeforeManeuver, window.offsetXBeforeManeuver, targetPitch, navigationMapInstance.getBearing());
             }
 
             if (distanceToManeuver <= ANIMATION_START_DISTANCE) {
@@ -19320,15 +19360,14 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
                     
                     let dynamicHorizontalTarget = 0;
                     const maneuver = currentStep.maneuver;
-                    
                     const instructionText = getManeuverInstructionText(maneuver).toLowerCase();
 
                     if (instructionText.includes('derecha')) {
-                        dynamicHorizontalTarget = -40; // Valor fijo para DERECHA
+                        dynamicHorizontalTarget = -40;
                     } else if (instructionText.includes('izquierda')) {
-                        dynamicHorizontalTarget = 40; // Valor fijo para IZQUIERDA
+                        dynamicHorizontalTarget = 40;
                     } else {
-                        dynamicHorizontalTarget = 0; // Sin desplazamiento para todo lo demás
+                        dynamicHorizontalTarget = 0;
                     }
                     
                     window.maneuverHorizontalTarget = dynamicHorizontalTarget;
@@ -19355,16 +19394,16 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
                 }
                 
                 const easedOffsetProgress = easeInOutQuad(Math.min(1, offsetProgress));
-                targetOffsetY = window.offsetYBeforeManeuver + (35 - window.offsetYBeforeManeuver) * easedOffsetProgress;
-                
-                targetOffsetX = window.offsetXBeforeManeuver + (window.maneuverHorizontalTarget - window.offsetXBeforeManeuver) * easedOffsetProgress;
+                // AÑADIDO: Se interpolan los offsets temporalmente para usarlos en el cálculo del centro
+                const interpolatedOffsetY = window.offsetYBeforeManeuver + (35 - window.offsetYBeforeManeuver) * easedOffsetProgress;
+                const interpolatedOffsetX = window.offsetXBeforeManeuver + (window.maneuverHorizontalTarget - window.offsetXBeforeManeuver) * easedOffsetProgress;
+                targetCenter = calculateCompensatedCenter(interpolatedOffsetY, interpolatedOffsetX, targetPitch, navigationMapInstance.getBearing());
 
             } else {
                 if (progressiveZoomState !== 'none') {
                     targetZoom = mapPreviousZoomLevelForProgressive;
                     targetPitch = window.pitchBeforeManeuver;
-                    targetOffsetY = window.offsetYBeforeManeuver;
-                    targetOffsetX = window.offsetXBeforeManeuver;
+                    targetCenter = calculateCompensatedCenter(window.offsetYBeforeManeuver, window.offsetXBeforeManeuver, targetPitch, navigationMapInstance.getBearing());
                 }
                 progressiveZoomState = 'none';
                 isZoomedForManeuver = false;
@@ -19373,16 +19412,23 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
             break;
     }
 
-    if (targetZoom !== null || targetPitch !== null || targetOffsetX !== null || targetOffsetY !== null) {
+    // MODIFICADO: Se devuelve el objeto con el centro compensado y los offsets a cero.
+    // // if (targetZoom !== null || targetPitch !== null || targetOffsetX !== null || targetOffsetY !== null) {
+    if (targetZoom !== null || targetPitch !== null || targetCenter !== null) {
         return { 
             zoom: targetZoom, 
             pitch: targetPitch, 
-            offsetX: targetOffsetX !== null ? Math.max(-75, Math.min(75, targetOffsetX)) : null,
-            offsetY: targetOffsetY !== null ? Math.max(-75, Math.min(75, targetOffsetY)) : null
+            // AÑADIDO: Devolvemos el centro calculado y reseteamos los offsets de pantalla
+            center: targetCenter,
+            offsetX: 0,
+            offsetY: 0
         };
     }
     return null;
 }
+
+
+    
     
 // ===================================================================
 // NOMBRE: handleProgressBarLockToggle (CORREGIDA)
