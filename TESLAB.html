@@ -1,4 +1,4 @@
-d6
+d7
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -198,7 +198,8 @@ d6
                  <button id="toggle-simulate-gps-button" class="reminders-map-button-action" title="Activar/Desactivar Simulación GPS (recorrido o clic)"><img src="PNG/GPS.PNG" alt="Simular Recorrido"></button>
                 <button id="simulate-route-button" class="reminders-map-button-action" title="Simular interacciones de ruta"><img src="PNG/SIMULAR.PNG" alt="Simular Ruta"></button>
              </div>
-             <div class="button-row" id="search-row-map-header">
+             <div class="button-row" id="search-row-map-header"> 
+                <button id="ai-route-planner-button" class="reminders-map-button-action" title="Asistente IA para crear rutas">  <img src="PNG/IA.PNG" alt="Asistente IA"></button>
                 <button id="reorder-route-stages-button" title="Ordenar Etapas de Ruta"><img src="./PNG/MOVER.PNG" alt="Ordenar Etapas"></button>
                 <button id="map-location-search-button" class="reminders-map-button-action"><img src="./PNG/ANADIRPUNTO.jpg" alt="Añadir Punto Ruta"></button>
                 <button id="clear-map-search-input-button" title="Limpiar búsqueda">X</button>
@@ -18873,6 +18874,29 @@ function assignMapButtonListeners() {
     
     newMapLocationSearchInput.value = '';
     newMapFilterInput.value = localStorage.getItem(MAP_FILTER_INPUT_KEY) || 'España';
+
+
+    const aiPlannerButton = document.getElementById('ai-route-planner-button');
+    if (aiPlannerButton) {
+        aiPlannerButton.addEventListener('click', () => {
+             // Primero, obtenemos la librería de IA de forma asíncrona
+            if (!window.genAI) {
+                showToast("Cargando Asistente IA...", "info");
+                const script = document.createElement('script');
+                script.src = "https://sdk.vercel.ai/ai/1.1.0/index.js";
+                script.onload = () => {
+                    showToast("Asistente listo.", "success");
+                    openAiPlannerModal();
+                };
+                script.onerror = () => {
+                    showToast("No se pudo cargar la librería de IA. Revisa la conexión.", "error");
+                };
+                document.head.appendChild(script);
+            } else {
+                openAiPlannerModal();
+            }
+        });
+    }
 }
     
 // ===================================================================
@@ -21953,10 +21977,272 @@ document.addEventListener('DOMContentLoaded', async () => {
 
 
 });   
+
+
+// ===================================================================
+// INICIO: LÓGICA DEL ASISTENTE DE RUTAS IA (Hugging Face - Proxy Gratuito)
+// ===================================================================
+
+// ⚠️ PEGA AQUÍ TU TOKEN DE HUGGING FACE QUE EMPIEZA POR "hf_..." ⚠️
+const HUGGING_FACE_TOKEN = "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"; 
+const HF_INFERENCE_API_URL = "https://api-inference.huggingface.co/models/NousResearch/Hermes-2-Pro-Mistral-7B";
+
+// Abre el modal de la IA y prepara los listeners
+function openAiPlannerModal() {
+    const modal = document.getElementById('ai-route-modal');
+    if (!modal) return;
+    modal.classList.remove('hidden');
+    document.getElementById('ai-prompt-input').value = '';
+    document.getElementById('ai-status-area').innerHTML = '<p>Listo para recibir tus instrucciones.</p>';
+    document.getElementById('ai-generate-route-button').onclick = handleAiRouteRequest;
+    document.getElementById('ai-cancel-button').onclick = () => modal.classList.add('hidden');
+}
+
+// La función principal que gestiona la conversación con la IA
+async function handleAiRouteRequest() {
+    const prompt = document.getElementById('ai-prompt-input').value;
+    const statusArea = document.getElementById('ai-status-area');
+    const generateBtn = document.getElementById('ai-generate-route-button');
+    if (!prompt) {
+        showToast("Por favor, escribe una petición.", "warning");
+        return;
+    }
+    
+    generateBtn.disabled = true;
+    statusArea.innerHTML = `<p>🧠 Analizando tu petición: "${prompt}"...</p>`;
+
+    const systemPrompt = `Tu eres un asistente experto en planificación de rutas y búsqueda de lugares para un navegador de coche. Tienes acceso a las siguientes herramientas:
+
+<tools>
+  <tool>
+    <name>search_places</name>
+    <description>Busca lugares de interés (POI) como restaurantes, museos, etc., en una ubicación. Puede buscar por un nombre específico o por una categoría.</description>
+    <parameters>
+      <property><name>query</name><type>string</type><description>El nombre del lugar o el tipo general a buscar. Ej: 'Torre Eiffel', 'pizzerías'.</description></property>
+      <property><name>location</name><type>string</type><description>La ciudad o área de búsqueda. Si el usuario dice 'cerca de aquí', usa 'current_location'.</description></property>
+      <property><name>category</name><type>string</type><description>La categoría del lugar. Opciones válidas: 'restaurant', 'museum', 'charging_station', 'general_poi'.</description></property>
+    </parameters>
+  </tool>
+  <tool>
+    <name>calculate_optimized_route</name>
+    <description>Calcula la ruta de conducción más eficiente que conecta una lista de waypoints.</description>
+    <parameters>
+      <property><name>waypoints</name><type>array</type><description>Una lista de objetos de puntos de parada con nombre, latitud y longitud.</description></property>
+    </parameters>
+  </tool>
+</tools>
+
+Responde únicamente con una llamada a la herramienta en formato JSON, como <tool_code>{"name": "...", "parameters": {...}}</tool_code>. No añadas texto explicativo fuera de la etiqueta. Si ya tienes toda la información para responder al usuario, resume el plan final en texto claro y, si es una ruta, proporciona los waypoints finales en un bloque JSON: \`\`\`json\n{"waypoints": [...]}\n\`\`\`.`;
+
+    let conversationHistory = [{ "role": "system", "content": systemPrompt }];
+
+    try {
+        let currentPromptForAI = prompt;
+        for (let i = 0; i < 5; i++) { // Bucle de seguridad para evitar infinitos
+            
+            conversationHistory.push({ "role": "user", "content": currentPromptForAI });
+            
+            // Construir el prompt en el formato ChatML que espera el modelo
+            const fullPrompt = conversationHistory.map(msg => `<|im_start|>${msg.role}\n${msg.content}<|im_end|>`).join('\n') + '\n<|im_start|>assistant';
+
+            const hfResponse = await fetch(HF_INFERENCE_API_URL, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${HUGGING_FACE_TOKEN}`,
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    inputs: fullPrompt,
+                    parameters: { max_new_tokens: 512, return_full_text: false, temperature: 0.1 }
+                })
+            });
+
+            if (!hfResponse.ok) {
+                const errorText = await hfResponse.text();
+                throw new Error(`Error del servidor de IA (${hfResponse.status}): ${errorText}`);
+            }
+
+            const hfResult = await hfResponse.json();
+            const assistantResponse = hfResult[0].generated_text;
+            
+            conversationHistory.push({ "role": "assistant", "content": assistantResponse });
+            
+            const toolCallMatch = assistantResponse.match(/<tool_code>(.*?)<\/tool_code>/);
+
+            if (!toolCallMatch) {
+                renderFinalAiAnswer(assistantResponse, prompt, statusArea);
+                break; // Fin del ciclo
+            }
+
+            const toolCall = JSON.parse(toolCallMatch[1]);
+            statusArea.innerHTML += `<p>⚙️ Usando herramienta: <b>${toolCall.name}</b>...</p>`;
+            
+            let toolResult;
+            if (toolCall.name === "search_places") {
+                toolResult = await ai_tool_search_places(toolCall.parameters);
+            } else if (toolCall.name === "calculate_optimized_route") {
+                toolResult = await ai_tool_calculate_optimized_route(toolCall.parameters.waypoints);
+            }
+
+            currentPromptForAI = `<tool_response>${JSON.stringify(toolResult)}</tool_response>`;
+        }
+
+    } catch (error) {
+        console.error("Error en la IA:", error);
+        statusArea.innerHTML = `<p style="color: #ff3b30;"><b>Error:</b> ${error.message}</p>`;
+    } finally {
+        generateBtn.disabled = false;
+    }
+}
+
+function renderFinalAiAnswer(finalAnswerText, originalPrompt, statusArea) {
+    statusArea.innerHTML = `<p>✅ <b>Sugerencia final de la IA:</b></p>${finalAnswerText.replace(/\n/g, '<br>')}`;
+    try {
+        const jsonMatch = finalAnswerText.match(/```json\n([\s\S]*?)\n```/);
+        if (!jsonMatch || !jsonMatch[1]) {
+             statusArea.innerHTML += "<p><i>La IA ha dado una respuesta textual. No se ha podido generar una ruta automática.</i></p>";
+             return;
+        }
+        
+        const suggestedWaypoints = JSON.parse(jsonMatch[1]).waypoints;
+        
+        const actionButtons = document.createElement('div');
+        actionButtons.className = 'ai-modal-buttons';
+        actionButtons.style.marginTop = '1rem';
+        actionButtons.innerHTML = `
+            <button id="ai-accept-route">Cargar Ruta en Mapa</button>
+            <button id="ai-refine-route">Cancelar</button>`;
+        statusArea.appendChild(actionButtons);
+
+        document.getElementById('ai-accept-route').onclick = () => {
+            const routeObject = { name: `Ruta IA: ${originalPrompt.substring(0, 25)}...`, waypoints: suggestedWaypoints };
+            loadRouteFromObject(routeObject, true);
+            document.getElementById('ai-route-modal').classList.add('hidden');
+        };
+        document.getElementById('ai-refine-route').onclick = () => document.getElementById('ai-route-modal').classList.add('hidden');
+
+    } catch (e) {
+        console.error("Error al parsear la respuesta final de la IA", e);
+        statusArea.innerHTML += "<p><i>La IA ha dado una respuesta que no parece una ruta válida. Intenta reformular tu petición.</i></p>";
+    }
+}
+
+async function ai_tool_search_places(args) {
+    const osmTagMap = {
+        'restaurant': 'amenity:restaurant', 'cafe': 'amenity:cafe', 'hotel': 'tourism:hotel',
+        'museum': 'tourism:museum', 'parking': 'amenity:parking', 'charging_station': 'amenity:charging_station',
+        'fuel_station': 'amenity:fuel', 'pharmacy': 'amenity:pharmacy', 'supermarket': 'shop:supermarket',
+        'tourist_attraction': 'tourism:attraction'
+    };
+    const osmTag = osmTagMap[args.category] || null;
+    if (args.location === 'current_location' && !navigationCurrentLocation) {
+        return { error: "Ubicación actual no disponible." };
+    }
+    const poiFeatures = await searchPoisByCategory(args.query, osmTag);
+    if (poiFeatures.length === 0) {
+        return { message: `No se encontraron resultados para '${args.query}'.` };
+    }
+    return poiFeatures.slice(0, 5).map(f => ({ // Limitar a 5 resultados para no sobrecargar
+        name: f.properties.name || f.properties.street || 'Punto de Interés',
+        lat: f.geometry.coordinates[1],
+        lng: f.geometry.coordinates[0]
+    }));
+}
+
+async function ai_tool_calculate_optimized_route(waypoints) {
+    if (!waypoints || waypoints.length < 2) return waypoints;
+    const coordsString = waypoints.map(wp => `${wp.lng},${wp.lat}`).join(';');
+    const url = `${OSRM_SERVICE_URL}/trip/v1/driving/${coordsString}?overview=false&roundtrip=false`;
+    
+    try {
+        const response = await fetch(url);
+        const data = await response.json();
+        if (data.code === 'Ok' && data.trips && data.trips.length > 0) {
+            return data.trips[0].waypoints.map(osrm_wp => waypoints[osrm_wp.waypoint_index]);
+        }
+        return { error: "No se pudo optimizar la ruta." };
+    } catch (error) {
+        return { error: `Error de red al optimizar: ${error.message}` };
+    }
+}
+
+//======================================== REEMPLAZA ESTA FUNCIÓN
+//===============================================================    
+async function searchPoisByCategory(query, osmKey) {
+    if (!query || query.trim() === '') {
+        return [];
+    }
+    const isCalledByAI = (new Error()).stack.includes('ai_tool_search_places');
+    if (!isCalledByAI) {
+        showToast(`Buscando "${query}"...`, "info");
+    }
+
+    const searchButton = document.getElementById('map-location-search-button');
+    let photonUrl = `https://photon.komoot.io/api/?q=${encodeURIComponent(query)}&limit=50`;
+    const bounds = navigationMapInstance.getBounds();
+    photonUrl += `&bbox=${bounds.getWest()},${bounds.getSouth()},${bounds.getEast()},${bounds.getNorth()}`;
+    if (osmKey) {
+        photonUrl += `&osm_tag=${osmKey}`;
+    }
+    const photonPromise = fetch(photonUrl).then(res => res.json()).catch(err => ({ features: [] }));
+    
+    const overpassQuery = osmKey ? buildOverpassQuery(osmKey) : `[out:json][timeout:25];(node[~"name"~"${query.replace(/"/g, '\\"')}"](${bounds.getSouth()},${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()});way[~"name"~"${query.replace(/"/g, '\\"')}"](${bounds.getSouth()},${bounds.getWest()},${bounds.getNorth()},${bounds.getEast()}););out center;`;
+    const overpassPromise = fetchOverpassData(overpassQuery).catch(err => []);
+
+    try {
+        const [photonResponse, overpassResponse] = await Promise.all([photonPromise, overpassPromise]);
+        const photonFeatures = (photonResponse.features || []);
+        const overpassFeaturesRaw = (overpassResponse || []);
+        const normalizedPhoton = photonFeatures.map(f => ({ ...f, properties: { ...f.properties, source: 'Photon' } }));
+        const normalizedOverpass = overpassFeaturesRaw.map(normalizeOverpassResult).filter(Boolean);
+        let combinedFeatures = [...normalizedPhoton, ...normalizedOverpass];
+        const uniqueFeatures = [];
+        const proximityThreshold = 20;
+        for (const feature of combinedFeatures) {
+            if (!uniqueFeatures.some(unique => turf.distance(turf.point(feature.geometry.coordinates), turf.point(unique.geometry.coordinates), { units: 'meters' }) < proximityThreshold)) {
+                uniqueFeatures.push(feature);
+            }
+        }
+        
+        if (!isCalledByAI) {
+            displayPoiSearchResults(uniqueFeatures, navigationMapInstance);
+            if (uniqueFeatures.length > 0) {
+                isPoiSearchActive = true;
+                if (searchButton) searchButton.style.setProperty('background-color', '#FFD700', 'important');
+            } else {
+                isPoiSearchActive = false;
+                if (searchButton) searchButton.style.removeProperty('background-color');
+            }
+        }
+        return uniqueFeatures;
+    } catch (error) {
+        if (!isCalledByAI) {
+            showToast(`Error en la búsqueda de POIs: ${error.message}`, "error");
+            clearPoiSearchResults();
+        }
+        return [];
+    }
+}    
+    
     
 </script>
 <div id="map-garage" style="display: none;"></div>   
 
+
+<div id="ai-route-modal" class="hidden">
+    <div class="ai-modal-content">
+        <h2>Asistente de Rutas IA</h2>
+        <p>Describe la ruta que quieres o lo que buscas. Por ejemplo: "Ruta de los 3 museos más importantes de Madrid" o "Un buen restaurante italiano cerca para cenar".</p>
+        <textarea id="ai-prompt-input" rows="3" placeholder="Escribe tu petición..."></textarea>
+        <div id="ai-status-area">
+            <!-- Los resultados y el estado de la IA aparecerán aquí -->
+        </div>
+        <div class="ai-modal-buttons">
+            <button id="ai-generate-route-button">Generar Sugerencia</button>
+            <button id="ai-cancel-button">Cerrar</button>
+        </div>
+    </div>
+</div>
     
 </body>
 </html>
