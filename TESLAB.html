@@ -1,4 +1,4 @@
-d33
+d34
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -21971,7 +21971,6 @@ function openAiPlannerModal() {
     document.getElementById('ai-generate-route-button').onclick = handleAiRouteRequest;
     document.getElementById('ai-cancel-button').onclick = () => modal.classList.add('hidden');
 }
-
 async function handleAiRouteRequest() {
     const prompt = document.getElementById('ai-prompt-input').value;
     const statusArea = document.getElementById('ai-status-area');
@@ -21984,54 +21983,52 @@ async function handleAiRouteRequest() {
     generateBtn.disabled = true;
     statusArea.innerHTML = `<p>🧠 Analizando tu petición: "${prompt}"...</p>`;
 
-    // --- Herramienta ÚNICA, sin cambios ---
+    // --- CORRECCIÓN: La herramienta ahora acepta un ARRAY de búsquedas ---
     const tools = [{
         "functionDeclarations": [{
             "name": "search_places_with_google",
-            "description": "Busca lugares de interés (POI) usando Google para obtener sus coordenadas. Es la única herramienta disponible y DEBE usarse para cualquier petición de lugares.",
+            "description": "Busca una LISTA de lugares de interés (POI) usando Google para obtener sus coordenadas.",
             "parameters": {
                 "type": "OBJECT",
                 "properties": {
-                    "query": { "type": "STRING", "description": "El lugar o tipo de lugar a buscar. Ej: 'Museo del Prado', 'pizzerías en Madrid'." }
+                    "queries": {
+                        "type": "ARRAY",
+                        "description": "Una lista de los lugares a buscar. Ej: ['Museo del Prado', 'Museo Reina Sofía']",
+                        "items": { "type": "STRING" }
+                    }
                 },
-                "required": ["query"]
+                "required": ["queries"]
             }
         }]
     }];
 
-    // --- CORRECCIÓN CLAVE: Instrucciones (System Prompt) mucho más estrictas y directas ---
-    let systemPrompt = `Eres un motor de llamadas a funciones. Tu ÚNICA tarea es identificar los lugares en la petición del usuario y llamar a la herramienta 'search_places_with_google' para CADA UNO de ellos.
-- NUNCA respondas con texto conversacional. Tu primera respuesta DEBE ser una llamada a la herramienta.
-- Si el usuario pide "los 3 museos de Madrid", debes identificar los 3 museos y llamar a la herramienta 3 veces, una para cada uno.
-- Después de recibir los resultados de TODAS las herramientas, tu respuesta final DEBE ser únicamente el bloque de código JSON con los waypoints encontrados. No incluyas ningún texto explicativo antes del JSON.
-- El formato final debe ser exactamente: \`\`\`json\n{\"waypoints\": [...]}\n\`\`\``;
+    // --- CORRECCIÓN CLAVE: Instrucciones para que la IA actúe de una sola vez ---
+    let systemPrompt = `Eres un asistente de rutas. Tu misión es:
+    1.  Identificar TODOS los lugares que el usuario pide.
+    2.  Llamar a la herramienta 'search_places_with_google' UNA SOLA VEZ con la lista completa de búsquedas.
+    3.  Una vez recibes el resultado de la herramienta, tu trabajo ha terminado.
+    4.  Resume en una frase lo que has encontrado.
+    5.  FINALIZA OBLIGATORIAMENTE tu respuesta con un bloque de código JSON con el formato: \`\`\`json\n{\"waypoints\": [...]}\n\`\`\`.`;
     if (navigationCurrentLocation) {
-        systemPrompt += ` CONTEXTO: La ubicación actual del usuario es latitud ${navigationCurrentLocation.latitude.toFixed(4)}, longitud ${navigationCurrentLocation.longitude.toFixed(4)}. Esto es útil para búsquedas 'cercanas'.`;
+        systemPrompt += ` CONTEXTO: La ubicación actual del usuario es latitud ${navigationCurrentLocation.latitude.toFixed(4)}, longitud ${navigationCurrentLocation.longitude.toFixed(4)}.`;
     }
 
     let conversationHistory = [
         { "role": "user", "parts": [{ "text": systemPrompt }] },
-        { "role": "model", "parts": [{ "text": "Entendido. Solo llamaré a las herramientas y devolveré JSON." }] }
+        { "role": "model", "parts": [{ "text": "Entendido. Identificaré todos los lugares, haré una sola llamada a la herramienta y devolveré el JSON final." }] }
     ];
 
     try {
         let currentPromptForAI = { "role": "user", "parts": [{ "text": prompt }] };
 
-        // Bucle de hasta 7 iteraciones para permitir múltiples búsquedas (ej. 3 museos)
-        for (let i = 0; i < 7; i++) {
+        // El bucle ahora es solo para el diálogo herramienta <-> IA, que debería ser de un solo paso.
+        for (let i = 0; i < 3; i++) {
             const contents = [...conversationHistory, currentPromptForAI];
 
             const response = await fetch(GEMINI_API_URL, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    "contents": contents,
-                    "tools": tools,
-                    // --- AÑADIDO: Configuración explícita para forzar el uso de herramientas ---
-                    "toolConfig": {
-                        "functionCallingConfig": { "mode": "ANY" }
-                    }
-                })
+                body: JSON.stringify({ "contents": contents, "tools": tools })
             });
 
             if (!response.ok) {
@@ -22040,12 +22037,9 @@ async function handleAiRouteRequest() {
             }
 
             const result = await response.json();
-
+            
             if (!result.candidates || result.candidates.length === 0) {
-                 const safetyFeedback = result.promptFeedback;
-                 let reason = "desconocida";
-                 if (safetyFeedback && safetyFeedback.blockReason) { reason = safetyFeedback.blockReason; }
-                 throw new Error(`La respuesta fue bloqueada por el filtro de seguridad. Razón: ${reason}`);
+                 throw new Error(`La respuesta de la IA fue bloqueada o está vacía.`);
             }
             
             const assistantResponsePart = result.candidates[0].content.parts[0];
@@ -22055,7 +22049,7 @@ async function handleAiRouteRequest() {
 
             if (assistantResponsePart.functionCall) {
                 const toolCall = assistantResponsePart.functionCall;
-                statusArea.innerHTML += `<p>⚙️ Buscando en Google: <b>${toolCall.args.query}</b>...</p>`;
+                statusArea.innerHTML += `<p>⚙️ Buscando en Google: <b>${toolCall.args.queries.join(', ')}</b>...</p>`;
                 
                 const toolResult = await ai_tool_google_search_places(toolCall.args);
                 
@@ -22064,7 +22058,6 @@ async function handleAiRouteRequest() {
                     "parts": [{ "functionResponse": { "name": toolCall.name, "response": { "result": toolResult } } }]
                 };
             } else {
-                // Si la IA responde con texto, es la respuesta final.
                 renderFinalAiAnswer(assistantResponsePart.text, prompt, statusArea);
                 break; 
             }
@@ -22075,7 +22068,7 @@ async function handleAiRouteRequest() {
     } finally {
         generateBtn.disabled = false;
     }
-}    
+}
     
 function renderFinalAiAnswer(finalAnswerText, originalPrompt, statusArea) {
     statusArea.innerHTML = `<p>✅ <b>Sugerencia final de la IA:</b></p>${finalAnswerText.replace(/\n/g, '<br>')}`;
@@ -22113,35 +22106,51 @@ async function ai_tool_google_search_places(args) {
     if (!window.google || !window.google.maps || !window.google.maps.places) {
         return { error: "El servicio de Google Places no está disponible." };
     }
-
-    const request = {
-        textQuery: args.query,
-        fields: ['displayName', 'location'],
-        maxResultCount: 5
-    };
-
-    if (navigationCurrentLocation) {
-        request.locationBias = {
-            center: { lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude },
-            radius: 50000 // 50km
-        };
+    if (!args.queries || args.queries.length === 0) {
+        return { message: "No se proporcionaron lugares para buscar." };
     }
 
-    try {
-        const { places } = await google.maps.places.Place.searchByText(request);
-        if (!places || places.length === 0) {
-            return { message: `No se encontraron resultados directos para '${args.query}'.` };
+    const searchPromises = args.queries.map(query => {
+        const request = {
+            textQuery: query,
+            fields: ['displayName', 'location'],
+            maxResultCount: 1 // Solo queremos el mejor resultado para cada búsqueda
+        };
+        if (navigationCurrentLocation) {
+            request.locationBias = {
+                center: { lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude },
+                radius: 50000 // 50km
+            };
         }
-        return places.map(place => ({
-            name: place.displayName,
-            lat: place.location.lat(),
-            lng: place.location.lng()
-        }));
+        return google.maps.places.Place.searchByText(request);
+    });
+
+    try {
+        const results = await Promise.all(searchPromises);
+        const waypoints = results.flatMap(result => {
+            if (result.places && result.places.length > 0) {
+                const place = result.places[0];
+                return {
+                    name: place.displayName,
+                    lat: place.location.lat(),
+                    lng: place.location.lng()
+                };
+            }
+            return []; // Devolvemos un array vacío si una búsqueda no tuvo éxito
+        });
+
+        if (waypoints.length === 0) {
+            return { message: `No se encontraron resultados para: ${args.queries.join(', ')}` };
+        }
+        
+        return waypoints;
+
     } catch (error) {
         console.error("Error en la búsqueda de Google Places:", error);
         return { error: `Error al contactar con Google Places: ${error.message}` };
     }
-}    
+}
+    
 // ===================================================================
 // FIN: LÓGICA DEL ASISTENTE DE RUTAS IA
 // ===================================================================
