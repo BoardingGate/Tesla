@@ -1,4 +1,4 @@
-j06
+j07
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -8224,98 +8224,67 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
                 accumulatedDistanceBeforeCurrentSegment = 0;
             }
 
-
 // Dentro de toggleNavigationState, en el bloque que inicia la navegación...
 if (mapResetInterval) clearInterval(mapResetInterval);
 const TWENTY_FIVE_MINUTES_IN_MS = 1 * 60 * 1000;
-mapResetInterval = setInterval(() => {
+mapResetInterval = setInterval(async () => {
     if (!isNavigating || !navigationMapInstance) {
         clearInterval(mapResetInterval);
         mapResetInterval = null;
         return;
     }
 
-    const canvas = navigationMapInstance.getCanvas();
-    const gl = canvas.getContext('webgl');
-    const loseContextExtension = gl ? gl.getExtension('WEBGL_lose_context') : null;
+    console.log("REINICIO PERIÓDICO COMPLETO (con limpieza de controles)...");
+    showToast("Refrescando mapa para optimizar memoria...", "info", 3000);
 
-    if (!loseContextExtension) {
-        console.log("Contexto WebGL no sopotado...");// Si no es compatible, no hacemos nada para evitar errores.
-        return;
-    }
-
-    // 1. Guardar el estado de la cámara ANTES de perder el contexto
-    const center = navigationMapInstance.getCenter();
-    const zoom = navigationMapInstance.getZoom();
-    const pitch = navigationMapInstance.getPitch();
-    const bearing = navigationMapInstance.getBearing();
-
-    // 2. Adjuntar el listener para cuando el contexto se restaure.
-    //    Esto es clave: toda la lógica de recreación ocurre DESPUÉS de este evento.
-    canvas.addEventListener('webglcontextrestored', async () => {
-        console.log("Contexto WebGL restaurado. Recargando y restaurando estado del mapa...");
-        // Mapbox debería recuperarse automáticamente, pero para asegurar un estado limpio,
-        // vamos a recrear los controles y volver a cargar todas las capas y marcadores.
-
-        // Recrear controles personalizados
-        const customControls = new CustomMapControlsGroup();
-        window.mapCustomControlsInstance = customControls; 
-        navigationMapInstance.addControl(customControls, 'bottom-right');
-
-        compassAndModeControl = new CompassAndStatsControl();
-        navigationMapInstance.addControl(compassAndModeControl, 'bottom-left');
-
-        // Restaurar estado visual y lógico completo
-        await loadAndAddMapImages(navigationMapInstance);
-        await configureMapAtmosphere();
-        plotRemindersOnNavigationMap();
-        displayChargingPointsOnMap();
-        displayAlertsOnMap();
-        
-        // Resetear referencias a marcadores del DOM que fueron destruidos
-        navigationWaypoints.forEach(wp => { if (wp) wp.marker = null; });
-        initialUserLocationMarker = null;
-        
-        // Volver a renderizar marcadores
-        renderWaypointMarkers();
-        if (navigationCurrentLocation) {
-            updateInitialUserPosition(navigationCurrentLocation, navigationMapInstance);
+    // Guardar el estado de la ruta y estadísticas que se pierden con resetNavigationState
+    const routeToRestore = {
+        name: currentRouteNameForSaving,
+        waypoints: sanitizeWaypointsForStorage(navigationWaypoints)
+    };
+    const recoveryInfoToRestore = {
+        tripStartTime: navigationStartTimeForStats.getTime(),
+        originalTripEtaTime: originalTripEtaTime ? originalTripEtaTime.getTime() : null,
+        stats: {
+            totalDistance: totalDistanceTravelledForStats,
+            maxSpeed: maxSpeedDuringTrip,
+            maxAltitude: maxAltitudeDuringTrip,
+            minAltitude: minAltitudeDuringTrip,
+            maxSpeedCoords: maxSpeedCoordinates
         }
+    };
+    
+    // 1. Ejecutar la secuencia de limpieza completa
+    closeNavigationMap(true); // El 'true' evita la recarga de la página
 
-        // Restaurar gráfica con datos
-        initializeNavigationGraph(true);
-        // Sincronizar UI del botón de seguimiento
-        updateLocateMeButtonsUI();
+    // 2. Esperar un instante para que la limpieza se procese
+    await new Promise(resolve => setTimeout(resolve, 450));
+
+    // 3. Volver a abrir el mapa y restaurar el estado del viaje
+    try {
+        await openNavigationMap(true); // 'true' para indicar que es una recuperación
         
-        // Re-adjuntar listeners del mapa que se pierden
-        navigationMapInstance.on('pitch', updateLineWidthsOnPitchChange);
-        navigationMapInstance.on('zoomend', updateAllIconSizes);
-        
-        // Espera activa y robusta para redibujar la ruta
-        const waitForMapReadyAndDraw = async () => {
-            let attempts = 0;
-            const maxAttempts = 50;
-            while (attempts < maxAttempts) {
-                if (navigationMapInstance && navigationMapInstance.isStyleLoaded()) {
-                    try {
-                        if (navigationCurrentRouteData?.routes?.[0]) {
-                            // Se usa reAddCustom... porque elimina capas antiguas antes de añadir las nuevas, es más seguro.
-                            await reAddCustomMapLayersAndSources(navigationMapInstance);
-                        }
-                        return;
-                    } catch (e) {
-                    }
-                }
-                await new Promise(resolve => setTimeout(resolve, 100));
-                attempts++;
+        // 4. Cargar el estado lógico de la ruta. Esto llamará internamente a recalculateAndDrawRoute.
+        await loadRouteFromObject(routeToRestore, true, true, recoveryInfoToRestore);
+
+        // === INICIO DE LA SOLUCIÓN PARA GARANTIZAR EL TRAZADO ===
+        // Después de que loadRouteFromObject haya terminado, esperamos un instante más
+        // y verificamos si la capa de la ruta está visible. Si no, la forzamos.
+        await new Promise(resolve => setTimeout(resolve, 500)); // Damos medio segundo extra
+
+        if (navigationMapInstance && navigationCurrentRouteData?.routes?.[0]) {
+            if (!navigationMapInstance.getLayer('route') || !navigationMapInstance.getSource('route')) {
+                console.warn("La ruta no se pintó tras la restauración. Forzando redibujado...");
+                await drawRouteOnMap(navigationCurrentRouteData.routes[0]);
             }
-        };
-        waitForMapReadyAndDraw();
-        
-    }, { once: true }); // El listener solo se ejecuta una vez
+        }
+        // === FIN DE LA SOLUCIÓN ===
 
-    // 3. Forzar la pérdida del contexto WebGL
-    loseContextExtension.loseContext();
+        console.log("Reinicio periódico completado y estado de navegación restaurado.");
+    } catch (e) {
+        console.error("Error al reabrir el mapa durante el reinicio periódico:", e);
+        showToast("Error al refrescar el mapa.", "error");
+    }
 
 }, TWENTY_FIVE_MINUTES_IN_MS);
     
@@ -17149,6 +17118,115 @@ function closeNavigationMap(force = false) {
     document.querySelectorAll('#config-button, #personal-button, #radar-button, #home-button, #reload-button, #keyword-assignment-button, #password-toggle-button, #versions-button, #info-button').forEach(el => el.style.display = 'block');
     const gridFilter = document.getElementById('grid-filter-container'); if (gridFilter) gridFilter.style.display = 'flex';
 }
+
+// ===================================================================
+// NOMBRE: closeNavigationMap (VERSIÓN CON LIMPIEZA PROFUNDA DE CONTROLES)
+// RESUMEN: Llama a la función de reseteo al cerrar el mapa para asegurar limpieza.
+function closeNavigationMap(force = false) {
+    const aiModal = document.getElementById('ai-route-modal');
+    if (aiModal) aiModal.classList.add('hidden');
+    
+    clearRecoveryFlag();
+    hideAddressSuggestionsModal();
+
+    // === INICIO DE LA SECUENCIA DE LIMPIEZA PROFUNDA ===
+    // 1. Detener todos los procesos activos que usan el mapa.
+    if (mapResetInterval) {
+        clearInterval(mapResetInterval);
+        mapResetInterval = null;
+    }
+    stopGpsWatching();
+    if (markerAnimationState.animationFrameId) {
+        cancelAnimationFrame(markerAnimationState.animationFrameId);
+        markerAnimationState.animationFrameId = null;
+    }
+    if (alertRefreshInterval) {
+        clearInterval(alertRefreshInterval);
+        alertRefreshInterval = null;
+    }
+    if (gpsHzMonitor.interval) {
+        clearInterval(gpsHzMonitor.interval);
+        gpsHzMonitor.interval = null;
+    }
+    if (manualZoomTimeout) { clearTimeout(manualZoomTimeout); manualZoomTimeout = null; }
+
+    // 2. Desvincular y destruir explícitamente los controles del mapa.
+    if (navigationMapInstance) {
+        if (window.mapCustomControlsInstance) {
+            try {
+                navigationMapInstance.removeControl(window.mapCustomControlsInstance);
+            } catch (e) { console.warn("Error al quitar CustomMapControlsGroup:", e); }
+            window.mapCustomControlsInstance = null;
+        }
+        if (compassAndModeControl) {
+            try {
+                navigationMapInstance.removeControl(compassAndModeControl);
+            } catch (e) { console.warn("Error al quitar CompassAndStatsControl:", e); }
+            compassAndModeControl = null;
+        }
+        
+        // 3. Limpiar listeners de elementos del DOM externos.
+        const header = document.getElementById('reminders-location-map-header');
+        if (header && header._mapButtonClickHandler) {
+            header.removeEventListener('click', header._mapButtonClickHandler);
+            delete header._mapButtonClickHandler;
+        }
+    
+        // 4. Destruir la instancia del mapa.
+        navigationMapInstance.remove();
+        navigationMapInstance = null;
+    }
+    
+    // 5. Forzar purga de recursos en segundo plano (workers).
+    mapboxgl.clearPrewarmedResources();
+    // === FIN DE LA SECUENCIA DE LIMPIEZA PROFUNDA ===
+    
+    resetNavigationState(); 
+
+    const wasInDirectToMapModeSession = sessionStorage.getItem('isInDirectToMapMode') === 'true';
+    const userPrefersDirectToNav = JSON.parse(localStorage.getItem(DIRECT_TO_NAVIGATION_KEY)) || false;
+    if (wasInDirectToMapModeSession && userPrefersDirectToNav && !force) {
+        sessionStorage.removeItem('isInDirectToMapMode');
+        sessionStorage.setItem(TEMP_PREVENT_DIRECT_NAV_KEY, 'true');
+        location.reload();
+        return;
+    }
+    
+    isNavigationMapActive = false;
+    sessionStorage.removeItem('mapContext');
+    
+    const mapModalElement = document.getElementById('reminders-location-map-modal');
+    if (mapModalElement) {
+        mapModalElement.classList.add('map-modal-hidden');
+    }
+    
+    const simModal = document.getElementById('simulation-modal');
+    if (simModal && !simModal.classList.contains('hidden')) {
+        if (simulationModalTimer) clearTimeout(simulationModalTimer);
+        const simCloseBtn = simModal.querySelector('#close-simulation-modal');
+        if (simCloseBtn) clearModalAutoCloseTimer(simModal, simCloseBtn, 'simulation-modal');
+        simModal.classList.add('hidden');
+        hideIntersectionPreviewMap();
+    }
+
+    sessionStorage.removeItem('boardinggate_map_should_reopen_after_form');
+    hideUnifiedReminderWindow();
+    
+    if (directToNavOnLoad) {
+        loadCustomData();
+        loadSavedSettings();
+        applyMainUISettings();
+        directToNavOnLoad = false;
+    }
+ 
+    const mainContent = document.querySelector('main'); if (mainContent) mainContent.style.display = 'block';
+    const footer = document.querySelector('footer'); if (footer) footer.style.display = 'block';
+    const noticesContainer = document.querySelector('.notices-icon-container'); if (noticesContainer) noticesContainer.style.display = 'flex';
+    const sideControls = document.querySelectorAll('.toggle-image, .toggle-sign, .scroll-toggle-button'); sideControls.forEach(el => el.style.display = 'flex');
+    document.querySelectorAll('#config-button, #personal-button, #radar-button, #home-button, #reload-button, #keyword-assignment-button, #password-toggle-button, #versions-button, #info-button').forEach(el => el.style.display = 'block');
+    const gridFilter = document.getElementById('grid-filter-container'); if (gridFilter) gridFilter.style.display = 'flex';
+}
+
     
 // ===================================================================
 // NOMBRE: updateStartNavigationButtonState 
