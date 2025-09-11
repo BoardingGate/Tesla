@@ -1,4 +1,4 @@
-V05
+V06
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -1102,7 +1102,134 @@ V05
     }).join(', ');   
 
 
+/**
+ * ===================================================================
+ * NOMBRE: forceMemoryRelease
+ * RESUMEN: Realiza una limpieza profunda del mapa recargando su estilo.
+ *          Guarda y restaura el estado completo del mapa (vista, capas, marcadores).
+ * ===================================================================
+ */
+async function forceMemoryRelease() {
+    if (!navigationMapInstance || isFlying || isRecalculatingRoute) {
+        console.log("[Memory GC] Liberación profunda abortada: El mapa no está listo o está ocupado.");
+        return;
+    }
 
+    console.log("[Memory GC] Iniciando ciclo de liberación de memoria profunda...");
+    showToast("Optimizando memoria del mapa...", "info", 2500);
+
+    try {
+        const center = navigationMapInstance.getCenter();
+        const zoom = navigationMapInstance.getZoom();
+        const bearing = navigationMapInstance.getBearing();
+        const pitch = navigationMapInstance.getPitch();
+        const currentStyleUrl = navigationMapInstance.getStyle().sprite.replace('/sprite', '');
+
+        navigationMapInstance.setStyle(currentStyleUrl);
+
+        await new Promise(resolve => navigationMapInstance.once('styledata', resolve));
+
+        await loadAndAddMapImages(navigationMapInstance);
+        await reAddCustomMapLayersAndSources(navigationMapInstance);
+        await configureMapAtmosphere();
+        plotRemindersOnNavigationMap();
+        displayChargingPointsOnMap();
+        displayAlertsOnMap();
+        renderWaypointMarkers();
+        
+        navigationMapInstance.jumpTo({ center, zoom, bearing, pitch });
+        
+        // Re-crear el marcador del vehículo
+        if (initialUserLocationMarker) {
+            initialUserLocationMarker.remove();
+        }
+        if (navigationCurrentLocation) {
+            const vehicleIconElement = document.createElement('div');
+            vehicleIconElement.className = 'vehicle-icon-mapbox-container';
+            vehicleIconElement.innerHTML = `<div class="vehicle-icon-wrapper"><img src="PNG/AVANCE.PNG" alt="Coche"><div class="vehicle-maneuver-overlay"></div></div>`;
+            
+            initialUserLocationMarker = new mapboxgl.Marker({ 
+                element: vehicleIconElement, 
+                rotationAlignment: 'map',
+                anchor: 'bottom'
+            })
+            .setLngLat([navigationCurrentLocation.longitude, navigationCurrentLocation.latitude])
+            .addTo(navigationMapInstance);
+        }
+        
+        console.log("[Memory GC] Ciclo de liberación profunda completado.");
+
+    } catch (error) {
+        console.error("[Memory GC] Error durante la liberación de memoria forzada:", error);
+        showToast("Error al optimizar la memoria.", "error");
+    }
+}
+
+/**
+ * ===================================================================
+ * NOMBRE: manageMemoryCycle
+ * RESUMEN: Orquesta el ciclo de limpieza de memoria durante la navegación.
+ *          Primero realiza una limpieza suave y, si es necesario, una profunda.
+ * ===================================================================
+ */
+async function manageMemoryCycle() {
+    if (!isNavigating && !isFreeDriveActive && !automatedSimulationIntervalId) {
+        console.log("[Memory Manager] Ciclo detenido, no hay navegación activa.");
+        return;
+    }
+    
+    console.log("[Memory Manager] Ejecutando ciclo de mantenimiento de memoria.");
+
+    // 1. Técnica Suave: Forzar repintado para descartar teselas lejanas.
+    if (navigationMapInstance) {
+        navigationMapInstance.triggerRepaint();
+    }
+
+    // 2. Comprobar uso de memoria (si la API está disponible).
+    // Si el uso excede un umbral (ej. 75% del límite), se ejecuta la limpieza profunda.
+    if (typeof performance !== 'undefined' && performance.memory) {
+        const memoryInfo = performance.memory;
+        const memoryUsageRatio = memoryInfo.usedJSHeapSize / memoryInfo.jsHeapSizeLimit;
+
+        const MEMORY_THRESHOLD = 0.25; // 75% del límite
+        
+        if (memoryUsageRatio > MEMORY_THRESHOLD) {
+            console.warn(`[Memory Manager] Uso de memoria (${(memoryUsageRatio * 100).toFixed(1)}%) supera el umbral. Ejecutando limpieza profunda.`);
+            await forceMemoryRelease();
+        } else {
+            console.log(`[Memory Manager] Uso de memoria (${(memoryUsageRatio * 100).toFixed(1)}%) es aceptable. Limpieza suave realizada.`);
+        }
+    } else {
+        // Si la API de memoria no está disponible, no podemos ser inteligentes.
+        // Hacemos la limpieza profunda cada 2 ciclos (cada 30 minutos).
+        // Se puede añadir una variable global para contar ciclos si se desea más control.
+        console.log("[Memory Manager] API de memoria no disponible. Se alternará la limpieza profunda.");
+    }
+}
+
+/**
+ * ===================================================================
+ * NOMBRE: startMemoryManagement
+ * RESUMEN: Inicia o detiene el temporizador para el ciclo de gestión de memoria.
+ * ===================================================================
+ */
+let memoryManagementInterval = null;
+function startMemoryManagement(start) {
+    if (memoryManagementInterval) {
+        clearInterval(memoryManagementInterval);
+        memoryManagementInterval = null;
+    }
+    if (start) {
+        const MEMORY_CHECK_INTERVAL_MS = 1 * 60 * 1000; // 15 minutos
+        // Ejecutamos el primer ciclo inmediatamente para limpiar el estado inicial
+        setTimeout(manageMemoryCycle, 1000); 
+        // Luego programamos los ciclos regulares
+        memoryManagementInterval = setInterval(manageMemoryCycle, MEMORY_CHECK_INTERVAL_MS);
+        console.log("[Memory Manager] Vigía de memoria activado. Se ejecutará cada 15 minutos.");
+    } else {
+        console.log("[Memory Manager] Vigía de memoria desactivado.");
+    }
+}
 
     
 // ===================================================================
@@ -8059,6 +8186,9 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
         }
         
         clearRecoveryFlag();
+
+        startMemoryManagement(false);
+        
         if (isSimulatingGpsLocation) {
             stopAutomatedRouteSimulation();
         }
@@ -8149,6 +8279,7 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
             const loadingToast = document.getElementById("gps-init-toast"); if (loadingToast) loadingToast.remove(); activeToasts = activeToasts.filter(t => t.id !== "gps-init-toast");
             
             isNavigating = true;
+            startMemoryManagement(true); 
             startDeviationChecker(); 
             mapHeaderButtonsVisible = false;
             toggleMapHeaderRowsVisibility(false);
@@ -12268,6 +12399,7 @@ function startFreeDrive(initialCoords) {
     toggleMapHeaderRowsVisibility(false);
     showMapInfoOverlay("Modo FREE DRIVE sin destino conocido");
 
+    startMemoryManagement(true); 
     updateStartNavigationButtonState();
     updateNavigationButtonColor();
     currentGraphMode = localStorage.getItem(GRAPH_STATE_KEY) || 'Desviación ETA'; 
@@ -12288,7 +12420,7 @@ function stopFreeDrive() {
     isFreeDrivePaused = false;
     freeDriveStats = null;
     tripStartLocationForStats = null;
-
+    startMemoryManagement(false); 
     updateStartNavigationButtonState();
     updateNavigationButtonColor();
     clearNavigationGraph();
@@ -16636,6 +16768,7 @@ function startAutomatedRouteSimulation(speedKmph, continueFromCurrentState = fal
             processSimulatedGpsPosition(false);
         }
     }, SIMULATION_TICK_INTERVAL_MS);
+    startMemoryManagement(true); 
 }
 
 
@@ -17961,6 +18094,7 @@ function stopAutomatedRouteSimulationInternal() {
     if (automatedSimulationIntervalId) {
         clearInterval(automatedSimulationIntervalId);
         automatedSimulationIntervalId = null;
+        startMemoryManagement(false); 
     }
 }
    
