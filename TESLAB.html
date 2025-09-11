@@ -1,4 +1,4 @@
-V07
+V08
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -1104,45 +1104,63 @@ V07
 
 /**
  * ===================================================================
- * NOMBRE: forceMemoryRelease
+ * NOMBRE: forceMemoryRelease (VERSIÓN 2 - ROBUSTA)
  * RESUMEN: Realiza una limpieza profunda del mapa recargando su estilo.
- *          Guarda y restaura el estado completo del mapa (vista, capas, marcadores).
+ *          Espera a que el mapa esté 'idle' (inactivo) en cada paso crítico
+ *          para asegurar la estabilidad, especialmente en navegadores más lentos.
  * ===================================================================
  */
 async function forceMemoryRelease() {
-    if (!navigationMapInstance || isFlying || isRecalculatingRoute) {
-        console.log("[Memory GC] Liberación profunda abortada: El mapa no está listo o está ocupado.");
+    if (!navigationMapInstance || navigationMapInstance._removed || isFlying || isRecalculatingRoute) {
+        console.log("[Memory GC] Liberación profunda abortada: El mapa no está disponible o está ocupado.");
         return;
     }
 
-    console.log("[Memory GC] Iniciando ciclo de liberación de memoria profunda...");
+    console.log("[Memory GC] v2: Iniciando ciclo de liberación de memoria profunda...");
     showToast("Optimizando memoria del mapa...", "info", 2500);
 
     try {
+        // 1. Guardar el estado actual de la cámara y el estilo
         const center = navigationMapInstance.getCenter();
         const zoom = navigationMapInstance.getZoom();
         const bearing = navigationMapInstance.getBearing();
         const pitch = navigationMapInstance.getPitch();
         const currentStyleUrl = navigationMapInstance.getStyle().sprite.replace('/sprite', '');
 
+        // 2. Establecer el estilo. Esto inicia la limpieza.
         navigationMapInstance.setStyle(currentStyleUrl);
 
-        await new Promise(resolve => navigationMapInstance.once('styledata', resolve));
-
+        // 3. Esperar a que el mapa no solo cargue el estilo, sino que esté completamente inactivo.
+        //    Esto es mucho más seguro que 'styledata'.
+        await new Promise(resolve => navigationMapInstance.once('idle', resolve));
+        console.log("[Memory GC] v2: Estilo recargado y mapa 'idle'.");
+        
+        // 4. Re-añadir todos los componentes visuales en secuencia, con pequeñas pausas.
         await loadAndAddMapImages(navigationMapInstance);
-        await reAddCustomMapLayersAndSources(navigationMapInstance);
-        await configureMapAtmosphere();
+        await reAddCustomMapLayersAndSources(navigationMapInstance); // Ruta principal y de velocidad
+        await configureMapAtmosphere(); // Niebla y terreno
+        
+        // Damos un respiro al motor de renderizado antes de añadir más capas
+        await wait(50); 
+        
         plotRemindersOnNavigationMap();
         displayChargingPointsOnMap();
         displayAlertsOnMap();
         renderWaypointMarkers();
         
+        // 5. Esperar a que el mapa vuelva a estar inactivo después de añadir todas las capas.
+        await new Promise(resolve => navigationMapInstance.once('idle', resolve));
+        console.log("[Memory GC] v2: Capas y fuentes re-aplicadas.");
+
+        // 6. Restaurar la vista de la cámara. 'jumpTo' es síncrono y no necesita espera.
         navigationMapInstance.jumpTo({ center, zoom, bearing, pitch });
         
-        // Re-crear el marcador del vehículo
+        // 7. Re-crear el marcador del vehículo.
+        //    La limpieza del marcador antiguo se hace por si acaso, aunque setStyle ya debería haberlo hecho.
         if (initialUserLocationMarker) {
-            initialUserLocationMarker.remove();
+            try { initialUserLocationMarker.remove(); } catch (e) {}
         }
+
         if (navigationCurrentLocation) {
             const vehicleIconElement = document.createElement('div');
             vehicleIconElement.className = 'vehicle-icon-mapbox-container';
@@ -1157,14 +1175,14 @@ async function forceMemoryRelease() {
             .addTo(navigationMapInstance);
         }
         
-        console.log("[Memory GC] Ciclo de liberación profunda completado.");
+        console.log("[Memory GC] v2: Ciclo de liberación completado con éxito.");
 
     } catch (error) {
-        console.error("[Memory GC] Error durante la liberación de memoria forzada:", error);
-        showToast("Error al optimizar la memoria.", "error");
+        // Ahora el error debería tener más contexto si lo hay.
+        console.error("[Memory GC] v2: Error durante la liberación de memoria forzada:", error, error.stack);
+        showToast("Error al optimizar la memoria del mapa.", "error");
     }
 }
-
 /**
  * ===================================================================
  * NOMBRE: manageMemoryCycle
@@ -1172,31 +1190,51 @@ async function forceMemoryRelease() {
  *          Primero realiza una limpieza suave y, si es necesario, una profunda.
  * ===================================================================
  */
+// AÑADE ESTA VARIABLE GLOBAL
+let memoryCycleCounter = 0;
+
+// REEMPLAZA TU FUNCIÓN manageMemoryCycle
 async function manageMemoryCycle() {
     if (!isNavigating && !isFreeDriveActive && !automatedSimulationIntervalId) {
+        console.log("[Memory Manager] Ciclo detenido, no hay navegación activa.");
         return;
     }
     
+    memoryCycleCounter++;
+    console.log(`[Memory Manager] Ejecutando ciclo de mantenimiento #${memoryCycleCounter}.`);
+
+    // 1. Limpieza suave siempre.
     if (navigationMapInstance) {
         navigationMapInstance.triggerRepaint();
     }
 
+    // 2. Comprobar si es necesario hacer limpieza profunda.
+    let needsDeepClean = false;
     if (typeof performance !== 'undefined' && performance.memory) {
         const memoryInfo = performance.memory;
         const memoryUsageRatio = memoryInfo.usedJSHeapSize / memoryInfo.jsHeapSizeLimit;
-
-        const MEMORY_THRESHOLD = 0.05; // 75% del límite
+        const MEMORY_THRESHOLD = 0.10; // 75%
         
         if (memoryUsageRatio > MEMORY_THRESHOLD) {
-            console.warn(`[Memory Manager] Uso de memoria (${(memoryUsageRatio * 100).toFixed(1)}%) supera el umbral. Ejecutando limpieza profunda.`);
-            await forceMemoryRelease();
+            console.warn(`[Memory Manager] Uso de memoria (${(memoryUsageRatio * 100).toFixed(1)}%) supera el umbral.`);
+            needsDeepClean = true;
         } else {
-            console.log(`[Memory Manager] Uso de memoria (${(memoryUsageRatio * 100).toFixed(1)}%) es aceptable. Limpieza suave realizada.`);
+            console.log(`[Memory Manager] Uso de memoria (${(memoryUsageRatio * 100).toFixed(1)}%) es aceptable.`);
         }
     } else {
-       }
+        // Fallback: Si no hay API de memoria, hacemos limpieza profunda cada 2 ciclos (30 minutos)
+        if (memoryCycleCounter % 2 === 0) {
+            console.log("[Memory Manager] API de memoria no disponible. Ejecutando limpieza profunda programada.");
+            needsDeepClean = true;
+        } else {
+            console.log("[Memory Manager] API de memoria no disponible. Saltando limpieza profunda en este ciclo.");
+        }
+    }
+    
+    if (needsDeepClean) {
+        await forceMemoryRelease();
+    }
 }
-
 /**
  * ===================================================================
  * NOMBRE: startMemoryManagement
