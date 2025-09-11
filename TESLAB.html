@@ -1,4 +1,4 @@
-V04
+V05
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -16915,6 +16915,21 @@ function stopGpsWatching() {
     // Reseteamos el contador de reintentos para la próxima vez que se inicie el seguimiento.
     gpsRetryAttempt = 0; 
 }
+
+// AÑADE ESTA NUEVA FUNCIÓN A TU CÓDIGO
+//==================================================================    
+function removeWaypointMarkerListeners(marker) {
+    if (!marker) return;
+    const element = marker.getElement();
+    if (element && element._onPointerDown) {
+        element.removeEventListener('mousedown', element._onPointerDown);
+        element.removeEventListener('touchstart', element._onPointerDown);
+        // Las de move y up se añaden/quitan dinámicamente, así que no es necesario quitarlas aquí.
+        delete element._onPointerDown;
+        delete element._onPointerMove;
+        delete element._onPointerUp;
+    }
+}
     
 // ===================================================================
 // NOMBRE: closeNavigationMap (MODIFICADA - USA RESET CENTRAL)
@@ -16947,6 +16962,18 @@ function closeNavigationMap(force = false) {
         delete header._mapButtonClickHandler; // Elimina la propiedad para limpiar la referencia.
     }
 
+   if (intersectionPreviewMap) {
+        try { intersectionPreviewMap.remove(); } catch(e){}
+        intersectionPreviewMap = null;
+        intersectionPreviewCarMarker = null; // También limpiar sus marcadores
+        intersectionPreviewManeuverMarker = null;
+    }
+    if (locationPickerMap) {
+        try { locationPickerMap.remove(); } catch(e){}
+        locationPickerMap = null;
+        locationPickerMarker = null;
+    }
+    
   // 3. Destruir la instancia del mapa. Esto debería limpiar sus propios listeners (.on) y liberar la mayoría de sus recursos.
     if (navigationMapInstance) {
         navigationMapInstance.remove();
@@ -19674,6 +19701,7 @@ async function getRouteForSingleLeg(lon1, lat1, lon2, lat2) {
 function clearAllWaypointMarkersFromMap() {
     navigationWaypoints.forEach(wp => {
         if (wp && wp.marker) {
+            removeWaypointMarkerListeners(wp.marker); 
             wp.marker.remove();
             wp.marker = null;
         }
@@ -19792,7 +19820,7 @@ function resetNavigationState() {
     maxAltitudeDuringTrip = -Infinity;
     minAltitudeDuringTrip = Infinity;
     window.averageSpeedKmh = 0;
-
+    reminderMapObjects = [];
     radaresEnRutaActual = [];
     tareasEnRutaActual = [];
     alternativeRoutesCache.clear();
@@ -19844,6 +19872,7 @@ async function handleDeleteWaypointClick(waypointId) {
     if (finalWaypointIndex !== -1) {
         const waypointToDelete = navigationWaypoints[finalWaypointIndex];
         if (waypointToDelete.marker && navigationMapInstance) {
+            removeWaypointMarkerListeners(waypointToDelete.marker); 
             waypointToDelete.marker.remove();
             waypointToDelete.marker = null;
         }
@@ -19864,7 +19893,6 @@ async function handleDeleteWaypointClick(waypointId) {
             navigationMapInstance.removeSource('route');
             navigationRouteLayer = null;
         }
-        
 
         navigationCurrentRouteData = null;
         hideNavigationUI();
@@ -20662,13 +20690,12 @@ function handleStageTouchStart(e) {
     }
 }
 
-// ===================================================================
-// NOMBRE: createWaypointMarkerIcon (MODIFICADA CON TAMAÑO DE FUENTE DINÁMICO Y COLOR DE VISITADO)
-// RESUMEN: Crea el elemento DOM para un marcador de etapa, con tamaño de fuente escalable y color gris para visitados.
+// =================================================================
 function createWaypointMarkerIcon(label, type, visited, id, currentZoomLevel = null) {
     const el = document.createElement('div');
     el.className = 'navigation-waypoint-marker';
-    
+    el.dataset.waypointId = id; 
+
     let color;
     if (visited) {
         color = 'rgba(85, 85, 85, 0.8)'; 
@@ -20679,7 +20706,6 @@ function createWaypointMarkerIcon(label, type, visited, id, currentZoomLevel = n
     } else {
         color = 'rgba(230, 140, 0, 0.80)'; 
     }
-    
     const ZOOM_PEQUENO = 12;
     const ZOOM_GRANDE = 17;
     const FONT_MINIMO = 15; 
@@ -20705,7 +20731,83 @@ function createWaypointMarkerIcon(label, type, visited, id, currentZoomLevel = n
     el.textContent = label;
     el.style.fontSize = `${Math.round(finalFontSize)}px`;
     el.style.cursor = 'pointer';
-    
+
+    if (!isNavigating) {
+        let isDragging = false;
+        let hasMovedEnough = false;
+        let startPos = { x: 0, y: 0 };
+        const waypointId = id; 
+
+        const onPointerDown = (e) => {
+            if (isNavigating) return;
+            e.stopPropagation();
+            isDragging = false;
+            hasMovedEnough = false;
+            const point = e.touches ? e.touches[0] : e;
+            startPos = { x: point.clientX, y: point.clientY };
+            document.addEventListener('mousemove', el._onPointerMove);
+            document.addEventListener('mouseup', el._onPointerUp);
+            document.addEventListener('touchmove', el._onPointerMove, { passive: false });
+            document.addEventListener('touchend', el._onPointerUp);
+        };
+
+        const onPointerMove = (e) => {
+            if (e.type === 'touchmove') e.preventDefault();
+            const point = e.touches ? e.touches[0] : e;
+            const deltaX = Math.abs(point.clientX - startPos.x);
+            const deltaY = Math.abs(point.clientY - startPos.y);
+            if (!hasMovedEnough && (deltaX > 5 || deltaY > 5)) {
+                hasMovedEnough = true;
+                navigationMapInstance.getCanvas().style.cursor = 'grabbing';
+                el.style.cursor = 'grabbing';
+            }
+            if (hasMovedEnough) {
+                isDragging = true;
+                const waypoint = navigationWaypoints.find(w => w.id === waypointId);
+                if(waypoint && waypoint.marker) {
+                    const mapContainer = document.getElementById('mapbox-map-actual-container');
+                    const mapRect = mapContainer.getBoundingClientRect();
+                    const relativeX = point.clientX - mapRect.left;
+                    const relativeY = point.clientY - mapRect.top;
+                    const coords = navigationMapInstance.unproject([relativeX, relativeY]);
+                    waypoint.marker.setLngLat(coords);
+                }
+            }
+        };
+
+        const onPointerUp = async (e) => {
+            document.removeEventListener('mousemove', el._onPointerMove);
+            document.removeEventListener('mouseup', el._onPointerUp);
+            document.removeEventListener('touchmove', el._onPointerMove);
+            document.removeEventListener('touchend', el._onPointerUp);
+            navigationMapInstance.getCanvas().style.cursor = '';
+            el.style.cursor = 'pointer';
+
+            if (isDragging) {
+                const waypoint = navigationWaypoints.find(w => w.id === waypointId);
+                if (waypoint && waypoint.marker) {
+                    const finalCoords = waypoint.marker.getLngLat();
+                    waypoint.lat = finalCoords.lat;
+                    waypoint.lng = finalCoords.lng;
+                    waypoint.address = await getAddressForWaypoint(finalCoords.lat, finalCoords.lng);
+                    await recalculateAndDrawRoute();
+                    renderWaypointMarkers();
+                }
+            } else {
+                showWaypointActionModal(waypointId);
+            }
+            isDragging = false;
+            hasMovedEnough = false;
+        };
+
+        el._onPointerDown = onPointerDown;
+        el._onPointerMove = onPointerMove;
+        el._onPointerUp = onPointerUp;
+        
+        el.addEventListener('mousedown', el._onPointerDown);
+        el.addEventListener('touchstart', el._onPointerDown, { passive: false });
+    }
+   
     return el;
 }
     
