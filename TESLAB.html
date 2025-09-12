@@ -1038,6 +1038,10 @@ V15
     let isPitchManuallyFlattened = false; 
     let previousLegIndexForEta = 0; 
     const _turfCarPointForAnimation = turf.point([0, 0]);
+
+    let memoryCycleCounter = 0;
+    let isPerformingControlledReload = false;
+
     
     const easeInOutQuad = t => t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
    
@@ -1104,9 +1108,6 @@ V15
  * =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
  * NOMBRE: clearTileCacheInternal (ESTRATEGIA B - No documentada)
  * RESUMEN: Accede a las cachés internas de las fuentes de Mapbox
- *          y llama al método .clearTiles() para purgar la memoria
- *          ocupada por las teselas del mapa base y del terreno.
- * =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
  */
 function clearTileCacheInternal() {
     if (!navigationMapInstance || navigationMapInstance._removed) {
@@ -1138,58 +1139,87 @@ function clearTileCacheInternal() {
     }
 }
     
+
 /**
  * ===================================================================
- * NOMBRE: manageMemoryCycle
- * RESUMEN: Orquesta el ciclo de limpieza de memoria durante la navegación.
- *          Primero realiza una limpieza suave y, si es necesario, una profunda.
- * ===================================================================
+ * NOMBRE: initiateControlledReload (NUEVA FUNCIÓN)
+ * RESUMEN: Guarda el estado actual de la navegación en la bandera de
  */
-// AÑADE ESTA VARIABLE GLOBAL
-let memoryCycleCounter = 0;
+async function initiateControlledReload() {
+    if (isPerformingControlledReload) return;
+    isPerformingControlledReload = true;
 
-// REEMPLAZA TU FUNCIÓN manageMemoryCycle
-async function manageMemoryCycle() {
-    if (!isNavigating && !isFreeDriveActive && !automatedSimulationIntervalId) {
-        return;
-    }
-    
-    memoryCycleCounter++;
-  
-    if (navigationMapInstance) {
-        navigationMapInstance.triggerRepaint();
-    }
+    try {
+        // 1. Leer la bandera de recuperación existente. Si no existe, no podemos continuar.
+        const recoveryFlagJSON = localStorage.getItem('boardinggate_nav_recovery_flag');
+        if (!recoveryFlagJSON) {
+            showToast("Error de optimización: no se encontró estado para guardar.", "error");
+            isPerformingControlledReload = false; // Permitir reintentos
+            return;
+        }
 
-    // 2. Comprobar si es necesario hacer limpieza profunda.
-    let needsDeepClean = false;
-    if (typeof performance !== 'undefined' && performance.memory) {
-        const memoryInfo = performance.memory;
-        const memoryUsageRatio = memoryInfo.usedJSHeapSize / memoryInfo.jsHeapSizeLimit;
-        const MEMORY_THRESHOLD = 0.40; 
+        const recoveryData = JSON.parse(recoveryFlagJSON);
+
+        // 2. Actualizar las estadísticas con los valores más recientes.
+        recoveryData.stats = {
+            totalDistance: totalDistanceTravelledForStats,
+            maxSpeed: maxSpeedDuringTrip,
+            maxAltitude: maxAltitudeDuringTrip,
+            minAltitude: minAltitudeDuringTrip,
+            maxSpeedCoords: maxSpeedCoordinates
+        };
         
-        if (memoryUsageRatio > MEMORY_THRESHOLD) {
-            needsDeepClean = true;
-        } else {
-            console.log(`[Memory Manager] Uso de memoria (${(memoryUsageRatio * 100).toFixed(1)}%) es aceptable.`);
-        }
-    } else {
-        if (memoryCycleCounter % 2 === 0) {
-            needsDeepClean = true;
-        } else {
-        }
-    }
-    
-    if (needsDeepClean) {
-        //AQUÍ LANZAR LA RECARGA CONTROLADA
+        // 3. Asegurar que los tiempos de inicio y ETA están actualizados.
+        recoveryData.tripStartTime = navigationStartTimeForStats ? navigationStartTimeForStats.getTime() : Date.now();
+        recoveryData.originalTripEtaTime = originalTripEtaTime ? originalTripEtaTime.getTime() : null;
+
+        // 4. Guardar de nuevo el objeto completo en localStorage.
+        localStorage.setItem('boardinggate_nav_recovery_flag', JSON.stringify(recoveryData));
+   
+        // 5. Recargar la página.
+        location.reload();
+
+    } catch(e) {
+        console.error("[Controlled Reload] Error durante el proceso de recarga controlada:", e);
+        showToast("Error crítico durante la optimización de memoria.", "error");
+        isPerformingControlledReload = false; // Permitir reintentos si algo falla
     }
 }
 
 /**
  * ===================================================================
+ * NOMBRE: manageMemoryCycle (VERSIÓN MODIFICADA)
+ * RESUMEN: Orquesta el ciclo de limpieza de memoria. Comprueba el uso
+ */
+async function manageMemoryCycle() {
+    // 1. No hacer nada si no se está navegando o si ya se está recargando
+    if (!isNavigating && !isFreeDriveActive && !automatedSimulationIntervalId) {
+        return;
+    }
+    if (isPerformingControlledReload) {
+        return;
+    }
+
+    // 2. Comprobar el uso de memoria
+    if (typeof performance !== 'undefined' && performance.memory) {
+        const memoryInfo = performance.memory;
+        const memoryUsageRatio = memoryInfo.usedJSHeapSize / memoryInfo.jsHeapSizeLimit;
+        const MEMORY_THRESHOLD = 0.10; // 40%
+
+        if (memoryUsageRatio > MEMORY_THRESHOLD) {
+            initiateControlledReload();
+        } else {
+            console.log(`[Memory Manager] Uso de memoria (${(memoryUsageRatio * 100).toFixed(1)}%) es aceptable.`);
+        }
+    } else {
+        console.log("[Memory Manager] La API de memoria no está disponible para una comprobación precisa.");
+    }
+}
+    
+/**
+ * ===================================================================
  * NOMBRE: manageMemoryCycle (Versión para Estrategia B)
  * RESUMEN: Orquesta el ciclo de limpieza de memoria durante la navegación
- *          llamando a la función de limpieza de caché interna.
- * ===================================================================
  */
 async function manageMemoryCycle() {
     if (!isNavigating && !isFreeDriveActive && !automatedSimulationIntervalId) {
