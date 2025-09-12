@@ -1,4 +1,4 @@
-V24
+V25
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -1105,27 +1105,311 @@ V24
 
 
 
+// ===================================================================
+// NOMBRE: toggleNavigationState (VERSIÓN CON GUARDADO DE CONTEXTO)
+// RESUMEN: Inicia/detiene la navegación. Ahora crea la bandera de recuperación
+//          CON EL CONTEXTO INICIAL del viaje (estadísticas y gráfica vacías).
+// ===================================================================
+async function toggleNavigationState(isRecalculationStop = false, isRecovery = false) {
+    const startNavButton = document.getElementById('start-navigation-button');
+    const startNavImg = startNavButton ? startNavButton.querySelector('img') : null;
+    const mapContainer = document.getElementById('reminders-location-map-div');
+    
+    if (isNavigating) {
+         if (navigationMapInstance && navigationCurrentLocation) {
+            isFlying = true;
+            navigationFollowUser = false;
+            shouldCenterOnUser = false;
+            const targetZoom = 16.5;
+            const targetPitch = 0;
+            const targetBearing = 0;
+            markerAnimationState.targetMapZoom = targetZoom;
+            markerAnimationState.targetMapPitch = targetPitch;
+            markerAnimationState.targetMapBearing = targetBearing;
+            markerAnimationState.currentMapZoom = navigationMapInstance.getZoom();
+            markerAnimationState.currentMapPitch = navigationMapInstance.getPitch();
+            markerAnimationState.currentMapBearing = navigationMapInstance.getBearing();
+            navigationMapInstance.flyTo({ center: [navigationCurrentLocation.longitude, navigationCurrentLocation.latitude], zoom: targetZoom, pitch: targetPitch, bearing: targetBearing, duration: 1500 });
+            navigationMapInstance.once('moveend', () => { isFlying = false; });
+        }
+        
+        clearRecoveryFlag();
+        startMemoryManagement(false);
+        
+        if (isSimulatingGpsLocation) {
+            stopAutomatedRouteSimulation();
+        }
+        if (!isRecalculationStop && !isArrivalSequenceStarted) {
+            if (!document.getElementById('arrival-stats-modal') || document.getElementById('arrival-stats-modal').classList.contains('hidden')) {
+                showArrivalStatsModal();
+            }
+        }
+        isNavigating = false;
+        navigationFollowUser = false;
+        
+    } else if (isFreeDriveActive) {
+        stopFreeDrive();
+    } else {
+        const hasEnoughWaypointsForRoute = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart).length >= 2;
+        const hasRouteData = navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0];
+        if (hasEnoughWaypointsForRoute && hasRouteData) {
+            isArrivalSequenceStarted = false;
+            hideAutoStartNavigationModal();
+            clearAlternativeRoutesDisplay();
+            
+            const waypointsForRecents = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
+            await Promise.all(waypointsForRecents.map(async (wp) => {
+                if (!wp.address) {
+                    wp.address = await getAddressForWaypoint(wp.lat, wp.lng);
+                }
+            }));
+            const lastWpForName = waypointsForRecents[waypointsForRecents.length - 1];
+            const isMultiStageForName = waypointsForRecents.length > 2;
+            const suggestedName = await getSuggestedRouteName(lastWpForName.lat, lastWpForName.lng, isMultiStageForName, waypointsForRecents.length);
+            
+            let routeForStorage;
+            const finalWaypoint = waypointsForRecents[waypointsForRecents.length - 1];
 
+            if (currentRouteNameForSaving && currentRouteNameForSaving.startsWith("UBICACIÓN: ") && finalWaypoint) {
+                routeForStorage = { name: currentRouteNameForSaving, waypoints: sanitizeWaypointsForStorage([finalWaypoint]) };
+            } else {
+                routeForStorage = { name: currentRouteNameForSaving || suggestedName, waypoints: sanitizeWaypointsForStorage(waypointsForRecents) };
+            }
+            addRouteToRecents(routeForStorage);
+            
+            if (!isRecovery) {
+                clearNavigationGraph();
+                navigationWaypoints.forEach(wp => { 
+                    if(wp) { 
+                        if (wp.type === 'S' || wp.type === 'S_Recalc') { wp.visited = true; } else { wp.visited = false; }
+                    }
+                });
+                tripStartLocationForStats = navigationCurrentLocation ? { ...navigationCurrentLocation } : null;
+                navigationStartTimeForStats = new Date();
+                totalDistanceTravelledForStats = 0;
+                maxSpeedDuringTrip = 0;
+                maxSpeedCoordinates = null;
+                maxAltitudeDuringTrip = -Infinity;
+                minAltitudeDuringTrip = Infinity;
+                window.averageSpeedKmh = 0; 
+                lastPositionForStats = navigationCurrentLocation ? {...navigationCurrentLocation} : null;
+                accumulatedDeviationMs = 0;
+                accumulatedDistanceBeforeCurrentSegment = 0;
+                graphDataPoints = { speed: [], altitude: [] };
+                graphLabels = [];
+                minAverageSpeedInTrip = Infinity;
+                maxAverageSpeedInTrip = -Infinity;
+            }
 
+            // La creación de la bandera se hace siempre
+            const recoveryData = { 
+                isActive: true, 
+                route: routeForStorage,
+                tripStartTime: navigationStartTimeForStats ? navigationStartTimeForStats.getTime() : Date.now(),
+                originalTripEtaTime: originalTripEtaTime ? originalTripEtaTime.getTime() : null,
+                stats: {
+                    totalDistance: totalDistanceTravelledForStats,
+                    maxSpeed: maxSpeedDuringTrip,
+                    maxAltitude: maxAltitudeDuringTrip,
+                    minAltitude: minAltitudeDuringTrip,
+                    maxSpeedCoords: maxSpeedCoordinates
+                },
+                tripContext: {
+                    graphLabels: graphLabels || [],
+                    graphDataPoints: graphDataPoints || { speed: [], altitude: [] },
+                    minAvgSpeed: minAverageSpeedInTrip,
+                    maxAvgSpeed: maxAverageSpeedInTrip,
+                    accumulatedDeviationMs: accumulatedDeviationMs
+                }
+            };
+            localStorage.setItem('boardinggate_nav_recovery_flag', JSON.stringify(recoveryData));
+            console.log("[Navigation Start] Recovery flag has been set/re-set with trip context.");
+            
+            navigationWaypoints.forEach(wp => { if (wp && wp.marker) wp.marker.setDraggable(false); });
+            
+            getCurrentLocation(
+                (initialCoords) => { navigationCurrentLocation = initialCoords; updateInitialUserPosition(initialCoords, navigationMapInstance); },
+                (errorMsg) => { showToast(`No se pudo obtener tu ubicación inicial: ${errorMsg}. El mapa se centrará cuando el GPS esté listo.`, "warning", 5000); }
+            );
+            startGpsWatching();
+            const loadingToast = document.getElementById("gps-init-toast"); if (loadingToast) loadingToast.remove(); activeToasts = activeToasts.filter(t => t.id !== "gps-init-toast");
+            
+            isNavigating = true;
+            startMemoryManagement(true); 
+            startDeviationChecker(); 
+            mapHeaderButtonsVisible = false;
+            toggleMapHeaderRowsVisibility(false);
+            
+            const routeData = navigationCurrentRouteData.routes[0];
+            if (routeData) {
+                tripInitialDurationSec = routeData.duration;
+                tripInitialDistanceMeters = routeData.distance;
+                tripInitialOverallEtaTime = new Date(Date.now() + routeData.duration * 1000);
+                if (routeData.legs && routeData.legs.length > 0) {
+                    currentStageInitialExpectedEtaTime = new Date(Date.now() + routeData.legs[0].duration * 1000);
+                }
+                if (!isRecovery) {
+                    originalTripEtaTime = tripInitialOverallEtaTime; 
+                }
+            }
+                  
+            const toastMessage = isRecovery ? "Navegación reanudada." : "Navegación iniciada. Esperando movimiento...";
+            showToast(toastMessage, "success");
+
+            currentGraphMode = localStorage.getItem(GRAPH_STATE_KEY) || 'Desviación ETA';
+            initializeNavigationGraph();
+            const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox'); if (radaresRutaCheckbox && radaresRutaCheckbox.checked) { toggleRadaresRuta(true); }
+            const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox'); if (tareasRutaCheckbox && tareasRutaCheckbox.checked) { toggleTareasRuta(true); }
+            if (navigationMapInstance) {
+                shouldCenterOnUser = true; 
+                navigationFollowUser = true;
+                updateLocateMeButtonsUI();
+                const locateMeButton = document.getElementById('locate-me-on-reminders-map');
+                if (locateMeButton) {
+                    const locateMeImg = locateMeButton.querySelector('img');
+                    if (locateMeImg) locateMeImg.src = "PNG/DEJARSEGUIR.PNG";
+                    locateMeButton.title = "Dejar de centrar el mapa en mi posición";
+                }
+                const startCoords = navigationCurrentLocation 
+                    ? [navigationCurrentLocation.longitude, navigationCurrentLocation.latitude] 
+                    : [navigationWaypoints[0].lng, navigationWaypoints[0].lat];
+                const savedViewMode = localStorage.getItem(MAP_VIEW_MODE_KEY) || 'static';
+                const modeDetails = MAP_VIEW_MODES[Object.keys(MAP_VIEW_MODES).find(key => MAP_VIEW_MODES[key].mode === savedViewMode)] || MAP_VIEW_MODES.NORTE;
+                let pitchToUse = 0;
+                if (modeDetails.mode === 'static') {
+                    pitchToUse = 0; 
+                } else {
+                    pitchToUse = mapPitchValue; 
+                }
+                const initialFlyToOptions = { center: startCoords, zoom: 17.5, pitch: pitchToUse, essential: true, duration: 1500 };
+                if ((modeDetails.mode === 'heading' || modeDetails.mode === 'perspective') && navigationCurrentLocation && navigationCurrentLocation.heading !== null) {
+                    initialFlyToOptions.bearing = navigationCurrentLocation.heading;
+                } else {
+                    initialFlyToOptions.bearing = modeDetails.bearing;
+                }
+                navigationMapInstance.flyTo(initialFlyToOptions);
+            }
+        } else {
+            try {
+                const initialCoords = await getCurrentLocationAsync();
+                startFreeDrive(initialCoords);
+            } catch (error) {
+                showToast(`No se pudo obtener la ubicación para iniciar el modo libre: ${error.message}`, "error");
+            }
+        }
+    }
+    updateStartNavigationButtonState();
+    updateNavigationButtonColor();
+    setNavigationMapClickHandler(); 
+    actualizarContadorRadares(radaresEnRutaActual.length);
+    actualizarContadorTareas(tareasEnRutaActual.length);
+}
 
 // ===================================================================
-// NOMBRE: initiateControlledReload (VERSIÓN FINAL CON SEÑALIZACIÓN)
-// RESUMEN: Guarda el estado, establece una señal para el evento 'beforeunload'
-//          y fuerza una recarga controlada.
+// NOMBRE: restoreTripProgress (VERSIÓN CON RESTAURACIÓN DE CONTEXTO)
+// RESUMEN: Restaura el estado del viaje, incluyendo ahora los datos de la gráfica y desviación.
+// ===================================================================
+async function restoreTripProgress(recoveryInfo) {
+    if (!navigationCurrentRouteData?.routes?.[0] || !recoveryInfo || !recoveryInfo.tripStartTime) {
+        return;
+    }
+
+    try {
+        const route = navigationCurrentRouteData.routes[0];
+        
+        navigationStartTimeForStats = new Date(recoveryInfo.tripStartTime);
+        if (recoveryInfo.originalTripEtaTime) {
+            originalTripEtaTime = new Date(recoveryInfo.originalTripEtaTime);
+        }
+        
+        const originalStartWaypoint = recoveryInfo.route?.waypoints?.[0];
+        const currentCoords = await getCurrentLocationAsync();
+        
+        let recoveredDistance = 0;
+        if (!originalStartWaypoint) {
+            showToast("Punto de inicio no encontrado en recuperación. Estadísticas reiniciadas.", "warning");
+            totalDistanceTravelledForStats = 0;
+            accumulatedDistanceBeforeCurrentSegment = 0;
+        } else {
+            if (recoveryInfo.stats) {
+                totalDistanceTravelledForStats = recoveryInfo.stats.totalDistance || 0;
+                accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
+                maxSpeedDuringTrip = recoveryInfo.stats.maxSpeed || 0;
+                maxAltitudeDuringTrip = recoveryInfo.stats.maxAltitude || -Infinity;
+                minAltitudeDuringTrip = recoveryInfo.stats.minAltitude || Infinity;
+                maxSpeedCoordinates = recoveryInfo.stats.maxSpeedCoords || null;
+            }
+            lastPositionForStats = { ...currentCoords };
+        }
+        
+        if (recoveryInfo.tripContext) {
+            graphLabels = recoveryInfo.tripContext.graphLabels || [];
+            graphDataPoints = recoveryInfo.tripContext.graphDataPoints || { speed: [], altitude: [] };
+            minAverageSpeedInTrip = recoveryInfo.tripContext.minAvgSpeed ?? Infinity;
+            maxAverageSpeedInTrip = recoveryInfo.tripContext.maxAvgSpeed ?? -Infinity;
+            accumulatedDeviationMs = recoveryInfo.tripContext.accumulatedDeviationMs || 0;
+            console.log("[RECOVERY] Contexto de gráfica y desviación restaurado.");
+        }
+
+        const carPoint = turf.point([currentCoords.longitude, currentCoords.latitude]);
+        const routeLine = turf.lineString(route.geometry.coordinates);
+        const nearestPointOnRoute = turf.nearestPointOnLine(routeLine, carPoint, { units: 'meters' });
+        const carDistanceAlongRoute = nearestPointOnRoute.properties.location;
+        
+        const timeElapsedS = (Date.now() - recoveryInfo.tripStartTime) / 1000;
+        if (timeElapsedS > 0 && totalDistanceTravelledForStats > 0) {
+            window.averageSpeedKmh = (totalDistanceTravelledForStats / timeElapsedS) * 3.6;
+        }
+        lastCarDistanceAlongRouteForNavLogic = carDistanceAlongRoute;
+        
+        let cumulativeDistance = 0;
+        let legFound = false;
+        for (let i = 0; i < route.legs.length; i++) {
+            const leg = route.legs[i];
+            if (!leg || !leg.steps) continue;
+            const legTotalDistance = leg.distance || leg.steps.reduce((sum, step) => sum + (step.distance || 0), 0);
+            
+            if (carDistanceAlongRoute <= cumulativeDistance + legTotalDistance) {
+                currentLegIndexNav = i;
+                let legDistanceTraveled = 0;
+                for (let j = 0; j < leg.steps.length; j++) {
+                    const step = leg.steps[j];
+                    const stepDistance = step.distance || 0;
+                    if (carDistanceAlongRoute <= cumulativeDistance + legDistanceTraveled + stepDistance) {
+                        currentStepIndexNav = j;
+                        legFound = true;
+                        break;
+                    }
+                    legDistanceTraveled += stepDistance;
+                }
+                if (legFound) break;
+            }
+            cumulativeDistance += legTotalDistance;
+        }
+
+        updateNavigationProgressDisplay(route, carDistanceAlongRoute);
+        updateTurnByTurnDisplay(route, carDistanceAlongRoute);
+
+    } catch (error) {
+        showToast(`Error al restaurar progreso: ${error.message}. Se continuará desde el inicio.`, "error");
+        navigationStartTimeForStats = new Date();
+        totalDistanceTravelledForStats = 0;
+        accumulatedDistanceBeforeCurrentSegment = 0;
+    }
+}
+
+// ===================================================================
+// NOMBRE: initiateControlledReload (VERSIÓN CON GUARDADO DE CONTEXTO)
+// RESUMEN: Guarda el estado, incluyendo los datos de la gráfica, y recarga.
 // ===================================================================
 async function initiateControlledReload() {
     if (isPerformingControlledReload) return;
-    
-    // --> AÑADIDO: Establecer la señal ANTES de hacer nada.
     isPerformingControlledReload = true; 
 
     try {
-        showToast("Optimizando memoria... Recargando en breve.", "info", 5000, false, "mem-opt-toast");
-
         const recoveryFlagJSON = localStorage.getItem('boardinggate_nav_recovery_flag');
         if (!recoveryFlagJSON) {
-            console.error("[Controlled Reload] No se encontró bandera de recuperación. Abortando recarga.");
-            isPerformingControlledReload = false; // Permitir reintentos
+            isPerformingControlledReload = false;
             return;
         }
 
@@ -1142,8 +1426,16 @@ async function initiateControlledReload() {
         recoveryData.tripStartTime = navigationStartTimeForStats ? navigationStartTimeForStats.getTime() : Date.now();
         recoveryData.originalTripEtaTime = originalTripEtaTime ? originalTripEtaTime.getTime() : null;
 
+        recoveryData.tripContext = {
+            graphLabels: graphLabels,
+            graphDataPoints: graphDataPoints,
+            minAvgSpeed: minAverageSpeedInTrip,
+            maxAvgSpeed: maxAverageSpeedInTrip,
+            accumulatedDeviationMs: accumulatedDeviationMs
+        };
+
         localStorage.setItem('boardinggate_nav_recovery_flag', JSON.stringify(recoveryData));
-        console.log("[Controlled Reload] Estado de navegación actualizado y guardado. Recargando ahora...");
+        console.log("[Controlled Reload] Estado de navegación y contexto guardado. Recargando ahora...");
 
         setTimeout(() => {
             location.reload();
@@ -1154,14 +1446,14 @@ async function initiateControlledReload() {
         isPerformingControlledReload = false;
     }
 }
-    
+
+  
 /**
  * ===================================================================
  * NOMBRE: manageMemoryCycle (VERSIÓN MODIFICADA)
  * RESUMEN: Orquesta el ciclo de limpieza de memoria. Comprueba el uso
  */
 async function manageMemoryCycle() {
-    // 1. No hacer nada si no se está navegando o si ya se está recargando
     if (!isNavigating && !isFreeDriveActive && !automatedSimulationIntervalId) {
         return;
     }
@@ -1171,7 +1463,6 @@ async function manageMemoryCycle() {
 
     navigationMapInstance.triggerRepaint();
     
-    // 2. Comprobar el uso de memoria
     if (typeof performance !== 'undefined' && performance.memory) {
         const memoryInfo = performance.memory;
         const memoryUsageRatio = memoryInfo.usedJSHeapSize / memoryInfo.jsHeapSizeLimit;
@@ -8120,222 +8411,6 @@ function updateNavigationProgressDisplay(route, carDistanceAlongTheRoute = 0) {
     }
 }
 
-// ===================================================================
-// NOMBRE: toggleNavigationState (VERSIÓN CORREGIDA - FLAG DE RECUPERACIÓN)
-// RESUMEN: Inicia/detiene la navegación. Ahora asegura que la bandera de 
-//          recuperación se cree siempre al iniciar, sea sesión nueva o recuperada.
-// ===================================================================
-async function toggleNavigationState(isRecalculationStop = false, isRecovery = false) {
-    const startNavButton = document.getElementById('start-navigation-button');
-    const startNavImg = startNavButton ? startNavButton.querySelector('img') : null;
-    const mapContainer = document.getElementById('reminders-location-map-div');
-    
-    if (isNavigating) {
-
-         if (navigationMapInstance && navigationCurrentLocation) {
-            isFlying = true;
-            navigationFollowUser = false;
-            shouldCenterOnUser = false;
-            
-            const targetZoom = 16.5;
-            const targetPitch = 0;
-            const targetBearing = 0;
-
-            markerAnimationState.targetMapZoom = targetZoom;
-            markerAnimationState.targetMapPitch = targetPitch;
-            markerAnimationState.targetMapBearing = targetBearing;
-            markerAnimationState.currentMapZoom = navigationMapInstance.getZoom();
-            markerAnimationState.currentMapPitch = navigationMapInstance.getPitch();
-            markerAnimationState.currentMapBearing = navigationMapInstance.getBearing();
-
-            navigationMapInstance.flyTo({
-                center: [navigationCurrentLocation.longitude, navigationCurrentLocation.latitude],
-                zoom: targetZoom,
-                pitch: targetPitch,
-                bearing: targetBearing,
-                duration: 1500
-            });
-            navigationMapInstance.once('moveend', () => { isFlying = false; });
-        }
-        
-        clearRecoveryFlag();
-        startMemoryManagement(false);
-        
-        if (isSimulatingGpsLocation) {
-            stopAutomatedRouteSimulation();
-        }
-        if (!isRecalculationStop && !isArrivalSequenceStarted) {
-            if (!document.getElementById('arrival-stats-modal') || document.getElementById('arrival-stats-modal').classList.contains('hidden')) {
-                showArrivalStatsModal();
-            }
-        }
-        isNavigating = false;
-        navigationFollowUser = false;
-        
-    } else if (isFreeDriveActive) {
-        stopFreeDrive();
-    } else {
-        const hasEnoughWaypointsForRoute = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart).length >= 2;
-        const hasRouteData = navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0];
-        if (hasEnoughWaypointsForRoute && hasRouteData) {
-            isArrivalSequenceStarted = false;
-            hideAutoStartNavigationModal();
-            clearAlternativeRoutesDisplay();
-            
-            const waypointsForRecents = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
-            await Promise.all(waypointsForRecents.map(async (wp) => {
-                if (!wp.address) {
-                    wp.address = await getAddressForWaypoint(wp.lat, wp.lng);
-                }
-            }));
-            const lastWpForName = waypointsForRecents[waypointsForRecents.length - 1];
-            const isMultiStageForName = waypointsForRecents.length > 2;
-            const suggestedName = await getSuggestedRouteName(lastWpForName.lat, lastWpForName.lng, isMultiStageForName, waypointsForRecents.length);
-            
-            let routeForStorage;
-            const finalWaypoint = waypointsForRecents[waypointsForRecents.length - 1];
-
-            if (currentRouteNameForSaving && currentRouteNameForSaving.startsWith("UBICACIÓN: ") && finalWaypoint) {
-                routeForStorage = {
-                    name: currentRouteNameForSaving,
-                    waypoints: sanitizeWaypointsForStorage([finalWaypoint])
-                };
-            } else {
-                routeForStorage = { 
-                    name: currentRouteNameForSaving || suggestedName, 
-                    waypoints: sanitizeWaypointsForStorage(waypointsForRecents)
-                };
-            }
-            addRouteToRecents(routeForStorage);
-        
-            clearNavigationGraph();
-           
-            // El reseteo de estadísticas SOLO ocurre si NO es una recuperación
-            if (!isRecovery) {
-                navigationWaypoints.forEach(wp => { 
-                    if(wp) { 
-                        if (wp.type === 'S' || wp.type === 'S_Recalc') { 
-                            wp.visited = true; 
-                        } else { 
-                            wp.visited = false; 
-                        }
-                    }
-                });
-                
-                tripStartLocationForStats = navigationCurrentLocation ? { ...navigationCurrentLocation } : null;
-                navigationStartTimeForStats = new Date();
-                totalDistanceTravelledForStats = 0;
-                maxDistanceReachedOnRoute = 0;
-                speedMarkerFeatures = []; 
-                maxSpeedDuringTrip = 0;
-                maxSpeedCoordinates = null;
-                maxAltitudeDuringTrip = -Infinity;
-                minAltitudeDuringTrip = Infinity;
-                window.averageSpeedKmh = 0; 
-                lastPositionForStats = navigationCurrentLocation ? {...navigationCurrentLocation} : null;
-                accumulatedDeviationMs = 0;
-                accumulatedDistanceBeforeCurrentSegment = 0;
-            }
-
-            // <-- MOVIDO AQUÍ: La creación de la bandera ahora se hace siempre
-            const recoveryData = { 
-                isActive: true, 
-                route: routeForStorage,
-                tripStartTime: navigationStartTimeForStats ? navigationStartTimeForStats.getTime() : Date.now(),
-                originalTripEtaTime: originalTripEtaTime ? originalTripEtaTime.getTime() : null,
-                stats: {
-                    totalDistance: totalDistanceTravelledForStats,
-                    maxSpeed: maxSpeedDuringTrip,
-                    maxAltitude: maxAltitudeDuringTrip,
-                    minAltitude: minAltitudeDuringTrip,
-                    maxSpeedCoords: maxSpeedCoordinates
-                }
-            };
-            localStorage.setItem('boardinggate_nav_recovery_flag', JSON.stringify(recoveryData));
-         
-
-            navigationWaypoints.forEach(wp => {
-                if (wp && wp.marker) wp.marker.setDraggable(false);
-            })
-
-            
-            getCurrentLocation(
-                (initialCoords) => { navigationCurrentLocation = initialCoords; updateInitialUserPosition(initialCoords, navigationMapInstance); },
-                (errorMsg) => { showToast(`No se pudo obtener tu ubicación inicial: ${errorMsg}. El mapa se centrará cuando el GPS esté listo.`, "warning", 5000); }
-            );
-            startGpsWatching();
-            const loadingToast = document.getElementById("gps-init-toast"); if (loadingToast) loadingToast.remove(); activeToasts = activeToasts.filter(t => t.id !== "gps-init-toast");
-            
-            isNavigating = true;
-            startMemoryManagement(true); 
-            startDeviationChecker(); 
-            mapHeaderButtonsVisible = false;
-            toggleMapHeaderRowsVisibility(false);
-            
-            const routeData = navigationCurrentRouteData.routes[0];
-            if (routeData) {
-                tripInitialDurationSec = routeData.duration;
-                tripInitialDistanceMeters = routeData.distance;
-                tripInitialOverallEtaTime = new Date(Date.now() + routeData.duration * 1000);
-                if (routeData.legs && routeData.legs.length > 0) {
-                    currentStageInitialExpectedEtaTime = new Date(Date.now() + routeData.legs[0].duration * 1000);
-                }
-                if (!isRecovery) {
-                    originalTripEtaTime = tripInitialOverallEtaTime; 
-                }
-            }
-
-            const toastMessage = isRecovery ? "Navegación reanudada." : "Navegación iniciada. Esperando movimiento...";
-            showToast(toastMessage, "success");
-
-            currentGraphMode = localStorage.getItem(GRAPH_STATE_KEY) || 'Desviación ETA';
-            initializeNavigationGraph();
-            const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox'); if (radaresRutaCheckbox && radaresRutaCheckbox.checked) { toggleRadaresRuta(true); }
-            const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox'); if (tareasRutaCheckbox && tareasRutaCheckbox.checked) { toggleTareasRuta(true); }
-            if (navigationMapInstance) {
-                shouldCenterOnUser = true; 
-                navigationFollowUser = true;
-                updateLocateMeButtonsUI();
-                const locateMeButton = document.getElementById('locate-me-on-reminders-map');
-                if (locateMeButton) {
-                    const locateMeImg = locateMeButton.querySelector('img');
-                    if (locateMeImg) locateMeImg.src = "PNG/DEJARSEGUIR.PNG";
-                    locateMeButton.title = "Dejar de centrar el mapa en mi posición";
-                }
-                const startCoords = navigationCurrentLocation 
-                    ? [navigationCurrentLocation.longitude, navigationCurrentLocation.latitude] 
-                    : [navigationWaypoints[0].lng, navigationWaypoints[0].lat];
-                const savedViewMode = localStorage.getItem(MAP_VIEW_MODE_KEY) || 'static';
-                const modeDetails = MAP_VIEW_MODES[Object.keys(MAP_VIEW_MODES).find(key => MAP_VIEW_MODES[key].mode === savedViewMode)] || MAP_VIEW_MODES.NORTE;
-                let pitchToUse = 0;
-                if (modeDetails.mode === 'static') {
-                    pitchToUse = 0; 
-                } else {
-                    pitchToUse = mapPitchValue; 
-                }
-                const initialFlyToOptions = { center: startCoords, zoom: 17.5, pitch: pitchToUse, essential: true, duration: 1500 };
-                if ((modeDetails.mode === 'heading' || modeDetails.mode === 'perspective') && navigationCurrentLocation && navigationCurrentLocation.heading !== null) {
-                    initialFlyToOptions.bearing = navigationCurrentLocation.heading;
-                } else {
-                    initialFlyToOptions.bearing = modeDetails.bearing;
-                }
-                navigationMapInstance.flyTo(initialFlyToOptions);
-            }
-        } else {
-            try {
-                const initialCoords = await getCurrentLocationAsync();
-                startFreeDrive(initialCoords);
-            } catch (error) {
-                showToast(`No se pudo obtener la ubicación para iniciar el modo libre: ${error.message}`, "error");
-            }
-        }
-    }
-    updateStartNavigationButtonState();
-    updateNavigationButtonColor();
-    setNavigationMapClickHandler(); 
-    actualizarContadorRadares(radaresEnRutaActual.length);
-    actualizarContadorTareas(tareasEnRutaActual.length);
-}    
     
 // ===================================================================
 // NOMBRE: checkForAndExecuteCrashRecovery 
@@ -8348,8 +8423,7 @@ async function checkForAndExecuteCrashRecovery() {
     try {
         const recoveryData = JSON.parse(recoveryFlagJSON);
         if (recoveryData && recoveryData.isActive && recoveryData.route) {
-            showToast("ESPERE UN MOMENTO POR FAVOR, Recuperando sesión de navegación anterior...", "error", 11000);
-
+          
             const mainContent = document.querySelector('main'); if (mainContent) mainContent.style.display = 'none';
             const footer = document.querySelector('footer'); if (footer) footer.style.display = 'none';
             const noticesContainer = document.querySelector('.notices-icon-container'); if (noticesContainer) noticesContainer.style.display = 'none';
@@ -8487,120 +8561,6 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
     }
 }    
     
-// ===================================================================
-// NOMBRE: restoreTripProgress 
-// RESUMEN: Restaura el estado de un viaje (distancia, tiempo, stats) tras una recuperación.
-async function restoreTripProgress(recoveryInfo) {
-    if (!navigationCurrentRouteData?.routes?.[0] || !recoveryInfo || !recoveryInfo.tripStartTime) {
-        return;
-    }
-
-    try {
-        const route = navigationCurrentRouteData.routes[0];
-        
-        // 1. Restaurar datos de tiempo
-        navigationStartTimeForStats = new Date(recoveryInfo.tripStartTime);
-        if (recoveryInfo.originalTripEtaTime) {
-            originalTripEtaTime = new Date(recoveryInfo.originalTripEtaTime);
-        }
-        
-        // 2. Obtener punto de partida original y ubicación actual
-        const originalStartWaypoint = recoveryInfo.route?.waypoints?.[0];
-        const currentCoords = await getCurrentLocationAsync();
-        
-        let recoveredDistance = 0;
-
-        if (!originalStartWaypoint) {
-            showToast("Punto de inicio no encontrado en recuperación. Estadísticas reiniciadas.", "warning");
-            totalDistanceTravelledForStats = 0;
-            accumulatedDistanceBeforeCurrentSegment = 0;
-        } else {
-            // 3. CALCULAR DISTANCIA REAL RECORRIDA
-            try {
-                // 3a. INTENTO 1: Calcular la distancia real por carretera llamando a la API
-                showToast("Calculando distancia recorrida...", "info", 2000);
-                const coordsStringForDistance = `${originalStartWaypoint.lng},${originalStartWaypoint.lat};${currentCoords.longitude},${currentCoords.latitude}`;
-                const distanceResult = await fetchRouteData(coordsStringForDistance);
-                
-                if (distanceResult.routeData && distanceResult.routeData.routes[0]) {
-                    recoveredDistance = distanceResult.routeData.routes[0].distance; // Distancia en metros
-                    console.log(`[RECOVERY] Distancia real por carretera recuperada: ${(recoveredDistance / 1000).toFixed(2)} km.`);
-                } else {
-                    throw new Error("La API no devolvió una ruta para el cálculo de distancia.");
-                }
-
-            } catch (apiError) {
-                // 3b. FALLBACK: Si la API falla, calcular distancia en línea recta como emergencia
-                console.warn("[RECOVERY] Falló la API para calcular distancia recorrida, usando fallback de línea recta.", apiError);
-                showToast("No se pudo calcular la distancia exacta, se usará una estimación.", "warning");
-                recoveredDistance = calculateDistance(
-                    originalStartWaypoint.lat, 
-                    originalStartWaypoint.lng, 
-                    currentCoords.latitude, 
-                    currentCoords.longitude
-                );
-            }
-            
-            // 4. Restaurar las estadísticas con el valor calculado
-            totalDistanceTravelledForStats = recoveredDistance;
-            accumulatedDistanceBeforeCurrentSegment = recoveredDistance; // CRUCIAL para la barra de progreso
-
-            if (recoveryInfo.stats) {
-                maxSpeedDuringTrip = recoveryInfo.stats.maxSpeed || 0;
-                maxAltitudeDuringTrip = recoveryInfo.stats.maxAltitude || -Infinity;
-                minAltitudeDuringTrip = recoveryInfo.stats.minAltitude || Infinity;
-                maxSpeedCoordinates = recoveryInfo.stats.maxSpeedCoords || null;
-            }
-            lastPositionForStats = { ...currentCoords };
-        }
-        
-        // 5. Recalcular la posición en la nueva ruta y actualizar la UI
-        const carPoint = turf.point([currentCoords.longitude, currentCoords.latitude]);
-        const routeLine = turf.lineString(route.geometry.coordinates);
-        const nearestPointOnRoute = turf.nearestPointOnLine(routeLine, carPoint, { units: 'meters' });
-        const carDistanceAlongRoute = nearestPointOnRoute.properties.location;
-        
-        const timeElapsedS = (Date.now() - recoveryInfo.tripStartTime) / 1000;
-        if (timeElapsedS > 0 && totalDistanceTravelledForStats > 0) {
-            window.averageSpeedKmh = (totalDistanceTravelledForStats / timeElapsedS) * 3.6;
-        }
-        lastCarDistanceAlongRouteForNavLogic = carDistanceAlongRoute;
-        
-        let cumulativeDistance = 0;
-        let legFound = false;
-        for (let i = 0; i < route.legs.length; i++) {
-            const leg = route.legs[i];
-            if (!leg || !leg.steps) continue;
-            const legTotalDistance = leg.distance || leg.steps.reduce((sum, step) => sum + (step.distance || 0), 0);
-            
-            if (carDistanceAlongRoute <= cumulativeDistance + legTotalDistance) {
-                currentLegIndexNav = i;
-                let legDistanceTraveled = 0;
-                for (let j = 0; j < leg.steps.length; j++) {
-                    const step = leg.steps[j];
-                    const stepDistance = step.distance || 0;
-                    if (carDistanceAlongRoute <= cumulativeDistance + legDistanceTraveled + stepDistance) {
-                        currentStepIndexNav = j;
-                        legFound = true;
-                        break;
-                    }
-                    legDistanceTraveled += stepDistance;
-                }
-                if (legFound) break;
-            }
-            cumulativeDistance += legTotalDistance;
-        }
-
-        updateNavigationProgressDisplay(route, carDistanceAlongRoute);
-        updateTurnByTurnDisplay(route, carDistanceAlongRoute);
-
-    } catch (error) {
-        showToast(`Error al restaurar progreso: ${error.message}. Se continuará desde el inicio.`, "error");
-        navigationStartTimeForStats = new Date();
-        totalDistanceTravelledForStats = 0;
-        accumulatedDistanceBeforeCurrentSegment = 0; // Asegurarse de resetear en caso de error
-    }
-}
     
 // ===================================================================
 // NOMBRE: fetchAndRenderChatUsers 
