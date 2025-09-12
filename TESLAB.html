@@ -1,4 +1,4 @@
-V18
+V19
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -1536,6 +1536,56 @@ function updateTripStatistics(coords) {
         }
     }
 }
+// ===================================================================
+// NOMBRE: checkForAndExecuteCrashRecovery (MODIFICADA - INICIA LA UI)
+// RESUMEN: Lee la bandera. Si es válida, inicia la UI del mapa y la
+//          restauración, devolviendo 'true' para detener el flujo normal.
+// ===================================================================
+async function checkForAndExecuteCrashRecovery() {
+    const recoveryFlagJSON = localStorage.getItem('boardinggate_nav_recovery_flag');
+    if (!recoveryFlagJSON) {
+        return false; // No hay nada que recuperar, flujo normal.
+    }
+    
+    // Limpiamos el flag INMEDIATAMENTE para evitar bucles si algo falla.
+    clearRecoveryFlag();
+    
+    try {
+        const recoveryData = JSON.parse(recoveryFlagJSON);
+        if (recoveryData && recoveryData.isActive && recoveryData.route) {
+            
+            // Forzamos el estado visual de la app a "modo mapa"
+            // Esto es lo que faltaba: simular el estado de la UI que initializeApp haría.
+            const mainContent = document.querySelector('main'); if (mainContent) mainContent.style.display = 'none';
+            const footer = document.querySelector('footer'); if (footer) footer.style.display = 'none';
+            const noticesContainer = document.querySelector('.notices-icon-container'); if (noticesContainer) noticesContainer.style.display = 'none';
+            const gridFilter = document.getElementById('grid-filter-container'); if (gridFilter) gridFilter.style.display = 'none';
+            
+            // Aunque los botones no estén visibles, los creamos para que existan en el DOM
+            // y no den error al cerrar el mapa.
+            createOtherButtons(); 
+            document.querySelectorAll('#config-button, #personal-button, #radar-button, #home-button, #reload-button, #keyword-assignment-button, #password-toggle-button, #versions-button, #info-button').forEach(el => el.style.display = 'none');
+            const sideControls = document.querySelectorAll('.toggle-image, .toggle-sign, .scroll-toggle-button'); sideControls.forEach(el => el.style.display = 'none');
+
+
+            showToast("Recuperando sesión de navegación anterior...", "info", 5000);
+
+            // Iniciar el proceso de recuperación del mapa y la ruta
+            await openNavigationMap(true); 
+            await loadRouteFromObject(recoveryData.route, true, true, recoveryData);
+
+            return true; // Éxito: indicamos que la recuperación tomó el control.
+        }
+    } catch (e) {
+        console.error("Error al procesar el recovery flag:", e);
+        // Si hay un error, el flag ya está limpio, la app cargará normalmente.
+    }
+     
+    return false; // El flag era inválido o estaba corrupto, flujo normal.
+}
+
+
+
     
 
     
@@ -8575,46 +8625,6 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
     actualizarContadorTareas(tareasEnRutaActual.length);
 }
     
-// ===================================================================
-// NOMBRE: checkForAndExecuteCrashRecovery 
-// RESUMEN: Lee la bandera de recuperación y ahora también el `tripStartTime`, pasándolo a la función de carga.
-async function checkForAndExecuteCrashRecovery() {
-    const recoveryFlagJSON = localStorage.getItem('boardinggate_nav_recovery_flag');
-    if (!recoveryFlagJSON) {
-        return false; }
-    
-    try {
-        const recoveryData = JSON.parse(recoveryFlagJSON);
-        if (recoveryData && recoveryData.isActive && recoveryData.route) {
-            showToast("ESPERE UN MOMENTO POR FAVOR, Recuperando sesión de navegación anterior...", "error", 11000);
-
-            const mainContent = document.querySelector('main'); if (mainContent) mainContent.style.display = 'none';
-            const footer = document.querySelector('footer'); if (footer) footer.style.display = 'none';
-            const noticesContainer = document.querySelector('.notices-icon-container'); if (noticesContainer) noticesContainer.style.display = 'none';
-            const sideControls = document.querySelectorAll('.toggle-image, .toggle-sign, .scroll-toggle-button'); sideControls.forEach(el => el.style.display = 'none');
-            document.querySelectorAll('#config-button, #personal-button, #radar-button, #home-button, #reload-button, #keyword-assignment-button, #password-toggle-button, #versions-button, #info-button, #accident-alert-button').forEach(el => el.style.display = 'none');
-            const gridFilter = document.getElementById('grid-filter-container'); if (gridFilter) gridFilter.style.display = 'none';
-            
-            try {
-                await openNavigationMap(true); 
-                
-                await loadRouteFromObject(recoveryData.route, true, true, recoveryData);
-
-                return true;  
-            } catch (recoveryError) {
-                showToast("La recuperación automática falló. Cargando la app normalmente.", "error", 6000);
-                clearRecoveryFlag();
-                setTimeout(() => location.reload(), 2000);
-                return true; }
-        }
-    } catch (e) {
-    } finally {
-        clearRecoveryFlag(); 
-    }
-    clearRecoveryFlag(); 
-     
-    return false; 
-}  
 
 // ===================================================================
 // NOMBRE: loadRouteFromObject
@@ -22024,27 +22034,94 @@ function stopResourceMonitor() {
 // ===================================================================
 
 // ===================================================================
-// NOMBRE: DOMContentLoaded (MODIFICADO)
-// RESUMEN: Punto de entrada principal. Ahora espera a la sincronización pre-vuelo ANTES de inicializar la app.
+// NOMBRE: DOMContentLoaded (VERSIÓN FINAL CON PRIORIDAD DE RECUPERACIÓN)
+// RESUMEN: Punto de entrada principal. Ejecuta la comprobación de recuperación
+//          ANTES de la lógica del PIN para asegurar que la recuperación automática
+//          no sea interrumpida por la petición de la clave.
+// ===================================================================
 document.addEventListener('DOMContentLoaded', async () => {
-     // 1. precargar ubicacion coche y Realiza la comprobación y posible descarga de datos antes de hacer nada más.
-    preloadGpsLocation(); 
+    // 1. ANTES DE TODO: Sincronización y pre-carga de GPS.
+    preloadGpsLocation();
     await preflightSync();
-     
-     // 2. Una vez que el localStorage está actualizado, procede con la lógica de renderizado normal.
-     storedPin = localStorage.getItem('password_pin');
-     const savedPasswordActive = localStorage.getItem('password_active');
-     isPasswordActive = savedPasswordActive ? JSON.parse(savedPasswordActive) : false;
-     const initialDirectToNavPref = JSON.parse(localStorage.getItem(DIRECT_TO_NAVIGATION_KEY)) || false;
-     const tempPreventDirectNav = sessionStorage.getItem(TEMP_PREVENT_DIRECT_NAV_KEY);
 
-     if (isPasswordActive && storedPin && !(initialDirectToNavPref && !tempPreventDirectNav)) {
-         promptForPin();
-     } else {
-         await initializeApp();
-     }
+    // 2. COMPROBACIÓN DE RECUPERACIÓN (MÁXIMA PRIORIDAD)
+    // checkForAndExecuteCrashRecovery ahora controla si debe arrancar en modo mapa.
+    // Devuelve 'true' si ha iniciado una recuperación, 'false' si no.
+    const recoveryWasStarted = await checkForAndExecuteCrashRecovery();
 
+    // 3. SI SE INICIÓ UNA RECUPERACIÓN, SE DETIENE EL FLUJO DE ARRANQUE NORMAL.
+    // La recuperación ya ha tomado el control y ha abierto el mapa.
+    if (recoveryWasStarted) {
+        console.log("Arranque en modo recuperación. Saltando flujo normal de PIN/Grid.");
+        
+        // Asignamos listeners esenciales que no se llamarían de otra forma.
+        assignMapButtonListeners();
+        
+        // El listener 'beforeunload' es crucial para guardar el estado al cerrar.
+        window.addEventListener('beforeunload', () => {
+             if (reminderCheckIntervalId) { clearInterval(reminderCheckIntervalId); }
+             if (locationWatchId !== null && navigator.geolocation) { navigator.geolocation.clearWatch(locationWatchId); locationWatchId = null; }
+             if (editingTargetElement) { editingTargetElement.classList.remove('editing-target'); editingTargetElement = null; }
+             const openReminderModal = document.querySelector('.reminder-modal');
+             if (openReminderModal && typeof openReminderModal.cleanUpModalTimers === 'function') { openReminderModal.cleanUpModalTimers(true); }
+             Object.keys(globalModalTimers).forEach(modalId => {
+                const timerData = globalModalTimers[modalId];
+                if (timerData) {
+                    clearModalAutoCloseTimer(timerData.modalElement, timerData.closeButtonElement, modalId);
+                }
+             });
+             globalModalTimers = {};
+             const openTableModal = document.querySelector('.reminder-table-modal');
+             if(openTableModal && openTableModal.autoCloseInterval) { clearInterval(openTableModal.autoCloseInterval); }
+             const openPostponeModal = document.getElementById('postpone-options-modal');
+             if(openPostponeModal && openPostponeModal.autoPostponeInterval) { clearInterval(openPostponeModal.autoPostponeInterval); }
+             const openSavedLocationsModal = document.querySelector('.saved-locations-modal');
+             if (openSavedLocationsModal && locationPickerMap) { try { locationPickerMap.remove(); } catch(e){} locationPickerMap = null; locationPickerMarker = null; }
+             const simModalUnload = document.getElementById('simulation-modal');
+             if (simModalUnload && simulationModalTimer) clearTimeout(simulationModalTimer);
+             if (autoStartNavTimer) clearTimeout(autoStartNavTimer);
+             if (isNavigationMapActive || navigationMapInstance) {
+                closeNavigationMap(true);
+             }
+             if (locationsPreviewMap) {
+                 try { locationsPreviewMap.remove(); } catch(e){}
+                 locationsPreviewMap = null;
+             }
+             if (isAssignmentMode || isEditMode || isKeywordAssignmentMode) { saveCustomData(); }
+             const filterInput = document.getElementById('grid-filter-input');
+             if (filterInput && filterInput.value.trim()) {
+                  localStorage.setItem('gridFilterValue', filterInput.value);
+             } else {
+                  localStorage.removeItem('gridFilterValue');
+             }
+              saveSettings();
+              if (reminderModalMap) try {reminderModalMap.remove();} catch(e){}
+              Object.values(previewMaps).forEach(map => {try {map?.remove();} catch(e){}});
+              if (intersectionPreviewMap) try {intersectionPreviewMap.remove();} catch(e){}
+              if (navigationChart) navigationChart.destroy();
+              if (graphIntervalTimer) clearInterval(graphIntervalTimer);
+        });
+
+        return; // Detenemos aquí.
+    }
+
+    // 4. SI NO HUBO RECUPERACIÓN, PROCEDER CON EL FLUJO NORMAL (PIN O CARGA DIRECTA)
+    storedPin = localStorage.getItem('password_pin');
+    const savedPasswordActive = JSON.parse(localStorage.getItem('password_active') || 'false');
+    const initialDirectToNavPref = JSON.parse(localStorage.getItem(DIRECT_TO_NAVIGATION_KEY)) || false;
+    const tempPreventDirectNav = sessionStorage.getItem(TEMP_PREVENT_DIRECT_NAV_KEY);
+
+    if (savedPasswordActive && storedPin && !(initialDirectToNavPref && !tempPreventDirectNav)) {
+        // El PIN es necesario, se pide. initializeApp se llamará desde checkPin().
+        promptForPin();
+    } else {
+        // No se necesita PIN, se inicializa la app directamente.
+        await initializeApp();
+    }
+
+    // Asignamos los listeners que deben correr en el flujo normal.
     assignMapButtonListeners();
+
     document.body.addEventListener('click', function(event) {
         const target = event.target;
         const targetId = target.id || (target.closest('[id]') ? target.closest('[id]').id : null);
@@ -22196,13 +22273,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
     }
 
-    if (reminderCheckIntervalId) {
-        clearInterval(reminderCheckIntervalId); // Doble seguridad por si acaso
-    }
-    checkReminders(); // Inicia el primer ciclo inmediatamente
-    
-
-     window.addEventListener('beforeunload', () => {
+    window.addEventListener('beforeunload', () => {
          if (reminderCheckIntervalId) { clearInterval(reminderCheckIntervalId); }
          if (locationWatchId !== null && navigator.geolocation) { navigator.geolocation.clearWatch(locationWatchId); locationWatchId = null; }
          if (editingTargetElement) { editingTargetElement.classList.remove('editing-target'); editingTargetElement = null; }
@@ -22245,6 +22316,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           if (navigationChart) navigationChart.destroy();
           if (graphIntervalTimer) clearInterval(graphIntervalTimer);
      });
+
 
  <!--  SCRIPT DE GUIA -->
     
