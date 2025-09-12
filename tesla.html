@@ -1,4 +1,3 @@
-
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -521,8 +520,8 @@
 
 <div id="flashing-border-overlay" class="hidden"></div>
 
-<div id="maneuver-flashing-border-overlay" class="hidden"></div>    
-
+<div id="maneuver-flashing-border-overlay" class="hidden"></div>
+    
 <div id="chat-modal-overlay" class="hidden">
     <div id="chat-modal-content">
         <div id="chat-left-column">
@@ -551,6 +550,10 @@
         </div>
     </div>
 </div>
+    <div id="route-recovery-overlay" class="hidden">
+        <div class="recovery-spinner"></div>
+        <p class="recovery-text">Reanudando navegación...</p>
+    </div>    
     
 </div>    
     
@@ -689,7 +692,6 @@
     let lastPdrSearchResults = []; 
     let currentChargingPointsOnRoute = [];
  
-
     let tripStartLocationForStats = null; 
     let stageScrollTimeout;
     let locationsPreviewMap = null;
@@ -936,7 +938,7 @@
 
     const MAP_TERRAIN_EXAGGERATION_KEY = 'boardinggate_mapTerrainExaggeration'; 
     let mapTerrainExaggeration = 0.8; 
-    
+
     const navigationTasks = {
         CRITICAL_VISUALS: {
             id: 'CRITICAL_VISUALS',
@@ -1031,6 +1033,10 @@
     let isPitchManuallyFlattened = false; 
     let previousLegIndexForEta = 0; 
     const _turfCarPointForAnimation = turf.point([0, 0]);
+
+    let isPerformingControlledReload = false;
+    let memoryReloadThreshold = 0.20; 
+
     
     const easeInOutQuad = t => t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
    
@@ -1051,7 +1057,9 @@
         'boardinggate_map_saturation', 'boardinggate_map_contrast', 
         LERP_RATE_POS_KEY, LERP_RATE_ROT_KEY, LERP_RATE_ZOOM_KEY,
         PERFORMANCE_CAMERA_FPS_KEY, MAP_TERRAIN_EXAGGERATION_KEY, 
-        'boardinggate_announce_maneuver_flash', 'boardinggate_dynamicRadarRadius'
+        'boardinggate_announce_maneuver_flash', 
+        'boardinggate_dynamicRadarRadius',
+        'boardinggate_memory_threshold'
      ];
 
     
@@ -1088,12 +1096,701 @@
             case PERFORMANCE_CAMERA_FPS_KEY: return 'FPS Animación Cámara';  
             case MAP_TERRAIN_EXAGGERATION_KEY: return 'Exageración 3D';  
             case 'boardinggate_announce_maneuver_flash': return 'Anunciar Maniobra Destello'; 
-            case 'boardinggate_dynamicRadarRadius': return 'Radio Radares Dinámicos';    
+            case 'boardinggate_dynamicRadarRadius': return 'Radio Radares Dinámicos'; 
+            case 'boardinggate_memory_threshold': return 'Umbral Recarga Memoria';    
             default:return k;
         }
     }).join(', ');   
 
 
+
+// ===================================================================
+// NOMBRE: toggleNavigationState (VERSIÓN CON GUARDADO DE CONTEXTO)
+// RESUMEN: Inicia/detiene la navegación. Ahora crea la bandera de recuperación
+async function toggleNavigationState(isRecalculationStop = false, isRecovery = false) {
+    const startNavButton = document.getElementById('start-navigation-button');
+    const startNavImg = startNavButton ? startNavButton.querySelector('img') : null;
+    const mapContainer = document.getElementById('reminders-location-map-div');
+    
+    if (isNavigating) {
+         if (navigationMapInstance && navigationCurrentLocation) {
+            isFlying = true;
+            navigationFollowUser = false;
+            shouldCenterOnUser = false;
+            const targetZoom = 16.5;
+            const targetPitch = 0;
+            const targetBearing = 0;
+            markerAnimationState.targetMapZoom = targetZoom;
+            markerAnimationState.targetMapPitch = targetPitch;
+            markerAnimationState.targetMapBearing = targetBearing;
+            markerAnimationState.currentMapZoom = navigationMapInstance.getZoom();
+            markerAnimationState.currentMapPitch = navigationMapInstance.getPitch();
+            markerAnimationState.currentMapBearing = navigationMapInstance.getBearing();
+            navigationMapInstance.flyTo({ center: [navigationCurrentLocation.longitude, navigationCurrentLocation.latitude], zoom: targetZoom, pitch: targetPitch, bearing: targetBearing, duration: 1500 });
+            navigationMapInstance.once('moveend', () => { isFlying = false; });
+        }
+        
+        clearRecoveryFlag();
+        startMemoryManagement(false);
+        
+        if (isSimulatingGpsLocation) {
+            stopAutomatedRouteSimulation();
+        }
+        if (!isRecalculationStop && !isArrivalSequenceStarted) {
+            if (!document.getElementById('arrival-stats-modal') || document.getElementById('arrival-stats-modal').classList.contains('hidden')) {
+                showArrivalStatsModal();
+            }
+        }
+        isNavigating = false;
+        navigationFollowUser = false;
+        
+    } else if (isFreeDriveActive) {
+        stopFreeDrive();
+    } else {
+        const hasEnoughWaypointsForRoute = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart).length >= 2;
+        const hasRouteData = navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0];
+        if (hasEnoughWaypointsForRoute && hasRouteData) {
+            isArrivalSequenceStarted = false;
+            hideAutoStartNavigationModal();
+            clearAlternativeRoutesDisplay();
+            
+            const waypointsForRecents = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
+            await Promise.all(waypointsForRecents.map(async (wp) => {
+                if (!wp.address) {
+                    wp.address = await getAddressForWaypoint(wp.lat, wp.lng);
+                }
+            }));
+            const lastWpForName = waypointsForRecents[waypointsForRecents.length - 1];
+            const isMultiStageForName = waypointsForRecents.length > 2;
+            const suggestedName = await getSuggestedRouteName(lastWpForName.lat, lastWpForName.lng, isMultiStageForName, waypointsForRecents.length);
+            
+            let routeForStorage;
+            const finalWaypoint = waypointsForRecents[waypointsForRecents.length - 1];
+
+            if (currentRouteNameForSaving && currentRouteNameForSaving.startsWith("UBICACIÓN: ") && finalWaypoint) {
+                routeForStorage = { name: currentRouteNameForSaving, waypoints: sanitizeWaypointsForStorage([finalWaypoint]) };
+            } else {
+                routeForStorage = { name: currentRouteNameForSaving || suggestedName, waypoints: sanitizeWaypointsForStorage(waypointsForRecents) };
+            }
+            addRouteToRecents(routeForStorage);
+            
+            if (!isRecovery) {
+                clearNavigationGraph();
+                navigationWaypoints.forEach(wp => { 
+                    if(wp) { 
+                        if (wp.type === 'S' || wp.type === 'S_Recalc') { wp.visited = true; } else { wp.visited = false; }
+                    }
+                });
+                tripStartLocationForStats = navigationCurrentLocation ? { ...navigationCurrentLocation } : null;
+                navigationStartTimeForStats = new Date();
+                totalDistanceTravelledForStats = 0;
+                maxSpeedDuringTrip = 0;
+                maxSpeedCoordinates = null;
+                maxAltitudeDuringTrip = -Infinity;
+                minAltitudeDuringTrip = Infinity;
+                window.averageSpeedKmh = 0; 
+                lastPositionForStats = navigationCurrentLocation ? {...navigationCurrentLocation} : null;
+                accumulatedDeviationMs = 0;
+                accumulatedDistanceBeforeCurrentSegment = 0;
+                graphDataPoints = { speed: [], altitude: [] };
+                graphLabels = [];
+                minAverageSpeedInTrip = Infinity;
+                maxAverageSpeedInTrip = -Infinity;
+            }
+
+            const recoveryData = { 
+                isActive: true, 
+                route: routeForStorage,
+                tripStartTime: navigationStartTimeForStats ? navigationStartTimeForStats.getTime() : Date.now(),
+                originalTripEtaTime: originalTripEtaTime ? originalTripEtaTime.getTime() : null,
+                stats: {
+                    totalDistance: totalDistanceTravelledForStats,
+                    maxSpeed: maxSpeedDuringTrip,
+                    maxAltitude: maxAltitudeDuringTrip,
+                    minAltitude: minAltitudeDuringTrip,
+                    maxSpeedCoords: maxSpeedCoordinates
+                },
+                tripContext: {
+                    graphLabels: graphLabels || [],
+                    graphDataPoints: graphDataPoints || { speed: [], altitude: [] },
+                    minAvgSpeed: minAverageSpeedInTrip,
+                    maxAvgSpeed: maxAverageSpeedInTrip,
+                    accumulatedDeviationMs: accumulatedDeviationMs
+                }
+            };
+            localStorage.setItem('boardinggate_nav_recovery_flag', JSON.stringify(recoveryData));
+            console.log("[Navigation Start] Recovery flag has been set/re-set with trip context.");
+            
+            navigationWaypoints.forEach(wp => { if (wp && wp.marker) wp.marker.setDraggable(false); });
+            
+            getCurrentLocation(
+                (initialCoords) => { navigationCurrentLocation = initialCoords; updateInitialUserPosition(initialCoords, navigationMapInstance); },
+                (errorMsg) => { showToast(`No se pudo obtener tu ubicación inicial: ${errorMsg}. El mapa se centrará cuando el GPS esté listo.`, "warning", 5000); }
+            );
+            startGpsWatching();
+            const loadingToast = document.getElementById("gps-init-toast"); if (loadingToast) loadingToast.remove(); activeToasts = activeToasts.filter(t => t.id !== "gps-init-toast");
+            
+            isNavigating = true;
+            startMemoryManagement(true); 
+            startDeviationChecker(); 
+            mapHeaderButtonsVisible = false;
+            toggleMapHeaderRowsVisibility(false);
+            
+            const routeData = navigationCurrentRouteData.routes[0];
+            if (routeData) {
+                tripInitialDurationSec = routeData.duration;
+                tripInitialDistanceMeters = routeData.distance;
+                tripInitialOverallEtaTime = new Date(Date.now() + routeData.duration * 1000);
+                if (routeData.legs && routeData.legs.length > 0) {
+                    currentStageInitialExpectedEtaTime = new Date(Date.now() + routeData.legs[0].duration * 1000);
+                }
+                if (!isRecovery) {
+                    originalTripEtaTime = tripInitialOverallEtaTime; 
+                }
+            }
+                  
+            const toastMessage = isRecovery ? "Navegación reanudada." : "Navegación iniciada. Esperando movimiento...";
+            showToast(toastMessage, "success");
+
+            currentGraphMode = localStorage.getItem(GRAPH_STATE_KEY) || 'Desviación ETA';
+            initializeNavigationGraph();
+            const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox'); if (radaresRutaCheckbox && radaresRutaCheckbox.checked) { toggleRadaresRuta(true); }
+            const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox'); if (tareasRutaCheckbox && tareasRutaCheckbox.checked) { toggleTareasRuta(true); }
+            if (navigationMapInstance) {
+                shouldCenterOnUser = true; 
+                navigationFollowUser = true;
+                updateLocateMeButtonsUI();
+                const locateMeButton = document.getElementById('locate-me-on-reminders-map');
+                if (locateMeButton) {
+                    const locateMeImg = locateMeButton.querySelector('img');
+                    if (locateMeImg) locateMeImg.src = "PNG/DEJARSEGUIR.PNG";
+                    locateMeButton.title = "Dejar de centrar el mapa en mi posición";
+                }
+                const startCoords = navigationCurrentLocation 
+                    ? [navigationCurrentLocation.longitude, navigationCurrentLocation.latitude] 
+                    : [navigationWaypoints[0].lng, navigationWaypoints[0].lat];
+                const savedViewMode = localStorage.getItem(MAP_VIEW_MODE_KEY) || 'static';
+                const modeDetails = MAP_VIEW_MODES[Object.keys(MAP_VIEW_MODES).find(key => MAP_VIEW_MODES[key].mode === savedViewMode)] || MAP_VIEW_MODES.NORTE;
+                let pitchToUse = 0;
+                if (modeDetails.mode === 'static') {
+                    pitchToUse = 0; 
+                } else {
+                    pitchToUse = mapPitchValue; 
+                }
+                const initialFlyToOptions = { center: startCoords, zoom: 17.5, pitch: pitchToUse, essential: true, duration: 1500 };
+                if ((modeDetails.mode === 'heading' || modeDetails.mode === 'perspective') && navigationCurrentLocation && navigationCurrentLocation.heading !== null) {
+                    initialFlyToOptions.bearing = navigationCurrentLocation.heading;
+                } else {
+                    initialFlyToOptions.bearing = modeDetails.bearing;
+                }
+                navigationMapInstance.flyTo(initialFlyToOptions);
+            }
+        } else {
+            try {
+                const initialCoords = await getCurrentLocationAsync();
+                startFreeDrive(initialCoords);
+            } catch (error) {
+                showToast(`No se pudo obtener la ubicación para iniciar el modo libre: ${error.message}`, "error");
+            }
+        }
+    }
+    updateStartNavigationButtonState();
+    updateNavigationButtonColor();
+    setNavigationMapClickHandler(); 
+    actualizarContadorRadares(radaresEnRutaActual.length);
+    actualizarContadorTareas(tareasEnRutaActual.length);
+}
+
+
+// ===================================================================
+// NOMBRE: restoreTripProgress (VERSIÓN FINAL CON OCULTACIÓN DE OVERLAY)
+// RESUMEN: Restaura todo el estado del viaje y, al finalizar,
+//          oculta el overlay de carga.
+// ===================================================================
+async function restoreTripProgress(recoveryInfo) {
+    if (!navigationCurrentRouteData?.routes?.[0] || !recoveryInfo || !recoveryInfo.tripStartTime) {
+        const overlay = document.getElementById('route-recovery-overlay');
+        if (overlay) overlay.classList.add('hidden');
+        return;
+    }
+
+    try {
+        const route = navigationCurrentRouteData.routes[0];
+        
+        navigationStartTimeForStats = new Date(recoveryInfo.tripStartTime);
+        if (recoveryInfo.originalTripEtaTime) {
+            originalTripEtaTime = new Date(recoveryInfo.originalTripEtaTime);
+        }
+        
+        const currentCoords = await getCurrentLocationAsync();
+        
+        if (recoveryInfo.stats) {
+            totalDistanceTravelledForStats = recoveryInfo.stats.totalDistance || 0;
+            accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
+            maxSpeedDuringTrip = recoveryInfo.stats.maxSpeed || 0;
+            maxAltitudeDuringTrip = recoveryInfo.stats.maxAltitude || -Infinity;
+            minAltitudeDuringTrip = recoveryInfo.stats.minAltitude || Infinity;
+            maxSpeedCoordinates = recoveryInfo.stats.maxSpeedCoords || null;
+        }
+        lastPositionForStats = { ...currentCoords };
+
+        if (recoveryInfo.tripContext) {
+            graphLabels = recoveryInfo.tripContext.graphLabels || [];
+            graphDataPoints = recoveryInfo.tripContext.graphDataPoints || { speed: [], altitude: [] };
+            minAverageSpeedInTrip = recoveryInfo.tripContext.minAvgSpeed ?? Infinity;
+            maxAverageSpeedInTrip = recoveryInfo.tripContext.maxAvgSpeed ?? -Infinity;
+            accumulatedDeviationMs = recoveryInfo.tripContext.accumulatedDeviationMs || 0;
+        }
+
+        // Recalcular posición en la ruta y actualizar UI
+        const carPoint = turf.point([currentCoords.longitude, currentCoords.latitude]);
+        const routeLine = turf.lineString(route.geometry.coordinates);
+        const nearestPointOnRoute = turf.nearestPointOnLine(routeLine, carPoint, { units: 'meters' });
+        const carDistanceAlongRoute = nearestPointOnRoute.properties.location;
+        
+        const timeElapsedS = (Date.now() - recoveryInfo.tripStartTime) / 1000;
+        if (timeElapsedS > 0 && totalDistanceTravelledForStats > 0) {
+            window.averageSpeedKmh = (totalDistanceTravelledForStats / timeElapsedS) * 3.6;
+        }
+        lastCarDistanceAlongRouteForNavLogic = carDistanceAlongRoute;
+        
+        let cumulativeDistance = 0;
+        let legFound = false;
+        for (let i = 0; i < route.legs.length; i++) {
+            const leg = route.legs[i];
+            if (!leg || !leg.steps) continue;
+            const legTotalDistance = leg.distance || leg.steps.reduce((sum, step) => sum + (step.distance || 0), 0);
+            if (carDistanceAlongRoute <= cumulativeDistance + legTotalDistance) {
+                currentLegIndexNav = i;
+                let legDistanceTraveled = 0;
+                for (let j = 0; j < leg.steps.length; j++) {
+                    const step = leg.steps[j];
+                    if (carDistanceAlongRoute <= cumulativeDistance + legDistanceTraveled + (step.distance || 0)) {
+                        currentStepIndexNav = j;
+                        legFound = true;
+                        break;
+                    }
+                    legDistanceTraveled += (step.distance || 0);
+                }
+                if (legFound) break;
+            }
+            cumulativeDistance += legTotalDistance;
+        }
+
+        updateNavigationProgressDisplay(route, carDistanceAlongRoute);
+        updateTurnByTurnDisplay(route, carDistanceAlongRoute);
+        
+        if (navigationChart) {
+            updateChartData();
+        }
+
+    } catch (error) {
+        showToast(`Error al restaurar progreso: ${error.message}. Se continuará desde el inicio.`, "error");
+        navigationStartTimeForStats = new Date();
+        totalDistanceTravelledForStats = 0;
+        accumulatedDistanceBeforeCurrentSegment = 0;
+    } finally {
+        const overlay = document.getElementById('route-recovery-overlay');
+        if (overlay) {
+            setTimeout(() => {
+                overlay.classList.add('hidden');
+            }, 600);
+        }
+    }
+}
+
+// ===================================================================
+//  openNavigationMap (YA NO GESTIONA EL OVERLAY DE RECUPERACIÓN)
+// ===================================================================
+async function openNavigationMap(isRecovery = false) {
+    return new Promise(async (resolve, reject) => {
+        const { primaryId: userId } = parseUserId(localStorage.getItem('userData_userId'));
+        
+        if (userId && userId.toLowerCase() !== 'boardinggate') {
+            const toastId = "map-access-check";
+            try {
+                const adminDocRef = window.doc(window.db, "user_data", "boardinggate");
+                const userDocRef = window.doc(window.db, "user_data", userId);
+                const [adminSnap, userSnap] = await Promise.all([window.getDoc(adminDocRef), window.getDoc(userDocRef)]);
+                if (userSnap.exists() && userSnap.data().mapAccessEnabled === false) {
+                    showToast("ACCESO DENEGADO A MAPAS TEMPORALMENTE. Contacte con el administrador vía chat", "error", 5000);
+                    reject(new Error("Acceso denegado"));
+                    return;
+                }
+                let maxSessions = Infinity;
+                if (adminSnap.exists() && typeof adminSnap.data().max_monthly_sessions === 'number') {
+                    maxSessions = adminSnap.data().max_monthly_sessions;
+                }
+                let userMonthlyCount = 0;
+                if (userSnap.exists()) {
+                    const userData = userSnap.data();
+                    const now = new Date();
+                    const currentMonthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+                    if (userData.map_sessions_last_month === currentMonthStr) {
+                        userMonthlyCount = userData.map_sessions_month || 0;
+                    }
+                }
+                const existingToast = document.getElementById(toastId);
+                if (existingToast) existingToast.remove();
+                if (userMonthlyCount >= maxSessions) {
+                    showToast("HA SUPERADO EL NÚMERO MÁXIMO DE SESIONES MENSUALES DE MAPA, consulte con el administrador vía chat", "error", 10000);
+                    reject(new Error("Límite de sesiones alcanzado"));
+                    return;
+                }
+            } catch (error) {
+                const existingToast = document.getElementById(toastId);
+                if (existingToast) existingToast.remove();
+            }
+        }
+                               
+        const mainContent = document.querySelector('main'); if (mainContent) mainContent.style.display = 'none';
+        const footer = document.querySelector('footer'); if (footer) footer.style.display = 'none';
+        const noticesContainer = document.querySelector('.notices-icon-container'); if (noticesContainer) noticesContainer.style.display = 'none';
+        const sideControls = document.querySelectorAll('.toggle-image, .toggle-sign, .scroll-toggle-button'); sideControls.forEach(el => el.style.display = 'none');
+        document.querySelectorAll('#config-button, #personal-button, #radar-button, #home-button, #reload-button, #keyword-assignment-button, #password-toggle-button, #versions-button, #info-button, #accident-alert-button').forEach(el => el.style.display = 'none');
+        const gridFilter = document.getElementById('grid-filter-container'); if (gridFilter) gridFilter.style.display = 'none';
+
+        isNavigationMapActive = true;
+        sessionStorage.setItem('mapContext', 'navigation');
+        closeOtherModals('reminders-location-map-modal');
+        
+        const mapModal = document.getElementById('reminders-location-map-modal');
+        if (!mapModal) { console.error("Error crítico: El modal del mapa no se encuentra en el HTML."); isNavigationMapActive = false; reject(new Error("Modal no encontrado")); return; }
+        
+        mapModal.classList.remove('map-modal-hidden');
+        const mapActualContainer = document.getElementById('mapbox-map-actual-container');
+        
+        const radaresCheckbox = document.getElementById('radares-ruta-checkbox');
+        if (radaresCheckbox) { radaresCheckbox.checked = localStorage.getItem(RADARES_RUTA_CHECKED_KEY) === 'true'; }
+        const tareasCheckbox = document.getElementById('tareas-ruta-checkbox');
+        if (tareasCheckbox) { tareasCheckbox.checked = localStorage.getItem(TAREAS_RUTA_CHECKED_KEY) === 'true'; }
+        const mapboxCheckbox = document.getElementById('mapbox-primary-checkbox');
+        if (mapboxCheckbox) { mapboxCheckbox.checked = localStorage.getItem('boardinggate_useMapboxAsPrimary') === 'true'; }
+        
+        if (navigationMapInstance) {
+            handleLoadOrDeleteRouteClick(null);
+            setNavigationMapClickHandler();
+            setTimeout(() => { if (navigationMapInstance) navigationMapInstance.resize(); }, 520);
+            resolve();
+        } else {
+            try {
+                const savedLayerName = localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO";
+                const finalLayerName = MAP_LEGACY_NAME_MAP[savedLayerName] || savedLayerName;
+                const initialStyle = MAP_STYLES[finalLayerName] || MAP_STYLES["HÍBRIDO"];
+                
+                if (!isRecovery) { showToast("INICIALIZANDO MAPA...", "info", 0, false, "map-init-toast"); }
+      
+                navigationMapInstance = new mapboxgl.Map({
+                    container: mapActualContainer,
+                    style: initialStyle, 
+                    center: [ -97.1903, 30.3715],
+                    zoom: 2.8, pitch: 0, bearing: 0,
+                    attributionControl: false, 
+                    pixelRatio: window.devicePixelRatio || 1,
+                    maxTileCacheSize: 35,
+                    transformRequest: (url, resourceType) => ({ url: url, cache: resourceType === 'Tile' ? 'no-cache' : 'default' }),
+                    accessToken: mapboxgl.accessToken
+                });
+ 
+                if (!isRecovery) { setMapImmersiveMode(true); }
+                
+                incrementMapSessionCount();
+                mapSessionStartTime = Date.now();
+                
+                const customControls = new CustomMapControlsGroup();
+                window.mapCustomControlsInstance = customControls; 
+                navigationMapInstance.addControl(customControls, 'bottom-right');
+                
+                compassAndModeControl = new CompassAndStatsControl();
+                navigationMapInstance.addControl(compassAndModeControl, 'bottom-left');
+                
+                if (!navigationMapInstance._interactionListenersAttached) {
+                    const mapCanvas = navigationMapInstance.getCanvasContainer();
+                    let touchStartPos = null, hasMovedEnoughToDrag = false;
+                    const DRAG_THRESHOLD = 10; 
+                    const onTouchStart = (e) => {
+                        if (e.touches && e.touches.length > 1) { handleManualMapInteraction(); return; }
+                        const touch = e.touches ? e.touches[0] : e;
+                        touchStartPos = { x: touch.clientX, y: touch.clientY };
+                        hasMovedEnoughToDrag = false;
+                    };
+                    const onTouchMove = (e) => {
+                        if (hasMovedEnoughToDrag || !touchStartPos || (e.touches && e.touches.length > 1)) return;
+                        const touch = e.touches ? e.touches[0] : e;
+                        const deltaX = Math.abs(touch.clientX - touchStartPos.x);
+                        const deltaY = Math.abs(touch.clientY - touchStartPos.y);
+                        if (deltaX > DRAG_THRESHOLD || deltaY > DRAG_THRESHOLD) { hasMovedEnoughToDrag = true; handleManualMapInteraction(); }
+                    };
+                    const onTouchEnd = () => { touchStartPos = null; hasMovedEnoughToDrag = false; };
+                    mapCanvas.addEventListener('touchstart', onTouchStart, { passive: true });
+                    mapCanvas.addEventListener('touchmove', onTouchMove, { passive: true });
+                    mapCanvas.addEventListener('touchend', onTouchEnd, { passive: true });
+                    navigationMapInstance.on('pitchend', (e) => {
+                        if (e.originalEvent) { 
+                            const newPitch = navigationMapInstance.getPitch();
+                            if (Math.abs(newPitch - mapPitchValue) > 0.1) { mapPitchValue = newPitch; saveSettings(); }
+                        }
+                    });
+                    navigationMapInstance._interactionListenersAttached = true; 
+                }
+
+                navigationMapInstance.on('error', (e) => { if (e.error && e.error.message.includes("Token")) { showToast("Error de Token de Mapbox...", "error", 10000); } });
+                
+                navigationMapInstance.on('load', async function() {
+                    try {
+                        if (!intersectionPreviewMap) {
+                            const previewContainer = document.getElementById('intersection-preview-map-container');
+                            if (previewContainer) {
+                                const initialMinimapStyle = MAP_STYLES[localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO"] || MAP_STYLES["HÍBRIDO"];
+                                intersectionPreviewMap = new mapboxgl.Map({ container: previewContainer, style: initialMinimapStyle, interactive: false, attributionControl: false, zoom: 16, pitch: 50, maxTileCacheSize: 8 });
+                                intersectionPreviewMap.on('load', () => {
+                                    intersectionPreviewMap.addSource('intersection-route', { type: 'geojson', data: { type: 'Feature', geometry: { type: 'LineString', coordinates: [] } } });
+                                    intersectionPreviewMap.addLayer({ id: 'intersection-route-layer', type: 'line', source: 'intersection-route', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': '#ACD10F', 'line-width': 13 } });
+                                    const carEl = document.createElement('div'); carEl.className = 'vehicle-icon-minimap'; carEl.innerHTML = `<img src="PNG/AVANCE.PNG" alt="Coche Mini">`;
+                                    intersectionPreviewCarMarker = new mapboxgl.Marker({ element: carEl, anchor: 'center', rotationAlignment: 'viewport', rotation: -90 }).setLngLat([0, 0]).addTo(intersectionPreviewMap);
+                                    const maneuverEl = document.createElement('div'); maneuverEl.style.cssText = `width: 49px; height: 49px; background-size: contain; background-repeat: no-repeat; background-position: center;`;
+                                    intersectionPreviewManeuverMarker = new mapboxgl.Marker({ element: maneuverEl, anchor: 'center' }).setLngLat([0, 0]).addTo(intersectionPreviewMap);
+                                });
+                            }
+                        }
+                        const lockButton = document.getElementById('toggle-progress-bar-lock');
+                        if (lockButton && !lockButton.dataset.listenerAttached) { lockButton.addEventListener('click', (e) => { e.stopPropagation(); handleProgressBarLockToggle(); }); lockButton.dataset.listenerAttached = 'true'; }
+                        updateProgressBarLockIcon();
+                        const topInfoBar = document.getElementById('navigation-top-info-bar');
+                        if (topInfoBar && !topInfoBar.dataset.listenerAttached) {
+                            topInfoBar.addEventListener('click', (e) => {
+                                e.stopPropagation();
+                                if (nextManeuverStepForPreview && navigationCurrentRouteData?.routes?.[0]) { showIntersectionPreviewMap(nextManeuverStepForPreview, navigationCurrentRouteData.routes[0], true, 10000); } 
+                                else { showToast("No hay una próxima maniobra que mostrar.", "info"); }
+                            });
+                            topInfoBar.dataset.listenerAttached = 'true';
+                        }
+                        
+                        const initToast = document.getElementById("map-init-toast"); if (initToast) initToast.remove();
+
+                        await loadAndAddMapImages(navigationMapInstance);
+                        reAddCustomMapLayersAndSources(navigationMapInstance);
+                        plotRemindersOnNavigationMap();
+                        await configureMapAtmosphere();
+                        await processTrafficAlerts(); 
+
+                        if (alertRefreshInterval) clearInterval(alertRefreshInterval); 
+                        alertRefreshInterval = setInterval(processTrafficAlerts, ALERT_CHECK_INTERVAL);
+                                        
+                        navigationMapInstance.on('pitch', updateLineWidthsOnPitchChange);
+                        mapPreviousZoomLevelForPDRs = navigationMapInstance.getZoom();
+                        navigationMapInstance.on('zoomend', updateAllIconSizes);
+                        toggleMapHeaderRowsVisibility(mapHeaderButtonsVisible);
+
+                        navigationMapInstance.on('click', async (e) => {
+                            if (isAddReminderAtLocationModeActive) { handleMapClickToAddReminder(e); return; }
+                            if (isSimulatingGpsLocation) { handleSimulateGpsPositionClick(e); return; }
+                            if (isNavigating) { return; }
+                            const point = e.point; const lngLat = e.lngLat;
+                            const pdrLayers = ['pdr-simple-circle-layer', 'pdr-cards-layer-bg-halo', 'pdr-cards-layer-bg'];
+                            const pdrFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: pdrLayers });
+                            if (pdrFeatures.length > 0) { const fullPdrData = window.lastOcmApiResponse.find(p => p.ID === pdrFeatures[0].properties.ocmId); if (fullPdrData) { showChargingPointModal(fullPdrData, pdrFeatures[0].properties.index); } return; }
+                            const alertLayers = ['traffic-alerts-layer'];
+                            const alertFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: alertLayers });
+                            if (alertFeatures.length > 0) {
+                                const alertDetailsMap = { 1: 'Accidente de tráfico', 2: 'Coche averiado', 3: 'Control de tráfico / Radar', 4: 'Atasco', 5: 'Peligro indeterminado', 6: 'Carretera en mal estado', 7: 'Obras', 8: 'Vía / Carretera cerrada' };
+                                showToast(alertDetailsMap[alertFeatures[0].properties.code] || 'Alerta de tráfico', 'warning', 4000); return;
+                            }
+                            const reminderLayers = ['reminders-icons-layer', 'radar-circles-layer'];
+                            const reminderFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: reminderLayers });
+                            if (reminderFeatures.length > 0) { showReminderActionModal(reminderFeatures[0].properties.reminderId); return; }
+                            const mapboxPoiLayers = ['poi-label'];
+                            const features = navigationMapInstance.queryRenderedFeatures(point, { layers: mapboxPoiLayers });
+                            const validPoiFeature = features.find(f => f.properties && (f.properties.name || f.properties.name_en || f.properties.text));
+                            if (validPoiFeature) {
+                                const { name, name_en, text, poi_category, category, maki } = validPoiFeature.properties;
+                                const poiName = name || name_en || text;
+                                let categories = [];
+                                if (poi_category && Array.isArray(poi_category)) { categories = poi_category; } 
+                                else if (category) { categories = category.split(',').map(c => c.trim()); } 
+                                else if (maki) { categories.push(maki); }
+                                showPoiInfoModal({ properties: { name: poiName, categories: categories }, geometry: validPoiFeature.geometry });
+                            } else { addWaypoint(lngLat); }
+                        });
+                        
+                        enablePoiInteractivity(navigationMapInstance);
+                        setNavigationMapClickHandler();
+                        
+                        let currentPos = await getInitialGpsPositionForMap();
+                        
+                        setMapImmersiveMode(false);
+                        navigationFollowUser = true;
+                        shouldCenterOnUser = true;
+                        updateLocateMeButtonsUI();
+                        toggleMapControls(true);
+                        navigationCurrentLocation = currentPos;
+                        
+                        const initialViewOptions = { center: [currentPos.longitude, currentPos.latitude], zoom: 17, essential: true };
+                        const mode = mapViewMode;
+                        if (mode === 'heading' || mode === 'perspective' || mode === 'relief') { initialViewOptions.bearing = currentPos.heading || 0; }
+                        if (mode === 'perspective' || mode === 'relief') { initialViewOptions.pitch = mapPitchValue; } else { initialViewOptions.pitch = 0; }
+                        
+                        if (!isRecovery) {
+                            const globeSpinPromise = new Promise(resolve => {
+                                const startCoords = { lat: 30.3715, lng: -97.1903 }; 
+                                const endCoords = { lat: 40.3748, lng: -3.7354 };   
+                                const duration = 1800;
+                                const totalLngChange = -(360 - (endCoords.lng - startCoords.lng));
+                                const totalLatChange = endCoords.lat - startCoords.lat;
+                                const startTimestamp = performance.now();
+                                function animateSpin(timestamp) {
+                                    const progress = Math.min((timestamp - startTimestamp) / duration, 1);
+                                    const easedProgress = 1 - Math.pow(1 - progress, 3);
+                                    navigationMapInstance.setCenter([startCoords.lng + (totalLngChange * easedProgress), startCoords.lat + (totalLatChange * easedProgress)]);
+                                    if (progress < 1) { requestAnimationFrame(animateSpin); } 
+                                    else { navigationMapInstance.setCenter([endCoords.lng, endCoords.lat]); resolve(); }
+                                }
+                                requestAnimationFrame(animateSpin);
+                            });
+                            await globeSpinPromise;
+                            navigationMapInstance.jumpTo(initialViewOptions); // <-- Salto instantáneo
+                        } else {
+                            navigationMapInstance.jumpTo(initialViewOptions);
+                        }
+
+                        markerAnimationState.currentMapCenter = navigationMapInstance.getCenter();
+                        markerAnimationState.currentMapZoom = navigationMapInstance.getZoom();
+                        markerAnimationState.currentMapPitch = navigationMapInstance.getPitch();
+                        markerAnimationState.currentMapBearing = navigationMapInstance.getBearing();
+                        markerAnimationState.targetMapCenter = navigationMapInstance.getCenter();
+                        markerAnimationState.targetMapZoom = navigationMapInstance.getZoom();
+                        markerAnimationState.targetMapPitch = navigationMapInstance.getPitch();
+                        markerAnimationState.targetMapBearing = navigationMapInstance.getBearing();
+
+                        updateInitialUserPosition(currentPos, navigationMapInstance);
+                        startGpsWatching();
+                        
+                        resolve();
+                        
+                    } catch (loadError) {
+                        const overlay = document.getElementById('route-recovery-overlay');
+                        if (overlay) overlay.classList.add('hidden');
+                        showToast(`Error crítico al cargar los recursos del mapa: ${loadError.message}`, "error", 10000);
+                        reject(loadError); 
+                    }
+                });
+                
+                navigationMapInstance.on('pitch', updateVehicleIconPerspective);
+    
+            } catch (initError) {
+                 const overlay = document.getElementById('route-recovery-overlay');
+                 if (overlay) overlay.classList.add('hidden');
+                 if (mapActualContainer) mapActualContainer.innerHTML = `<div style="color:red; text-align:center; padding:20px;"><h2>Error al cargar el mapa</h2><p>${initError.message}</p></div>`;
+                 isNavigationMapActive = false;
+                 reject(initError); 
+            }
+        }
+    }); 
+}
+
+    
+// ===================================================================
+// NOMBRE: initiateControlledReload (VERSIÓN CON GUARDADO DE CONTEXTO)
+// RESUMEN: Guarda el estado, incluyendo los datos de la gráfica, y recarga.
+// ===================================================================
+async function initiateControlledReload() {
+    if (isPerformingControlledReload) return;
+    isPerformingControlledReload = true; 
+
+    try {
+        const recoveryFlagJSON = localStorage.getItem('boardinggate_nav_recovery_flag');
+        if (!recoveryFlagJSON) {
+            isPerformingControlledReload = false;
+            return;
+        }
+
+        const recoveryData = JSON.parse(recoveryFlagJSON);
+
+        recoveryData.stats = {
+            totalDistance: totalDistanceTravelledForStats,
+            maxSpeed: maxSpeedDuringTrip,
+            maxAltitude: maxAltitudeDuringTrip,
+            minAltitude: minAltitudeDuringTrip,
+            maxSpeedCoords: maxSpeedCoordinates
+        };
+        
+        recoveryData.tripStartTime = navigationStartTimeForStats ? navigationStartTimeForStats.getTime() : Date.now();
+        recoveryData.originalTripEtaTime = originalTripEtaTime ? originalTripEtaTime.getTime() : null;
+
+        recoveryData.tripContext = {
+            graphLabels: graphLabels,
+            graphDataPoints: graphDataPoints,
+            minAvgSpeed: minAverageSpeedInTrip,
+            maxAvgSpeed: maxAverageSpeedInTrip,
+            accumulatedDeviationMs: accumulatedDeviationMs
+        };
+
+        localStorage.setItem('boardinggate_nav_recovery_flag', JSON.stringify(recoveryData));
+        console.log("[Controlled Reload] Estado de navegación y contexto guardado. Recargando ahora...");
+
+        setTimeout(() => {
+            location.reload();
+        }, 1500);
+
+    } catch(e) {
+        showToast("Error crítico durante la optimización de memoria.", "error");
+        isPerformingControlledReload = false;
+    }
+}
+
+// ===================================================================
+// NOMBRE: manageMemoryCycle (VERSIÓN CON UMBRAL DINÁMICO)
+// ===================================================================
+async function manageMemoryCycle() {
+    if (!isNavigating && !isFreeDriveActive && !automatedSimulationIntervalId) {
+        return;
+    }
+    if (isPerformingControlledReload) {
+        return;
+    }
+
+    if (navigationMapInstance) {
+        navigationMapInstance.triggerRepaint();
+    }
+
+    if (typeof performance !== 'undefined' && performance.memory) {
+        const memoryInfo = performance.memory;
+        const memoryUsageRatio = memoryInfo.usedJSHeapSize / memoryInfo.jsHeapSizeLimit;
+        
+        const MEMORY_THRESHOLD = memoryReloadThreshold; 
+
+        if (memoryUsageRatio > MEMORY_THRESHOLD) {
+            showToast("Optimizando memoria...", "info", 0, false, "mem-opt-toast");
+            initiateControlledReload();
+        } else {
+            console.log(`[Memory Manager] Uso de memoria (${(memoryUsageRatio * 100).toFixed(1)}%) es aceptable (Umbral: ${MEMORY_THRESHOLD * 100}%).`);
+        }
+    } else {
+    }
+}  
+    
+    
+/**
+ * ===================================================================
+ * NOMBRE: startMemoryManagement
+ * RESUMEN: Inicia o detiene el temporizador para el ciclo de gestión de memoria.
+ * ===================================================================
+ */
+let memoryManagementInterval = null;
+function startMemoryManagement(start) {
+    if (memoryManagementInterval) {
+        clearInterval(memoryManagementInterval);
+        memoryManagementInterval = null;
+    }
+    if (start) {
+        const MEMORY_CHECK_INTERVAL_MS = 1 * 60 * 1000; 
+        setTimeout(manageMemoryCycle, 1000); 
+        memoryManagementInterval = setInterval(manageMemoryCycle, MEMORY_CHECK_INTERVAL_MS);
+    } else {
+  }
+}
+
+    
 // ===================================================================
 //  Clase MapLayerAndViewController 
 // ===================================================================
@@ -2954,8 +3651,10 @@ function saveSettings() {
     markCacheAsDirty(); 
 }
 
+
 // ===================================================================
-// NOMBRE: loadSavedSettings 
+// NOMBRE: loadSavedSettings
+// ===================================================================
 function loadSavedSettings() {
     const savedDarkMode = localStorage.getItem('darkMode');
     isDarkMode = savedDarkMode ? JSON.parse(savedDarkMode) : false;
@@ -2984,6 +3683,8 @@ function loadSavedSettings() {
  
     if (!localStorage.getItem('boardinggate_map_saturation')) localStorage.setItem('boardinggate_map_saturation', '1.6');
     if (!localStorage.getItem('boardinggate_map_contrast')) localStorage.setItem('boardinggate_map_contrast', '1.2');
+    
+    memoryReloadThreshold = parseFloat(localStorage.getItem('boardinggate_memory_threshold')) || 0.20;
     
     const savedZoomState = localStorage.getItem('zoomState');
     const zoomButtonElem = document.getElementById('zoom-button');
@@ -5544,7 +6245,6 @@ function addSlideButtonListeners(slideElement, reminder) {
 // RESUMEN: Procesa la ruta una sola vez para crear el objeto Turf LineString y las distancias acumuladas.
 function precalculateRouteStepDistances(routeData) {
     if (!routeData || !routeData.routes || !routeData.routes[0]) {
-        console.warn("[PRE-CALC] No se pudo pre-calcular: el objeto de la ruta es inválido.");
         if(routeData && routeData.routes && routeData.routes[0]) {
             delete routeData.routes[0].totalPrecalculatedDistance;
         }
@@ -5571,8 +6271,7 @@ function precalculateRouteStepDistances(routeData) {
         }
         route.totalPrecalculatedDistance = cumulativeDistance;
         window.optimizationHasFailed = false; // Marcamos como exitoso
-        console.log("[PRE-CALC] Distancias de la ruta pre-calculadas con éxito.");
-
+    
     } catch (error) {
         console.error("[PRE-CALC] Error durante el pre-cálculo de distancias:", error);
         if(routeData && routeData.routes && routeData.routes[0]) {
@@ -7547,6 +8246,483 @@ async function getInitialGpsPositionForMap() {
 }
 
 // ===================================================================
+// NOMBRE: showNavigationMapHelpModal (VERSIÓN COMPLETA Y CORREGIDA)
+// RESUMEN: Muestra el modal de ayuda/configuración del mapa con TODOS
+//          los controles, incluyendo el nuevo campo numérico para memoria.
+// ===================================================================
+function showNavigationMapHelpModal() {
+    const existingHelpModal = document.getElementById('reminders-map-help-modal-instance');
+    if (existingHelpModal) {
+        clearModalAutoCloseTimer(existingHelpModal, existingHelpModal.querySelector('#close-reminders-map-help-instance'), 'reminders-map-help-modal-instance');
+        existingHelpModal.remove();
+    }
+
+    const helpModal = document.createElement('div');
+    helpModal.id = 'reminders-map-help-modal-instance';
+    helpModal.className = 'help-modal';
+    helpModal.setAttribute('aria-label', 'Ayuda Mapa de Navegación/Radares');
+    
+    const LERP_RATE_POS_KEY = 'boardinggate_lerp_rate_position';
+    const LERP_RATE_ROT_KEY = 'boardinggate_lerp_rate_rotation';
+    const LERP_RATE_ZOOM_KEY = 'boardinggate_lerp_rate_zoom';
+
+    const currentLerpPosition = localStorage.getItem(LERP_RATE_POS_KEY) || '0.004';
+    const currentLerpRotation = localStorage.getItem(LERP_RATE_ROT_KEY) || '0.001';
+    const currentLerpZoom = localStorage.getItem(LERP_RATE_ZOOM_KEY) || '0.001';
+    
+    helpModal.innerHTML = `
+        <style>
+            #reminders-map-help-modal-instance h3 { color: #87CEEB; margin-top: 1.2rem; margin-bottom: 0.5rem; border-bottom: 1px solid #444; padding-bottom: 4px;}
+            #reminders-map-help-modal-instance ul { list-style-position: inside; padding-left: 0.5rem; }
+            #reminders-map-help-modal-instance li { margin-bottom: 0.5rem; }
+            #reminders-map-help-modal-instance .icon-in-text { height: 1.4em; display: inline; vertical-align: middle; margin: 0 4px; padding: 2px; border-radius: 4px; background: rgba(255,255,255,0.1);}
+            #reminders-map-help-modal-instance .icon-in-text.circle { border-radius: 50%; }
+            .visual-settings-container { background-color: rgba(255,255,255,0.05); padding: 15px; border-radius: 8px; margin-top: 10px; flex-grow: 1;}
+            .slider-control { display: flex; align-items: center; gap: 15px; margin-bottom: 10px; }
+            .slider-control label { flex-shrink: 0; text-align: right; font-weight: bold; color: #a0a0a0; }
+            .slider-control .value-display { width: 90px; flex-shrink: 0; font-weight: bold; color: #f0f0f0; text-align: left; }
+            .slider-control > input[type="range"] { flex-grow: 1; }
+            .reset-visuals-btn { background-color: #0838a3; color: white; padding: 4px 8px; border:none; border-radius: 5px; cursor: pointer; margin-top: 5px; }
+            .slider-input-wrapper { display: flex; align-items: center; gap: 8px; flex-grow: 1; }
+            .slider-input-wrapper input[type="range"] { flex-grow: 1; }
+            .slider-btn {
+                flex-shrink: 0; width: 28px; height: 28px;
+                background-color: #0838a3; color: white;
+                border: 1px solid #777; border-radius: 50%;
+                cursor: pointer; font-size: 20px; font-weight: bold;
+                line-height: 26px; text-align: center;
+                padding: 0; user-select: none;
+            }
+            .slider-btn:active { background-color: #777; transform: scale(0.95); }
+            .lerp-help-text { font-size: 0.8rem; color: #b0b0b0; margin-top: 10px; text-align: center; font-style: italic; }
+            .two-column-layout { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1rem; }
+            .two-column-layout > div { display: flex; flex-direction: column; }
+            .settings-checkbox-label {display: flex; align-items: center; cursor: pointer; font-size: 1rem; user-select: none;}
+            .settings-checkbox-label input {width: 1.2rem; height: 1.2rem; margin-right: 10px; flex-shrink: 0;}
+            .settings-checkbox-label span {font-weight: bold; color: #a0a0a0;}
+            .memory-input-control { display: flex; align-items: center; gap: 10px; margin-bottom: 15px; border-top: 1px solid #444; padding-top: 15px; }
+            .memory-input-control label { white-space: normal; text-align: left; color: #a0a0a0; font-weight: bold; flex-grow: 1; }
+            .memory-input-control input[type="number"] { width: 70px; text-align: center; background-color: #3a3a3c; border: 1px solid #555; color: #f0f0f0; border-radius: 4px; padding: 4px; font-size: 1rem; -moz-appearance: textfield; }
+            .memory-input-control input[type="number"]::-webkit-outer-spin-button, .memory-input-control input[type="number"]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+        </style>
+
+        <h2 class="text-xl font-bold mb-4">Ayuda del Mapa de Navegación</h2>
+        <div class="modal-top-buttons" style="justify-content: flex-end;">
+            <button type="button" id="close-reminders-map-help-instance" style="flex: 0 1 auto; min-width: 120px;">Entendido</button>
+        </div>
+        <div style="max-height: 70vh; overflow-y: auto; padding-right: 15px;">
+            
+            <h3><img src="https://boardinggate.github.io/Tesla/PNG/personal.png" class="icon-in-text"> Ajustes Visuales y Suavizado</h3>
+            <div class="two-column-layout">
+                <div>
+                    <div class="visual-settings-container">
+                        <div class="slider-control">
+                            <label for="map-saturation-slider">Saturación:</label>
+                            <input type="range" id="map-saturation-slider" min="0.5" max="2" step="0.01">
+                            <span id="map-saturation-value" class="value-display"></span>
+                        </div>
+                        <div class="slider-control">
+                            <label for="map-contrast-slider">Contraste:</label>
+                            <input type="range" id="map-contrast-slider" min="0.5" max="2" step="0.01">
+                            <span id="map-contrast-value" class="value-display"></span>
+                        </div>
+                        <div class="slider-control">
+                            <label for="map-exaggeration-slider">Desnivel 3D:</label>
+                            <input type="range" id="map-exaggeration-slider" min="0" max="3" step="0.01">
+                            <span id="map-exaggeration-value" class="value-display"></span>
+                        </div>
+                        <button id="map-visuals-reset-btn" class="reset-visuals-btn">Valores óptimos</button>
+                        <div class="visual-settings-container" style="margin-top: 10px; padding: 10px; text-align: left;">
+                             <label for="direct-to-nav-checkbox-map-help" class="settings-checkbox-label">
+                                 <input type="checkbox" id="direct-to-nav-checkbox-map-help">
+                                 <span>Entrar directamente al Navegador</span>
+                             </label>
+                             <label for="announce-maneuver-flash-checkbox" class="settings-checkbox-label" style="margin-top: 10px;">
+                                 <input type="checkbox" id="announce-maneuver-flash-checkbox">
+                                 <span>Anunciar maniobra con destello</span>
+                             </label>
+                             <div class="slider-control" style="margin-top: 15px; border-top: 1px solid #444; padding-top: 15px;">
+                                <label for="dynamic-radar-radius-slider">Radio Radares Dinámicos:</label>
+                                <input type="range" id="dynamic-radar-radius-slider" min="50" max="2000" step="10">
+                                <span id="dynamic-radar-radius-value" class="value-display"></span>
+                             </div>
+                        </div>
+                    </div>
+                </div>
+                <div>
+                    <div class="visual-settings-container">
+                        <div class="slider-control">
+                            <label for="lerp-position-slider" title="SUAVIZADO MOV.LATERAL MAPA:">Movimiento Lateral:</label>
+                            <input type="range" id="lerp-position-slider" min="0.0001" max="0.02" step="0.0001" value="${currentLerpPosition}">
+                            <span id="lerp-position-value" class="value-display">${parseFloat(currentLerpPosition).toFixed(4)}</span>
+                        </div>
+                        <div class="slider-control">
+                            <label for="lerp-rotation-slider" title="SUAVIZADO ROTACIONES:">Rotaciones:</label>
+                            <input type="range" id="lerp-rotation-slider" min="0.0001" max="0.02" step="0.0001" value="${currentLerpRotation}">
+                            <span id="lerp-rotation-value" class="value-display">${parseFloat(currentLerpRotation).toFixed(4)}</span>
+                        </div>
+                        <div class="slider-control">
+                            <label for="lerp-zoom-slider" title="SUAVIZADO INCLINACIÓN">Zoom e Inclinación:</label>
+                            <input type="range" id="lerp-zoom-slider" min="0.0001" max="0.02" step="0.0001" value="${currentLerpZoom}">
+                            <span id="lerp-zoom-value" class="value-display">${parseFloat(currentLerpZoom).toFixed(4)}</span>
+                        </div>
+                        <button id="lerp-reset-btn" class="reset-visuals-btn">Valores óptimos</button>
+                        <p class="lerp-help-text">(*) Valor Mayor = Movimientos más bruscos y rápidos. Valor Menor = Más suaves y lentos.</p>
+                    </div>
+                </div>
+            </div>
+
+            <h3><img src="https://boardinggate.github.io/Tesla/PNG/config.jpg" class="icon-in-text"> Ajuste de Rendimiento (Navegación)</h3>
+            <div class="visual-settings-container">
+                <p style="font-size: 0.9rem; margin-bottom: 15px;">Ajusta la frecuencia de actualización para optimizar el rendimiento. Un número más alto significa que la tarea se ejecuta con menos frecuencia (mejor rendimiento, menos actualizaciones). Un número más bajo es más "en tiempo real" pero consume más recursos.</p>
+                <div class="slider-control">
+                    <label for="gps-hz-display" style="color: #f0f0f0;">GPS Ticks/seg:</label>
+                    <span id="gps-hz-display" class="value-display" style="text-align: left;">Calculando...</span>
+                </div>
+                <div class="slider-control">
+                    <label for="camera-fps-slider">Animación Cámara FPS:</label>
+                    <div class="slider-input-wrapper">
+                        <button type="button" class="slider-btn minus" data-target="camera-fps-slider">-</button>
+                        <button type="button" class="slider-btn plus" data-target="camera-fps-slider">+</button>
+                        <input type="range" id="camera-fps-slider" min="15" max="60" step="1">
+                    </div>
+                    <span id="camera-fps-value" class="value-display"></span>
+                </div>
+                <div class="slider-control">
+                    <label for="ratio-critical-update-slider">Procesos Críticos.........:</label>
+                    <div class="slider-input-wrapper">
+                        <button type="button" class="slider-btn minus" data-target="ratio-critical-update-slider">-</button>
+                        <button type="button" class="slider-btn plus" data-target="ratio-critical-update-slider">+</button>
+                        <input type="range" id="ratio-critical-update-slider" min="1" max="100" step="1">
+                    </div>
+                    <span id="ratio-critical-update-value" class="value-display"></span>
+                </div>
+                <div class="slider-control">
+                    <label for="ratio-route-progress-slider">Progreso Ruta..............:</label>
+                     <div class="slider-input-wrapper">
+                        <button type="button" class="slider-btn minus" data-target="ratio-route-progress-slider">-</button>
+                        <button type="button" class="slider-btn plus" data-target="ratio-route-progress-slider">+</button>
+                        <input type="range" id="ratio-route-progress-slider" min="1" max="200" step="1">
+                    </div>
+                    <span id="ratio-route-progress-value" class="value-display"></span>
+                </div>
+                <div class="slider-control">
+                    <label for="ratio-traffic-alerts-slider">Alertas Tráfico.............:</label>
+                    <div class="slider-input-wrapper">
+                        <button type="button" class="slider-btn minus" data-target="ratio-traffic-alerts-slider">-</button>
+                        <button type="button" class="slider-btn plus" data-target="ratio-traffic-alerts-slider">+</button>
+                        <input type="range" id="ratio-traffic-alerts-slider" min="1" max="1000" step="1">
+                    </div>
+                    <span id="ratio-traffic-alerts-value" class="value-display"></span>
+                </div>
+                <div class="slider-control">
+                    <label for="ratio-trip-stats-slider">Estadísticas.................:</label>
+                    <div class="slider-input-wrapper">
+                        <button type="button" class="slider-btn minus" data-target="ratio-trip-stats-slider">-</button>
+                        <button type="button" class="slider-btn plus" data-target="ratio-trip-stats-slider">+</button>
+                        <input type="range" id="ratio-trip-stats-slider" min="1" max="1000" step="1">
+                    </div>
+                    <span id="ratio-trip-stats-value" class="value-display"></span>
+                </div>
+                <div class="slider-control">
+                    <label for="ratio-performance-graph-slider">Gráfica.........................:</label>
+                    <div class="slider-input-wrapper">
+                        <button type="button" class="slider-btn minus" data-target="ratio-performance-graph-slider">-</button>
+                        <button type="button" class="slider-btn plus" data-target="ratio-performance-graph-slider">+</button>
+                        <input type="range" id="ratio-performance-graph-slider" min="1" max="1000" step="1">
+                    </div>
+                    <span id="ratio-performance-graph-value" class="value-display"></span>
+                </div>
+                <button id="perf-ratios-reset-btn" class="reset-visuals-btn">Valores óptimos</button>
+                <div class="visual-settings-container" style="margin-top: 10px; text-align: left;">
+                     <div class="memory-input-control">
+                         <label for="memory-threshold-input">Prevenir cuelgue al llegar la memoria al (%):</label>
+                         <input type="number" id="memory-threshold-input" min="10" max="100" step="5">
+                     </div>
+                    <label for="monitor-resources-checkbox-map" class="settings-checkbox-label">
+                        <input type="checkbox" id="monitor-resources-checkbox-map">
+                        <span>Activar Monitor de Recursos (Memoria/FPS)</span>
+                    </label>
+                    <p style="font-size: 0.8rem; margin-left: 32px; color: #ff9500;">No dejar activado permanentemente, consume recursos adicionales.</p>
+                </div>
+            </div>
+        </div>
+    `;
+    
+    document.body.appendChild(helpModal); 
+    const mapModal = document.getElementById('reminders-location-map-modal');
+    if (mapModal) {
+        mapModal.style.zIndex = 6400;
+    }
+ 
+    const announceFlashCheckbox = helpModal.querySelector('#announce-maneuver-flash-checkbox');
+    if (announceFlashCheckbox) {
+        announceFlashCheckbox.checked = announceManeuverWithFlash;
+        announceFlashCheckbox.addEventListener('change', () => {
+            announceManeuverWithFlash = announceFlashCheckbox.checked;
+            localStorage.setItem('boardinggate_announce_maneuver_flash', JSON.stringify(announceManeuverWithFlash));
+            markCacheAsDirty();
+            showToast(`Anuncio de maniobra por destello ${announceManeuverWithFlash ? 'ACTIVADO' : 'DESACTIVADO'}.`, 'info');
+        });
+    }
+ 
+    const directToNavCheckboxMapHelp = helpModal.querySelector('#direct-to-nav-checkbox-map-help');
+    if (directToNavCheckboxMapHelp) {
+        directToNavCheckboxMapHelp.checked = JSON.parse(localStorage.getItem(DIRECT_TO_NAVIGATION_KEY)) || false;
+        directToNavCheckboxMapHelp.addEventListener('change', () => {
+            const isChecked = directToNavCheckboxMapHelp.checked;
+            localStorage.setItem(DIRECT_TO_NAVIGATION_KEY, JSON.stringify(isChecked));
+            markCacheAsDirty();
+            showToast(`Inicio directo al navegador ${isChecked ? 'ACTIVADO' : 'DESACTIVADO'}.`, 'info');
+        });
+    }
+    
+    const setupLerpSlider = (sliderId, valueId, storageKey) => {
+        const slider = helpModal.querySelector(`#${sliderId}`);
+        const valueDisplay = helpModal.querySelector(`#${valueId}`);
+        if (!slider || !valueDisplay) return;
+        slider.addEventListener('input', () => {
+            const val = slider.value;
+            valueDisplay.textContent = parseFloat(val).toFixed(4);
+            localStorage.setItem(storageKey, val);
+            loadAndCacheLerpSettings(); 
+            markCacheAsDirty();
+         });
+    };
+    setupLerpSlider('lerp-position-slider', 'lerp-position-value', LERP_RATE_POS_KEY);
+    setupLerpSlider('lerp-rotation-slider', 'lerp-rotation-value', LERP_RATE_ROT_KEY);
+    setupLerpSlider('lerp-zoom-slider', 'lerp-zoom-value', LERP_RATE_ZOOM_KEY);
+
+    const lerpResetBtn = helpModal.querySelector('#lerp-reset-btn');
+    lerpResetBtn.addEventListener('click', () => {
+        const defaults = { 'lerp-position-slider': '0.004', 'lerp-rotation-slider': '0.001', 'lerp-zoom-slider': '0.001' };
+        for (const sliderId in defaults) {
+            const slider = helpModal.querySelector(`#${sliderId}`);
+            if (slider) { slider.value = defaults[sliderId]; slider.dispatchEvent(new Event('input')); }
+        }
+     });
+
+    const monitorCheckboxMap = helpModal.querySelector('#monitor-resources-checkbox-map');
+    if (monitorCheckboxMap) {
+        monitorCheckboxMap.checked = isMonitoring;
+        monitorCheckboxMap.addEventListener('change', () => {
+            if (monitorCheckboxMap.checked) { startResourceMonitor(); showToast('Monitor de recursos ACTIVADO.', 'info'); } 
+            else { stopResourceMonitor(); showToast('Monitor de recursos DESACTIVADO.', 'info'); }
+        });
+    }
+
+    helpModal.addEventListener('click', (e) => {
+        if (e.target.classList.contains('slider-btn')) {
+            e.preventDefault(); 
+            const targetSliderId = e.target.dataset.target;
+            const slider = helpModal.querySelector(`#${targetSliderId}`);
+            if (slider) {
+                if (e.target.classList.contains('minus')) { slider.stepDown(); } 
+                else { slider.stepUp(); }
+                slider.dispatchEvent(new Event('input'));
+            }
+        }
+    });
+
+    const gpsHzDisplay = helpModal.querySelector('#gps-hz-display');
+    let baseFrequency = 0;
+    
+    const cameraFpsSlider = helpModal.querySelector('#camera-fps-slider');
+    const cameraFpsValue = helpModal.querySelector('#camera-fps-value');
+    if (cameraFpsSlider && cameraFpsValue) {
+        const savedFps = parseInt(localStorage.getItem(PERFORMANCE_CAMERA_FPS_KEY)) || 30;
+        cameraFpsSlider.value = savedFps;
+        cameraFpsValue.textContent = `${savedFps} FPS`;
+        cameraFpsSlider.addEventListener('input', () => {
+            const fps = parseInt(cameraFpsSlider.value);
+            cameraFpsValue.textContent = `${fps} FPS`;
+            MAP_UPDATE_INTERVAL_MS = 1000 / fps; 
+            localStorage.setItem(PERFORMANCE_CAMERA_FPS_KEY, fps);
+            markCacheAsDirty();
+        });
+    }
+
+    const sliders = [
+        { id: 'ratio-critical-update-slider', valueId: 'ratio-critical-update-value', key: PERFORMANCE_RATIO_CRITICAL_KEY, default: 3, name: 'criticalUpdate' },
+        { id: 'ratio-route-progress-slider', valueId: 'ratio-route-progress-value', key: PERFORMANCE_RATIO_ROUTE_KEY, default: 30, name: 'routeProgress' },
+        { id: 'ratio-traffic-alerts-slider', valueId: 'ratio-traffic-alerts-value', key: PERFORMANCE_RATIO_ALERTS_KEY, default: 300, name: 'trafficAlerts' },
+        { id: 'ratio-trip-stats-slider', valueId: 'ratio-trip-stats-value', key: PERFORMANCE_RATIO_STATS_KEY, default: 32, name: 'tripStats' },
+        { id: 'ratio-performance-graph-slider', valueId: 'ratio-performance-graph-value', key: PERFORMANCE_RATIO_GRAPH_KEY, default: 70, name: 'performanceGraph' }
+    ];
+
+    const updateAllIntervalDisplays = () => {
+        if (baseFrequency > 0) {
+            sliders.forEach(sliderConfig => {
+                const slider = helpModal.querySelector(`#${sliderConfig.id}`);
+                const valueDisplay = helpModal.querySelector(`#${sliderConfig.valueId}`);
+                if (slider && valueDisplay) {
+                    const ratio = parseInt(slider.value);
+                    const intervalMs = Math.round((ratio / baseFrequency) * 1000);
+                    valueDisplay.textContent = `${ratio} (~${intervalMs} ms)`;
+                }
+            });
+        } else {
+            sliders.forEach(sliderConfig => {
+                const slider = helpModal.querySelector(`#${sliderConfig.id}`);
+                const valueDisplay = helpModal.querySelector(`#${sliderConfig.valueId}`);
+                if (slider && valueDisplay) {
+                    valueDisplay.textContent = `${slider.value} (~? ms)`;
+                }
+            });
+        }
+    };
+
+    const setupRatioSlider = (config) => {
+        const slider = helpModal.querySelector(`#${config.id}`);
+        const valueDisplay = helpModal.querySelector(`#${config.valueId}`);
+        if (!slider || !valueDisplay) return;
+        slider.value = localStorage.getItem(config.key) || config.default;
+        performanceRatios[config.name] = parseInt(slider.value);
+        slider.addEventListener('input', () => {
+            const val = slider.value;
+            localStorage.setItem(config.key, val);
+            markCacheAsDirty(); 
+            performanceRatios[config.name] = parseInt(val);
+            updateAllIntervalDisplays();
+        });
+    };
+    
+    sliders.forEach(setupRatioSlider);
+    
+    if (gpsHzDisplay) {
+        if (gpsHzMonitor.interval) clearInterval(gpsHzMonitor.interval);
+        gpsHzMonitor.interval = setInterval(() => {
+            if (document.body.contains(gpsHzDisplay)) {
+                if (isSimulatingGpsLocation) {
+                    baseFrequency = (1000 / SIMULATION_TICK_INTERVAL_MS);
+                    gpsHzDisplay.textContent = `SIM (~${baseFrequency.toFixed(1)})`;
+                } else {
+                    baseFrequency = gpsHzMonitor.ticks;
+                    gpsHzDisplay.textContent = `${baseFrequency.toFixed(1)}`;
+                    gpsHzMonitor.ticks = 0;
+                }
+                updateAllIntervalDisplays();
+            } else {
+                clearInterval(gpsHzMonitor.interval);
+                gpsHzMonitor.interval = null;
+            }
+        }, 1000);
+    }
+
+    const perfResetBtn = helpModal.querySelector('#perf-ratios-reset-btn');
+    perfResetBtn.addEventListener('click', () => {
+        const teslaYearStr = localStorage.getItem('userData_teslaYear');
+        const teslaYear = parseInt(teslaYearStr, 10);
+        const defaultsNewerCars = { cameraFps: 30, criticalUpdate: 3, routeProgress: 30, trafficAlerts: 300, tripStats: 32, performanceGraph: 70 };
+        const defaultsOlderCars = { cameraFps: 25, criticalUpdate: 4, routeProgress: 40, trafficAlerts: 350, tripStats: 50, performanceGraph: 100 };
+        let defaultsToApply = (isNaN(teslaYear) || teslaYear >= 2021) ? defaultsNewerCars : defaultsOlderCars;
+        if (cameraFpsSlider) {
+            cameraFpsSlider.value = defaultsToApply.cameraFps;
+            cameraFpsSlider.dispatchEvent(new Event('input'));
+        }
+        sliders.forEach(config => {
+            const slider = document.getElementById(config.id);
+            if (slider && defaultsToApply.hasOwnProperty(config.name)) {
+                slider.value = defaultsToApply[config.name];
+                slider.dispatchEvent(new Event('input'));
+            }
+        });
+        showToast("Valores restaurados por defecto.", 'success');
+    });
+
+    const memoryThresholdInput = helpModal.querySelector('#memory-threshold-input');
+    if (memoryThresholdInput) {
+        memoryThresholdInput.value = Math.round(memoryReloadThreshold * 100);
+        memoryThresholdInput.addEventListener('change', () => {
+            let value = parseInt(memoryThresholdInput.value, 10);
+            if (isNaN(value) || value < 10 || value > 100) {
+                showToast("El umbral debe estar entre 10 y 100.", "warning");
+                memoryThresholdInput.value = Math.round(memoryReloadThreshold * 100);
+                return;
+            }
+            memoryReloadThreshold = value / 100.0;
+            localStorage.setItem('boardinggate_memory_threshold', memoryReloadThreshold);
+            markCacheAsDirty();
+            showToast(`Umbral de recarga de memoria guardado al ${value}%.`, 'success');
+        });
+    }
+
+    const saturationSlider = helpModal.querySelector('#map-saturation-slider');
+    const contrastSlider = helpModal.querySelector('#map-contrast-slider');
+    const exaggerationSlider = helpModal.querySelector('#map-exaggeration-slider'); 
+    const saturationValue = helpModal.querySelector('#map-saturation-value');
+    const contrastValue = helpModal.querySelector('#map-contrast-value');
+    const exaggerationValue = helpModal.querySelector('#map-exaggeration-value'); 
+    const resetButton = helpModal.querySelector('#map-visuals-reset-btn');
+    const updateVisualLabels = () => {
+        saturationValue.textContent = `${Math.round(saturationSlider.value * 100)}%`;
+        contrastValue.textContent = `${Math.round(contrastSlider.value * 100)}%`;
+        exaggerationValue.textContent = `${parseFloat(exaggerationSlider.value).toFixed(2)}x`; 
+    };
+    saturationSlider.value = getComputedStyle(document.documentElement).getPropertyValue('--map-saturation').trim() || '1.6';
+    contrastSlider.value = getComputedStyle(document.documentElement).getPropertyValue('--map-contrast').trim() || '1.15';
+    exaggerationSlider.value = mapTerrainExaggeration; 
+    updateVisualLabels();
+    saturationSlider.addEventListener('input', () => {
+        document.documentElement.style.setProperty('--map-saturation', saturationSlider.value);
+        localStorage.setItem('boardinggate_map_saturation', saturationSlider.value);
+        markCacheAsDirty(); updateVisualLabels();
+    });
+    contrastSlider.addEventListener('input', () => {
+        document.documentElement.style.setProperty('--map-contrast', contrastSlider.value);
+        localStorage.setItem('boardinggate_map_contrast', contrastSlider.value);
+        updateVisualLabels(); markCacheAsDirty();
+    });
+    exaggerationSlider.addEventListener('input', async () => {
+        mapTerrainExaggeration = parseFloat(exaggerationSlider.value);
+        saveSettings(); await configureMapAtmosphere(); updateVisualLabels();
+    });
+    resetButton.addEventListener('click', () => {
+        saturationSlider.value = '1.6';
+        contrastSlider.value = '1.2';
+        exaggerationSlider.value = '0.8'; 
+        saturationSlider.dispatchEvent(new Event('input'));
+        contrastSlider.dispatchEvent(new Event('input'));
+        exaggerationSlider.dispatchEvent(new Event('input')); 
+        showToast('Ajustes visuales restaurados.', 'info');
+    });
+
+    const DYNAMIC_RADAR_RADIUS_KEY = 'boardinggate_dynamicRadarRadius';
+    const radarRadiusSlider = helpModal.querySelector('#dynamic-radar-radius-slider');
+    const radarRadiusValue = helpModal.querySelector('#dynamic-radar-radius-value');
+    if (radarRadiusSlider && radarRadiusValue) {
+        const savedRadius = parseInt(localStorage.getItem(DYNAMIC_RADAR_RADIUS_KEY)) || 400;
+        radarRadiusSlider.value = savedRadius;
+        radarRadiusValue.textContent = `${savedRadius} m`;
+        radarRadiusSlider.addEventListener('input', () => {
+            const radius = parseInt(radarRadiusSlider.value);
+            radarRadiusValue.textContent = `${radius} m`;
+            localStorage.setItem(DYNAMIC_RADAR_RADIUS_KEY, radius);
+            markCacheAsDirty();
+        });
+        resetButton.addEventListener('click', () => {
+            const defaultRadius = 400;
+            radarRadiusSlider.value = defaultRadius;
+            radarRadiusValue.textContent = `${defaultRadius} m`;
+            localStorage.setItem(DYNAMIC_RADAR_RADIUS_KEY, defaultRadius);
+            markCacheAsDirty();
+        });
+    }
+   
+    const closeButtonHelp = helpModal.querySelector('#close-reminders-map-help-instance');
+    const closeHandlerHelp = () => { 
+        if(gpsHzMonitor.interval) clearInterval(gpsHzMonitor.interval);
+        gpsHzMonitor.interval = null;
+        clearModalAutoCloseTimer(helpModal, closeButtonHelp, 'reminders-map-help-modal-instance'); 
+        if (helpModal.parentNode) helpModal.remove(); 
+        if (mapModal) mapModal.style.zIndex = '';
+    };
+    
+    closeButtonHelp.addEventListener('click', closeHandlerHelp); 
+    addModalAutoCloseTimer(helpModal, closeButtonHelp, 'reminders-map-help-modal-instance', 90000);
+}
+    
+// ===================================================================
 // NOMBRE: updateTurnByTurnDisplay 
 // ===================================================================
 function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
@@ -7794,6 +8970,7 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     }
 }    
 
+showNavigationMapHelpModal    
 
 // ===================================================================
 // NOMBRE: updateNavigationProgressDisplay
@@ -8008,233 +9185,23 @@ function updateNavigationProgressDisplay(route, carDistanceAlongTheRoute = 0) {
     }
 }
 
-    
 // ===================================================================
-// NOMBRE: toggleNavigationState 
-// RESUMEN: Añade el parámetro 'isRecovery' para evitar resetear las estadísticas en una sesión restaurada.
-async function toggleNavigationState(isRecalculationStop = false, isRecovery = false) {
-    const startNavButton = document.getElementById('start-navigation-button');
-    const startNavImg = startNavButton ? startNavButton.querySelector('img') : null;
-    const mapContainer = document.getElementById('reminders-location-map-div');
-    
-    if (isNavigating) {
-
-         if (navigationMapInstance && navigationCurrentLocation) {
-            isFlying = true;
-            navigationFollowUser = false; // Desactivamos el seguimiento ANTES de volar
-            shouldCenterOnUser = false;
-            
-            const targetZoom = 16.5;
-            const targetPitch = 0;
-            const targetBearing = 0;
-
-            // 1. Forzamos el estado de la animación a los nuevos valores objetivo
-            markerAnimationState.targetMapZoom = targetZoom;
-            markerAnimationState.targetMapPitch = targetPitch;
-            markerAnimationState.targetMapBearing = targetBearing;
-            markerAnimationState.currentMapZoom = navigationMapInstance.getZoom(); // Empezamos desde el zoom actual
-            markerAnimationState.currentMapPitch = navigationMapInstance.getPitch();
-            markerAnimationState.currentMapBearing = navigationMapInstance.getBearing();
-
-            // 2. Ejecutamos la animación visual
-            navigationMapInstance.flyTo({
-                center: [navigationCurrentLocation.longitude, navigationCurrentLocation.latitude],
-                zoom: targetZoom,
-                pitch: targetPitch,
-                bearing: targetBearing,
-                duration: 1500
-            });
-            navigationMapInstance.once('moveend', () => { isFlying = false; });
-        }
-        
-        clearRecoveryFlag();
-        if (isSimulatingGpsLocation) {
-            stopAutomatedRouteSimulation();
-        }
-        if (!isRecalculationStop && !isArrivalSequenceStarted) {
-            if (!document.getElementById('arrival-stats-modal') || document.getElementById('arrival-stats-modal').classList.contains('hidden')) {
-                showArrivalStatsModal();
-            }
-        }
-        isNavigating = false;
-        navigationFollowUser = false;
-        ; 
-    } else if (isFreeDriveActive) {
-        stopFreeDrive();
-    } else {
-        const hasEnoughWaypointsForRoute = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart).length >= 2;
-        const hasRouteData = navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0];
-        if (hasEnoughWaypointsForRoute && hasRouteData) {
-            isArrivalSequenceStarted = false;
-            hideAutoStartNavigationModal();
-            clearAlternativeRoutesDisplay();
-            
-            const waypointsForRecents = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
-            await Promise.all(waypointsForRecents.map(async (wp) => {
-                if (!wp.address) {
-                    wp.address = await getAddressForWaypoint(wp.lat, wp.lng);
-                }
-            }));
-            const lastWpForName = waypointsForRecents[waypointsForRecents.length - 1];
-            const isMultiStageForName = waypointsForRecents.length > 2;
-            const suggestedName = await getSuggestedRouteName(lastWpForName.lat, lastWpForName.lng, isMultiStageForName, waypointsForRecents.length);
-            
-            let routeForStorage;
-            const finalWaypoint = waypointsForRecents[waypointsForRecents.length - 1];
-
-            if (currentRouteNameForSaving && currentRouteNameForSaving.startsWith("UBICACIÓN: ") && finalWaypoint) {
-                routeForStorage = {
-                    name: currentRouteNameForSaving,
-                    waypoints: sanitizeWaypointsForStorage([finalWaypoint])
-                };
-            } else {
-                routeForStorage = { 
-                    name: currentRouteNameForSaving || suggestedName, 
-                    waypoints: sanitizeWaypointsForStorage(waypointsForRecents)
-                };
-            }
-            addRouteToRecents(routeForStorage);
-            
-            if (!isRecovery) {
-                const recoveryData = { 
-                    isActive: true, 
-                    route: routeForStorage,
-                    tripStartTime: Date.now(),
-                    originalTripEtaTime: originalTripEtaTime ? originalTripEtaTime.getTime() : null,
-                    stats: {
-                        totalDistance: totalDistanceTravelledForStats,
-                        maxSpeed: maxSpeedDuringTrip,
-                        maxAltitude: maxAltitudeDuringTrip,
-                        minAltitude: minAltitudeDuringTrip,
-                        maxSpeedCoords: null  
-                    }
-                };
-                localStorage.setItem('boardinggate_nav_recovery_flag', JSON.stringify(recoveryData));
-            }
-        
-            clearNavigationGraph();
-           
-            if (!isRecovery) {
-                navigationWaypoints.forEach(wp => { 
-                    if(wp) { 
-                        if (wp.type === 'S' || wp.type === 'S_Recalc') { 
-                            wp.visited = true; 
-                        } else { 
-                            wp.visited = false; 
-                        }
-                    }
-                });
-            }
-            navigationWaypoints.forEach(wp => {
-                if (wp && wp.marker) wp.marker.setDraggable(false);
-            })
-
-            
-            getCurrentLocation(
-                (initialCoords) => { navigationCurrentLocation = initialCoords; updateInitialUserPosition(initialCoords, navigationMapInstance); },
-                (errorMsg) => { showToast(`No se pudo obtener tu ubicación inicial: ${errorMsg}. El mapa se centrará cuando el GPS esté listo.`, "warning", 5000); }
-            );
-            startGpsWatching();
-            const loadingToast = document.getElementById("gps-init-toast"); if (loadingToast) loadingToast.remove(); activeToasts = activeToasts.filter(t => t.id !== "gps-init-toast");
-            
-            isNavigating = true;
-            startDeviationChecker(); 
-            mapHeaderButtonsVisible = false;
-            toggleMapHeaderRowsVisibility(false);
-            
-            const routeData = navigationCurrentRouteData.routes[0];
-            if (routeData) {
-                tripInitialDurationSec = routeData.duration;
-                tripInitialDistanceMeters = routeData.distance;
-                tripInitialOverallEtaTime = new Date(Date.now() + routeData.duration * 1000);
-                if (routeData.legs && routeData.legs.length > 0) {
-                    currentStageInitialExpectedEtaTime = new Date(Date.now() + routeData.legs[0].duration * 1000);
-                }
-                if (!isRecovery) {
-                    originalTripEtaTime = tripInitialOverallEtaTime; 
-                }
-            }
-
-            if (!isRecovery) {
-                tripStartLocationForStats = navigationCurrentLocation ? { ...navigationCurrentLocation } : null;
-                navigationStartTimeForStats = new Date();
-                totalDistanceTravelledForStats = 0;
-                maxDistanceReachedOnRoute = 0;
-                speedMarkerFeatures = []; 
-                maxSpeedDuringTrip = 0;
-                maxSpeedCoordinates = null;
-                maxAltitudeDuringTrip = -Infinity;
-                minAltitudeDuringTrip = Infinity;
-                window.averageSpeedKmh = 0; 
-                lastPositionForStats = navigationCurrentLocation ? {...navigationCurrentLocation} : null;
-                accumulatedDeviationMs = 0;
-                accumulatedDistanceBeforeCurrentSegment = 0;
-            }
-                  
-            const toastMessage = isRecovery ? "Navegación reanudada." : "Navegación iniciada. Esperando movimiento...";
-            showToast(toastMessage, "success");
-
-            currentGraphMode = localStorage.getItem(GRAPH_STATE_KEY) || 'Desviación ETA';
-            initializeNavigationGraph();
-            const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox'); if (radaresRutaCheckbox && radaresRutaCheckbox.checked) { toggleRadaresRuta(true); }
-            const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox'); if (tareasRutaCheckbox && tareasRutaCheckbox.checked) { toggleTareasRuta(true); }
-            if (navigationMapInstance) {
-                shouldCenterOnUser = true; 
-                navigationFollowUser = true;
-                updateLocateMeButtonsUI();
-                const locateMeButton = document.getElementById('locate-me-on-reminders-map');
-                if (locateMeButton) {
-                    const locateMeImg = locateMeButton.querySelector('img');
-                    if (locateMeImg) locateMeImg.src = "PNG/DEJARSEGUIR.PNG";
-                    locateMeButton.title = "Dejar de centrar el mapa en mi posición";
-                }
-                const startCoords = navigationCurrentLocation 
-                    ? [navigationCurrentLocation.longitude, navigationCurrentLocation.latitude] 
-                    : [navigationWaypoints[0].lng, navigationWaypoints[0].lat];
-                const savedViewMode = localStorage.getItem(MAP_VIEW_MODE_KEY) || 'static';
-                const modeDetails = MAP_VIEW_MODES[Object.keys(MAP_VIEW_MODES).find(key => MAP_VIEW_MODES[key].mode === savedViewMode)] || MAP_VIEW_MODES.NORTE;
-                let pitchToUse = 0;
-                if (modeDetails.mode === 'static') {
-                    pitchToUse = 0; 
-                } else {
-                    pitchToUse = mapPitchValue; 
-                }
-                const initialFlyToOptions = { center: startCoords, zoom: 17.5, pitch: pitchToUse, essential: true, duration: 1500 };
-                if ((modeDetails.mode === 'heading' || modeDetails.mode === 'perspective') && navigationCurrentLocation && navigationCurrentLocation.heading !== null) {
-                    initialFlyToOptions.bearing = navigationCurrentLocation.heading;
-                } else {
-                    initialFlyToOptions.bearing = modeDetails.bearing;
-                }
-                navigationMapInstance.flyTo(initialFlyToOptions);
-            }
-        } else {
-            try {
-                const initialCoords = await getCurrentLocationAsync();
-                startFreeDrive(initialCoords);
-            } catch (error) {
-                showToast(`No se pudo obtener la ubicación para iniciar el modo libre: ${error.message}`, "error");
-            }
-        }
-    }
-    updateStartNavigationButtonState();
-    updateNavigationButtonColor();
-    setNavigationMapClickHandler(); 
-    actualizarContadorRadares(radaresEnRutaActual.length);
-    actualizarContadorTareas(tareasEnRutaActual.length);
-}
-    
+// NOMBRE: checkForAndExecuteCrashRecovery (VERSIÓN CON OVERLAY)
+// RESUMEN: Activa el overlay de carga si encuentra una bandera de recuperación.
 // ===================================================================
-// NOMBRE: checkForAndExecuteCrashRecovery 
-// RESUMEN: Lee la bandera de recuperación y ahora también el `tripStartTime`, pasándolo a la función de carga.
 async function checkForAndExecuteCrashRecovery() {
     const recoveryFlagJSON = localStorage.getItem('boardinggate_nav_recovery_flag');
     if (!recoveryFlagJSON) {
-        return false; }
-    
+        return false;
+    }
+
     try {
         const recoveryData = JSON.parse(recoveryFlagJSON);
         if (recoveryData && recoveryData.isActive && recoveryData.route) {
-            showToast("ESPERE UN MOMENTO POR FAVOR, Recuperando sesión de navegación anterior...", "error", 11000);
+            const overlay = document.getElementById('route-recovery-overlay');
+            if (overlay) {
+                overlay.classList.remove('hidden');
+            }
 
             const mainContent = document.querySelector('main'); if (mainContent) mainContent.style.display = 'none';
             const footer = document.querySelector('footer'); if (footer) footer.style.display = 'none';
@@ -8244,25 +9211,22 @@ async function checkForAndExecuteCrashRecovery() {
             const gridFilter = document.getElementById('grid-filter-container'); if (gridFilter) gridFilter.style.display = 'none';
             
             try {
-                await openNavigationMap(true); 
-                
+                await openNavigationMap(true);
                 await loadRouteFromObject(recoveryData.route, true, true, recoveryData);
-
-                return true;  
+                return true;
             } catch (recoveryError) {
-                showToast("La recuperación automática falló. Cargando la app normalmente.", "error", 6000);
                 clearRecoveryFlag();
+                if (overlay) overlay.classList.add('hidden'); // Ocultar si falla
                 setTimeout(() => location.reload(), 2000);
-                return true; }
+                return true;
+            }
         }
     } catch (e) {
-    } finally {
-        clearRecoveryFlag(); 
     }
-    clearRecoveryFlag(); 
-     
-    return false; 
-}  
+
+    clearRecoveryFlag();
+    return false;
+}    
 
 // ===================================================================
 // NOMBRE: loadRouteFromObject
@@ -8373,120 +9337,6 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
     }
 }    
     
-// ===================================================================
-// NOMBRE: restoreTripProgress 
-// RESUMEN: Restaura el estado de un viaje (distancia, tiempo, stats) tras una recuperación.
-async function restoreTripProgress(recoveryInfo) {
-    if (!navigationCurrentRouteData?.routes?.[0] || !recoveryInfo || !recoveryInfo.tripStartTime) {
-        return;
-    }
-
-    try {
-        const route = navigationCurrentRouteData.routes[0];
-        
-        // 1. Restaurar datos de tiempo
-        navigationStartTimeForStats = new Date(recoveryInfo.tripStartTime);
-        if (recoveryInfo.originalTripEtaTime) {
-            originalTripEtaTime = new Date(recoveryInfo.originalTripEtaTime);
-        }
-        
-        // 2. Obtener punto de partida original y ubicación actual
-        const originalStartWaypoint = recoveryInfo.route?.waypoints?.[0];
-        const currentCoords = await getCurrentLocationAsync();
-        
-        let recoveredDistance = 0;
-
-        if (!originalStartWaypoint) {
-            showToast("Punto de inicio no encontrado en recuperación. Estadísticas reiniciadas.", "warning");
-            totalDistanceTravelledForStats = 0;
-            accumulatedDistanceBeforeCurrentSegment = 0;
-        } else {
-            // 3. CALCULAR DISTANCIA REAL RECORRIDA
-            try {
-                // 3a. INTENTO 1: Calcular la distancia real por carretera llamando a la API
-                showToast("Calculando distancia recorrida...", "info", 2000);
-                const coordsStringForDistance = `${originalStartWaypoint.lng},${originalStartWaypoint.lat};${currentCoords.longitude},${currentCoords.latitude}`;
-                const distanceResult = await fetchRouteData(coordsStringForDistance);
-                
-                if (distanceResult.routeData && distanceResult.routeData.routes[0]) {
-                    recoveredDistance = distanceResult.routeData.routes[0].distance; // Distancia en metros
-                    console.log(`[RECOVERY] Distancia real por carretera recuperada: ${(recoveredDistance / 1000).toFixed(2)} km.`);
-                } else {
-                    throw new Error("La API no devolvió una ruta para el cálculo de distancia.");
-                }
-
-            } catch (apiError) {
-                // 3b. FALLBACK: Si la API falla, calcular distancia en línea recta como emergencia
-                console.warn("[RECOVERY] Falló la API para calcular distancia recorrida, usando fallback de línea recta.", apiError);
-                showToast("No se pudo calcular la distancia exacta, se usará una estimación.", "warning");
-                recoveredDistance = calculateDistance(
-                    originalStartWaypoint.lat, 
-                    originalStartWaypoint.lng, 
-                    currentCoords.latitude, 
-                    currentCoords.longitude
-                );
-            }
-            
-            // 4. Restaurar las estadísticas con el valor calculado
-            totalDistanceTravelledForStats = recoveredDistance;
-            accumulatedDistanceBeforeCurrentSegment = recoveredDistance; // CRUCIAL para la barra de progreso
-
-            if (recoveryInfo.stats) {
-                maxSpeedDuringTrip = recoveryInfo.stats.maxSpeed || 0;
-                maxAltitudeDuringTrip = recoveryInfo.stats.maxAltitude || -Infinity;
-                minAltitudeDuringTrip = recoveryInfo.stats.minAltitude || Infinity;
-                maxSpeedCoordinates = recoveryInfo.stats.maxSpeedCoords || null;
-            }
-            lastPositionForStats = { ...currentCoords };
-        }
-        
-        // 5. Recalcular la posición en la nueva ruta y actualizar la UI
-        const carPoint = turf.point([currentCoords.longitude, currentCoords.latitude]);
-        const routeLine = turf.lineString(route.geometry.coordinates);
-        const nearestPointOnRoute = turf.nearestPointOnLine(routeLine, carPoint, { units: 'meters' });
-        const carDistanceAlongRoute = nearestPointOnRoute.properties.location;
-        
-        const timeElapsedS = (Date.now() - recoveryInfo.tripStartTime) / 1000;
-        if (timeElapsedS > 0 && totalDistanceTravelledForStats > 0) {
-            window.averageSpeedKmh = (totalDistanceTravelledForStats / timeElapsedS) * 3.6;
-        }
-        lastCarDistanceAlongRouteForNavLogic = carDistanceAlongRoute;
-        
-        let cumulativeDistance = 0;
-        let legFound = false;
-        for (let i = 0; i < route.legs.length; i++) {
-            const leg = route.legs[i];
-            if (!leg || !leg.steps) continue;
-            const legTotalDistance = leg.distance || leg.steps.reduce((sum, step) => sum + (step.distance || 0), 0);
-            
-            if (carDistanceAlongRoute <= cumulativeDistance + legTotalDistance) {
-                currentLegIndexNav = i;
-                let legDistanceTraveled = 0;
-                for (let j = 0; j < leg.steps.length; j++) {
-                    const step = leg.steps[j];
-                    const stepDistance = step.distance || 0;
-                    if (carDistanceAlongRoute <= cumulativeDistance + legDistanceTraveled + stepDistance) {
-                        currentStepIndexNav = j;
-                        legFound = true;
-                        break;
-                    }
-                    legDistanceTraveled += stepDistance;
-                }
-                if (legFound) break;
-            }
-            cumulativeDistance += legTotalDistance;
-        }
-
-        updateNavigationProgressDisplay(route, carDistanceAlongRoute);
-        updateTurnByTurnDisplay(route, carDistanceAlongRoute);
-
-    } catch (error) {
-        showToast(`Error al restaurar progreso: ${error.message}. Se continuará desde el inicio.`, "error");
-        navigationStartTimeForStats = new Date();
-        totalDistanceTravelledForStats = 0;
-        accumulatedDistanceBeforeCurrentSegment = 0; // Asegurarse de resetear en caso de error
-    }
-}
     
 // ===================================================================
 // NOMBRE: fetchAndRenderChatUsers 
@@ -9005,489 +9855,6 @@ function eliminarRadaresDeRuta() {
     }
 }
 
-// ===================================================================
-// NOMBRE: showNavigationMapHelpModal (VERSIÓN FINAL Y COMPLETA)
-// RESUMEN: Muestra el modal de ayuda y configuración avanzada del mapa,
-//          gestionando todos los sliders y ajustes en tiempo real.
-// ===================================================================
-function showNavigationMapHelpModal() {
-    const existingHelpModal = document.getElementById('reminders-map-help-modal-instance');
-    if (existingHelpModal) {
-        clearModalAutoCloseTimer(existingHelpModal, existingHelpModal.querySelector('#close-reminders-map-help-instance'), 'reminders-map-help-modal-instance');
-        existingHelpModal.remove();
-    }
-
-    const helpModal = document.createElement('div');
-    helpModal.id = 'reminders-map-help-modal-instance';
-    helpModal.className = 'help-modal';
-    helpModal.setAttribute('aria-label', 'Ayuda Mapa de Navegación/Radares');
-    
-    const LERP_RATE_POS_KEY = 'boardinggate_lerp_rate_position';
-    const LERP_RATE_ROT_KEY = 'boardinggate_lerp_rate_rotation';
-    const LERP_RATE_ZOOM_KEY = 'boardinggate_lerp_rate_zoom';
-
-    const currentLerpPosition = localStorage.getItem(LERP_RATE_POS_KEY) || '0.004';
-    const currentLerpRotation = localStorage.getItem(LERP_RATE_ROT_KEY) || '0.001';
-    const currentLerpZoom = localStorage.getItem(LERP_RATE_ZOOM_KEY) || '0.001';
-    
-    helpModal.innerHTML = `
-        <style>
-            #reminders-map-help-modal-instance h3 { color: #87CEEB; margin-top: 1.2rem; margin-bottom: 0.5rem; border-bottom: 1px solid #444; padding-bottom: 4px;}
-            #reminders-map-help-modal-instance ul { list-style-position: inside; padding-left: 0.5rem; }
-            #reminders-map-help-modal-instance li { margin-bottom: 0.5rem; }
-            #reminders-map-help-modal-instance .icon-in-text { height: 1.4em; display: inline; vertical-align: middle; margin: 0 4px; padding: 2px; border-radius: 4px; background: rgba(255,255,255,0.1);}
-            #reminders-map-help-modal-instance .icon-in-text.circle { border-radius: 50%; }
-            .visual-settings-container { background-color: rgba(255,255,255,0.05); padding: 15px; border-radius: 8px; margin-top: 10px; flex-grow: 1;}
-            .slider-control { display: flex; align-items: center; gap: 15px; margin-bottom: 10px; }
-            .slider-control label { flex-shrink: 0; text-align: right; font-weight: bold; color: #a0a0a0; }
-            .slider-control .value-display { width: 90px; flex-shrink: 0; font-weight: bold; color: #f0f0f0; text-align: left; }
-            .slider-control > input[type="range"] { flex-grow: 1; }
-            .reset-visuals-btn { background-color: #0838a3; color: white; padding: 4px 8px; border:none; border-radius: 5px; cursor: pointer; margin-top: 5px; }
-            .slider-input-wrapper { display: flex; align-items: center; gap: 8px; flex-grow: 1; }
-            .slider-input-wrapper input[type="range"] { flex-grow: 1; }
-            .slider-btn {
-                flex-shrink: 0; width: 28px; height: 28px;
-                background-color: #0838a3; color: white;
-                border: 1px solid #777; border-radius: 50%;
-                cursor: pointer; font-size: 20px; font-weight: bold;
-                line-height: 26px; text-align: center;
-                padding: 0; user-select: none;
-            }
-            .slider-btn:active { background-color: #777; transform: scale(0.95); }
-            .lerp-help-text { font-size: 0.8rem; color: #b0b0b0; margin-top: 10px; text-align: center; font-style: italic; }
-            .two-column-layout { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-bottom: 1rem; }
-            .two-column-layout > div { display: flex; flex-direction: column; }
-            .settings-checkbox-label {display: flex; align-items: center; cursor: pointer; font-size: 1rem; user-select: none;}
-            .settings-checkbox-label input {width: 1.2rem; height: 1.2rem; margin-right: 10px; flex-shrink: 0;}
-            .settings-checkbox-label span {font-weight: bold; color: #a0a0a0;}
-        </style>
-
-        <h2 class="text-xl font-bold mb-4">Ayuda del Mapa de Navegación</h2>
-        <div class="modal-top-buttons" style="justify-content: flex-end;">
-            <button type="button" id="close-reminders-map-help-instance" style="flex: 0 1 auto; min-width: 120px;">Entendido</button>
-        </div>
-        <div style="max-height: 70vh; overflow-y: auto; padding-right: 15px;">
-            
-            <h3><img src="https://boardinggate.github.io/Tesla/PNG/personal.png" class="icon-in-text"> Ajustes Visuales y Suavizado</h3>
-            <div class="two-column-layout">
-                <div>
-                    <div class="visual-settings-container">
-                        <div class="slider-control">
-                            <label for="map-saturation-slider">Saturación:</label>
-                            <input type="range" id="map-saturation-slider" min="0.5" max="2" step="0.01">
-                            <span id="map-saturation-value" class="value-display"></span>
-                        </div>
-                        <div class="slider-control">
-                            <label for="map-contrast-slider">Contraste:</label>
-                            <input type="range" id="map-contrast-slider" min="0.5" max="2" step="0.01">
-                            <span id="map-contrast-value" class="value-display"></span>
-                        </div>
-                        <div class="slider-control">
-                            <label for="map-exaggeration-slider">Desnivel 3D:</label>
-                            <input type="range" id="map-exaggeration-slider" min="0" max="3" step="0.01">
-                            <span id="map-exaggeration-value" class="value-display"></span>
-                        </div>
-                        <button id="map-visuals-reset-btn" class="reset-visuals-btn">Valores óptimos</button>
-                        <div class="visual-settings-container" style="margin-top: 10px; padding: 10px; text-align: left;">
-                             <label for="direct-to-nav-checkbox-map-help" class="settings-checkbox-label">
-                                 <input type="checkbox" id="direct-to-nav-checkbox-map-help">
-                                 <span>Entrar directamente al Navegador</span>
-                             </label>
-                             <label for="announce-maneuver-flash-checkbox" class="settings-checkbox-label" style="margin-top: 10px;">
-                                 <input type="checkbox" id="announce-maneuver-flash-checkbox">
-                                 <span>Anunciar maniobra con destello</span>
-                             </label>
-                             <div class="slider-control" style="margin-top: 15px; border-top: 1px solid #444; padding-top: 15px;">
-                                <label for="dynamic-radar-radius-slider">Radio Radares Dinámicos:</label>
-                                <input type="range" id="dynamic-radar-radius-slider" min="50" max="2000" step="10">
-                                <span id="dynamic-radar-radius-value" class="value-display"></span>
-                             </div>
-                             
-                             </div>
-                    </div>
-                </div>
-                <div>
-                    <div class="visual-settings-container">
-                        <div class="slider-control">
-                            <label for="lerp-position-slider" title="SUAVIZADO MOV.LATERAL MAPA:">Movimiento Lateral:</label>
-                            <input type="range" id="lerp-position-slider" min="0.0001" max="0.02" step="0.0001" value="${currentLerpPosition}">
-                            <span id="lerp-position-value" class="value-display">${parseFloat(currentLerpPosition).toFixed(4)}</span>
-                        </div>
-                        <div class="slider-control">
-                            <label for="lerp-rotation-slider" title="SUAVIZADO ROTACIONES:">Rotaciones:</label>
-                            <input type="range" id="lerp-rotation-slider" min="0.0001" max="0.02" step="0.0001" value="${currentLerpRotation}">
-                            <span id="lerp-rotation-value" class="value-display">${parseFloat(currentLerpRotation).toFixed(4)}</span>
-                        </div>
-                        <div class="slider-control">
-                            <label for="lerp-zoom-slider" title="SUAVIZADO INCLINACIÓN">Zoom e Inclinación:</label>
-                            <input type="range" id="lerp-zoom-slider" min="0.0001" max="0.02" step="0.0001" value="${currentLerpZoom}">
-                            <span id="lerp-zoom-value" class="value-display">${parseFloat(currentLerpZoom).toFixed(4)}</span>
-                        </div>
-                        <button id="lerp-reset-btn" class="reset-visuals-btn">Valores óptimos</button>
-                        <p class="lerp-help-text">(*) Valor Mayor = Movimientos más bruscos y rápidos. Valor Menor = Más suaves y lentos.</p>
-                    </div>
-                </div>
-            </div>
-
-            <h3><img src="https://boardinggate.github.io/Tesla/PNG/config.jpg" class="icon-in-text"> Ajuste de Rendimiento (Navegación)</h3>
-            <div class="visual-settings-container">
-                <p style="font-size: 0.9rem; margin-bottom: 15px;">Ajusta la frecuencia de actualización para optimizar el rendimiento. Un número más alto significa que la tarea se ejecuta con menos frecuencia (mejor rendimiento, menos actualizaciones). Un número más bajo es más "en tiempo real" pero consume más recursos.</p>
-                <div class="slider-control">
-                    <label for="gps-hz-display" style="color: #f0f0f0;">GPS Ticks/seg:</label>
-                    <span id="gps-hz-display" class="value-display" style="text-align: left;">Calculando...</span>
-                </div>
-                <div class="slider-control">
-                    <label for="camera-fps-slider">Animación Cámara FPS:</label>
-                    <div class="slider-input-wrapper">
-                        <button type="button" class="slider-btn minus" data-target="camera-fps-slider">-</button>
-                        <button type="button" class="slider-btn plus" data-target="camera-fps-slider">+</button>
-                        <input type="range" id="camera-fps-slider" min="1" max="60" step="1">
-                    </div>
-                    <span id="camera-fps-value" class="value-display"></span>
-                </div>
-                <div class="slider-control">
-                    <label for="ratio-critical-update-slider">Procesos Críticos.........:</label>
-                    <div class="slider-input-wrapper">
-                        <button type="button" class="slider-btn minus" data-target="ratio-critical-update-slider">-</button>
-                        <button type="button" class="slider-btn plus" data-target="ratio-critical-update-slider">+</button>
-                        <input type="range" id="ratio-critical-update-slider" min="1" max="100" step="1">
-                    </div>
-                    <span id="ratio-critical-update-value" class="value-display"></span>
-                </div>
-                <div class="slider-control">
-                    <label for="ratio-route-progress-slider">Progreso Ruta..............:</label>
-                     <div class="slider-input-wrapper">
-                        <button type="button" class="slider-btn minus" data-target="ratio-route-progress-slider">-</button>
-                        <button type="button" class="slider-btn plus" data-target="ratio-route-progress-slider">+</button>
-                        <input type="range" id="ratio-route-progress-slider" min="1" max="200" step="1">
-                    </div>
-                    <span id="ratio-route-progress-value" class="value-display"></span>
-                </div>
-                <div class="slider-control">
-                    <label for="ratio-traffic-alerts-slider">Alertas Tráfico.............:</label>
-                    <div class="slider-input-wrapper">
-                        <button type="button" class="slider-btn minus" data-target="ratio-traffic-alerts-slider">-</button>
-                        <button type="button" class="slider-btn plus" data-target="ratio-traffic-alerts-slider">+</button>
-                        <input type="range" id="ratio-traffic-alerts-slider" min="1" max="1000" step="1">
-                    </div>
-                    <span id="ratio-traffic-alerts-value" class="value-display"></span>
-                </div>
-                <div class="slider-control">
-                    <label for="ratio-trip-stats-slider">Estadísticas.................:</label>
-                    <div class="slider-input-wrapper">
-                        <button type="button" class="slider-btn minus" data-target="ratio-trip-stats-slider">-</button>
-                        <button type="button" class="slider-btn plus" data-target="ratio-trip-stats-slider">+</button>
-                        <input type="range" id="ratio-trip-stats-slider" min="1" max="1000" step="1">
-                    </div>
-                    <span id="ratio-trip-stats-value" class="value-display"></span>
-                </div>
-                <div class="slider-control">
-                    <label for="ratio-performance-graph-slider">Gráfica.........................:</label>
-                    <div class="slider-input-wrapper">
-                        <button type="button" class="slider-btn minus" data-target="ratio-performance-graph-slider">-</button>
-                        <button type="button" class="slider-btn plus" data-target="ratio-performance-graph-slider">+</button>
-                        <input type="range" id="ratio-performance-graph-slider" min="1" max="1000" step="1">
-                    </div>
-                    <span id="ratio-performance-graph-value" class="value-display"></span>
-                </div>
-                <button id="perf-ratios-reset-btn" class="reset-visuals-btn">Valores óptimos</button>
-                <div class="visual-settings-container" style="margin-top: 10px; text-align: left;">
-                    <label for="monitor-resources-checkbox-map" class="settings-checkbox-label">
-                        <input type="checkbox" id="monitor-resources-checkbox-map">
-                        <span>Activar Monitor de Recursos (Memoria/FPS)</span>
-                    </label>
-                    <p style="font-size: 0.8rem; margin-left: 32px; color: #ff9500;">No dejar activado permanentemente, consume recursos adicionales.</p>
-                </div>
-            </div>
-        </div>
-    `;
-
-    const mapModal = document.getElementById('reminders-location-map-modal');
-    if (mapModal) {
-        mapModal.style.zIndex = 6400;
-    }
- 
-    document.body.appendChild(helpModal); 
-    
-    const announceFlashCheckbox = helpModal.querySelector('#announce-maneuver-flash-checkbox');
-    if (announceFlashCheckbox) {
-        announceFlashCheckbox.checked = announceManeuverWithFlash;
-        announceFlashCheckbox.addEventListener('change', () => {
-            announceManeuverWithFlash = announceFlashCheckbox.checked;
-            localStorage.setItem('boardinggate_announce_maneuver_flash', JSON.stringify(announceManeuverWithFlash));
-            markCacheAsDirty();
-            showToast(`Anuncio de maniobra por destello ${announceManeuverWithFlash ? 'ACTIVADO' : 'DESACTIVADO'}.`, 'info');
-        });
-    }
- 
-    const directToNavCheckboxMapHelp = helpModal.querySelector('#direct-to-nav-checkbox-map-help');
-    if (directToNavCheckboxMapHelp) {
-        directToNavCheckboxMapHelp.checked = JSON.parse(localStorage.getItem(DIRECT_TO_NAVIGATION_KEY)) || false;
-        directToNavCheckboxMapHelp.addEventListener('change', () => {
-            const isChecked = directToNavCheckboxMapHelp.checked;
-            localStorage.setItem(DIRECT_TO_NAVIGATION_KEY, JSON.stringify(isChecked));
-            markCacheAsDirty();
-            showToast(`Inicio directo al navegador ${isChecked ? 'ACTIVADO' : 'DESACTIVADO'}.`, 'info');
-        });
-    }
-    
-    const setupLerpSlider = (sliderId, valueId, storageKey) => {
-        const slider = helpModal.querySelector(`#${sliderId}`);
-        const valueDisplay = helpModal.querySelector(`#${valueId}`);
-        if (!slider || !valueDisplay) return;
-
-        slider.addEventListener('input', () => {
-            const val = slider.value;
-            valueDisplay.textContent = parseFloat(val).toFixed(4);
-            localStorage.setItem(storageKey, val);
-            loadAndCacheLerpSettings(); 
-            markCacheAsDirty();
-         });
-    };
-    setupLerpSlider('lerp-position-slider', 'lerp-position-value', LERP_RATE_POS_KEY);
-    setupLerpSlider('lerp-rotation-slider', 'lerp-rotation-value', LERP_RATE_ROT_KEY);
-    setupLerpSlider('lerp-zoom-slider', 'lerp-zoom-value', LERP_RATE_ZOOM_KEY);
-
-    const lerpResetBtn = helpModal.querySelector('#lerp-reset-btn');
-    lerpResetBtn.addEventListener('click', () => {
-        const defaults = {
-            'lerp-position-slider': '0.004',
-            'lerp-rotation-slider': '0.001',
-            'lerp-zoom-slider': '0.001'
-        };
-        for (const sliderId in defaults) {
-            const slider = helpModal.querySelector(`#${sliderId}`);
-            if (slider) {
-                slider.value = defaults[sliderId];
-                slider.dispatchEvent(new Event('input'));
-            }
-        }
-     });
-
-    const monitorCheckboxMap = helpModal.querySelector('#monitor-resources-checkbox-map');
-    if (monitorCheckboxMap) {
-        monitorCheckboxMap.checked = isMonitoring;
-        monitorCheckboxMap.addEventListener('change', () => {
-            if (monitorCheckboxMap.checked) {
-                startResourceMonitor();
-                showToast('Monitor de recursos ACTIVADO.', 'info');
-            } else {
-                stopResourceMonitor();
-                showToast('Monitor de recursos DESACTIVADO.', 'info');
-            }
-        });
-    }
-
-    helpModal.addEventListener('click', (e) => {
-        if (e.target.classList.contains('slider-btn')) {
-            e.preventDefault(); 
-            const targetSliderId = e.target.dataset.target;
-            const slider = helpModal.querySelector(`#${targetSliderId}`);
-            if (slider) {
-                if (e.target.classList.contains('minus')) {
-                    slider.stepDown();
-                } else {
-                    slider.stepUp();
-                }
-                slider.dispatchEvent(new Event('input'));
-            }
-        }
-    });
-
-    const gpsHzDisplay = helpModal.querySelector('#gps-hz-display');
-    let baseFrequency = 0;
-    
-    const cameraFpsSlider = helpModal.querySelector('#camera-fps-slider');
-    const cameraFpsValue = helpModal.querySelector('#camera-fps-value');
-    if (cameraFpsSlider && cameraFpsValue) {
-        const savedFps = parseInt(localStorage.getItem(PERFORMANCE_CAMERA_FPS_KEY)) || 30;
-        cameraFpsSlider.value = savedFps;
-        cameraFpsValue.textContent = `${savedFps} FPS`;
-
-        cameraFpsSlider.addEventListener('input', () => {
-            const fps = parseInt(cameraFpsSlider.value);
-            cameraFpsValue.textContent = `${fps} FPS`;
-            MAP_UPDATE_INTERVAL_MS = 1000 / fps; 
-            localStorage.setItem(PERFORMANCE_CAMERA_FPS_KEY, fps);
-            markCacheAsDirty();
-        });
-    }
-
-    const sliders = [
-        { id: 'ratio-critical-update-slider', valueId: 'ratio-critical-update-value', key: PERFORMANCE_RATIO_CRITICAL_KEY, default: 3, name: 'criticalUpdate' },
-        { id: 'ratio-route-progress-slider', valueId: 'ratio-route-progress-value', key: PERFORMANCE_RATIO_ROUTE_KEY, default: 30, name: 'routeProgress' },
-        { id: 'ratio-traffic-alerts-slider', valueId: 'ratio-traffic-alerts-value', key: PERFORMANCE_RATIO_ALERTS_KEY, default: 300, name: 'trafficAlerts' },
-        { id: 'ratio-trip-stats-slider', valueId: 'ratio-trip-stats-value', key: PERFORMANCE_RATIO_STATS_KEY, default: 32, name: 'tripStats' },
-        { id: 'ratio-performance-graph-slider', valueId: 'ratio-performance-graph-value', key: PERFORMANCE_RATIO_GRAPH_KEY, default: 70, name: 'performanceGraph' }
-    ];
-
-    const updateAllIntervalDisplays = () => {
-        if (baseFrequency > 0) {
-            sliders.forEach(sliderConfig => {
-                const slider = helpModal.querySelector(`#${sliderConfig.id}`);
-                const valueDisplay = helpModal.querySelector(`#${sliderConfig.valueId}`);
-                if (slider && valueDisplay) {
-                    const ratio = parseInt(slider.value);
-                    const intervalMs = Math.round((ratio / baseFrequency) * 1000);
-                    valueDisplay.textContent = `${ratio} (~${intervalMs} ms)`;
-                }
-            });
-        } else {
-            sliders.forEach(sliderConfig => {
-                const slider = helpModal.querySelector(`#${sliderConfig.id}`);
-                const valueDisplay = helpModal.querySelector(`#${sliderConfig.valueId}`);
-                if (slider && valueDisplay) {
-                    valueDisplay.textContent = `${slider.value} (~? ms)`;
-                }
-            });
-        }
-    };
-
-    const setupRatioSlider = (config) => {
-        const slider = helpModal.querySelector(`#${config.id}`);
-        const valueDisplay = helpModal.querySelector(`#${config.valueId}`);
-        if (!slider || !valueDisplay) return;
-
-        slider.value = localStorage.getItem(config.key) || config.default;
-        performanceRatios[config.name] = parseInt(slider.value);
-        
-        slider.addEventListener('input', () => {
-            const val = slider.value;
-            localStorage.setItem(config.key, val);
-            markCacheAsDirty(); 
-            performanceRatios[config.name] = parseInt(val);
-            updateAllIntervalDisplays();
-        });
-    };
-    
-    sliders.forEach(setupRatioSlider);
-    
-    if (gpsHzDisplay) {
-        if (gpsHzMonitor.interval) clearInterval(gpsHzMonitor.interval);
-        gpsHzMonitor.interval = setInterval(() => {
-            if (document.body.contains(gpsHzDisplay)) {
-                if (isSimulatingGpsLocation) {
-                    baseFrequency = (1000 / SIMULATION_TICK_INTERVAL_MS);
-                    gpsHzDisplay.textContent = `SIM (~${baseFrequency.toFixed(1)})`;
-                } else {
-                    baseFrequency = gpsHzMonitor.ticks;
-                    gpsHzDisplay.textContent = `${baseFrequency.toFixed(1)}`;
-                    gpsHzMonitor.ticks = 0;
-                }
-                updateAllIntervalDisplays();
-            } else {
-                clearInterval(gpsHzMonitor.interval);
-                gpsHzMonitor.interval = null;
-            }
-        }, 1000);
-    }
-
-    const perfResetBtn = helpModal.querySelector('#perf-ratios-reset-btn');
-    perfResetBtn.addEventListener('click', () => {
-        const teslaYearStr = localStorage.getItem('userData_teslaYear');
-        const teslaYear = parseInt(teslaYearStr, 10);
-        const defaultsNewerCars = { cameraFps: 30, criticalUpdate: 3, routeProgress: 30, trafficAlerts: 300, tripStats: 32, performanceGraph: 70 };
-        const defaultsOlderCars = { cameraFps: 25, criticalUpdate: 4, routeProgress: 40, trafficAlerts: 350, tripStats: 50, performanceGraph: 100 };
-        let defaultsToApply = (isNaN(teslaYear) || teslaYear >= 2021) ? defaultsNewerCars : defaultsOlderCars;
-        
-        if (cameraFpsSlider) {
-            cameraFpsSlider.value = defaultsToApply.cameraFps;
-            cameraFpsSlider.dispatchEvent(new Event('input'));
-        }
-        sliders.forEach(config => {
-            const slider = document.getElementById(config.id);
-            if (slider && defaultsToApply.hasOwnProperty(config.name)) {
-                slider.value = defaultsToApply[config.name];
-                slider.dispatchEvent(new Event('input'));
-            }
-        });
-        showToast("Valores restaurados por defecto.", 'success');
-    });
-
-    const saturationSlider = helpModal.querySelector('#map-saturation-slider');
-    const contrastSlider = helpModal.querySelector('#map-contrast-slider');
-    const exaggerationSlider = helpModal.querySelector('#map-exaggeration-slider'); 
-    const saturationValue = helpModal.querySelector('#map-saturation-value');
-    const contrastValue = helpModal.querySelector('#map-contrast-value');
-    const exaggerationValue = helpModal.querySelector('#map-exaggeration-value'); 
-    const resetButton = helpModal.querySelector('#map-visuals-reset-btn');
-
-    const updateVisualLabels = () => {
-        saturationValue.textContent = `${Math.round(saturationSlider.value * 100)}%`;
-        contrastValue.textContent = `${Math.round(contrastSlider.value * 100)}%`;
-        exaggerationValue.textContent = `${parseFloat(exaggerationSlider.value).toFixed(2)}x`; 
-    };
-
-    saturationSlider.value = getComputedStyle(document.documentElement).getPropertyValue('--map-saturation').trim() || '1.6';
-    contrastSlider.value = getComputedStyle(document.documentElement).getPropertyValue('--map-contrast').trim() || '1.15';
-    exaggerationSlider.value = mapTerrainExaggeration; 
-
-    updateVisualLabels();
-
-    saturationSlider.addEventListener('input', () => {
-        document.documentElement.style.setProperty('--map-saturation', saturationSlider.value);
-        localStorage.setItem('boardinggate_map_saturation', saturationSlider.value);
-        markCacheAsDirty();
-        updateVisualLabels();
-    });
-    contrastSlider.addEventListener('input', () => {
-        document.documentElement.style.setProperty('--map-contrast', contrastSlider.value);
-        localStorage.setItem('boardinggate_map_contrast', contrastSlider.value);
-        updateVisualLabels();
-        markCacheAsDirty();
-    });
-    exaggerationSlider.addEventListener('input', async () => {
-        mapTerrainExaggeration = parseFloat(exaggerationSlider.value);
-        saveSettings(); 
-        await configureMapAtmosphere();
-        updateVisualLabels();
-    });
-    resetButton.addEventListener('click', () => {
-        saturationSlider.value = '1.6';
-        contrastSlider.value = '1.2';
-        exaggerationSlider.value = '0.8'; 
-        saturationSlider.dispatchEvent(new Event('input'));
-        contrastSlider.dispatchEvent(new Event('input'));
-        exaggerationSlider.dispatchEvent(new Event('input')); 
-        showToast('Ajustes visuales restaurados.', 'info');
-    });
-
-    const DYNAMIC_RADAR_RADIUS_KEY = 'boardinggate_dynamicRadarRadius';
-    const radarRadiusSlider = helpModal.querySelector('#dynamic-radar-radius-slider');
-    const radarRadiusValue = helpModal.querySelector('#dynamic-radar-radius-value');
-
-    if (radarRadiusSlider && radarRadiusValue) {
-        const savedRadius = parseInt(localStorage.getItem(DYNAMIC_RADAR_RADIUS_KEY)) || 400;
-        radarRadiusSlider.value = savedRadius;
-        radarRadiusValue.textContent = `${savedRadius} m`;
-
-        radarRadiusSlider.addEventListener('input', () => {
-            const radius = parseInt(radarRadiusSlider.value);
-            radarRadiusValue.textContent = `${radius} m`;
-            localStorage.setItem(DYNAMIC_RADAR_RADIUS_KEY, radius);
-            markCacheAsDirty();
-        });
-        resetButton.addEventListener('click', () => {
-            const defaultRadius = 400;
-            radarRadiusSlider.value = defaultRadius;
-            radarRadiusValue.textContent = `${defaultRadius} m`;
-            localStorage.setItem(DYNAMIC_RADAR_RADIUS_KEY, defaultRadius);
-            markCacheAsDirty();
-        });
-    }
-   
-    const closeButtonHelp = helpModal.querySelector('#close-reminders-map-help-instance');
-    const closeHandlerHelp = () => { 
-        if(gpsHzMonitor.interval) clearInterval(gpsHzMonitor.interval);
-        gpsHzMonitor.interval = null;
-        clearModalAutoCloseTimer(helpModal, closeButtonHelp, 'reminders-map-help-modal-instance'); 
-        if (helpModal.parentNode) helpModal.remove(); 
-        if (mapModal) mapModal.style.zIndex = '';
-    };
-    
-    closeButtonHelp.addEventListener('click', closeHandlerHelp); 
-    addModalAutoCloseTimer(helpModal, closeButtonHelp, 'reminders-map-help-modal-instance', 90000);
-}
 
     
 // ===================================================================
@@ -12257,6 +12624,7 @@ function startFreeDrive(initialCoords) {
     toggleMapHeaderRowsVisibility(false);
     showMapInfoOverlay("Modo FREE DRIVE sin destino conocido");
 
+    startMemoryManagement(true); 
     updateStartNavigationButtonState();
     updateNavigationButtonColor();
     currentGraphMode = localStorage.getItem(GRAPH_STATE_KEY) || 'Desviación ETA'; 
@@ -12277,7 +12645,7 @@ function stopFreeDrive() {
     isFreeDrivePaused = false;
     freeDriveStats = null;
     tripStartLocationForStats = null;
-
+    startMemoryManagement(false); 
     updateStartNavigationButtonState();
     updateNavigationButtonColor();
     clearNavigationGraph();
@@ -16304,9 +16672,11 @@ function updateChartData() {
     navigationChart.data.labels = graphLabels; 
     navigationChart.update('none');
 }    
+ // ===================================================================
+// NOMBRE: initializeNavigationGraph (VERSIÓN CONSCIENTE DE RECUPERACIÓN)
+// RESUMEN: Inicializa la gráfica. Si los datos ya han sido restaurados
+//          (es decir, los arrays no están vacíos), no los borra.
 // ===================================================================
-// NOMBRE: initializeNavigationGraph
-// RESUMEN: Inicializa el gráfico de Chart.js para la navegación.
 function initializeNavigationGraph() {
     const graphCard = document.getElementById('navigation-graph-card');
     const graphContainer = document.getElementById('navigation-graph-container');
@@ -16319,20 +16689,28 @@ function initializeNavigationGraph() {
     graphCard.classList.remove('hidden');
     const compassElement = document.querySelector('.map-control-orientation-altitude');
     graphCard.style.height = compassElement ? (compassElement.offsetHeight + 'px') : '157px';
-    isCarStoppedForGraph = false;
-    graphDataPoints = { speed: [], altitude: [] };
-    graphLabels = [];
-    minAverageSpeedInTrip = Infinity;
-    maxAverageSpeedInTrip = -Infinity;
-    graphPlotState = { 
-        lastPlotTime: Date.now(), 
-        lastPlotCoords: navigationCurrentLocation ? { ...navigationCurrentLocation } : null 
-    };
+    
     if (navigationChart) {
         navigationChart.destroy();
         navigationChart = null;
     }
     isGraphingActive = true;
+    
+    if (graphLabels.length === 0 && graphDataPoints.speed.length === 0) {
+        isCarStoppedForGraph = false;
+        graphDataPoints = { speed: [], altitude: [] };
+        graphLabels = [];
+        minAverageSpeedInTrip = Infinity;
+        maxAverageSpeedInTrip = -Infinity;
+    } else {
+        console.log(`[Graph] Inicializando gráfica con ${graphLabels.length} puntos de datos pre-cargados desde recuperación.`);
+    }
+ 
+    graphPlotState = { 
+        lastPlotTime: Date.now(), 
+        lastPlotCoords: navigationCurrentLocation ? { ...navigationCurrentLocation } : null 
+    };
+
     const ctx = document.getElementById('navigation-chart')?.getContext('2d');
     if (!ctx || !ctx.canvas) {
         showToast("Error crítico: Canvas para gráfica no encontrado.", "error");
@@ -16345,7 +16723,6 @@ function initializeNavigationGraph() {
     
     const graphWidth = ctx.canvas.clientWidth || 300;
     const pixelsPerPoint = 3;
-    // MODIFICADO: Se actualiza la variable global en lugar de una local.
     maxGraphPoints = Math.floor(graphWidth / pixelsPerPoint) || 150;
     
     if (isNavigating && initialRouteDurationSec > 0 && maxGraphPoints > 0) {
@@ -16362,10 +16739,10 @@ function initializeNavigationGraph() {
     navigationChart = new Chart(ctx, {
         type: 'line',
         data: {
-            labels: [],
+            labels: graphLabels, // Usamos los datos ya existentes
             datasets: [
                 {
-                    label: 'Velocidad Media Real', data: [],
+                    label: 'Velocidad Media Real', data: graphDataPoints.speed,
                     borderColor: 'rgba(75, 192, 192, 0.5)',
                     backgroundColor: 'rgba(75, 192, 192, 0.25)',
                     tension: 0.1, yAxisID: 'yPrimary', 
@@ -16374,7 +16751,7 @@ function initializeNavigationGraph() {
                     fill: 'origin'
                 },
                 {
-                    label: 'Área Desnivel', data: [],
+                    label: 'Área Desnivel', data: graphDataPoints.altitude,
                     borderColor: 'rgba(255, 165, 0, 0.5)', 
                     backgroundColor: 'rgba(255, 165, 0, 0.3)', 
                     fill: 'origin',
@@ -16449,13 +16826,12 @@ function initializeNavigationGraph() {
                     }
                  }
             },
-            animation: { duration: 250 }
+            animation: { duration: 0 } // Desactivar la animación inicial en la recuperación
         }
     });
     startGraphIntervalTimer();
     updateNavigationGraphVisibilityAndMode();
-}
-    
+}   
 
 // ===================================================================
 // NOMBRE: startAutomatedRouteSimulation (VERSIÓN FINAL CON REINICIO CORRECTO)
@@ -16625,6 +17001,7 @@ function startAutomatedRouteSimulation(speedKmph, continueFromCurrentState = fal
             processSimulatedGpsPosition(false);
         }
     }, SIMULATION_TICK_INTERVAL_MS);
+    startMemoryManagement(true); 
 }
 
 
@@ -16904,6 +17281,21 @@ function stopGpsWatching() {
     // Reseteamos el contador de reintentos para la próxima vez que se inicie el seguimiento.
     gpsRetryAttempt = 0; 
 }
+
+// AÑADE ESTA NUEVA FUNCIÓN A TU CÓDIGO
+//==================================================================    
+function removeWaypointMarkerListeners(marker) {
+    if (!marker) return;
+    const element = marker.getElement();
+    if (element && element._onPointerDown) {
+        element.removeEventListener('mousedown', element._onPointerDown);
+        element.removeEventListener('touchstart', element._onPointerDown);
+        // Las de move y up se añaden/quitan dinámicamente, así que no es necesario quitarlas aquí.
+        delete element._onPointerDown;
+        delete element._onPointerMove;
+        delete element._onPointerUp;
+    }
+}
     
 // ===================================================================
 // NOMBRE: closeNavigationMap (MODIFICADA - USA RESET CENTRAL)
@@ -16936,6 +17328,18 @@ function closeNavigationMap(force = false) {
         delete header._mapButtonClickHandler; // Elimina la propiedad para limpiar la referencia.
     }
 
+   if (intersectionPreviewMap) {
+        try { intersectionPreviewMap.remove(); } catch(e){}
+        intersectionPreviewMap = null;
+        intersectionPreviewCarMarker = null; // También limpiar sus marcadores
+        intersectionPreviewManeuverMarker = null;
+    }
+    if (locationPickerMap) {
+        try { locationPickerMap.remove(); } catch(e){}
+        locationPickerMap = null;
+        locationPickerMarker = null;
+    }
+    
   // 3. Destruir la instancia del mapa. Esto debería limpiar sus propios listeners (.on) y liberar la mayoría de sus recursos.
     if (navigationMapInstance) {
         navigationMapInstance.remove();
@@ -17923,6 +18327,7 @@ function stopAutomatedRouteSimulationInternal() {
     if (automatedSimulationIntervalId) {
         clearInterval(automatedSimulationIntervalId);
         automatedSimulationIntervalId = null;
+        startMemoryManagement(false); 
     }
 }
    
@@ -19663,6 +20068,7 @@ async function getRouteForSingleLeg(lon1, lat1, lon2, lat2) {
 function clearAllWaypointMarkersFromMap() {
     navigationWaypoints.forEach(wp => {
         if (wp && wp.marker) {
+            removeWaypointMarkerListeners(wp.marker); 
             wp.marker.remove();
             wp.marker = null;
         }
@@ -19781,7 +20187,7 @@ function resetNavigationState() {
     maxAltitudeDuringTrip = -Infinity;
     minAltitudeDuringTrip = Infinity;
     window.averageSpeedKmh = 0;
-
+    reminderMapObjects = [];
     radaresEnRutaActual = [];
     tareasEnRutaActual = [];
     alternativeRoutesCache.clear();
@@ -19833,6 +20239,7 @@ async function handleDeleteWaypointClick(waypointId) {
     if (finalWaypointIndex !== -1) {
         const waypointToDelete = navigationWaypoints[finalWaypointIndex];
         if (waypointToDelete.marker && navigationMapInstance) {
+            removeWaypointMarkerListeners(waypointToDelete.marker); 
             waypointToDelete.marker.remove();
             waypointToDelete.marker = null;
         }
@@ -19853,7 +20260,6 @@ async function handleDeleteWaypointClick(waypointId) {
             navigationMapInstance.removeSource('route');
             navigationRouteLayer = null;
         }
-        
 
         navigationCurrentRouteData = null;
         hideNavigationUI();
@@ -20651,13 +21057,12 @@ function handleStageTouchStart(e) {
     }
 }
 
-// ===================================================================
-// NOMBRE: createWaypointMarkerIcon (MODIFICADA CON TAMAÑO DE FUENTE DINÁMICO Y COLOR DE VISITADO)
-// RESUMEN: Crea el elemento DOM para un marcador de etapa, con tamaño de fuente escalable y color gris para visitados.
+// =================================================================
 function createWaypointMarkerIcon(label, type, visited, id, currentZoomLevel = null) {
     const el = document.createElement('div');
     el.className = 'navigation-waypoint-marker';
-    
+    el.dataset.waypointId = id; 
+
     let color;
     if (visited) {
         color = 'rgba(85, 85, 85, 0.8)'; 
@@ -20668,7 +21073,6 @@ function createWaypointMarkerIcon(label, type, visited, id, currentZoomLevel = n
     } else {
         color = 'rgba(230, 140, 0, 0.80)'; 
     }
-    
     const ZOOM_PEQUENO = 12;
     const ZOOM_GRANDE = 17;
     const FONT_MINIMO = 15; 
@@ -20694,7 +21098,83 @@ function createWaypointMarkerIcon(label, type, visited, id, currentZoomLevel = n
     el.textContent = label;
     el.style.fontSize = `${Math.round(finalFontSize)}px`;
     el.style.cursor = 'pointer';
-    
+
+    if (!isNavigating) {
+        let isDragging = false;
+        let hasMovedEnough = false;
+        let startPos = { x: 0, y: 0 };
+        const waypointId = id; 
+
+        const onPointerDown = (e) => {
+            if (isNavigating) return;
+            e.stopPropagation();
+            isDragging = false;
+            hasMovedEnough = false;
+            const point = e.touches ? e.touches[0] : e;
+            startPos = { x: point.clientX, y: point.clientY };
+            document.addEventListener('mousemove', el._onPointerMove);
+            document.addEventListener('mouseup', el._onPointerUp);
+            document.addEventListener('touchmove', el._onPointerMove, { passive: false });
+            document.addEventListener('touchend', el._onPointerUp);
+        };
+
+        const onPointerMove = (e) => {
+            if (e.type === 'touchmove') e.preventDefault();
+            const point = e.touches ? e.touches[0] : e;
+            const deltaX = Math.abs(point.clientX - startPos.x);
+            const deltaY = Math.abs(point.clientY - startPos.y);
+            if (!hasMovedEnough && (deltaX > 5 || deltaY > 5)) {
+                hasMovedEnough = true;
+                navigationMapInstance.getCanvas().style.cursor = 'grabbing';
+                el.style.cursor = 'grabbing';
+            }
+            if (hasMovedEnough) {
+                isDragging = true;
+                const waypoint = navigationWaypoints.find(w => w.id === waypointId);
+                if(waypoint && waypoint.marker) {
+                    const mapContainer = document.getElementById('mapbox-map-actual-container');
+                    const mapRect = mapContainer.getBoundingClientRect();
+                    const relativeX = point.clientX - mapRect.left;
+                    const relativeY = point.clientY - mapRect.top;
+                    const coords = navigationMapInstance.unproject([relativeX, relativeY]);
+                    waypoint.marker.setLngLat(coords);
+                }
+            }
+        };
+
+        const onPointerUp = async (e) => {
+            document.removeEventListener('mousemove', el._onPointerMove);
+            document.removeEventListener('mouseup', el._onPointerUp);
+            document.removeEventListener('touchmove', el._onPointerMove);
+            document.removeEventListener('touchend', el._onPointerUp);
+            navigationMapInstance.getCanvas().style.cursor = '';
+            el.style.cursor = 'pointer';
+
+            if (isDragging) {
+                const waypoint = navigationWaypoints.find(w => w.id === waypointId);
+                if (waypoint && waypoint.marker) {
+                    const finalCoords = waypoint.marker.getLngLat();
+                    waypoint.lat = finalCoords.lat;
+                    waypoint.lng = finalCoords.lng;
+                    waypoint.address = await getAddressForWaypoint(finalCoords.lat, finalCoords.lng);
+                    await recalculateAndDrawRoute();
+                    renderWaypointMarkers();
+                }
+            } else {
+                showWaypointActionModal(waypointId);
+            }
+            isDragging = false;
+            hasMovedEnough = false;
+        };
+
+        el._onPointerDown = onPointerDown;
+        el._onPointerMove = onPointerMove;
+        el._onPointerUp = onPointerUp;
+        
+        el.addEventListener('mousedown', el._onPointerDown);
+        el.addEventListener('touchstart', el._onPointerDown, { passive: false });
+    }
+   
     return el;
 }
     
@@ -21005,477 +21485,8 @@ function handleLocateMeClick(isExplicitAction = false) {
     updateLocateMeButtonsUI();
     updateStartNavigationButtonState();
 }
-    
-// ===================================================================
-//  openNavigationMap
-// REEMPLAZA esta función. Se asegura de que la animación inicial use el pitch correcto.
-async function openNavigationMap(isRecovery = false) {
-    return new Promise(async (resolve, reject) => {
-        const { primaryId: userId } = parseUserId(localStorage.getItem('userData_userId'));
-        
-        // El administrador siempre tiene acceso
-        if (userId && userId.toLowerCase() !== 'boardinggate') {
-            const toastId = "map-access-check";
-            try {
-                const adminDocRef = window.doc(window.db, "user_data", "boardinggate");
-                const userDocRef = window.doc(window.db, "user_data", userId);
-                
-                const [adminSnap, userSnap] = await Promise.all([window.getDoc(adminDocRef), window.getDoc(userDocRef)]);
 
-                // 1. Comprobar si el administrador ha denegado el acceso explícitamente.
-                if (userSnap.exists() && userSnap.data().mapAccessEnabled === false) {
-                    const existingToast = document.getElementById(toastId);
-                    if(existingToast) existingToast.remove();
-                    showToast("ACCESO DENEGADO A MAPAS TEMPORALMENTE. Contacte con el administrador vía chat", "error", 5000);
-                    reject(new Error("Acceso denegado"));
-                    return;
-                }
 
-                // 2. Comprobar el límite de sesiones mensuales.
-                let maxSessions = Infinity;
-                if (adminSnap.exists() && typeof adminSnap.data().max_monthly_sessions === 'number') {
-                    maxSessions = adminSnap.data().max_monthly_sessions;
-                }
-                
-                let userMonthlyCount = 0;
-                if (userSnap.exists()) {
-                    const userData = userSnap.data();
-                    const now = new Date();
-                    const currentMonthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
-                    if (userData.map_sessions_last_month === currentMonthStr) {
-                        userMonthlyCount = userData.map_sessions_month || 0;
-                    }
-                }
-
-                const existingToast = document.getElementById(toastId);
-                if(existingToast) existingToast.remove();
-                
-                if (userMonthlyCount >= maxSessions) {
-                    showToast("HA SUPERADO EL NÚMERO MÁXIMO DE SESIONES MENSUALES DE MAPA, consulte con el administrador vía chat", "error", 10000);
-                    reject(new Error("Límite de sesiones alcanzado")); 
-                    return; 
-                }
-            } catch (error) {
-                const existingToast = document.getElementById(toastId);
-                if(existingToast) existingToast.remove();
-            }
-        }
-                               
-        const mainContent = document.querySelector('main'); if (mainContent) mainContent.style.display = 'none';
-        const footer = document.querySelector('footer'); if (footer) footer.style.display = 'none';
-        const noticesContainer = document.querySelector('.notices-icon-container'); if (noticesContainer) noticesContainer.style.display = 'none';
-        const sideControls = document.querySelectorAll('.toggle-image, .toggle-sign, .scroll-toggle-button'); sideControls.forEach(el => el.style.display = 'none');
-        document.querySelectorAll('#config-button, #personal-button, #radar-button, #home-button, #reload-button, #keyword-assignment-button, #password-toggle-button, #versions-button, #info-button, #accident-alert-button').forEach(el => el.style.display = 'none');
-        const gridFilter = document.getElementById('grid-filter-container'); if (gridFilter) gridFilter.style.display = 'none';
-
-        isNavigationMapActive = true;
-        sessionStorage.setItem('mapContext', 'navigation');
-        closeOtherModals('reminders-location-map-modal');
-        
-        const mapModal = document.getElementById('reminders-location-map-modal');
-        if (!mapModal) { console.error("Error crítico: El modal del mapa no se encuentra en el HTML."); isNavigationMapActive = false; reject(new Error("Modal no encontrado")); return; }
-        
-        mapModal.classList.remove('map-modal-hidden');
-        const mapActualContainer = document.getElementById('mapbox-map-actual-container');
-        
-        const radaresCheckbox = document.getElementById('radares-ruta-checkbox');
-        if (radaresCheckbox) {
-            radaresCheckbox.checked = localStorage.getItem(RADARES_RUTA_CHECKED_KEY) === 'true';
-        }
-        const tareasCheckbox = document.getElementById('tareas-ruta-checkbox');
-        if (tareasCheckbox) {
-            tareasCheckbox.checked = localStorage.getItem(TAREAS_RUTA_CHECKED_KEY) === 'true';
-        }
-        const mapboxCheckbox = document.getElementById('mapbox-primary-checkbox');
-        if (mapboxCheckbox) {
-            mapboxCheckbox.checked = localStorage.getItem('boardinggate_useMapboxAsPrimary') === 'true';
-        }
-        
-        if (navigationMapInstance) {
-            handleLoadOrDeleteRouteClick(null);
-            setNavigationMapClickHandler();
-            setTimeout(() => { if (navigationMapInstance) navigationMapInstance.resize(); }, 520);
-            resolve(); 
-            
-        } else {
-            try {
-                const savedLayerName = localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO";
-                const finalLayerName = MAP_LEGACY_NAME_MAP[savedLayerName] || savedLayerName;
-                const initialStyle = MAP_STYLES[finalLayerName] || MAP_STYLES["HÍBRIDO"];
-                showToast("INICIALIZANDO MAPA...", "info", 0, false, "map-init-toast");
-      
-                const startCoordsTexas = { lat: 30.3715, lng: -97.1903 };
-                navigationMapInstance = new mapboxgl.Map({
-                    container: mapActualContainer,
-                    style: initialStyle, 
-                    center: [startCoordsTexas.lng, startCoordsTexas.lat],
-                    zoom: 2.8,
-                    pitch: 0,
-                    bearing: 0,
-                    attributionControl: false, 
-                    pixelRatio: window.devicePixelRatio || 1,
-                    maxTileCacheSize: 25,
-                    transformRequest: (url, resourceType) => {
-                        return {
-                            url: url,
-                            cache: resourceType === 'Tile' ? 'no-cache' : 'default'
-                                };
-                            },
-                    accessToken: mapboxgl.accessToken
-                });
- 
-                if (!isRecovery) {
-                    setMapImmersiveMode(true);
-                }
-                
-                incrementMapSessionCount();
-                mapSessionStartTime = Date.now();
-                
-                const customControls = new CustomMapControlsGroup();
-                window.mapCustomControlsInstance = customControls; 
-                navigationMapInstance.addControl(customControls, 'bottom-right');
-                
-                compassAndModeControl = new CompassAndStatsControl();
-                navigationMapInstance.addControl(compassAndModeControl, 'bottom-left');
-                
-                if (!navigationMapInstance._interactionListenersAttached) {
-                    const mapCanvas = navigationMapInstance.getCanvasContainer();
-                    let touchStartPos = null;
-                    let hasMovedEnoughToDrag = false;
-                    const DRAG_THRESHOLD = 10; 
-
-                    const onTouchStart = (e) => {
-                        if (e.touches && e.touches.length > 1) {
-                            handleManualMapInteraction();
-                            return;
-                        }
-                        const touch = e.touches ? e.touches[0] : e;
-                        touchStartPos = { x: touch.clientX, y: touch.clientY };
-                        hasMovedEnoughToDrag = false;
-                    };
-
-                    const onTouchMove = (e) => {
-                        if (hasMovedEnoughToDrag || !touchStartPos || (e.touches && e.touches.length > 1)) return;
-                        
-                        const touch = e.touches ? e.touches[0] : e;
-                        const deltaX = Math.abs(touch.clientX - touchStartPos.x);
-                        const deltaY = Math.abs(touch.clientY - touchStartPos.y);
-
-                        if (deltaX > DRAG_THRESHOLD || deltaY > DRAG_THRESHOLD) {
-                            hasMovedEnoughToDrag = true;
-                            handleManualMapInteraction(); 
-                        }
-                    };
-
-                    const onTouchEnd = () => {
-                        touchStartPos = null;
-                        hasMovedEnoughToDrag = false;
-                    };
-
-                    mapCanvas.addEventListener('touchstart', onTouchStart, { passive: true });
-                    mapCanvas.addEventListener('touchmove', onTouchMove, { passive: true });
-                    mapCanvas.addEventListener('touchend', onTouchEnd, { passive: true });
-
-                    navigationMapInstance.on('pitchend', (e) => {
-                        if (e.originalEvent) { 
-                            const newPitch = navigationMapInstance.getPitch();
-                            if (Math.abs(newPitch - mapPitchValue) > 0.1) {
-                                mapPitchValue = newPitch;
-                                saveSettings();
-                            }
-                        }
-                    });
-                    navigationMapInstance._interactionListenersAttached = true; 
-                }
-
-                navigationMapInstance.on('error', (e) => {
-                    if (e.error && e.error.message.includes("Token")) {
-                        showToast("Error de Token de Mapbox. Revisa los permisos (scopes) en tu cuenta.", "error", 10000);
-                    }
-                });
-                
-                navigationMapInstance.on('load', async function() {
-                    try {
-
-                            if (!intersectionPreviewMap) {
-                                const previewContainer = document.getElementById('intersection-preview-map-container');
-                                if (previewContainer) {
-                                    
-                                    const savedLayerName = localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO";
-                                    const finalLayerName = MAP_LEGACY_NAME_MAP[savedLayerName] || savedLayerName;
-                                    const initialMinimapStyle = MAP_STYLES[finalLayerName] || MAP_STYLES["HÍBRIDO"];
-                            
-                                    intersectionPreviewMap = new mapboxgl.Map({
-                                        container: previewContainer,
-                                        style: initialMinimapStyle, 
-                                        interactive: false,
-                                        attributionControl: false,
-                                        zoom: 16,
-                                        pitch: 50,
-                                    });
-                            
-                                    intersectionPreviewMap.on('load', () => {
-                                        // Crear fuentes con datos vacíos, listas para ser actualizadas
-                                        intersectionPreviewMap.addSource('intersection-route', {
-                                            type: 'geojson',
-                                            data: { type: 'Feature', geometry: { type: 'LineString', coordinates: [] } }
-                                        });
-                            
-                                        // Añadir la capa de la ruta
-                                        intersectionPreviewMap.addLayer({
-                                            id: 'intersection-route-layer',
-                                            type: 'line',
-                                            source: 'intersection-route',
-                                            layout: { 'line-join': 'round', 'line-cap': 'round' },
-                                            paint: { 'line-color': '#ACD10F', 'line-width': 13 }
-                                        });
-                            
-                                        // Crear los marcadores una sola vez
-                                        const carEl = document.createElement('div');
-                                        carEl.className = 'vehicle-icon-minimap';
-                                        carEl.innerHTML = `<img src="PNG/AVANCE.PNG" alt="Coche Mini">`;
-                                        intersectionPreviewCarMarker = new mapboxgl.Marker({ element: carEl, anchor: 'center', rotationAlignment: 'viewport', rotation: -90 })
-                                            .setLngLat([0, 0])
-                                            .addTo(intersectionPreviewMap);
-                            
-                                        const maneuverEl = document.createElement('div');
-                                        maneuverEl.style.cssText = `width: 49px; height: 49px; background-size: contain; background-repeat: no-repeat; background-position: center;`;
-                                        intersectionPreviewManeuverMarker = new mapboxgl.Marker({ element: maneuverEl, anchor: 'center' })
-                                            .setLngLat([0, 0])
-                                            .addTo(intersectionPreviewMap);
-                                    });
-                                }
-                            }
-      
-                        const lockButton = document.getElementById('toggle-progress-bar-lock');
-                        if (lockButton && !lockButton.dataset.listenerAttached) {
-                            lockButton.addEventListener('click', (e) => {
-                                e.stopPropagation();
-                                handleProgressBarLockToggle();
-                            });
-                            lockButton.dataset.listenerAttached = 'true';
-                        }
-                        updateProgressBarLockIcon();
-                        
-                        const topInfoBar = document.getElementById('navigation-top-info-bar');
-                        if (topInfoBar && !topInfoBar.dataset.listenerAttached) {
-                            topInfoBar.addEventListener('click', (e) => {
-                                e.stopPropagation();
-                                if (nextManeuverStepForPreview && navigationCurrentRouteData?.routes?.[0]) {
-                                    showIntersectionPreviewMap(
-                                        nextManeuverStepForPreview, 
-                                        navigationCurrentRouteData.routes[0], 
-                                        true, 
-                                        10000 
-                                    );
-                                } else {
-                                    showToast("No hay una próxima maniobra que mostrar.", "info");
-                                }
-                            });
-                            topInfoBar.dataset.listenerAttached = 'true';
-                        }
-                        
-                        const initToast = document.getElementById("map-init-toast");
-                        if (initToast) initToast.remove();
-
-                        await loadAndAddMapImages(navigationMapInstance);
-                        reAddCustomMapLayersAndSources(navigationMapInstance);
-                        plotRemindersOnNavigationMap();
-                        
-                        await configureMapAtmosphere();
-                        
-                        await processTrafficAlerts(); 
-
-                        if (alertRefreshInterval) clearInterval(alertRefreshInterval); 
-                        alertRefreshInterval = setInterval(processTrafficAlerts, ALERT_CHECK_INTERVAL);
-                                        
-                        navigationMapInstance.on('pitch', updateLineWidthsOnPitchChange);
-                        
-                        mapPreviousZoomLevelForPDRs = navigationMapInstance.getZoom();
-                        navigationMapInstance.on('zoomend', updateAllIconSizes);
-                        toggleMapHeaderRowsVisibility(mapHeaderButtonsVisible);
-
-                        navigationMapInstance.on('click', async (e) => {
-                            if (isAddReminderAtLocationModeActive) { handleMapClickToAddReminder(e); return; }
-                            if (isSimulatingGpsLocation) { handleSimulateGpsPositionClick(e); return; }
-                            if (isNavigating) { return; }
-
-                            const point = e.point;
-                            const lngLat = e.lngLat;
-                            
-                            const pdrLayers = ['pdr-simple-circle-layer', 'pdr-cards-layer-bg-halo', 'pdr-cards-layer-bg'];
-                            const pdrFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: pdrLayers });
-                            if (pdrFeatures.length > 0) {
-                                const fullPdrData = window.lastOcmApiResponse.find(p => p.ID === pdrFeatures[0].properties.ocmId);
-                                if (fullPdrData) {
-                                    showChargingPointModal(fullPdrData, pdrFeatures[0].properties.index);
-                                }
-                                return;
-                            }
-
-                            const alertLayers = ['traffic-alerts-layer'];
-                            const alertFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: alertLayers });
-                            if (alertFeatures.length > 0) {
-                                const alertCode = alertFeatures[0].properties.code;
-                                const alertDetailsMap = {
-                                    1: 'Accidente de tráfico', 2: 'Coche averiado', 3: 'Control de tráfico / Radar',
-                                    4: 'Atasco', 5: 'Peligro indeterminado', 6: 'Carretera en mal estado',
-                                    7: 'Obras', 8: 'Vía / Carretera cerrada'
-                                };
-                                const alertText = alertDetailsMap[alertCode] || 'Alerta de tráfico';
-                                showToast(alertText, 'warning', 4000);
-                                return;
-                            }
-                            
-                            const reminderLayers = ['reminders-icons-layer', 'radar-circles-layer'];
-                            const reminderFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: reminderLayers });
-                            if (reminderFeatures.length > 0) {
-                                const reminderId = reminderFeatures[0].properties.reminderId;
-                                showReminderActionModal(reminderId);
-                                return;
-                            }
-
-                            const mapboxPoiLayers = ['poi-label'];
-                            const features = navigationMapInstance.queryRenderedFeatures(point, { layers: mapboxPoiLayers });
-                            
-                            const validPoiFeature = features.find(f => {
-                                 if (!f.properties) return false;
-                                 const poiName = f.properties.name || f.properties.name_en || f.properties.text;
-                                 return f.layer.id === 'poi-label' && poiName;
-                            });
-
-                            if (validPoiFeature) {
-                                const properties = validPoiFeature.properties;
-                                const poiName = properties.name || properties.name_en || properties.text;
-                                let categories = [];
-                                if (properties.poi_category && Array.isArray(properties.poi_category)) { categories = properties.poi_category; } 
-                                else if (properties.category) { categories = properties.category.split(',').map(c => c.trim()); } 
-                                else if (properties.maki) { categories = [properties.maki]; }
-                                
-                                const featureForModal = { properties: { name: poiName, categories: categories }, geometry: validPoiFeature.geometry };
-                                showPoiInfoModal(featureForModal);
-                            } else {
-                                addWaypoint(lngLat);
-                            }
-                        });
-                        
-                        enablePoiInteractivity(navigationMapInstance);
-                        setNavigationMapClickHandler();
-                        
-                        if (!isRecovery) {
-                            const globeSpinPromise = new Promise(resolve => {
-                                const startCoords = { lat: 30.3715, lng: -97.1903 }; 
-                                const endCoords = { lat: 40.3748, lng: -3.7354 };   
-                                const duration = 1800;
-
-                                const directLngDiff = endCoords.lng - startCoords.lng;
-                                const totalLngChange = -(360 - directLngDiff);
-                                const totalLatChange = endCoords.lat - startCoords.lat;
-                                const startTimestamp = performance.now();
-
-                                function animateSpin(timestamp) {
-                                    const elapsedTime = timestamp - startTimestamp;
-                                    let progress = Math.min(elapsedTime / duration, 1);
-                                    progress = 1 - Math.pow(1 - progress, 3);
-
-                                    const currentLng = startCoords.lng + (totalLngChange * progress);
-                                    const currentLat = startCoords.lat + (totalLatChange * progress);
-                                    
-                                    navigationMapInstance.setCenter([currentLng, currentLat]);
-
-                                    if (progress < 1) {
-                                        requestAnimationFrame(animateSpin);
-                                    } else {
-                                        navigationMapInstance.setCenter([endCoords.lng, endCoords.lat]);
-                                        resolve(); 
-                                    }
-                                }
-                                requestAnimationFrame(animateSpin);
-                            });
-                            
-                            await globeSpinPromise;
-                        }
-               
-                        let currentPos;
-
-                        if (preloadedGpsPosition) {
-                            console.log("Usando la ubicación GPS precargada para abrir el mapa.");
-                            currentPos = preloadedGpsPosition;
-                            preloadedGpsPosition = null;
-                        } else {
-                            console.log("La ubicación GPS no fue precargada. Buscando activamente...");
-                            try {
-                                showToast("LOCALIZANDO VEHÍCULO...", "info", 0, false, "gps-locate-toast");
-                                currentPos = await getCurrentLocationAsync();
-                                const loadingToast = document.getElementById("gps-locate-toast");
-                                if (loadingToast) loadingToast.remove();
-                            } catch (error) {
-                                const loadingToast = document.getElementById("gps-locate-toast");
-                                if (loadingToast) loadingToast.remove();
-                                showToast(`No se pudo obtener la ubicación para abrir el mapa. Se centrará en la vista por defecto.`, "error");
-                                currentPos = { latitude: 40.416775, longitude: -3.703790, heading: 0, speed: 0, altitude: 0, accuracy: 0 };
-                            }
-                        }
-                        
-                        setMapImmersiveMode(false);
-                        
-                        navigationFollowUser = true;
-                        shouldCenterOnUser = true;
-                        updateLocateMeButtonsUI();
-                        toggleMapControls(true);
-                        navigationCurrentLocation = currentPos;
-                        
-                        const initialViewOptions = {
-                            center: [currentPos.longitude, currentPos.latitude],
-                            zoom: 17,
-                            essential: true
-                        };
-
-                        const mode = mapViewMode;
-                        
-                        if (mode === 'heading' || mode === 'perspective' || mode === 'relief') {
-                            initialViewOptions.bearing = currentPos.heading || 0;
-                        }
-                        if (mode === 'perspective' || mode === 'relief') {
-                            initialViewOptions.pitch = mapPitchValue;
-                        } else {
-                            initialViewOptions.pitch = 0;
-                        }
-                        
-                        navigationMapInstance.jumpTo(initialViewOptions);
-                        isFlying = false;
-
-                        markerAnimationState.currentMapCenter = navigationMapInstance.getCenter();
-                        markerAnimationState.currentMapZoom = navigationMapInstance.getZoom();
-                        markerAnimationState.currentMapPitch = navigationMapInstance.getPitch();
-                        markerAnimationState.currentMapBearing = navigationMapInstance.getBearing();
-                        markerAnimationState.targetMapCenter = navigationMapInstance.getCenter();
-                        markerAnimationState.targetMapZoom = navigationMapInstance.getZoom();
-                        markerAnimationState.targetMapPitch = navigationMapInstance.getPitch();
-                        markerAnimationState.targetMapBearing = navigationMapInstance.getBearing();
-
-                        updateInitialUserPosition(currentPos, navigationMapInstance);
-                        
-                        startGpsWatching();
-                        
-                        resolve();
-                        
-                    } catch (loadError) {
-                        showToast(`Error crítico al cargar los recursos del mapa: ${loadError.message}`, "error", 10000);
-                        reject(loadError); 
-                    }
-                });
-                
-                navigationMapInstance.on('pitch', updateVehicleIconPerspective);
-    
-            } catch (initError) {
-                 if (mapActualContainer) mapActualContainer.innerHTML = `<div style="color:red; text-align:center; padding:20px; background: rgba(0,0,0,0.7); height:100%; display:flex; align-items:center; justify-content:center; flex-direction:column;"><h2>Error al cargar el mapa</h2><p>${initError.message}</p><p style="margin-top:10px; font-size:0.9rem;">Por favor, revisa tu token de Mapbox y sus permisos (scopes).</p></div>`;
-                 isNavigationMapActive = false;
-                 reject(initError); 
-            }
-        }
-    }); 
-}
     
     
 // ===================================================================
@@ -21857,8 +21868,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     checkReminders(); // Inicia el primer ciclo inmediatamente
     
-
-     window.addEventListener('beforeunload', () => {
+   // ESTE BLOQUE ES LO QUE SE EJECTUA AUTOMATICAMENTE EN CADA CIERRE O REINICIO DE LA WEB
+    window.addEventListener('beforeunload', () => {
          if (reminderCheckIntervalId) { clearInterval(reminderCheckIntervalId); }
          if (locationWatchId !== null && navigator.geolocation) { navigator.geolocation.clearWatch(locationWatchId); locationWatchId = null; }
          if (editingTargetElement) { editingTargetElement.classList.remove('editing-target'); editingTargetElement = null; }
@@ -21880,9 +21891,14 @@ document.addEventListener('DOMContentLoaded', async () => {
          const simModalUnload = document.getElementById('simulation-modal');
          if (simModalUnload && simulationModalTimer) clearTimeout(simulationModalTimer);
          if (autoStartNavTimer) clearTimeout(autoStartNavTimer);
-         if (isNavigationMapActive || navigationMapInstance) {
-            closeNavigationMap(true);
+    
+         // --> AÑADIDO: Condición para no limpiar durante una recarga controlada
+         if (!isPerformingControlledReload) {
+             if (isNavigationMapActive || navigationMapInstance) {
+                closeNavigationMap(true);
+             }
          }
+    
          if (locationsPreviewMap) {
              try { locationsPreviewMap.remove(); } catch(e){}
              locationsPreviewMap = null;
@@ -21900,7 +21916,7 @@ document.addEventListener('DOMContentLoaded', async () => {
           if (intersectionPreviewMap) try {intersectionPreviewMap.remove();} catch(e){}
           if (navigationChart) navigationChart.destroy();
           if (graphIntervalTimer) clearInterval(graphIntervalTimer);
-     });
+    });
 
  <!--  SCRIPT DE GUIA -->
     
