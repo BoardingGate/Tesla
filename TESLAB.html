@@ -1,4 +1,4 @@
-V23
+V15
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -1100,212 +1100,104 @@ V23
         }
     }).join(', ');   
 
+/**
+ * =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+ * NOMBRE: clearTileCacheInternal (ESTRATEGIA B - No documentada)
+ * RESUMEN: Accede a las cachés internas de las fuentes de Mapbox
+ *          y llama al método .clearTiles() para purgar la memoria
+ *          ocupada por las teselas del mapa base y del terreno.
+ * =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+ */
+function clearTileCacheInternal() {
+    if (!navigationMapInstance || navigationMapInstance._removed) {
+        console.warn("[Memory GC - Internal] Limpieza abortada, mapa no disponible.");
+        return;
+    }
 
- 
+    console.log("[Memory GC - Internal] Iniciando limpieza de caché de teselas...");
+    let clearedCaches = 0;
+
+    if (navigationMapInstance.style && navigationMapInstance.style.sourceCaches) {
+        for (const id in navigationMapInstance.style.sourceCaches) {
+            if (id.includes('mapbox') || id === 'composite') { 
+                const sourceCache = navigationMapInstance.style.sourceCaches[id];
+                if (sourceCache && typeof sourceCache.clearTiles === 'function') {
+                    sourceCache.clearTiles();
+                    clearedCaches++;
+                    console.log(`[Memory GC - Internal] Caché de la fuente '${id}' limpiada.`);
+                }
+            }
+        }
+    }
+
+    if (clearedCaches > 0) {
+        navigationMapInstance.triggerRepaint();
+        showToast(`Caché de ${clearedCaches} fuente(s) de mapa optimizada.`, "success", 1500);
+    } else {
+        console.log("[Memory GC - Internal] No se encontraron cachés de teselas para limpiar.");
+    }
+}
     
 /**
  * ===================================================================
- * NOMBRE: forceMemoryRelease (VERSIÓN 2 - ROBUSTA)
- * RESUMEN: Realiza una limpieza profunda del mapa recargando su estilo.
- *          Espera a que el mapa esté 'idle' (inactivo) en cada paso crítico
- *          para asegurar la estabilidad, especialmente en navegadores más lentos.
+ * NOMBRE: manageMemoryCycle
+ * RESUMEN: Orquesta el ciclo de limpieza de memoria durante la navegación.
+ *          Primero realiza una limpieza suave y, si es necesario, una profunda.
  * ===================================================================
  */
-async function forceMemoryRelease() {
-    if (!navigationMapInstance || navigationMapInstance._removed || isFlying || isRecalculatingRoute) {
-        return;
-    }
-
-    try {
-        const center = navigationMapInstance.getCenter();
-        const zoom = navigationMapInstance.getZoom();
-        const bearing = navigationMapInstance.getBearing();
-        const pitch = navigationMapInstance.getPitch();
-
-        const savedLayerName = localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO";
-        const finalLayerName = MAP_LEGACY_NAME_MAP[savedLayerName] || savedLayerName;
-        const styleUrlToSet = MAP_STYLES[finalLayerName] || MAP_STYLES["HÍBRIDO"];
-
-        if (!styleUrlToSet) {
-            throw new Error(`No se encontró una URL de estilo válida para el nombre: ${finalLayerName}`);
-        }
-
-        navigationMapInstance.setStyle(styleUrlToSet);
-
-        await new Promise(resolve => navigationMapInstance.once('idle', resolve));
-        
-        await loadAndAddMapImages(navigationMapInstance);
-        await reAddCustomMapLayersAndSources(navigationMapInstance);
-        await configureMapAtmosphere();
-        
-        await wait(160); 
-        
-        plotRemindersOnNavigationMap();
-        displayChargingPointsOnMap();
-        displayAlertsOnMap();
-        renderWaypointMarkers();
-        
-        await new Promise(resolve => navigationMapInstance.once('idle', resolve));
-
-        navigationMapInstance.jumpTo({ center, zoom, bearing, pitch });
-        
-        if (initialUserLocationMarker) {
-            try { initialUserLocationMarker.remove(); } catch (e) {}
-        }
-        if (navigationCurrentLocation) {
-            initialUserLocationMarker = new mapboxgl.Marker({ 
-                element: vehicleIconElement, 
-                rotationAlignment: 'map',
-                anchor: 'bottom'
-            })
-            .setLngLat([navigationCurrentLocation.longitude, navigationCurrentLocation.latitude])
-            .addTo(navigationMapInstance);
-        }
-        
-
-    } catch (error) {
-    }
-}
-
-// ===================================================================
-// NOMBRE: saveRecoveryFlagData (VERSIÓN ÚNICA Y FINAL)
-// RESUMEN: Construye y guarda el objeto de recuperación.
-//          Si 'isControlledReload' es true, añade los datos de estado
-//          instantáneo (progreso, estadísticas, gráfica).
-// ===================================================================
-function saveRecoveryFlagData(isControlledReload = false) {
-    if (!isNavigating && !isFreeDriveActive) {
-        clearRecoveryFlag();
-        return;
-    }
-
-    const waypointsForStorage = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
-    const routeForStorage = { 
-        name: currentRouteNameForSaving || "Ruta en curso", 
-        waypoints: sanitizeWaypointsForStorage(waypointsForStorage)
-    };
-
-    // Estructura base, siempre se guarda
-    const recoveryData = { 
-        isActive: true, 
-        route: routeForStorage,
-        tripStartTime: navigationStartTimeForStats ? navigationStartTimeForStats.getTime() : null,
-        originalTripEtaTime: originalTripEtaTime ? originalTripEtaTime.getTime() : null
-        // NO guardamos 'currentRouteData'. Confiamos en el recálculo.
-    };
-
-    // Si es una recarga controlada, añadimos los datos volátiles
-    if (isControlledReload) {
-        recoveryData.stats = {
-            totalDistanceTravelledForStats: totalDistanceTravelledForStats,
-            maxSpeedDuringTrip: maxSpeedDuringTrip,
-            maxAltitudeDuringTrip: maxAltitudeDuringTrip,
-            minAltitudeDuringTrip: minAltitudeDuringTrip,
-            maxSpeedCoordinates: maxSpeedCoordinates,
-            averageSpeedKmh: window.averageSpeedKmh
-        };
-        recoveryData.graphData = {
-            graphDataPoints: graphDataPoints,
-            graphLabels: graphLabels
-        };
-    } else {
-    }
-    
-    localStorage.setItem('boardinggate_nav_recovery_flag', JSON.stringify(recoveryData));
-}    
-// ===================================================================
-// NOMBRE: triggerControlledReload (VERSIÓN FINAL CON GUARDADO SELECTIVO)
-// ===================================================================
-async function triggerControlledReload() {
-    if (window.isReloading) return;
-    window.isReloading = true;
-    
-    const toastId = "reloading-toast";
-    showToast("Optimizando... Guardando sesión...", "warning", 0, false, toastId);
-
-    if (memoryManagementInterval) clearInterval(memoryManagementInterval);
-    if (deviationCheckIntervalId) clearInterval(deviationCheckIntervalId);
-
-    saveRecoveryFlagData(true);
-
-    await wait(500);
-
-    let saveConfirmed = false;
-    try {
-        const flagJSON = localStorage.getItem('boardinggate_nav_recovery_flag');
-        if (flagJSON) {
-            const flagData = JSON.parse(flagJSON);
-            if (flagData && flagData.stats) {
-                saveConfirmed = true;
-            }
-        }
-    } catch (e) {
-        saveConfirmed = false;
-    }
-
-    if (saveConfirmed) {
-        const toastElement = document.getElementById(toastId);
-        if(toastElement) toastElement.remove();
-        showToast("Sesión guardada. Recargando ahora...", "success", 2000);
-        await wait(500);
-        location.reload();
-    } else {
-        const toastElement = document.getElementById(toastId);
-        if(toastElement) toastElement.remove();
-        showToast("Error al guardar sesión. Recarga cancelada.", "error", 10000);
-        window.isReloading = false;
-        startMemoryManagement(true);
-    }
-}    
-
-// ===================================================================
-// NOMBRE: manageMemoryCycle
-// RESUMEN: Orquesta el ciclo de limpieza de memoria durante la navegación
-//          con una lógica de 3 niveles basada en umbrales de memoria.
-// ===================================================================
+// AÑADE ESTA VARIABLE GLOBAL
 let memoryCycleCounter = 0;
+
+// REEMPLAZA TU FUNCIÓN manageMemoryCycle
 async function manageMemoryCycle() {
     if (!isNavigating && !isFreeDriveActive && !automatedSimulationIntervalId) {
-        startMemoryManagement(false); // Detenerse si ya no se navega
         return;
     }
     
     memoryCycleCounter++;
-    console.log(`[Memory Manager] Ejecutando ciclo de mantenimiento #${memoryCycleCounter}.`);
-
+  
     if (navigationMapInstance) {
         navigationMapInstance.triggerRepaint();
     }
 
+    // 2. Comprobar si es necesario hacer limpieza profunda.
+    let needsDeepClean = false;
     if (typeof performance !== 'undefined' && performance.memory) {
         const memoryInfo = performance.memory;
         const memoryUsageRatio = memoryInfo.usedJSHeapSize / memoryInfo.jsHeapSizeLimit;
+        const MEMORY_THRESHOLD = 0.40; 
         
-        console.log(`[Memory Manager] Uso de memoria actual: ${(memoryUsageRatio * 100).toFixed(1)}%`);
-
-        const RELOAD_THRESHOLD = 0.10; // 45%
-        const DEEP_CLEAN_THRESHOLD = 0.35; // 35%
-        
-        if (memoryUsageRatio > RELOAD_THRESHOLD) {
-            console.warn(`[Memory Manager] ¡Umbral CRÍTICO de memoria superado! Iniciando recarga controlada.`);
-            await triggerControlledReload();
-        } else if (memoryUsageRatio > DEEP_CLEAN_THRESHOLD) {
-            console.warn(`[Memory Manager] Umbral ALTO de memoria superado. Ejecutando limpieza profunda.`);
-            await forceMemoryRelease();
+        if (memoryUsageRatio > MEMORY_THRESHOLD) {
+            needsDeepClean = true;
+        } else {
+            console.log(`[Memory Manager] Uso de memoria (${(memoryUsageRatio * 100).toFixed(1)}%) es aceptable.`);
         }
     } else {
-        // Plan B: Si no hay API de memoria, usamos un contador de ciclos.
-        const DEEP_CLEAN_CYCLE = 15; // Cada 15 minutos
-        const RELOAD_CYCLE = 30;     // Cada 30 minutos
-
-        if (memoryCycleCounter % RELOAD_CYCLE === 0) {
-            await triggerControlledReload();
-        } else if (memoryCycleCounter % DEEP_CLEAN_CYCLE === 0) {
-            await forceMemoryRelease();
+        if (memoryCycleCounter % 2 === 0) {
+            needsDeepClean = true;
+        } else {
         }
     }
-}    
+    
+    if (needsDeepClean) {
+        //AQUÍ LANZAR LA RECARGA CONTROLADA
+    }
+}
 
+/**
+ * ===================================================================
+ * NOMBRE: manageMemoryCycle (Versión para Estrategia B)
+ * RESUMEN: Orquesta el ciclo de limpieza de memoria durante la navegación
+ *          llamando a la función de limpieza de caché interna.
+ * ===================================================================
+ */
+async function manageMemoryCycle() {
+    if (!isNavigating && !isFreeDriveActive && !automatedSimulationIntervalId) {
+        return;
+    }
+    clearTileCacheInternal();
+}    
+    
 /**
  * ===================================================================
  * NOMBRE: startMemoryManagement
@@ -1325,215 +1217,6 @@ function startMemoryManagement(start) {
     } else {
   }
 }
-
-// ===================================================================
-// NOMBRE: restoreTripProgress (VERSIÓN COMPLETA CON RE-CÁLCULO DE PROGRESO)
-// RESUMEN: Restaura el estado de un viaje. Siempre recalcula la ruta para
-async function restoreTripProgress(recoveryInfo) {
-    if (!recoveryInfo) {
-        return;
-    }
-    console.log("[Recovery] Iniciando restauración de progreso desde el recovery flag.");
-
-    try {
-        // 1. Restaurar datos de tiempo (común a ambos casos)
-        if (recoveryInfo.tripStartTime) {
-            navigationStartTimeForStats = new Date(recoveryInfo.tripStartTime);
-        }
-        if (recoveryInfo.originalTripEtaTime) {
-            originalTripEtaTime = new Date(recoveryInfo.originalTripEtaTime);
-        }
-
-        // 2. RECALCULAR SIEMPRE LA RUTA (lógica robusta y probada)
-        await recalculateAndDrawRoute(false);
-        const route = navigationCurrentRouteData.routes[0];
-        if (!route) {
-            throw new Error("No se pudo recalcular la ruta durante la recuperación.");
-        }
-
-        // 3. Restaurar estadísticas (si existen en el flag)
-        if (recoveryInfo.stats) {
-            const stats = recoveryInfo.stats;
-            totalDistanceTravelledForStats = stats.totalDistanceTravelledForStats || 0;
-            maxSpeedDuringTrip = stats.maxSpeedDuringTrip || 0;
-            maxAltitudeDuringTrip = stats.maxAltitudeDuringTrip || -Infinity;
-            minAltitudeDuringTrip = stats.minAltitudeDuringTrip || Infinity;
-            maxSpeedCoordinates = stats.maxSpeedCoordinates || null;
-            window.averageSpeedKmh = stats.averageSpeedKmh || 0;
-            console.log(`[Recovery] Estadísticas restauradas. Distancia total: ${(totalDistanceTravelledForStats/1000).toFixed(1)} km.`);
-        }
-        
-        // 4. USAR LAS ESTADÍSTICAS RESTAURADAS PARA RECALCULAR EL PROGRESO EN LA NUEVA RUTA
-        // Si no había stats (cuelgue fortuito), la distancia es 0 y el progreso empieza desde el principio.
-        const recoveredDistance = totalDistanceTravelledForStats;
-        lastCarDistanceAlongRouteForNavLogic = recoveredDistance;
-
-        let cumulativeDistance = 0;
-        let legFound = false;
-        for (let i = 0; i < route.legs.length; i++) {
-            const leg = route.legs[i];
-            if (!leg || !leg.steps) continue;
-            const legTotalDistance = leg.distance || leg.steps.reduce((sum, step) => sum + (step.distance || 0), 0);
-            
-            if (recoveredDistance <= cumulativeDistance + legTotalDistance) {
-                currentLegIndexNav = i;
-                let legDistanceTraveled = 0;
-                for (let j = 0; j < leg.steps.length; j++) {
-                    const step = leg.steps[j];
-                    const stepDistance = step.distance || 0;
-                    if (recoveredDistance <= cumulativeDistance + legDistanceTraveled + stepDistance) {
-                        currentStepIndexNav = j;
-                        legFound = true;
-                        break;
-                    }
-                    legDistanceTraveled += stepDistance;
-                }
-                if (legFound) break;
-            }
-            cumulativeDistance += legTotalDistance;
-        }
-        console.log(`[Recovery] Progreso re-sincronizado a ${recoveredDistance.toFixed(0)}m (Leg: ${currentLegIndexNav}, Step: ${currentStepIndexNav}).`);
-        
-        // 5. Restaurar datos de la gráfica (si existen)
-        if (recoveryInfo.graphData) {
-            graphDataPoints = recoveryInfo.graphData.graphDataPoints || { speed: [], altitude: [] };
-            graphLabels = recoveryInfo.graphData.graphLabels || [];
-            console.log(`[Recovery] Datos de la gráfica restaurados con ${graphLabels.length} puntos.`);
-        }
-        
-        // 6. Actualizar la UI con todos los datos restaurados/recalculados
-        updateNavigationProgressDisplay(route, lastCarDistanceAlongRouteForNavLogic);
-        updateTurnByTurnDisplay(route, lastCarDistanceAlongRouteForNavLogic);
-        initializeNavigationGraph();
-        updateChartData();
-
-    } catch (error) {
-        console.error("[Recovery] Error al restaurar el progreso:", error);
-        showToast(`Error al restaurar progreso: ${error.message}. Se continuará desde el inicio.`, "error");
-        // En caso de error, reseteamos las variables de progreso para evitar un estado inconsistente
-        navigationStartTimeForStats = new Date();
-        totalDistanceTravelledForStats = 0;
-        accumulatedDistanceBeforeCurrentSegment = 0;
-        // Limpiamos también la gráfica
-        graphDataPoints = { speed: [], altitude: [] };
-        graphLabels = [];
-    }
-}
-    
-    
-// ===================================================================
-// NOMBRE: updateTripStatistics (COMPLETA Y MODIFICADA)
-// RESUMEN: Gestiona los cálculos y la actualización de la UI.
-//          Ahora llama a saveRecoveryFlagData para el guardado periódico.
-// ===================================================================
-function updateTripStatistics(coords) {
-    if (compassAndModeControl) {
-        compassAndModeControl.updateAltitude(coords.altitude);
-
-        if (window.lastPositionForSpeedCalc && typeof coords.speed === 'number' && coords.speed !== null) {
-            const distM = calculateDistance(window.lastPositionForSpeedCalc.latitude, window.lastPositionForSpeedCalc.longitude, coords.latitude, coords.longitude);
-            const timeS = (Date.now() - window.lastPositionForSpeedCalc.time) / 1000;
-            if (timeS > 0 && distM >= 0) {
-                let speedMs = coords.speed;
-                if (typeof speedMs !== 'number' || speedMs === null || speedMs < 0) { speedMs = distM / timeS; }
-                window.currentSpeedKmh = speedMs * 3.6;
-            } else { window.currentSpeedKmh = 0; }
-        } else {
-            if (typeof coords.speed === 'number' && coords.speed !== null && coords.speed >= 0) { window.currentSpeedKmh = coords.speed * 3.6; } else { window.currentSpeedKmh = 0; }
-        }
-        window.lastPositionForSpeedCalc = { latitude: coords.latitude, longitude: coords.longitude, time: Date.now() };
-
-        const isTripActive = isNavigating || isFreeDriveActive;
-        if (isTripActive) {
-             if (navigationStartTimeForStats === null && window.currentSpeedKmh > 1) {
-                navigationStartTimeForStats = new Date();
-             }
-             if (lastPositionForStats && navigationStartTimeForStats) {
-                const distanceMoved = calculateDistance(lastPositionForStats.latitude, lastPositionForStats.longitude, coords.latitude, coords.longitude);
-                totalDistanceTravelledForStats += distanceMoved;
-                const timeElapsedS = (Date.now() - navigationStartTimeForStats.getTime()) / 1000;
-                if (timeElapsedS > 0) {
-                    window.averageSpeedKmh = (totalDistanceTravelledForStats / timeElapsedS) * 3.6;
-                }
-             }
-            lastPositionForStats = { ...coords };
-            
-            let statsChanged = false;
-
-            if (window.currentSpeedKmh > maxSpeedDuringTrip) {
-                maxSpeedDuringTrip = window.currentSpeedKmh;
-                if (coords) { maxSpeedCoordinates = { lat: coords.latitude, lng: coords.longitude }; }
-                statsChanged = true;
-            }
-            if (coords.altitude !== null && !isNaN(coords.altitude)) {
-                if (coords.altitude > maxAltitudeDuringTrip) {
-                    maxAltitudeDuringTrip = coords.altitude;
-                    statsChanged = true;
-                }
-                if (coords.altitude < minAltitudeDuringTrip) {
-                    minAltitudeDuringTrip = coords.altitude;
-                    statsChanged = true;
-                }
-            }
-
-            // Si alguna de las estadísticas clave ha cambiado, y han pasado más de 20 minutos...
-            if (statsChanged && navigationStartTimeForStats) {
-                const TWENTY_MINUTES_IN_MS = 20 * 60 * 1000;
-                const timeElapsed = Date.now() - navigationStartTimeForStats.getTime();
-                
-                if (timeElapsed > TWENTY_MINUTES_IN_MS) {
-                    saveRecoveryFlagData(false); // Llamada a la función unificada
-                }
-            }
-        }
-        compassAndModeControl.updateCurrentSpeed(window.currentSpeedKmh);
-        compassAndModeControl.updateAverageSpeed(window.averageSpeedKmh);
-        compassAndModeControl.updateMaxSpeed(maxSpeedDuringTrip);
- 
-        if (isFreeDriveActive) {
-            updateNavigationProgressDisplay(); 
-        }
-    }
-}
-
-
-// ===================================================================
-// NOMBRE: checkForAndExecuteCrashRecovery (VERSIÓN RESTAURADA Y CORRECTA)
-// RESUMEN: Lee la bandera. Si es válida, inicia la apertura del mapa y la
-//          restauración de datos. Devuelve 'true' para que initializeApp
-//          tome la decisión final sobre qué UI mostrar.
-// ===================================================================
-async function checkForAndExecuteCrashRecovery() {
-    const recoveryFlagJSON = localStorage.getItem('boardinggate_nav_recovery_flag');
-    if (!recoveryFlagJSON) {
-        return false; // No hay nada que recuperar, flujo normal.
-    }
-    
-    try {
-        const recoveryData = JSON.parse(recoveryFlagJSON);
-        if (recoveryData && recoveryData.isActive && recoveryData.route) {
-            
-            // NO se manipula la UI aquí. Solo se inician las operaciones de recuperación.
-            await openNavigationMap(true); 
-            await loadRouteFromObject(recoveryData.route, true, true, recoveryData);
-
-            // Se limpia el flag DESPUÉS de que la carga ha sido exitosa.
-            clearRecoveryFlag();
-            console.log("[Recovery] Recuperación completada. Flag limpiado.");
-
-            return true; // Éxito: indicamos que la recuperación debe proceder.
-        }
-    } catch (e) {
-        console.error("Error al procesar el recovery flag. Se limpiará para evitar bucles.", e);
-        clearRecoveryFlag(); // Limpiar en caso de error para no entrar en bucle.
-    }
-     
-    return false; // El flag era inválido o la recuperación falló.
-}    
-
-
-
-    
 
     
 // ===================================================================
@@ -2801,12 +2484,10 @@ function togglePoiCategorySearch() {
         showPoiCategoryModal();
     }
 }
-
-// =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
-// NOMBRE: initializeApp (VERSIÓN ORIGINAL RESTAURADA)
-// RESUMEN: Llama a checkForAndExecuteCrashRecovery y luego decide qué
-//          interfaz mostrar: el mapa (en recuperación/directo) o el grid.
-// =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+    
+// ===================================================================
+// NOMBRE: initializeApp 
+// RESUMEN: Llama a la nueva función `uploadDirtyCacheOnLoad_Car` y establece el timestamp inicial para la sincronización móvil.
 async function initializeApp() {
     const recoveryExecuted = await checkForAndExecuteCrashRecovery();
     loadCustomData();
@@ -2825,7 +2506,6 @@ async function initializeApp() {
     const termsAccepted = localStorage.getItem('termsAccepted_v1') === 'true';
     const shouldDirectToNav = JSON.parse(localStorage.getItem(DIRECT_TO_NAVIGATION_KEY)) || false;
     const tempPreventDirectNav = sessionStorage.getItem(TEMP_PREVENT_DIRECT_NAV_KEY);
-    
     if ((shouldDirectToNav && !tempPreventDirectNav && termsAccepted) || recoveryExecuted) {
         if(!recoveryExecuted) sessionStorage.setItem('isInDirectToMapMode', 'true');
         directToNavOnLoad = true;
@@ -3062,14 +2742,8 @@ async function initializeApp() {
             if (isEditMode || isAssignmentMode || isKeywordAssignmentMode) return;
             openAlertModal();
         });
-    }
-
-    if (reminderCheckIntervalId) {
-        clearInterval(reminderCheckIntervalId); // Doble seguridad por si acaso
-    }
-    checkReminders(); // Inicia el primer ciclo inmediatamente
-}
-    
+    }  
+}    
 
 // ===================================================================
 // NOMBRE: recalculateAndSaveUserCount (FUNCIÓN DE ADMIN)
@@ -6594,6 +6268,101 @@ function updateMapCamera(coords, mapInstanceToUse) {
     markerAnimationState.targetMapBearing = targetBearing;
 }
     
+
+// ===================================================================
+// NOMBRE: updateTripStatistics 
+// RESUMEN: Gestiona los cálculos y la actualización de la UI de estadísticas de viaje.
+function updateTripStatistics(coords) {
+    if (compassAndModeControl) {
+        compassAndModeControl.updateAltitude(coords.altitude);
+
+        if (window.lastPositionForSpeedCalc && typeof coords.speed === 'number' && coords.speed !== null) {
+            const distM = calculateDistance(window.lastPositionForSpeedCalc.latitude, window.lastPositionForSpeedCalc.longitude, coords.latitude, coords.longitude);
+            const timeS = (Date.now() - window.lastPositionForSpeedCalc.time) / 1000;
+            if (timeS > 0 && distM >= 0) {
+                let speedMs = coords.speed;
+                if (typeof speedMs !== 'number' || speedMs === null || speedMs < 0) { speedMs = distM / timeS; }
+                window.currentSpeedKmh = speedMs * 3.6;
+            } else { window.currentSpeedKmh = 0; }
+        } else {
+            if (typeof coords.speed === 'number' && coords.speed !== null && coords.speed >= 0) { window.currentSpeedKmh = coords.speed * 3.6; } else { window.currentSpeedKmh = 0; }
+        }
+        window.lastPositionForSpeedCalc = { latitude: coords.latitude, longitude: coords.longitude, time: Date.now() };
+
+        const isTripActive = isNavigating || isFreeDriveActive;
+        if (isTripActive) {
+             if (navigationStartTimeForStats === null && window.currentSpeedKmh > 1) {
+                navigationStartTimeForStats = new Date();
+             }
+             if (lastPositionForStats && navigationStartTimeForStats) {
+                const distanceMoved = calculateDistance(lastPositionForStats.latitude, lastPositionForStats.longitude, coords.latitude, coords.longitude);
+                totalDistanceTravelledForStats += distanceMoved;
+                const timeElapsedS = (Date.now() - navigationStartTimeForStats.getTime()) / 1000;
+                if (timeElapsedS > 0) {
+                    window.averageSpeedKmh = (totalDistanceTravelledForStats / timeElapsedS) * 3.6;
+                }
+             }
+            lastPositionForStats = { ...coords };
+            
+            let statsChanged = false;
+
+            if (window.currentSpeedKmh > maxSpeedDuringTrip) {
+                maxSpeedDuringTrip = window.currentSpeedKmh;
+                if (coords) { maxSpeedCoordinates = { lat: coords.latitude, lng: coords.longitude }; }
+                statsChanged = true;
+            }
+            if (coords.altitude !== null && !isNaN(coords.altitude)) {
+                if (coords.altitude > maxAltitudeDuringTrip) {
+                    maxAltitudeDuringTrip = coords.altitude;
+                    statsChanged = true;
+                }
+                if (coords.altitude < minAltitudeDuringTrip) {
+                    minAltitudeDuringTrip = coords.altitude;
+                    statsChanged = true;
+                }
+            }
+
+            // Si alguna de las estadísticas clave ha cambiado, y han pasado más de 20 minutos...
+            if (statsChanged && navigationStartTimeForStats) {
+                const TWENTY_MINUTES_IN_MS = 20 * 60 * 1000;
+                const timeElapsed = Date.now() - navigationStartTimeForStats.getTime();
+                
+                if (timeElapsed > TWENTY_MINUTES_IN_MS) {
+                    // 1. Leer el flag de recuperación existente.
+                    const recoveryFlagJSON = localStorage.getItem('boardinggate_nav_recovery_flag');
+                    if (recoveryFlagJSON) {
+                        try {
+                            // 2. Convertirlo en un objeto.
+                            const recoveryData = JSON.parse(recoveryFlagJSON);
+
+                            // 3. Modificar ÚNICAMENTE el sub-objeto de estadísticas.
+                            recoveryData.stats = {
+                                totalDistance: totalDistanceTravelledForStats,
+                                maxSpeed: maxSpeedDuringTrip,
+                                maxAltitude: maxAltitudeDuringTrip,
+                                minAltitude: minAltitudeDuringTrip,
+                                maxSpeedCoords: maxSpeedCoordinates // Guardamos también las coordenadas
+                            };
+                            
+                            // 4. Guardar de nuevo el objeto completo.
+                            localStorage.setItem('boardinggate_nav_recovery_flag', JSON.stringify(recoveryData));
+                        } catch(e) {
+                            console.error("Error al actualizar el flag de recuperación:", e);
+                        }
+                    }
+                }
+            }
+        }
+        compassAndModeControl.updateCurrentSpeed(window.currentSpeedKmh);
+        compassAndModeControl.updateAverageSpeed(window.averageSpeedKmh);
+        compassAndModeControl.updateMaxSpeed(maxSpeedDuringTrip);
+ 
+        if (isFreeDriveActive) {
+            updateNavigationProgressDisplay(); 
+        }
+    }
+}
+
 // ===================================================================
 // NOMBRE: processRouteProgress 
 // RESUMEN: Elimina el umbral de pre-vigilancia. La alerta se activa
@@ -8362,11 +8131,10 @@ function updateNavigationProgressDisplay(route, carDistanceAlongTheRoute = 0) {
     }
 }
 
+    
 // ===================================================================
-// NOMBRE: toggleNavigationState
-// RESUMEN: Inicia o detiene la navegación. Ahora llama a saveRecoveryFlagData
-//          al iniciar para crear el flag de recuperación.
-// ===================================================================
+// NOMBRE: toggleNavigationState 
+// RESUMEN: Añade el parámetro 'isRecovery' para evitar resetear las estadísticas en una sesión restaurada.
 async function toggleNavigationState(isRecalculationStop = false, isRecovery = false) {
     const startNavButton = document.getElementById('start-navigation-button');
     const startNavImg = startNavButton ? startNavButton.querySelector('img') : null;
@@ -8403,6 +8171,9 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
         }
         
         clearRecoveryFlag();
+
+        startMemoryManagement(false);
+        
         if (isSimulatingGpsLocation) {
             stopAutomatedRouteSimulation();
         }
@@ -8413,7 +8184,7 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
         }
         isNavigating = false;
         navigationFollowUser = false;
-        
+        ; 
     } else if (isFreeDriveActive) {
         stopFreeDrive();
     } else {
@@ -8450,9 +8221,23 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
             }
             addRouteToRecents(routeForStorage);
             
-            // Se llama a la nueva función de guardado unificada en modo "simple".
-            saveRecoveryFlagData(false);
-           
+            if (!isRecovery) {
+                const recoveryData = { 
+                    isActive: true, 
+                    route: routeForStorage,
+                    tripStartTime: Date.now(),
+                    originalTripEtaTime: originalTripEtaTime ? originalTripEtaTime.getTime() : null,
+                    stats: {
+                        totalDistance: totalDistanceTravelledForStats,
+                        maxSpeed: maxSpeedDuringTrip,
+                        maxAltitude: maxAltitudeDuringTrip,
+                        minAltitude: minAltitudeDuringTrip,
+                        maxSpeedCoords: null  
+                    }
+                };
+                localStorage.setItem('boardinggate_nav_recovery_flag', JSON.stringify(recoveryData));
+            }
+        
             clearNavigationGraph();
            
             if (!isRecovery) {
@@ -8479,6 +8264,7 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
             const loadingToast = document.getElementById("gps-init-toast"); if (loadingToast) loadingToast.remove(); activeToasts = activeToasts.filter(t => t.id !== "gps-init-toast");
             
             isNavigating = true;
+            startMemoryManagement(true); 
             startDeviationChecker(); 
             mapHeaderButtonsVisible = false;
             toggleMapHeaderRowsVisibility(false);
@@ -8562,8 +8348,48 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
     setNavigationMapClickHandler(); 
     actualizarContadorRadares(radaresEnRutaActual.length);
     actualizarContadorTareas(tareasEnRutaActual.length);
-}    
+}
     
+// ===================================================================
+// NOMBRE: checkForAndExecuteCrashRecovery 
+// RESUMEN: Lee la bandera de recuperación y ahora también el `tripStartTime`, pasándolo a la función de carga.
+async function checkForAndExecuteCrashRecovery() {
+    const recoveryFlagJSON = localStorage.getItem('boardinggate_nav_recovery_flag');
+    if (!recoveryFlagJSON) {
+        return false; }
+    
+    try {
+        const recoveryData = JSON.parse(recoveryFlagJSON);
+        if (recoveryData && recoveryData.isActive && recoveryData.route) {
+            showToast("ESPERE UN MOMENTO POR FAVOR, Recuperando sesión de navegación anterior...", "error", 11000);
+
+            const mainContent = document.querySelector('main'); if (mainContent) mainContent.style.display = 'none';
+            const footer = document.querySelector('footer'); if (footer) footer.style.display = 'none';
+            const noticesContainer = document.querySelector('.notices-icon-container'); if (noticesContainer) noticesContainer.style.display = 'none';
+            const sideControls = document.querySelectorAll('.toggle-image, .toggle-sign, .scroll-toggle-button'); sideControls.forEach(el => el.style.display = 'none');
+            document.querySelectorAll('#config-button, #personal-button, #radar-button, #home-button, #reload-button, #keyword-assignment-button, #password-toggle-button, #versions-button, #info-button, #accident-alert-button').forEach(el => el.style.display = 'none');
+            const gridFilter = document.getElementById('grid-filter-container'); if (gridFilter) gridFilter.style.display = 'none';
+            
+            try {
+                await openNavigationMap(true); 
+                
+                await loadRouteFromObject(recoveryData.route, true, true, recoveryData);
+
+                return true;  
+            } catch (recoveryError) {
+                showToast("La recuperación automática falló. Cargando la app normalmente.", "error", 6000);
+                clearRecoveryFlag();
+                setTimeout(() => location.reload(), 2000);
+                return true; }
+        }
+    } catch (e) {
+    } finally {
+        clearRecoveryFlag(); 
+    }
+    clearRecoveryFlag(); 
+     
+    return false; 
+}  
 
 // ===================================================================
 // NOMBRE: loadRouteFromObject
@@ -8674,6 +8500,120 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
     }
 }    
     
+// ===================================================================
+// NOMBRE: restoreTripProgress 
+// RESUMEN: Restaura el estado de un viaje (distancia, tiempo, stats) tras una recuperación.
+async function restoreTripProgress(recoveryInfo) {
+    if (!navigationCurrentRouteData?.routes?.[0] || !recoveryInfo || !recoveryInfo.tripStartTime) {
+        return;
+    }
+
+    try {
+        const route = navigationCurrentRouteData.routes[0];
+        
+        // 1. Restaurar datos de tiempo
+        navigationStartTimeForStats = new Date(recoveryInfo.tripStartTime);
+        if (recoveryInfo.originalTripEtaTime) {
+            originalTripEtaTime = new Date(recoveryInfo.originalTripEtaTime);
+        }
+        
+        // 2. Obtener punto de partida original y ubicación actual
+        const originalStartWaypoint = recoveryInfo.route?.waypoints?.[0];
+        const currentCoords = await getCurrentLocationAsync();
+        
+        let recoveredDistance = 0;
+
+        if (!originalStartWaypoint) {
+            showToast("Punto de inicio no encontrado en recuperación. Estadísticas reiniciadas.", "warning");
+            totalDistanceTravelledForStats = 0;
+            accumulatedDistanceBeforeCurrentSegment = 0;
+        } else {
+            // 3. CALCULAR DISTANCIA REAL RECORRIDA
+            try {
+                // 3a. INTENTO 1: Calcular la distancia real por carretera llamando a la API
+                showToast("Calculando distancia recorrida...", "info", 2000);
+                const coordsStringForDistance = `${originalStartWaypoint.lng},${originalStartWaypoint.lat};${currentCoords.longitude},${currentCoords.latitude}`;
+                const distanceResult = await fetchRouteData(coordsStringForDistance);
+                
+                if (distanceResult.routeData && distanceResult.routeData.routes[0]) {
+                    recoveredDistance = distanceResult.routeData.routes[0].distance; // Distancia en metros
+                    console.log(`[RECOVERY] Distancia real por carretera recuperada: ${(recoveredDistance / 1000).toFixed(2)} km.`);
+                } else {
+                    throw new Error("La API no devolvió una ruta para el cálculo de distancia.");
+                }
+
+            } catch (apiError) {
+                // 3b. FALLBACK: Si la API falla, calcular distancia en línea recta como emergencia
+                console.warn("[RECOVERY] Falló la API para calcular distancia recorrida, usando fallback de línea recta.", apiError);
+                showToast("No se pudo calcular la distancia exacta, se usará una estimación.", "warning");
+                recoveredDistance = calculateDistance(
+                    originalStartWaypoint.lat, 
+                    originalStartWaypoint.lng, 
+                    currentCoords.latitude, 
+                    currentCoords.longitude
+                );
+            }
+            
+            // 4. Restaurar las estadísticas con el valor calculado
+            totalDistanceTravelledForStats = recoveredDistance;
+            accumulatedDistanceBeforeCurrentSegment = recoveredDistance; // CRUCIAL para la barra de progreso
+
+            if (recoveryInfo.stats) {
+                maxSpeedDuringTrip = recoveryInfo.stats.maxSpeed || 0;
+                maxAltitudeDuringTrip = recoveryInfo.stats.maxAltitude || -Infinity;
+                minAltitudeDuringTrip = recoveryInfo.stats.minAltitude || Infinity;
+                maxSpeedCoordinates = recoveryInfo.stats.maxSpeedCoords || null;
+            }
+            lastPositionForStats = { ...currentCoords };
+        }
+        
+        // 5. Recalcular la posición en la nueva ruta y actualizar la UI
+        const carPoint = turf.point([currentCoords.longitude, currentCoords.latitude]);
+        const routeLine = turf.lineString(route.geometry.coordinates);
+        const nearestPointOnRoute = turf.nearestPointOnLine(routeLine, carPoint, { units: 'meters' });
+        const carDistanceAlongRoute = nearestPointOnRoute.properties.location;
+        
+        const timeElapsedS = (Date.now() - recoveryInfo.tripStartTime) / 1000;
+        if (timeElapsedS > 0 && totalDistanceTravelledForStats > 0) {
+            window.averageSpeedKmh = (totalDistanceTravelledForStats / timeElapsedS) * 3.6;
+        }
+        lastCarDistanceAlongRouteForNavLogic = carDistanceAlongRoute;
+        
+        let cumulativeDistance = 0;
+        let legFound = false;
+        for (let i = 0; i < route.legs.length; i++) {
+            const leg = route.legs[i];
+            if (!leg || !leg.steps) continue;
+            const legTotalDistance = leg.distance || leg.steps.reduce((sum, step) => sum + (step.distance || 0), 0);
+            
+            if (carDistanceAlongRoute <= cumulativeDistance + legTotalDistance) {
+                currentLegIndexNav = i;
+                let legDistanceTraveled = 0;
+                for (let j = 0; j < leg.steps.length; j++) {
+                    const step = leg.steps[j];
+                    const stepDistance = step.distance || 0;
+                    if (carDistanceAlongRoute <= cumulativeDistance + legDistanceTraveled + stepDistance) {
+                        currentStepIndexNav = j;
+                        legFound = true;
+                        break;
+                    }
+                    legDistanceTraveled += stepDistance;
+                }
+                if (legFound) break;
+            }
+            cumulativeDistance += legTotalDistance;
+        }
+
+        updateNavigationProgressDisplay(route, carDistanceAlongRoute);
+        updateTurnByTurnDisplay(route, carDistanceAlongRoute);
+
+    } catch (error) {
+        showToast(`Error al restaurar progreso: ${error.message}. Se continuará desde el inicio.`, "error");
+        navigationStartTimeForStats = new Date();
+        totalDistanceTravelledForStats = 0;
+        accumulatedDistanceBeforeCurrentSegment = 0; // Asegurarse de resetear en caso de error
+    }
+}
     
 // ===================================================================
 // NOMBRE: fetchAndRenderChatUsers 
@@ -21973,33 +21913,27 @@ function stopResourceMonitor() {
 // ===================================================================
 
 // ===================================================================
-// NOMBRE: DOMContentLoaded (VERSIÓN MÍNIMAMENTE INVASIVA)
-// RESUMEN: Flujo de arranque original con una única modificación:
-//          Si existe un 'recovery_flag', se salta la petición del PIN
-//          para permitir que la recuperación se ejecute sin interrupción.
-// ===================================================================
+// NOMBRE: DOMContentLoaded (MODIFICADO)
+// RESUMEN: Punto de entrada principal. Ahora espera a la sincronización pre-vuelo ANTES de inicializar la app.
 document.addEventListener('DOMContentLoaded', async () => {
-    // 1. Lógica original de pre-carga y sincronización (sin cambios)
-    preloadGpsLocation();
+     // 1. precargar ubicacion coche y Realiza la comprobación y posible descarga de datos antes de hacer nada más.
+    preloadGpsLocation(); 
     await preflightSync();
      
-    // 2. Lógica original de comprobación de PIN (CON LA ÚNICA MODIFICACIÓN)
-    storedPin = localStorage.getItem('password_pin');
-    const savedPasswordActive = JSON.parse(localStorage.getItem('password_active') || 'false');
-    const initialDirectToNavPref = JSON.parse(localStorage.getItem(DIRECT_TO_NAVIGATION_KEY)) || false;
-    const tempPreventDirectNav = sessionStorage.getItem(TEMP_PREVENT_DIRECT_NAV_KEY);
-    
-    const recoveryFlagExists = !!localStorage.getItem('boardinggate_nav_recovery_flag');
+     // 2. Una vez que el localStorage está actualizado, procede con la lógica de renderizado normal.
+     storedPin = localStorage.getItem('password_pin');
+     const savedPasswordActive = localStorage.getItem('password_active');
+     isPasswordActive = savedPasswordActive ? JSON.parse(savedPasswordActive) : false;
+     const initialDirectToNavPref = JSON.parse(localStorage.getItem(DIRECT_TO_NAVIGATION_KEY)) || false;
+     const tempPreventDirectNav = sessionStorage.getItem(TEMP_PREVENT_DIRECT_NAV_KEY);
 
-    if (savedPasswordActive && storedPin && !recoveryFlagExists && !(initialDirectToNavPref && !tempPreventDirectNav)) {
-        promptForPin();
-    } else {
-        await initializeApp();
-    }
+     if (isPasswordActive && storedPin && !(initialDirectToNavPref && !tempPreventDirectNav)) {
+         promptForPin();
+     } else {
+         await initializeApp();
+     }
 
-    // 3. Lógica original de asignación de listeners (sin cambios)
     assignMapButtonListeners();
-
     document.body.addEventListener('click', function(event) {
         const target = event.target;
         const targetId = target.id || (target.closest('[id]') ? target.closest('[id]').id : null);
@@ -22151,6 +22085,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         });
     }
 
+    if (reminderCheckIntervalId) {
+        clearInterval(reminderCheckIntervalId); // Doble seguridad por si acaso
+    }
+    checkReminders(); // Inicia el primer ciclo inmediatamente
+    
+
      window.addEventListener('beforeunload', () => {
          if (reminderCheckIntervalId) { clearInterval(reminderCheckIntervalId); }
          if (locationWatchId !== null && navigator.geolocation) { navigator.geolocation.clearWatch(locationWatchId); locationWatchId = null; }
@@ -22194,7 +22134,6 @@ document.addEventListener('DOMContentLoaded', async () => {
           if (navigationChart) navigationChart.destroy();
           if (graphIntervalTimer) clearInterval(graphIntervalTimer);
      });
-
 
  <!--  SCRIPT DE GUIA -->
     
