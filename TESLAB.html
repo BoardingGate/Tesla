@@ -1,4 +1,4 @@
-S01
+S02
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -19733,6 +19733,182 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
     }
     return null;
 }
+
+// ===================================================================
+// NOMBRE: handleProgressiveManeuverZoom (VERSIÓN CORREGIDA Y ROBUSTA)
+// RESUMEN: Gestiona el zoom progresivo al acercarse a una maniobra.
+//          Esta versión corrige un bug donde el nivel de zoom manual
+//          se perdía durante maniobras encadenadas. Ahora, el zoom
+//          original se guarda una sola vez al inicio de la secuencia
+//          y se restaura de forma fiable al final.
+// ===================================================================
+function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDistanceAlongRouteForNavLogic) {
+    // Si el usuario está interactuando manualmente, no hacemos nada.
+    if (isManualZoomActive) return null;
+
+    // Si no estamos navegando o no hay un paso actual, reseteamos y salimos.
+    if (!isNavigating || !navigationMapInstance || !currentStep) {
+        if (isZoomedForManeuver) isZoomedForManeuver = false;
+        // Reseteamos el nivel de zoom guardado al salir del modo maniobra.
+        if (mapPreviousZoomLevelForProgressive !== null) mapPreviousZoomLevelForProgressive = null;
+        return null;
+    }
+    
+    // Distancia a la que empieza la animación de zoom-in.
+    let ANIMATION_START_DISTANCE = 210;
+    if (navigationMapInstance.getZoom() < 16) {
+        ANIMATION_START_DISTANCE = 250;
+    }
+
+    const route = navigationCurrentRouteData?.routes?.[0];
+    if (!route || !route.geometry || !route.geometry.coordinates || route.geometry.coordinates.length < 2) {
+        return null;
+    }
+    
+    // Constantes que definen el comportamiento de la animación
+    const OFFSET_PEAK_DISTANCE = 120;
+    const ZOOM_PEAK_DISTANCE = 50;
+    const PROGRESSIVE_ZOOM_EXIT_START_DISTANCE = 40;
+    const PROGRESSIVE_ZOOM_EXIT_END_DISTANCE = 160;
+    const HOLD_ZOOM_THRESHOLD = 250; // Distancia a la siguiente maniobra para decidir si mantenemos el zoom.
+    const maxZoomForMap = navigationMapInstance.getMaxZoom() || 21;
+    const currentMapLayerName = (localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO").toLowerCase();
+    const isSatelliteWithLabels = currentMapLayerName.includes("satélite") && currentMapLayerName.includes("calles");
+    const MANEUVER_PEAK_ZOOM_LEVEL = Math.min(isSatelliteWithLabels ? 17.5 : 18.5, 19.5);
+    
+    // Identificador único para el paso actual, para detectar cuándo hemos avanzado.
+    const currentStepIdentifier = `${currentLegIndexNav}_${currentStepIndexNav}`;
+    if (lastProcessedStepIdentifier !== null && lastProcessedStepIdentifier !== currentStepIdentifier) {
+        // Hemos cambiado de paso, así que iniciamos la fase de "zoom-out" o "holding".
+        if (progressiveZoomState === 'zooming-in' || progressiveZoomState === 'holding') {
+            progressiveZoomState = 'zooming-out';
+        }
+    }
+    lastProcessedStepIdentifier = currentStepIdentifier;
+
+    const distanceIntoCurrentStep = currentStep.distance - distanceToManeuver;
+    let targetZoom = null, targetPitch = null, targetOffsetX = null, targetOffsetY = null;
+
+    switch (progressiveZoomState) {
+        case 'zooming-out':
+            isZoomedForManeuver = true;
+            const nextStepAfterCurrent = findNextValidStep(route, currentLegIndexNav, currentStepIndexNav);
+            const distanceToNextStep = nextStepAfterCurrent ? calculateDistanceToEndOfStep(route, nextStepAfterCurrent.legIndex, nextStepAfterCurrent.stepIndex) - carDistanceAlongRouteForNavLogic : Infinity;
+            
+            // Si la siguiente maniobra está muy cerca, MANTENEMOS el zoom.
+            if (nextStepAfterCurrent && distanceToNextStep < HOLD_ZOOM_THRESHOLD) {
+                targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
+                const pitchTarget = (mapViewMode === 'perspective' || mapViewMode === 'relief') ? window.pitchBeforeManeuver * 0.75 : 55;
+                targetPitch = Math.max(55, pitchTarget); 
+                targetOffsetY = window.offsetYBeforeManeuver;
+                targetOffsetX = window.maneuverHorizontalTarget;
+                
+            } else {
+                // Si la siguiente maniobra está lejos, podemos empezar a volver al zoom original.
+                if (distanceIntoCurrentStep > PROGRESSIVE_ZOOM_EXIT_END_DISTANCE || mapPreviousZoomLevelForProgressive === null) {
+                    targetZoom = mapPreviousZoomLevelForProgressive;
+                    targetPitch = window.pitchBeforeManeuver;
+                    targetOffsetY = window.offsetYBeforeManeuver;
+                    targetOffsetX = window.offsetXBeforeManeuver;
+
+                    // *** CORRECCIÓN CLAVE ***
+                    // Reseteamos el estado y el zoom guardado SÓLO cuando la secuencia ha terminado completamente.
+                    progressiveZoomState = 'none';
+                    isZoomedForManeuver = false;
+                    mapPreviousZoomLevelForProgressive = null; // <- Limpiamos el zoom guardado.
+                    MAP_UPDATE_INTERVAL_MS = originalMapUpdateIntervalMs;
+                } else {
+                    // Aún estamos saliendo de la maniobra anterior, mantenemos el zoom.
+                    targetZoom = MANEUVER_PEAK_ZOOM_LEVEL;
+                    const pitchTarget = (mapViewMode === 'perspective' || mapViewMode === 'relief') ? window.pitchBeforeManeuver * 0.75 : 55;
+                    targetPitch = Math.max(55, pitchTarget); 
+                    targetOffsetY = window.offsetYBeforeManeuver;
+                    targetOffsetX = window.maneuverHorizontalTarget;
+                }
+            }
+            break;
+
+        default: // Cubre los estados 'none' y 'zooming-in'
+            if (distanceToManeuver <= ANIMATION_START_DISTANCE) {
+                // Estamos cerca de una maniobra, iniciamos el zoom-in.
+                if (progressiveZoomState === 'none') {
+                    // *** CORRECCIÓN CLAVE ***
+                    // Solo guardamos el zoom original si no lo hemos guardado ya en esta secuencia.
+                    if (mapPreviousZoomLevelForProgressive === null) {
+                        originalMapUpdateIntervalMs = MAP_UPDATE_INTERVAL_MS;
+                        MAP_UPDATE_INTERVAL_MS = 1000 / 60; // Aumentamos FPS para la animación.
+                        
+                        const currentAutoZoomMode = localStorage.getItem(AUTO_ZOOM_MODE_KEY) || 'off';
+                        if (currentAutoZoomMode === 'off' && manualZoomLevelMemory !== null) {
+                            mapPreviousZoomLevelForProgressive = manualZoomLevelMemory; // Priorizamos el zoom manual explícito del usuario.
+                        } else {
+                            mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
+                        }
+                        
+                        window.pitchBeforeManeuver = navigationMapInstance.getPitch();
+                        window.offsetXBeforeManeuver = mapOffsetX;
+                        window.offsetYBeforeManeuver = mapOffsetY;
+                        
+                        let dynamicHorizontalTarget = 0;
+                        const maneuver = currentStep.maneuver;
+                        const instructionText = getManeuverInstructionText(maneuver).toLowerCase();
+                        if (instructionText.includes('derecha')) dynamicHorizontalTarget = -5; 
+                        else if (instructionText.includes('izquierda')) dynamicHorizontalTarget = 5;
+                        window.maneuverHorizontalTarget = dynamicHorizontalTarget;
+                    }
+                    progressiveZoomState = 'zooming-in';
+                    isZoomedForManeuver = true;
+                }
+                
+                // Calculamos el progreso de la animación de zoom.
+                let zoomProgress = 0;
+                if (distanceToManeuver <= ZOOM_PEAK_DISTANCE) zoomProgress = 1;
+                else if (distanceToManeuver < ANIMATION_START_DISTANCE) zoomProgress = (ANIMATION_START_DISTANCE - distanceToManeuver) / (ANIMATION_START_DISTANCE - ZOOM_PEAK_DISTANCE);
+                
+                const easedZoomProgress = easeInOutQuad(Math.max(0, Math.min(1, zoomProgress)));
+                targetZoom = mapPreviousZoomLevelForProgressive + (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * easedZoomProgress;
+                
+                if (mapViewMode === 'perspective' || mapViewMode === 'relief') {
+                    const pitchTarget = window.pitchBeforeManeuver * 0.75;
+                    const finalPitchTarget = Math.max(55, pitchTarget);
+                    targetPitch = window.pitchBeforeManeuver - ((window.pitchBeforeManeuver - finalPitchTarget) * easedZoomProgress);
+                } else {
+                    targetPitch = window.pitchBeforeManeuver + (55 - window.pitchBeforeManeuver) * easedZoomProgress;
+                }
+                
+                targetOffsetY = window.offsetYBeforeManeuver;
+                targetOffsetX = window.maneuverHorizontalTarget;
+              
+            } else {
+                 // Estamos lejos de cualquier maniobra.
+                if (progressiveZoomState !== 'none') {
+                    // Si estábamos en medio de una secuencia, volvemos al estado guardado.
+                    targetZoom = mapPreviousZoomLevelForProgressive;
+                    targetPitch = window.pitchBeforeManeuver;
+                    targetOffsetY = window.offsetYBeforeManeuver;
+                    targetOffsetX = window.offsetXBeforeManeuver;
+                }
+
+                // *** CORRECCIÓN CLAVE ***
+                // Reseteamos todo al estado 'none' solo cuando estamos lejos de una maniobra.
+                progressiveZoomState = 'none';
+                isZoomedForManeuver = false;
+                if (mapPreviousZoomLevelForProgressive !== null) mapPreviousZoomLevelForProgressive = null; // <- Limpiamos el zoom guardado.
+                MAP_UPDATE_INTERVAL_MS = originalMapUpdateIntervalMs;
+              }
+            break;
+    }
+
+    if (targetZoom !== null || targetPitch !== null || targetOffsetX !== null || targetOffsetY !== null) {
+        return { 
+            zoom: targetZoom, 
+            pitch: targetPitch, 
+            offsetX: targetOffsetX !== null ? Math.max(-75, Math.min(75, targetOffsetX)) : null,
+            offsetY: targetOffsetY !== null ? Math.max(-75, Math.min(75, targetOffsetY)) : null
+        };
+    }
+    return null;
+}    
  
 // ===================================================================
 // NOMBRE: handleProgressBarLockToggle
