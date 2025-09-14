@@ -1,4 +1,4 @@
-D14
+D15
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -22103,7 +22103,74 @@ function renderAssistantMessage(htmlContent, type = 'assistant') {
     statusArea.appendChild(messageDiv);
     statusArea.scrollTop = statusArea.scrollHeight;
 }
+
+
+// ===================================================================
+// NOMBRE: renderAiResponse (NUEVA FUNCIÓN UNIFICADA)
+// RESUMEN: Muestra CUALQUIER respuesta de la IA en el chat.
+//          Si detecta un JSON válido, muestra los botones de acción de ruta.
+// ===================================================================
+function renderAiResponse(aiText, originalUserPrompt) {
+    const statusArea = document.getElementById('ai-status-area');
+    if (!statusArea) return;
+
+    // 1. Limpia el contenedor de botones anterior, si existe.
+    const oldButtons = document.getElementById('ai-buttons-container');
+    if (oldButtons) oldButtons.remove();
+
+    // 2. Extrae y limpia el texto visible para el usuario (sin el bloque JSON).
+    const summaryText = aiText.replace(/```json\n([\s\S]*?)\n```/, '').trim();
     
+    // 3. Muestra SIEMPRE el texto de la IA en el chat.
+    if (summaryText) {
+        renderAssistantMessage(summaryText.replace(/\n/g, '<br>'));
+    }
+
+    // 4. Intenta encontrar y parsear el bloque JSON.
+    try {
+        const jsonMatch = aiText.match(/```json\n([\s\S]*?)\n```/);
+        
+        // Si no hay JSON, la función termina aquí. La conversación queda abierta.
+        if (!jsonMatch || !jsonMatch[1]) {
+            console.log("IA respondió sin JSON. Esperando siguiente input del usuario.");
+            return; 
+        }
+
+        const waypoints = JSON.parse(jsonMatch[1]).waypoints;
+        
+        // ¡Éxito! Tenemos waypoints válidos.
+        if (!waypoints || !Array.isArray(waypoints) || waypoints.length === 0) {
+            console.log("IA devolvió un JSON de waypoints vacío. Dejando la conversación abierta.");
+            return;
+        }
+
+        // 5. Si hay JSON válido, crea y añade los botones de acción.
+        const buttonsContainer = document.createElement('div');
+        buttonsContainer.id = 'ai-buttons-container';
+        buttonsContainer.className = 'ai-modal-buttons';
+        buttonsContainer.style.marginTop = '1rem';
+        buttonsContainer.innerHTML = `
+            <button id="ai-accept-route">Cargar Ruta en Mapa</button>
+            <button id="ai-refine-route">Cerrar</button>
+        `;
+        statusArea.appendChild(buttonsContainer);
+        statusArea.scrollTop = statusArea.scrollHeight;
+
+        document.getElementById('ai-accept-route').onclick = () => {
+            const routeObject = { name: `Ruta IA: ${originalUserPrompt.substring(0, 25)}...`, waypoints: waypoints };
+            loadRouteFromObject(routeObject, true);
+            document.getElementById('ai-route-modal').classList.add('hidden');
+        };
+        document.getElementById('ai-refine-route').onclick = () => {
+            document.getElementById('ai-route-modal').classList.add('hidden');
+        };
+
+    } catch (e) {
+        // El JSON estaba mal formado. Informamos al usuario y dejamos la conversación abierta.
+        console.error("Error al parsear el JSON de la IA:", e);
+        renderAssistantMessage("He intentado generar la ruta, pero el formato JSON tenía un error. ¿Podrías pedirme que lo intente de nuevo o aclarar la petición?", 'error');
+    }
+}    
 
 // ===================================================================
 // NOMBRE: openAiPlannerModal (MODIFICADA CON GESTIÓN DE ESTADO)
@@ -22145,12 +22212,11 @@ function openAiPlannerModal() {
 
     
 
-// ... justo después de las otras variables globales
 let aiConversationHistory = []; // <-- ¡ESTA ES LA MEMORIA DE LA IA!
 // ...    
 // ===================================================================
-// NOMBRE: handleAiRouteRequest (VERSIÓN CONVERSACIONAL FINAL)
-// RESUMEN: Gestiona la conversación completa, mostrando todas las respuestas intermedias de la IA.
+// NOMBRE: handleAiRouteRequest (VERSIÓN CON RENDERIZADO INTELIGENTE)
+// RESUMEN: Gestiona la conversación y usa renderAiResponse para mostrar la UI.
 // ===================================================================
 async function handleAiRouteRequest() {
     const promptInput = document.getElementById('ai-prompt-input');
@@ -22171,111 +22237,6 @@ async function handleAiRouteRequest() {
     const currentUserPrompt = { "role": "user", "parts": [{ "text": prompt }] };
     aiConversationHistory.push(currentUserPrompt);
 
-    const tools = [{ /* ... (tu definición de 'tools' no cambia) ... */ }];
-
-    try {
-        // --- BUCLE DE CONVERSACIÓN ---
-        // Este bucle se ejecutará mientras la IA siga pidiendo herramientas o dialogando.
-        // Lo limitamos a 5 turnos para evitar bucles infinitos.
-        for (let i = 0; i < 5; i++) {
-            
-            const response = await fetch(GEMINI_API_URL, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ "contents": aiConversationHistory, "tools": tools })
-            });
-
-            if (!response.ok) {
-                const errorData = await response.json();
-                throw new Error(`Error del servidor de IA (${response.status}): ${errorData.error.message}`);
-            }
-            
-            const result = await response.json();
-            if (!result.candidates || result.candidates.length === 0) {
-                // NUEVO: Gestionar respuestas bloqueadas
-                const blockReason = result.promptFeedback?.blockReason || 'desconocida';
-                throw new Error(`La respuesta de la IA fue bloqueada por motivo: ${blockReason}. Intenta reformular tu petición.`);
-            }
-
-            const assistantResponsePart = result.candidates[0].content.parts[0];
-            aiConversationHistory.push({ "role": "model", "parts": [assistantResponsePart] });
-
-            if (assistantResponsePart.functionCall) {
-                const toolCall = assistantResponsePart.functionCall;
-                
-                // NUEVO: Mostramos al usuario que la IA está trabajando con la herramienta.
-                renderAssistantMessage(`⚙️ Buscando en Google: <b>${toolCall.args.queries.join(', ')}</b>...`, 'tool');
-
-                const toolResult = await ai_tool_google_search_places(toolCall.args);
-                
-                // Añadimos el resultado de la herramienta al historial para la siguiente iteración.
-                aiConversationHistory.push({
-                    "role": "user", // En el protocolo de Gemini, la respuesta de la herramienta la envía el "user".
-                    "parts": [{ "functionResponse": { "name": toolCall.name, "response": { "result": toolResult } } }]
-                });
-                
-                // Continuamos el bucle para que la IA procese el resultado de la herramienta.
-
-            } else {
-                // NUEVO: Si la respuesta es texto, podría ser final o una pregunta intermedia.
-                const aiTextResponse = assistantResponsePart.text;
-
-                // Intentamos parsear. Si funciona, es una respuesta final.
-                const jsonMatch = aiTextResponse.match(/```json\n([\s\S]*?)\n```/);
-                if (jsonMatch && jsonMatch[1]) {
-                    // Es una respuesta final con JSON, la procesamos y salimos del bucle.
-                    await parseAndRenderAIResponse(aiTextResponse, prompt, statusArea);
-                    return; // Fin de la función
-                } else {
-                    // NUEVO: Es una respuesta intermedia (ej: "¿Algo más?"). La mostramos y dejamos al usuario responder.
-                    renderAssistantMessage(aiTextResponse.replace(/\n/g, '<br>'));
-                    return; // Salimos de la función y esperamos el siguiente input del usuario.
-                }
-            }
-        }
-        // Si el bucle termina sin una respuesta final, informamos al usuario.
-        renderAssistantMessage("Parece que la conversación se ha alargado. ¿Puedes resumir la ruta completa que quieres?", 'error');
-
-    } catch (error) {
-        console.error("Error en la IA:", error);
-        renderAssistantMessage(`<b>Error:</b> ${error.message}`, 'error');
-        // Eliminamos los dos últimos mensajes para poder reintentar.
-        aiConversationHistory.pop(); 
-        aiConversationHistory.pop();
-    } finally {
-        generateBtn.disabled = false;
-        statusArea.scrollTop = statusArea.scrollHeight;
-    }
-}
-
-
-// ===================================================================
-// NOMBRE: handleAiRouteRequest (MODIFICADA CON GESTIÓN DE ESTADO)
-// RESUMEN: Gestiona una petición incremental a la IA, usando el historial de conversación.
-// ===================================================================
-async function handleAiRouteRequest() {
-    const promptInput = document.getElementById('ai-prompt-input');
-    const prompt = promptInput.value.trim();
-    const statusArea = document.getElementById('ai-status-area');
-    const generateBtn = document.getElementById('ai-generate-route-button');
-
-    if (!prompt) {
-        showToast("Por favor, escribe una petición.", "warning");
-        return;
-    }
-
-    // Añadir el mensaje del usuario a la UI del chat
-    statusArea.innerHTML += `<div class="ai-message user"><p>${prompt}</p></div>`;
-    promptInput.value = ''; // Limpiar el input
-    generateBtn.disabled = true;
-    statusArea.scrollTop = statusArea.scrollHeight; // Auto-scroll
-
-    // --- LÓGICA CONVERSACIONAL ---
-    // 1. Añade la nueva pregunta del usuario al historial existente.
-    const currentUserPrompt = { "role": "user", "parts": [{ "text": prompt }] };
-    aiConversationHistory.push(currentUserPrompt);
-
-    // Definimos las herramientas (sin cambios)
     const tools = [{
         "functionDeclarations": [{
             "name": "search_places_with_google",
@@ -22289,70 +22250,46 @@ async function handleAiRouteRequest() {
     }];
 
     try {
-        // 2. Envía TODO el historial a la API
-        const response = await fetch(GEMINI_API_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ "contents": aiConversationHistory, "tools": tools })
-        });
-
-        if (!response.ok) {
-            const errorData = await response.json();
-            throw new Error(`Error del servidor de IA (${response.status}): ${errorData.error.message}`);
-        }
-        
-        const result = await response.json();
-        if (!result.candidates || result.candidates.length === 0) {
-            throw new Error(`La respuesta de la IA fue bloqueada o está vacía.`);
-        }
-
-        const assistantResponsePart = result.candidates[0].content.parts[0];
-
-        // 3. Guarda la respuesta de la IA en el historial para la próxima pregunta.
-        aiConversationHistory.push({ "role": "model", "parts": [assistantResponsePart] });
-
-        // 4. Procesa la respuesta (si es una llamada a herramienta o texto final)
-        if (assistantResponsePart.functionCall) {
-            const toolCall = assistantResponsePart.functionCall;
-            statusArea.innerHTML += `<div class="ai-message assistant"><p>⚙️ Buscando en Google: <b>${toolCall.args.queries.join(', ')}</b>...</p></div>`;
-            statusArea.scrollTop = statusArea.scrollHeight;
-
-            const toolResult = await ai_tool_google_search_places(toolCall.args);
-            
-            // 5. Envía el resultado de la herramienta de vuelta a la IA en la siguiente petición.
-            const toolResponsePrompt = {
-                "role": "user",
-                "parts": [{ "functionResponse": { "name": toolCall.name, "response": { "result": toolResult } } }]
-            };
-            aiConversationHistory.push(toolResponsePrompt);
-
-            // Hacemos la llamada final a la IA con el resultado de la herramienta
-            const finalResponse = await fetch(GEMINI_API_URL, {
+        for (let i = 0; i < 5; i++) {
+            const response = await fetch(GEMINI_API_URL, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ "contents": aiConversationHistory, "tools": tools })
             });
-            const finalResult = await finalResponse.json();
-            const finalAssistantResponse = finalResult.candidates[0].content.parts[0];
+
+            if (!response.ok) {
+                const errorData = await response.json();
+                throw new Error(`Error del servidor de IA (${response.status}): ${errorData.error.message}`);
+            }
             
-            // Guardamos la respuesta final en el historial
-            aiConversationHistory.push({ "role": "model", "parts": [finalAssistantResponse] });
-            renderFinalAiAnswer(finalAssistantResponse.text, prompt, statusArea);
+            const result = await response.json();
+            if (!result.candidates || result.candidates.length === 0) {
+                const blockReason = result.promptFeedback?.blockReason || 'desconocida';
+                throw new Error(`La respuesta de la IA fue bloqueada por motivo: ${blockReason}. Intenta reformular tu petición.`);
+            }
 
-        } else {
-            console.log("🤖 RESPUESTA FINAL DE LA IA (TEXTO CRUDO):");
-    console.log(assistantResponsePart.text);
-    // --- FIN DEL BLOQUE DE DIAGNÓSTICO ---
-    
-            // Si la IA responde directamente sin llamar a la herramienta
-            renderFinalAiAnswer(assistantResponsePart.text, prompt, statusArea);
+            const assistantResponsePart = result.candidates[0].content.parts[0];
+            aiConversationHistory.push({ "role": "model", "parts": [assistantResponsePart] });
+
+            if (assistantResponsePart.functionCall) {
+                const toolCall = assistantResponsePart.functionCall;
+                renderAssistantMessage(`⚙️ Buscando en Google: <b>${toolCall.args.queries.join(', ')}</b>...`, 'tool');
+                const toolResult = await ai_tool_google_search_places(toolCall.args);
+                aiConversationHistory.push({
+                    "role": "user",
+                    "parts": [{ "functionResponse": { "name": toolCall.name, "response": { "result": toolResult } } }]
+                });
+            } else {
+                const aiTextResponse = assistantResponsePart.text;
+                renderAiResponse(aiTextResponse, prompt);
+                return; 
+            }
         }
-
+        renderAssistantMessage("Parece que la conversación se ha alargado. ¿Puedes resumir la ruta completa que quieres?", 'error');
     } catch (error) {
         console.error("Error en la IA:", error);
-        statusArea.innerHTML += `<div class="ai-message assistant error"><p><b>Error:</b> ${error.message}</p></div>`;
-        // Si hay un error, eliminamos los dos últimos mensajes (pregunta fallida y respuesta de error) para poder reintentar.
-        aiConversationHistory.pop();
+        renderAssistantMessage(`<b>Error:</b> ${error.message}`, 'error');
+        aiConversationHistory.pop(); 
         aiConversationHistory.pop();
     } finally {
         generateBtn.disabled = false;
@@ -22363,83 +22300,6 @@ async function handleAiRouteRequest() {
 
     
     
-function renderFinalAiAnswer(finalAnswerText, originalPrompt, statusArea) {
-    statusArea.innerHTML = `<p>✅ <b>Sugerencia final de la IA:</b></p>${finalAnswerText.replace(/\n/g, '<br>')}`;
-    try {
-        const jsonMatch = finalAnswerText.match(/```json\n([\s\S]*?)\n```/);
-        if (!jsonMatch || !jsonMatch[1]) {
-             statusArea.innerHTML += "<p><i>La IA ha dado una respuesta textual. No se ha podido generar una ruta automática.</i></p>";
-             return;
-        }
-        
-        const suggestedWaypoints = JSON.parse(jsonMatch[1]).waypoints;
-        
-        const actionButtons = document.createElement('div');
-        actionButtons.className = 'ai-modal-buttons';
-        actionButtons.style.marginTop = '1rem';
-        actionButtons.innerHTML = `
-            <button id="ai-accept-route">Cargar Ruta en Mapa</button>
-            <button id="ai-refine-route">Cancelar</button>`;
-        statusArea.appendChild(actionButtons);
-
-        document.getElementById('ai-accept-route').onclick = () => {
-            const routeObject = { name: `Ruta IA: ${originalPrompt.substring(0, 25)}...`, waypoints: suggestedWaypoints };
-            loadRouteFromObject(routeObject, true);
-            document.getElementById('ai-route-modal').classList.add('hidden');
-        };
-        document.getElementById('ai-refine-route').onclick = () => document.getElementById('ai-route-modal').classList.add('hidden');
-
-    } catch (e) {
-        console.error("Error al parsear la respuesta final de la IA", e);
-        statusArea.innerHTML += "<p><i>La IA ha dado una respuesta que no parece una ruta válida. Intenta reformular tu petición.</i></p>";
-    }
-}
-
-
-
-function renderFinalAiAnswer(finalAnswerText, originalPrompt, statusArea) {
-    // Ya no limpiamos el statusArea, sino que añadimos la respuesta final.
-    const aiResponseHtml = finalAnswerText.replace(/```json\n([\s\S]*?)\n```/, '').replace(/\n/g, '<br>').trim();
-    statusArea.innerHTML += `<div class="ai-message assistant"><p>✅ <b>Sugerencia final:</b></p><p>${aiResponseHtml}</p></div>`;
-    
-    try {
-        const jsonMatch = finalAnswerText.match(/```json\n([\s\S]*?)\n```/);
-        if (!jsonMatch || !jsonMatch[1]) {
-             statusArea.innerHTML += "<div class='ai-message assistant'><p><i>La IA ha dado una respuesta textual. No se ha podido generar una ruta automática.</i></p></div>";
-             return;
-        }
-        
-        const suggestedWaypoints = JSON.parse(jsonMatch[1]).waypoints;
-        
-        const actionButtonsHtml = `
-            <div class="ai-modal-buttons" style="margin-top: 1rem;">
-                <button id="ai-accept-route">Cargar Ruta en Mapa</button>
-                <button id="ai-refine-route">Cerrar</button>
-            </div>`;
-        
-        // Añadimos un contenedor para los botones para no borrar el historial
-        let buttonsContainer = document.getElementById('ai-buttons-container');
-        if(!buttonsContainer) {
-            buttonsContainer = document.createElement('div');
-            buttonsContainer.id = 'ai-buttons-container';
-            statusArea.appendChild(buttonsContainer);
-        }
-        buttonsContainer.innerHTML = actionButtonsHtml;
-
-        document.getElementById('ai-accept-route').onclick = () => {
-            const routeObject = { name: `Ruta IA: ${originalPrompt.substring(0, 25)}...`, waypoints: suggestedWaypoints };
-            loadRouteFromObject(routeObject, true);
-            document.getElementById('ai-route-modal').classList.add('hidden');
-        };
-        document.getElementById('ai-refine-route').onclick = () => document.getElementById('ai-route-modal').classList.add('hidden');
-
-    } catch (e) {
-        console.error("Error al parsear la respuesta final de la IA", e);
-        statusArea.innerHTML += "<div class='ai-message assistant error'><p><i>La IA ha dado una respuesta que no es una ruta válida. Intenta reformular tu petición.</i></p></div>";
-    }
-    statusArea.scrollTop = statusArea.scrollHeight;
-}
-
 
     
 async function ai_tool_google_search_places(args) {
