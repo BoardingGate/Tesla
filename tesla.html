@@ -52,7 +52,7 @@
 </head>
 
 <style>
-
+    
 </style>
     
 </head>
@@ -255,8 +255,8 @@
     <div id="ai-route-modal" class="hidden">
         <div class="ai-modal-content">
             <h2>Asistente de Rutas IA</h2>
-            <p>Describe la ruta que quieres o lo que buscas (Preferiblemente por voz). Por ejemplo: "Ruta de los 3 museos más importantes de Madrid" o "Un buen restaurante italiano cerca para cenar".</p>
-            <textarea id="ai-prompt-input" rows="3" placeholder="Escribe tu petición (Mejor usa los comandos de voz, seleccionando antes este campo)..."></textarea>
+            <p>Describe la ruta que quieres o lo que buscas (Preferiblemente por voz). Por ejemplo: "Sugiereme los 3 museos más importantes para visitar en Madrid" o "Busca un buen restaurante italiano cerca para cenar".</p>
+            <textarea id="ai-prompt-input" rows="3" placeholder="Escribe o dicta tu petición. Puedes mantener una conversación y repreguntar..."></textarea>
             <div id="ai-status-area">
                 <!-- Los resultados y el estado de la IA aparecerán aquí -->
             </div>
@@ -939,6 +939,8 @@
 
     const MAP_TERRAIN_EXAGGERATION_KEY = 'boardinggate_mapTerrainExaggeration'; 
     let mapTerrainExaggeration = 0.8; 
+    let aiConversationHistory = []; 
+
 
     const navigationTasks = {
         CRITICAL_VISUALS: {
@@ -22031,137 +22033,207 @@ function openAiPlannerModal() {
     document.getElementById('ai-generate-route-button').onclick = handleAiRouteRequest;
     document.getElementById('ai-cancel-button').onclick = () => modal.classList.add('hidden');
 }
-async function handleAiRouteRequest() {
-    const prompt = document.getElementById('ai-prompt-input').value;
+
+
+// ===================================================================
+// NOMBRE: renderAssistantMessage
+// RESUMEN: Añade un mensaje de la IA a la UI del chat y hace scroll.
+// ===================================================================
+function renderAssistantMessage(htmlContent, type = 'assistant') {
     const statusArea = document.getElementById('ai-status-area');
-    const generateBtn = document.getElementById('ai-generate-route-button');
-    if (!prompt) {
-        showToast("Por favor, escribe (Mejor usando el botón de comandos vocales) una petición.", "warning");
+    if (!statusArea) return;
+
+    const buttonsContainer = document.getElementById('ai-buttons-container');
+    if (buttonsContainer) {
+        buttonsContainer.remove();
+    }
+
+    const messageDiv = document.createElement('div');
+    messageDiv.className = `ai-message ${type}`; // type puede ser 'assistant', 'tool', 'error'
+    messageDiv.innerHTML = `<p>${htmlContent}</p>`;
+    
+    statusArea.appendChild(messageDiv);
+    statusArea.scrollTop = statusArea.scrollHeight;
+}
+
+// ===================================================================
+// NOMBRE: renderAiResponse (VERSIÓN FINAL Y CORRECTA)
+// RESUMEN: Muestra SIEMPRE el texto de la IA. Si además detecta un
+//          JSON válido, AÑADE los botones de acción de ruta.
+// ===================================================================
+function renderAiResponse(aiText, originalUserPrompt) {
+    const statusArea = document.getElementById('ai-status-area');
+    if (!statusArea) return;
+
+    const oldButtons = document.getElementById('ai-buttons-container');
+    if (oldButtons) oldButtons.remove();
+
+    let summaryText = aiText.replace(/```json\n([\s\S]*?)\n```/, '').trim();
+
+    let waypoints = null;
+    try {
+        const jsonMatch = aiText.match(/```json\n([\s\S]*?)\n```/);
+        if (jsonMatch && jsonMatch[1]) {
+            const parsedData = JSON.parse(jsonMatch[1]);
+            if (parsedData.waypoints && Array.isArray(parsedData.waypoints) && parsedData.waypoints.length > 0) {
+                waypoints = parsedData.waypoints;
+            }
+        }
+    } catch (e) {
+        renderAssistantMessage("He intentado generar la ruta, pero el formato tenía un error. ¿Podrías pedirme que lo intente de nuevo o aclarar la petición?", 'error');
+        return; 
+    }
+
+    if (waypoints && !summaryText) {
+        summaryText = `¡Listo! He preparado una ruta con ${waypoints.length} punto${waypoints.length > 1 ? 's' : ''}. ¿Quieres cargarla en el mapa?`;
+    }
+
+    if (summaryText) {
+        renderAssistantMessage(summaryText.replace(/\n/g, '<br>'));
+    } else if (!waypoints) {
+        renderAssistantMessage("He recibido una respuesta vacía. ¿Podrías intentarlo de nuevo?", 'error');
         return;
     }
 
-    generateBtn.disabled = true;
-    statusArea.innerHTML = `<p>🧠 Analizando tu petición: "${prompt}"...</p>`;
+    if (waypoints) {
+        const buttonsContainer = document.createElement('div');
+        buttonsContainer.id = 'ai-buttons-container';
+        buttonsContainer.className = 'ai-modal-buttons';
+        buttonsContainer.style.marginTop = '1rem';
+        buttonsContainer.innerHTML = `
+            <button id="ai-accept-route">Cargar Ruta en Mapa</button>
+            <button id="ai-refine-route">Cerrar</button>
+        `;
+        statusArea.appendChild(buttonsContainer);
+        statusArea.scrollTop = statusArea.scrollHeight;
 
-    // --- CORRECCIÓN: La herramienta ahora acepta un ARRAY de búsquedas ---
+        document.getElementById('ai-accept-route').onclick = () => {
+            const routeObject = { name: `Ruta IA: ${originalUserPrompt.substring(0, 25)}...`, waypoints: waypoints };
+            loadRouteFromObject(routeObject, true);
+            document.getElementById('ai-route-modal').classList.add('hidden');
+        };
+        document.getElementById('ai-refine-route').onclick = () => {
+            document.getElementById('ai-route-modal').classList.add('hidden');
+        };
+    }
+}
+
+// ===================================================================
+// NOMBRE: openAiPlannerModal (MODIFICADA CON GESTIÓN DE ESTADO)
+// RESUMEN: Abre el modal e INICIA el historial de la conversación para la IA.
+// ===================================================================
+function openAiPlannerModal() {
+    const modal = document.getElementById('ai-route-modal');
+    if (!modal) return;
+
+    let systemPrompt = `Eres un asistente de rutas para un coche Tesla. Tu misión es:
+    1. Identificar TODOS los lugares que el usuario pide en su conversación. Si te pide añadir más, inclúyelos en la lista.
+    2. Cuando creas que el usuario ha terminado de añadir lugares, llama a la herramienta 'search_places_with_google' UNA SOLA VEZ con la lista COMPLETA de búsquedas.
+    3. Una vez recibes el resultado de la herramienta, tu trabajo ha terminado.
+    4. Resume en una frase lo que has encontrado.
+    5. FINALIZA OBLIGATORIAMENTE tu respuesta con un bloque de código JSON con el formato: \`\`\`json\n{\"waypoints\": [...]}\n\`\`\`.`;
+    if (navigationCurrentLocation) {
+        systemPrompt += ` CONTEXTO: La ubicación actual del usuario es latitud ${navigationCurrentLocation.latitude.toFixed(4)}, longitud ${navigationCurrentLocation.longitude.toFixed(4)}.`;
+    }
+
+    aiConversationHistory = [
+        { "role": "user", "parts": [{ "text": systemPrompt }] },
+        { "role": "model", "parts": [{ "text": "Entendido. Esperando la lista de lugares del usuario. Iré acumulando los sitios que me pida y llamaré a la herramienta de búsqueda al final." }] }
+    ];
+    modal.classList.remove('hidden');
+    document.getElementById('ai-prompt-input').value = '';
+    
+    const statusArea = document.getElementById('ai-status-area');
+    statusArea.innerHTML = '<div class="ai-message assistant"><p>Hola, soy tu asistente de rutas. ¿Qué lugares quieres visitar o qué tipo de ruta te gustaría hacer?</p></div>';
+    
+    document.getElementById('ai-generate-route-button').onclick = handleAiRouteRequest;
+    document.getElementById('ai-cancel-button').onclick = () => modal.classList.add('hidden');
+}
+        
+
+// ===================================================================
+// NOMBRE: handleAiRouteRequest (VERSIÓN CON RENDERIZADO INTELIGENTE)
+// RESUMEN: Gestiona la conversación y usa renderAiResponse para mostrar la UI.
+// ===================================================================
+async function handleAiRouteRequest() {
+    const promptInput = document.getElementById('ai-prompt-input');
+    const prompt = promptInput.value.trim();
+    const statusArea = document.getElementById('ai-status-area');
+    const generateBtn = document.getElementById('ai-generate-route-button');
+
+    if (!prompt) {
+        showToast("Por favor, escribe una petición.", "warning");
+        return;
+    }
+
+    statusArea.innerHTML += `<div class="ai-message user"><p>${prompt}</p></div>`;
+    promptInput.value = '';
+    generateBtn.disabled = true;
+    statusArea.scrollTop = statusArea.scrollHeight;
+
+    const currentUserPrompt = { "role": "user", "parts": [{ "text": prompt }] };
+    aiConversationHistory.push(currentUserPrompt);
+
     const tools = [{
         "functionDeclarations": [{
             "name": "search_places_with_google",
             "description": "Busca una LISTA de lugares de interés (POI) usando Google para obtener sus coordenadas.",
             "parameters": {
                 "type": "OBJECT",
-                "properties": {
-                    "queries": {
-                        "type": "ARRAY",
-                        "description": "Una lista de los lugares a buscar. Ej: ['Museo del Prado', 'Museo Reina Sofía']",
-                        "items": { "type": "STRING" }
-                    }
-                },
+                "properties": { "queries": { "type": "ARRAY", "description": "Una lista de los lugares a buscar. Ej: ['Museo del Prado', 'Museo Reina Sofía']", "items": { "type": "STRING" } } },
                 "required": ["queries"]
             }
         }]
     }];
 
-    // --- CORRECCIÓN CLAVE: Instrucciones para que la IA actúe de una sola vez ---
-    let systemPrompt = `Eres un asistente de rutas. Tu misión es:
-    1.  Identificar TODOS los lugares que el usuario pide.
-    2.  Llamar a la herramienta 'search_places_with_google' UNA SOLA VEZ con la lista completa de búsquedas.
-    3.  Una vez recibes el resultado de la herramienta, tu trabajo ha terminado.
-    4.  Resume en una frase lo que has encontrado.
-    5.  FINALIZA OBLIGATORIAMENTE tu respuesta con un bloque de código JSON con el formato: \`\`\`json\n{\"waypoints\": [...]}\n\`\`\`.`;
-    if (navigationCurrentLocation) {
-        systemPrompt += ` CONTEXTO: La ubicación actual del usuario es latitud ${navigationCurrentLocation.latitude.toFixed(4)}, longitud ${navigationCurrentLocation.longitude.toFixed(4)}.`;
-    }
-
-    let conversationHistory = [
-        { "role": "user", "parts": [{ "text": systemPrompt }] },
-        { "role": "model", "parts": [{ "text": "Entendido. Identificaré todos los lugares, haré una sola llamada a la herramienta y devolveré el JSON final." }] }
-    ];
-
     try {
-        let currentPromptForAI = { "role": "user", "parts": [{ "text": prompt }] };
-
-        // El bucle ahora es solo para el diálogo herramienta <-> IA, que debería ser de un solo paso.
-        for (let i = 0; i < 3; i++) {
-            const contents = [...conversationHistory, currentPromptForAI];
-
+        for (let i = 0; i < 5; i++) {
             const response = await fetch(GEMINI_API_URL, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ "contents": contents, "tools": tools })
+                body: JSON.stringify({ "contents": aiConversationHistory, "tools": tools })
             });
 
             if (!response.ok) {
                 const errorData = await response.json();
                 throw new Error(`Error del servidor de IA (${response.status}): ${errorData.error.message}`);
             }
-
+            
             const result = await response.json();
-            
             if (!result.candidates || result.candidates.length === 0) {
-                 throw new Error(`La respuesta de la IA fue bloqueada o está vacía.`);
+                const blockReason = result.promptFeedback?.blockReason || 'desconocida';
+                throw new Error(`La respuesta de la IA fue bloqueada por motivo: ${blockReason}. Intenta reformular tu petición.`);
             }
-            
+
             const assistantResponsePart = result.candidates[0].content.parts[0];
-            
-            conversationHistory.push(currentPromptForAI);
-            conversationHistory.push({ "role": "model", "parts": [assistantResponsePart] });
+            aiConversationHistory.push({ "role": "model", "parts": [assistantResponsePart] });
 
             if (assistantResponsePart.functionCall) {
                 const toolCall = assistantResponsePart.functionCall;
-                statusArea.innerHTML += `<p>⚙️ Buscando en Google: <b>${toolCall.args.queries.join(', ')}</b>...</p>`;
-                
+                renderAssistantMessage(`⚙️ Buscando en Google: <b>${toolCall.args.queries.join(', ')}</b>...`, 'tool');
                 const toolResult = await ai_tool_google_search_places(toolCall.args);
-                
-                currentPromptForAI = {
+                aiConversationHistory.push({
                     "role": "user",
                     "parts": [{ "functionResponse": { "name": toolCall.name, "response": { "result": toolResult } } }]
-                };
+                });
             } else {
-                renderFinalAiAnswer(assistantResponsePart.text, prompt, statusArea);
-                break; 
+                const aiTextResponse = assistantResponsePart.text;
+                renderAiResponse(aiTextResponse, prompt);
+                return; 
             }
         }
+        renderAssistantMessage("Parece que la conversación se ha alargado. ¿Puedes resumir la ruta completa que quieres?", 'error');
     } catch (error) {
-        console.error("Error en la IA:", error);
-        statusArea.innerHTML = `<p style="color: #ff3b30;"><b>Error:</b> ${error.message}</p>`;
+        renderAssistantMessage(`<b>Error:</b> ${error.message}`, 'error');
+        aiConversationHistory.pop(); 
+        aiConversationHistory.pop();
     } finally {
         generateBtn.disabled = false;
+        statusArea.scrollTop = statusArea.scrollHeight;
     }
 }
+
     
-function renderFinalAiAnswer(finalAnswerText, originalPrompt, statusArea) {
-    statusArea.innerHTML = `<p>✅ <b>Sugerencia final de la IA:</b></p>${finalAnswerText.replace(/\n/g, '<br>')}`;
-    try {
-        const jsonMatch = finalAnswerText.match(/```json\n([\s\S]*?)\n```/);
-        if (!jsonMatch || !jsonMatch[1]) {
-             statusArea.innerHTML += "<p><i>La IA ha dado una respuesta textual. No se ha podido generar una ruta automática.</i></p>";
-             return;
-        }
-        
-        const suggestedWaypoints = JSON.parse(jsonMatch[1]).waypoints;
-        
-        const actionButtons = document.createElement('div');
-        actionButtons.className = 'ai-modal-buttons';
-        actionButtons.style.marginTop = '1rem';
-        actionButtons.innerHTML = `
-            <button id="ai-accept-route">Cargar Ruta en Mapa</button>
-            <button id="ai-refine-route">Cancelar</button>`;
-        statusArea.appendChild(actionButtons);
-
-        document.getElementById('ai-accept-route').onclick = () => {
-            const routeObject = { name: `Ruta IA: ${originalPrompt.substring(0, 25)}...`, waypoints: suggestedWaypoints };
-            loadRouteFromObject(routeObject, true);
-            document.getElementById('ai-route-modal').classList.add('hidden');
-        };
-        document.getElementById('ai-refine-route').onclick = () => document.getElementById('ai-route-modal').classList.add('hidden');
-
-    } catch (e) {
-        console.error("Error al parsear la respuesta final de la IA", e);
-        statusArea.innerHTML += "<p><i>La IA ha dado una respuesta que no parece una ruta válida. Intenta reformular tu petición.</i></p>";
-    }
-}
-
 async function ai_tool_google_search_places(args) {
     if (!window.google || !window.google.maps || !window.google.maps.places) {
         return { error: "El servicio de Google Places no está disponible." };
@@ -22206,7 +22278,6 @@ async function ai_tool_google_search_places(args) {
         return waypoints;
 
     } catch (error) {
-        console.error("Error en la búsqueda de Google Places:", error);
         return { error: `Error al contactar con Google Places: ${error.message}` };
     }
 }
