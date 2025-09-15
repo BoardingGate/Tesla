@@ -1,3 +1,4 @@
+
 (function() {
 
     const APP_CONFIG = {
@@ -21,9 +22,11 @@
         
         endpoints: {
             gemini: function() {
-                return `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${this.keys.gemini}`;
+                return `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${APP_CONFIG.keys.gemini}`;
             }
         }
     };
+
     window.APP_CONFIG = APP_CONFIG;
+
 })();
