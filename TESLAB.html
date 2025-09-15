@@ -22348,6 +22348,321 @@ async function searchPoisByCategory(query, osmKey) {
         return [];
     }
 }    
+
+
+// ===================================================================
+// INICIO: BLOQUE COMPLETO DEL ASISTENTE DE RUTAS IA
+// Reemplaza las funciones existentes con este bloque.
+// ===================================================================
+
+// -------------------------------------------------------------------
+// NOMBRE: openAiPlannerModal (Versión Copiloto Inteligente)
+// -------------------------------------------------------------------
+function openAiPlannerModal() {
+    const modal = document.getElementById('ai-route-modal');
+    if (!modal) return;
+
+    let systemPrompt = `Eres un copiloto inteligente para un coche Tesla. Tienes dos capacidades principales:
+
+1.  **Planificador de Rutas:** Si el usuario te pide crear, modificar o hablar sobre una ruta (ej: "llévame a...", "añade una parada en...", "ruta por..."), tu objetivo es usar la herramienta 'search_places_with_google' para obtener las coordenadas y, al final, generar el bloque de código JSON con la lista de "waypoints".
+
+2.  **Asistente de Información:** Si el usuario te hace una pregunta general, una consulta o una pregunta sobre un lugar específico (ej: "qué tiempo hace en...", "a qué hora abre...", "dime la capital de..."), tu objetivo es usar las herramientas de información como 'get_weather_forecast' o 'get_business_details' y responder de forma conversacional en texto. **En este caso, NO debes generar un bloque de código JSON de "waypoints".**
+
+Tu primera tarea es analizar la petición del usuario y decidir qué capacidad usar.`;
+
+    if (navigationCurrentLocation) {
+        systemPrompt += ` CONTEXTO: La ubicación actual del usuario es latitud ${navigationCurrentLocation.latitude.toFixed(4)}, longitud ${navigationCurrentLocation.longitude.toFixed(4)}.`;
+    }
+
+    aiConversationHistory = [
+        { "role": "user", "parts": [{ "text": systemPrompt }] },
+        { "role": "model", "parts": [{ "text": "Entendido. Soy un copiloto inteligente. Analizaré la petición del usuario para decidir si debo planificar una ruta o responder a una pregunta general usando las herramientas adecuadas." }] }
+    ];
+
+    modal.classList.remove('hidden');
+    document.getElementById('ai-prompt-input').value = '';
+    
+    const statusArea = document.getElementById('ai-status-area');
+    statusArea.innerHTML = '<div class="ai-message assistant"><p>Hola, soy tu asistente de rutas. ¿Qué lugares quieres visitar o qué tipo de ruta te gustaría hacer?</p></div>';
+    
+    document.getElementById('ai-generate-route-button').onclick = handleAiRouteRequest;
+    document.getElementById('ai-cancel-button').onclick = () => modal.classList.add('hidden');
+}
+
+// -------------------------------------------------------------------
+// NOMBRE: handleAiRouteRequest (Versión Copiloto Inteligente)
+// -------------------------------------------------------------------
+async function handleAiRouteRequest() {
+    const promptInput = document.getElementById('ai-prompt-input');
+    const prompt = promptInput.value.trim();
+    const statusArea = document.getElementById('ai-status-area');
+    const generateBtn = document.getElementById('ai-generate-route-button');
+
+    if (!prompt) {
+        showToast("Por favor, escribe una petición.", "warning");
+        return;
+    }
+
+    statusArea.innerHTML += `<div class="ai-message user"><p>${prompt}</p></div>`;
+    promptInput.value = '';
+    generateBtn.disabled = true;
+    statusArea.scrollTop = statusArea.scrollHeight;
+
+    const currentUserPrompt = { "role": "user", "parts": [{ "text": prompt }] };
+    aiConversationHistory.push(currentUserPrompt);
+
+    const tools = [{
+        "functionDeclarations": [
+            {
+                "name": "search_places_with_google",
+                "description": "Busca una LISTA de lugares para obtener sus coordenadas para PLANIFICAR UNA RUTA.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": { "queries": { "type": "ARRAY", "description": "Una lista de los lugares a buscar. Ej: ['Museo del Prado', 'Museo Reina Sofía']", "items": { "type": "STRING" } } },
+                    "required": ["queries"]
+                }
+            },
+            {
+                "name": "get_weather_forecast",
+                "description": "Obtiene el pronóstico del tiempo para una ubicación específica.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "location": {
+                            "type": "STRING",
+                            "description": "La ciudad para la cual se solicita el pronóstico del tiempo, ej: 'Madrid, España'."
+                        }
+                    },
+                    "required": ["location"]
+                }
+            },
+            {
+                "name": "get_business_details",
+                "description": "Obtiene información detallada de un negocio, como su horario de apertura.",
+                "parameters": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "place_name": {
+                            "type": "STRING",
+                            "description": "El nombre del negocio o lugar a buscar, ej: 'Restaurante Botín'."
+                        }
+                    },
+                    "required": ["place_name"]
+                }
+            }
+        ]
+    }];
+
+    try {
+        for (let i = 0; i < 5; i++) {
+            const response = await fetch(GEMINI_API_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ "contents": aiConversationHistory, "tools": tools })
+            });
+
+            if (!response.ok) {
+                const errorData = await response.json();
+                throw new Error(`Error del servidor de IA (${response.status}): ${errorData.error.message}`);
+            }
+            
+            const result = await response.json();
+            if (!result.candidates || result.candidates.length === 0) {
+                const blockReason = result.promptFeedback?.blockReason || 'desconocida';
+                throw new Error(`La respuesta de la IA fue bloqueada por motivo: ${blockReason}. Intenta reformular tu petición.`);
+            }
+
+            const assistantResponsePart = result.candidates[0].content.parts[0];
+            aiConversationHistory.push({ "role": "model", "parts": [assistantResponsePart] });
+
+            if (assistantResponsePart.functionCall) {
+                const toolCall = assistantResponsePart.functionCall;
+                let toolResult;
+
+                switch (toolCall.name) {
+                    case "search_places_with_google":
+                        renderAssistantMessage(`⚙️ Planificando ruta y buscando en Google: <b>${toolCall.args.queries.join(', ')}</b>...`, 'tool');
+                        toolResult = await ai_tool_google_search_places(toolCall.args);
+                        break;
+                    case "get_weather_forecast":
+                        renderAssistantMessage(`🌦️ Consultando el tiempo para <b>${toolCall.args.location}</b>...`, 'tool');
+                        toolResult = await ai_tool_get_weather_forecast(toolCall.args);
+                        break;
+                    case "get_business_details":
+                        renderAssistantMessage(`ℹ️ Buscando detalles de <b>${toolCall.args.place_name}</b>...`, 'tool');
+                        toolResult = await ai_tool_get_business_details(toolCall.args);
+                        break;
+                    default:
+                        toolResult = { error: `Herramienta desconocida: ${toolCall.name}` };
+                }
+                
+                aiConversationHistory.push({
+                    "role": "user",
+                    "parts": [{ "functionResponse": { "name": toolCall.name, "response": { "result": toolResult } } }]
+                });
+
+            } else {
+                const aiTextResponse = assistantResponsePart.text;
+                renderAiResponse(aiTextResponse, prompt);
+                return; 
+            }
+        }
+        renderAssistantMessage("Parece que la conversación se ha alargado. ¿Puedes resumir la ruta completa que quieres?", 'error');
+    } catch (error) {
+        console.error("Error en la IA:", error);
+        renderAssistantMessage(`<b>Error:</b> ${error.message}`, 'error');
+        aiConversationHistory.pop(); 
+        aiConversationHistory.pop();
+    } finally {
+        generateBtn.disabled = false;
+        statusArea.scrollTop = statusArea.scrollHeight;
+    }
+}
+
+// -------------------------------------------------------------------
+// NOMBRE: renderAssistantMessage
+// -------------------------------------------------------------------
+function renderAssistantMessage(htmlContent, type = 'assistant') {
+    const statusArea = document.getElementById('ai-status-area');
+    if (!statusArea) return;
+
+    const buttonsContainer = document.getElementById('ai-buttons-container');
+    if (buttonsContainer) {
+        buttonsContainer.remove();
+    }
+
+    const messageDiv = document.createElement('div');
+    messageDiv.className = `ai-message ${type}`;
+    messageDiv.innerHTML = `<p>${htmlContent}</p>`;
+    
+    statusArea.appendChild(messageDiv);
+    statusArea.scrollTop = statusArea.scrollHeight;
+}
+
+// -------------------------------------------------------------------
+// NOMBRE: renderAiResponse
+// -------------------------------------------------------------------
+function renderAiResponse(aiText, originalUserPrompt) {
+    const statusArea = document.getElementById('ai-status-area');
+    if (!statusArea) return;
+
+    const oldButtons = document.getElementById('ai-buttons-container');
+    if (oldButtons) oldButtons.remove();
+
+    let summaryText = aiText.replace(/```json\n([\s\S]*?)\n```/, '').trim();
+    
+    let waypoints = null;
+    try {
+        const jsonMatch = aiText.match(/```json\n([\s\S]*?)\n```/);
+        if (jsonMatch && jsonMatch[1]) {
+            const parsedData = JSON.parse(jsonMatch[1]);
+            if (parsedData.waypoints && Array.isArray(parsedData.waypoints) && parsedData.waypoints.length > 0) {
+                waypoints = parsedData.waypoints;
+            }
+        }
+    } catch (e) {
+        console.error("Error al parsear el JSON de la IA:", e);
+        renderAssistantMessage("He intentado generar la ruta, pero el formato tenía un error. ¿Podrías pedirme que lo intente de nuevo o aclarar la petición?", 'error');
+        return; 
+    }
+
+    if (waypoints && !summaryText) {
+        summaryText = `¡Listo! He preparado una ruta con ${waypoints.length} punto${waypoints.length > 1 ? 's' : ''}. ¿Quieres cargarla en el mapa?`;
+    }
+
+    if (summaryText) {
+        renderAssistantMessage(summaryText.replace(/\n/g, '<br>'));
+    } else if (!waypoints) {
+        renderAssistantMessage("He recibido una respuesta vacía. ¿Podrías intentarlo de nuevo?", 'error');
+        return;
+    }
+
+    if (waypoints) {
+        const buttonsContainer = document.createElement('div');
+        buttonsContainer.id = 'ai-buttons-container';
+        buttonsContainer.className = 'ai-modal-buttons';
+        buttonsContainer.style.marginTop = '1rem';
+        buttonsContainer.innerHTML = `
+            <button id="ai-accept-route">Cargar Ruta en Mapa</button>
+            <button id="ai-refine-route">Cerrar</button>
+        `;
+        statusArea.appendChild(buttonsContainer);
+        statusArea.scrollTop = statusArea.scrollHeight;
+
+        document.getElementById('ai-accept-route').onclick = () => {
+            const routeObject = { name: `Ruta IA: ${originalUserPrompt.substring(0, 25)}...`, waypoints: waypoints };
+            loadRouteFromObject(routeObject, true);
+            document.getElementById('ai-route-modal').classList.add('hidden');
+        };
+        document.getElementById('ai-refine-route').onclick = () => {
+            document.getElementById('ai-route-modal').classList.add('hidden');
+        };
+    }
+}
+
+// -------------------------------------------------------------------
+// NOMBRE: ai_tool_get_weather_forecast (Herramienta de Clima)
+// -------------------------------------------------------------------
+async function ai_tool_get_weather_forecast(args) {
+    const location = args.location || "la ubicación actual";
+    console.log(`Herramienta de Clima llamada para: ${location}`);
+    
+    // Simulación de respuesta de API
+    const temperatures = [15, 18, 22, 25, 23, 19];
+    const temp = temperatures[Math.floor(Math.random() * temperatures.length)];
+    const conditions = ["soleado", "parcialmente nuboso", "despejado con algunas nubes", "muy agradable"];
+    const condition = conditions[Math.floor(Math.random() * conditions.length)];
+
+    return { 
+        forecast: `El tiempo para ${location} es ${condition}, con una temperatura aproximada de ${temp}°C.` 
+    };
+}
+
+// -------------------------------------------------------------------
+// NOMBRE: ai_tool_get_business_details (Herramienta de Detalles)
+// -------------------------------------------------------------------
+async function ai_tool_get_business_details(args) {
+    const placeName = args.place_name;
+    if (!placeName) {
+        return { error: "No se especificó el nombre del lugar." };
+    }
+    console.log(`Herramienta de Detalles llamada para: ${placeName}`);
+
+    try {
+        const center = navigationCurrentLocation 
+            ? { lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude }
+            : { lat: 40.416775, lng: -3.703790 }; // Fallback a Madrid
+
+        const placeId = await findGooglePlaceId(placeName, center.lat, center.lng);
+        if (!placeId) {
+            return { information: `No pude encontrar un lugar llamado "${placeName}" cerca.` };
+        }
+        
+        const placeDetails = await getGooglePlaceDetails(placeId);
+        if (!placeDetails) {
+            return { information: `Encontré "${placeName}" pero no pude obtener sus detalles.` };
+        }
+        
+        let info = `Detalles para ${placeDetails.displayName}: `;
+        if (placeDetails.regularOpeningHours) {
+            const today = new Date().getDay(); // 0=Domingo, 1=Lunes...
+            const dayIndex = (today === 0) ? 6 : today - 1;
+            info += `Hoy, el horario es: ${placeDetails.regularOpeningHours.weekdayDescriptions[dayIndex]}.`;
+        } else {
+            info += "No tengo información sobre su horario de apertura.";
+        }
+        
+        return { information: info };
+
+    } catch (error) {
+        return { error: `Ocurrió un error al buscar los detalles: ${error.message}` };
+    }
+}
+
+// ===================================================================
+// FIN: BLOQUE COMPLETO DEL ASISTENTE DE RUTAS IA
+// ===================================================================
+    
     
     
 </script>
