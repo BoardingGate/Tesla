@@ -18097,6 +18097,132 @@ function animateMarkerAndMap(timestamp) {
     
     markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
 }
+
+// ===================================================================
+// NOMBRE: animateMarkerAndMap (VERSIÓN CON FRECUENCIAS DESACOPLADAS)
+// RESUMEN: Actualiza la animación visual del marcador a los FPS definidos por el usuario,
+//          pero limita la actualización de la cámara (la operación más costosa)
+//          a la mitad de esa frecuencia para estabilizar el uso de memoria.
+// ===================================================================
+function animateMarkerAndMap(timestamp) {
+    // ---> [MODIFICACIÓN] La variable para el intervalo de la cámara se calcula aquí dentro.
+    // Multiplicamos por 2 para obtener la mitad de la frecuencia.
+    // Usamos un mínimo de 66ms (~15 FPS) para asegurar que no sea demasiado lento si el usuario pone FPS muy bajos.
+    const CAMERA_JUMP_INTERVAL_MS = Math.max(MAP_UPDATE_INTERVAL_MS * 2, 66); 
+
+    const now = timestamp || performance.now();
+    
+    // Mantenemos tu control de FPS principal para las animaciones visuales.
+    if (now - lastMapUpdateTime < MAP_UPDATE_INTERVAL_MS) {
+        markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
+        return;
+    }
+    lastMapUpdateTime = now;
+
+    if (!initialUserLocationMarker || !navigationMapInstance || isFlying) {
+        markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
+        return;
+    }
+
+    if (!markerAnimationState.lastTimestamp) {
+        markerAnimationState.lastTimestamp = timestamp;
+        markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
+        return;
+    }
+    
+    const deltaTime = timestamp - markerAnimationState.lastTimestamp;
+    markerAnimationState.lastTimestamp = timestamp;
+    const clampedDeltaTime = Math.min(deltaTime, 50);
+
+    const posLerpFactor = 1.0 - Math.exp(-clampedDeltaTime * lerpRatePosition);
+    const rotLerpFactor = 1.0 - Math.exp(-clampedDeltaTime * lerpRateRotation);
+    
+    // --- TAREA 1: Animación del MARCADOR (Alta Frecuencia: ~38 FPS por defecto) ---
+    // Esta parte se ejecuta en cada frame visual para máxima fluidez del icono del coche.
+    if (markerAnimationState.currentLngLat && markerAnimationState.targetLngLat) {
+        markerAnimationState.currentLngLat.lng += (markerAnimationState.targetLngLat.lng - markerAnimationState.currentLngLat.lng) * posLerpFactor;
+        markerAnimationState.currentLngLat.lat += (markerAnimationState.targetLngLat.lat - markerAnimationState.currentLngLat.lat) * posLerpFactor;
+        initialUserLocationMarker.setLngLat(markerAnimationState.currentLngLat);
+        if (groundAnchorMarker) {
+            groundAnchorMarker.setLngLat(markerAnimationState.currentLngLat);
+        }
+    }
+    
+    let deltaIconRotation = markerAnimationState.targetIconRotation - markerAnimationState.currentIconRotation;
+    if (deltaIconRotation > 180) deltaIconRotation -= 360;
+    if (deltaIconRotation < -180) deltaIconRotation += 360;
+    markerAnimationState.currentIconRotation += deltaIconRotation * rotLerpFactor;
+    initialUserLocationMarker.setRotation(markerAnimationState.currentIconRotation);
+
+    // --- TAREA 2: Actualización de la CÁMARA (Baja Frecuencia: ~19 FPS por defecto) ---
+    if ((shouldCenterOnUser || navigationFollowUser) && (now - markerAnimationState.lastCameraTimestamp > CAMERA_JUMP_INTERVAL_MS)) {
+        markerAnimationState.lastCameraTimestamp = now;
+
+        // Se usa el lerp factor de zoom/pitch que también depende de clampedDeltaTime.
+        const zoomPitchLerpFactor = 1.0 - Math.exp(-clampedDeltaTime * lerpRateZoom);
+
+        // Actualizamos los valores de la cámara con la interpolación acumulada hasta este momento.
+        if (markerAnimationState.currentMapCenter && markerAnimationState.targetLngLat) {
+            markerAnimationState.currentMapCenter.lng += (markerAnimationState.targetLngLat.lng - markerAnimationState.currentMapCenter.lng) * posLerpFactor;
+            markerAnimationState.currentMapCenter.lat += (markerAnimationState.targetLngLat.lat - markerAnimationState.currentMapCenter.lat) * posLerpFactor;
+        }
+
+        let deltaMapBearing = markerAnimationState.targetMapBearing - markerAnimationState.currentMapBearing;
+        if (deltaMapBearing > 180) deltaMapBearing -= 360;
+        if (deltaMapBearing < -180) deltaMapBearing += 360;
+        markerAnimationState.currentMapBearing += deltaMapBearing * rotLerpFactor;
+        
+        markerAnimationState.currentMapZoom += (markerAnimationState.targetMapZoom - markerAnimationState.currentMapZoom) * zoomPitchLerpFactor;
+        markerAnimationState.currentMapPitch += (markerAnimationState.targetMapPitch - markerAnimationState.currentMapPitch) * zoomPitchLerpFactor;
+        
+        markerAnimationState.currentMapOffsetX += (markerAnimationState.targetMapOffsetX - markerAnimationState.currentMapOffsetX) * zoomPitchLerpFactor;
+        markerAnimationState.currentMapOffsetY += (markerAnimationState.targetMapOffsetY - markerAnimationState.currentMapOffsetY) * zoomPitchLerpFactor;
+
+        // La llamada costosa a jumpTo() solo se ejecuta aquí, con menos frecuencia.
+        const canvas = navigationMapInstance.getCanvas();
+        const pitchInRadians = (markerAnimationState.currentMapPitch * Math.PI) / 180;
+        const cameraHeightAboveCar = 150; 
+        
+        let offsetXToUse = markerAnimationState.currentMapOffsetX;
+        let offsetYToUse = markerAnimationState.currentMapOffsetY;
+        const savedViewMode = localStorage.getItem(MAP_VIEW_MODE_KEY) || 'relief';
+        if (savedViewMode === 'relief') {
+            offsetXToUse = Math.max(-10, Math.min(offsetXToUse, 10));
+            offsetYToUse = Math.max(-20, Math.min(offsetYToUse, 20));
+        }
+        
+        const verticalOffsetFactor = offsetYToUse / 100;
+        const groundDistanceOffset = (cameraHeightAboveCar * Math.tan(pitchInRadians)) * verticalOffsetFactor * -1;
+        const metersPerPixel = 156543.03 * Math.cos(markerAnimationState.currentMapCenter.lat * Math.PI / 180) / Math.pow(2, markerAnimationState.currentMapZoom);
+        const pixelOffsetX = canvas.clientWidth * (offsetXToUse / 100);
+        const horizontalDistanceOffset = metersPerPixel * pixelOffsetX * -1;
+        
+        const totalDistance = Math.sqrt(Math.pow(groundDistanceOffset, 2) + Math.pow(horizontalDistanceOffset, 2));
+        const angleAdjustment = Math.atan2(horizontalDistanceOffset, groundDistanceOffset) * (180 / Math.PI);
+        
+        _turfCarPointForAnimation.geometry.coordinates[0] = markerAnimationState.currentMapCenter.lng;
+        _turfCarPointForAnimation.geometry.coordinates[1] = markerAnimationState.currentMapCenter.lat;
+        const finalBearingForOffset = markerAnimationState.currentMapBearing - 180 + angleAdjustment;
+        const cameraAnchorPoint = turf.destination(_turfCarPointForAnimation, totalDistance / 1000, finalBearingForOffset, { units: 'kilometers' });
+
+        const cameraOptions = {
+            center: cameraAnchorPoint.geometry.coordinates,
+            zoom: markerAnimationState.currentMapZoom,
+            bearing: markerAnimationState.currentMapBearing,
+            pitch: markerAnimationState.currentMapPitch,
+            offset: [0, 0]
+        };
+        
+        if (markerAnimationState.currentMapAltitude !== null && !isNaN(markerAnimationState.currentMapAltitude)) {
+            cameraOptions.altitude = markerAnimationState.currentMapAltitude;
+        }
+
+        navigationMapInstance.jumpTo(cameraOptions);
+    }
+    
+    markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
+}
+    
     
 // ===================================================================
 // NOMBRE: getRouteStyleProperties (VERSIÓN CORREGIDA)
