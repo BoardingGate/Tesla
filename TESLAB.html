@@ -1,4 +1,4 @@
-L15
+L16
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -775,7 +775,6 @@ L15
     let tempSavedLocations = [];
     let navigationMapInstance = null;
     let isNavigationMapActive = false;
-    let initialUserLocationMarker = null;
     let initialUserLocationMarkerLat = null;
     let initialUserLocationMarkerLng = null;
     let navigationCurrentLocation = null;
@@ -6795,6 +6794,96 @@ function updateVehicleMarker(coords, mapInstanceToUse) {
         markerAnimationState.lastCompassUpdateTime = now; // Actualizamos el timestamp
     }
 }
+
+// ===================================================================
+// NOMBRE: updateVehicleMarker (VERSIÓN CON CAPA DE SÍMBOLO)
+// RESUMEN: Gestiona el icono del coche como una capa de símbolo dentro del canvas de WebGL
+//          en lugar de un marcador HTML, para permitir un movimiento fluido
+//          independientemente de la frecuencia de actualización de la cámara.
+// ===================================================================
+function updateVehicleMarker(coords, mapInstanceToUse) {
+    lastGpsUpdateTime = Date.now();
+    const lngLat = new mapboxgl.LngLat(coords.longitude, coords.latitude);
+    initialUserLocationMarkerLat = coords.latitude;
+    initialUserLocationMarkerLng = coords.longitude;
+
+    let validatedHeading = null;
+    if (coords.heading !== null && typeof coords.heading === 'number' && !isNaN(coords.heading) && coords.heading >= 0) {
+        validatedHeading = coords.heading;
+    } else if (window.lastPositionForSpeedCalc && typeof turf !== 'undefined' && (window.currentSpeedKmh || 0) > 5) {
+        _turfLastPoint.geometry.coordinates[0] = window.lastPositionForSpeedCalc.longitude;
+        _turfLastPoint.geometry.coordinates[1] = window.lastPositionForSpeedCalc.latitude;
+        _turfCurrentPoint.geometry.coordinates[0] = coords.longitude;
+        _turfCurrentPoint.geometry.coordinates[1] = coords.latitude;
+        if (turf.distance(_turfLastPoint, _turfCurrentPoint, { units: 'meters' }) > 1) {
+            const bearing = turf.bearing(_turfLastPoint, _turfCurrentPoint);
+            validatedHeading = (bearing < 0) ? bearing + 360 : bearing;
+        }
+    }
+    
+    if (validatedHeading === null) {
+        validatedHeading = (markerAnimationState.currentIconRotation + 360) % 360; // El icono de símbolo no necesita el -90
+    }
+
+    if (!mapInstanceToUse.getSource('vehicle-source')) {
+        mapInstanceToUse.loadImage('PNG/AVANCE.PNG', (error, image) => {
+            if (error) throw error;
+            if (!mapInstanceToUse.hasImage('vehicle-icon')) {
+                mapInstanceToUse.addImage('vehicle-icon', image);
+            }
+
+            mapInstanceToUse.addSource('vehicle-source', {
+                'type': 'geojson',
+                'data': {
+                    'type': 'Feature',
+                    'geometry': {
+                        'type': 'Point',
+                        'coordinates': [lngLat.lng, lngLat.lat]
+                    }
+                }
+            });
+
+            // 3. Creamos la capa de tipo 'symbol' que mostrará el icono
+            mapInstanceToUse.addLayer({
+                'id': 'vehicle-layer',
+                'type': 'symbol',
+                'source': 'vehicle-source',
+                'layout': {
+                    'icon-image': 'vehicle-icon',
+                    'icon-size': 0.08, // Ajusta este valor para el tamaño deseado
+                    'icon-rotation-alignment': 'map', // El icono rota con el mapa
+                    'icon-allow-overlap': true,
+                    'icon-ignore-placement': true
+                }
+            });
+        });
+
+        if (!groundAnchorMarker) {
+             const anchorEl = document.createElement('div');
+             anchorEl.className = 'ground-anchor-marker ground-anchor-hidden';
+             groundAnchorMarker = new mapboxgl.Marker({ 
+                 element: anchorEl, 
+                 anchor: 'center' 
+             }).setLngLat(lngLat).addTo(mapInstanceToUse);
+        }
+    }
+    
+    
+    if (!markerAnimationState.currentLngLat) {
+        markerAnimationState.currentLngLat = lngLat;
+    }
+   
+    markerAnimationState.targetLngLat = lngLat;
+    markerAnimationState.targetIconRotation = validatedHeading; 
+
+    updateMapCamera(coords, mapInstanceToUse);
+    
+    const now = Date.now();
+    if (compassAndModeControl && (now - markerAnimationState.lastCompassUpdateTime > 1800)) {
+        compassAndModeControl.updateOrientation(validatedHeading);
+        markerAnimationState.lastCompassUpdateTime = now;
+    }
+}    
     
 
 // =====================================================================================
@@ -17439,6 +17528,121 @@ function closeNavigationMap(force = false) {
     document.querySelectorAll('#config-button, #personal-button, #radar-button, #home-button, #reload-button, #keyword-assignment-button, #password-toggle-button, #versions-button, #info-button').forEach(el => el.style.display = 'block');
     const gridFilter = document.getElementById('grid-filter-container'); if (gridFilter) gridFilter.style.display = 'flex';
 }
+
+// ===================================================================
+// NOMBRE: closeNavigationMap (MODIFICADA - INCLUYE LIMPIEZA DE CAPA DE VEHÍCULO)
+// RESUMEN: Cierra el mapa de navegación, asegurando la destrucción completa
+//          de todas sus capas, fuentes, listeners y mapas secundarios asociados.
+// ===================================================================
+function closeNavigationMap(force = false) {
+    const aiModal = document.getElementById('ai-route-modal');
+    if (aiModal) aiModal.classList.add('hidden');
+    
+    clearRecoveryFlag();
+    hideAddressSuggestionsModal();
+    stopGpsWatching();
+    if (markerAnimationState.animationFrameId) {
+        cancelAnimationFrame(markerAnimationState.animationFrameId);
+        markerAnimationState.animationFrameId = null;
+    }
+    if (alertRefreshInterval) {
+        clearInterval(alertRefreshInterval);
+        alertRefreshInterval = null;
+    }
+    if (gpsHzMonitor.interval) {
+        clearInterval(gpsHzMonitor.interval);
+        gpsHzMonitor.interval = null;
+    }
+    if (manualZoomTimeout) { clearTimeout(manualZoomTimeout); manualZoomTimeout = null; }
+
+    const header = document.getElementById('reminders-location-map-header');
+    if (header && header._mapButtonClickHandler) {
+        header.removeEventListener('click', header._mapButtonClickHandler);
+        delete header._mapButtonClickHandler;
+    }
+
+    if (intersectionPreviewMap) {
+        try { intersectionPreviewMap.remove(); } catch(e){}
+        intersectionPreviewMap = null;
+        intersectionPreviewCarMarker = null;
+        intersectionPreviewManeuverMarker = null;
+    }
+    if (locationPickerMap) {
+        try { locationPickerMap.remove(); } catch(e){}
+        locationPickerMap = null;
+        locationPickerMarker = null;
+    }
+    
+    // --> [MODIFICACIÓN CLAVE] Limpieza explícita del mapa de navegación ANTES de resetear el estado.
+    if (navigationMapInstance) {
+        try {
+            // Desregistra todos los listeners de eventos para evitar fugas de memoria.
+            navigationMapInstance.off('load');
+            navigationMapInstance.off('error');
+            navigationMapInstance.off('pitch');
+            navigationMapInstance.off('zoomend');
+            navigationMapInstance.off('click');
+            navigationMapInstance.off('sourcedata');
+            navigationMapInstance.off('mouseenter');
+            navigationMapInstance.off('mouseleave');
+
+            // Llama a .remove() que se encarga de destruir el contexto WebGL y otros recursos.
+            navigationMapInstance.remove();
+        } catch (e) {
+            console.error("Error durante la limpieza del mapa de navegación:", e);
+        }
+        navigationMapInstance = null;
+    }
+
+    // Llama a la función de reseteo que limpiará todas las variables de estado.
+    resetNavigationState(); 
+
+    isManualZoomActive = false;
+    
+    const wasInDirectToMapModeSession = sessionStorage.getItem('isInDirectToMapMode') === 'true';
+    const userPrefersDirectToNav = JSON.parse(localStorage.getItem(DIRECT_TO_NAVIGATION_KEY)) || false;
+    if (wasInDirectToMapModeSession && userPrefersDirectToNav && !force) {
+        sessionStorage.removeItem('isInDirectToMapMode');
+        sessionStorage.setItem(TEMP_PREVENT_DIRECT_NAV_KEY, 'true');
+        location.reload();
+        return;
+    }
+    
+    isNavigationMapActive = false;
+    sessionStorage.removeItem('mapContext');
+    
+    const mapModalElement = document.getElementById('reminders-location-map-modal');
+    if (mapModalElement) {
+        mapModalElement.classList.add('map-modal-hidden');
+    }
+    
+    const simModal = document.getElementById('simulation-modal');
+    if (simModal && !simModal.classList.contains('hidden')) {
+        if (simulationModalTimer) clearTimeout(simulationModalTimer);
+        const simCloseBtn = simModal.querySelector('#close-simulation-modal');
+        if (simCloseBtn) clearModalAutoCloseTimer(simModal, simCloseBtn, 'simulation-modal');
+        simModal.classList.add('hidden');
+        hideIntersectionPreviewMap();
+    }
+
+    sessionStorage.removeItem('boardinggate_map_should_reopen_after_form');
+    hideUnifiedReminderWindow();
+    
+    if (directToNavOnLoad) {
+        loadCustomData();
+        loadSavedSettings();
+        applyMainUISettings();
+        directToNavOnLoad = false;
+    }
+ 
+    const mainContent = document.querySelector('main'); if (mainContent) mainContent.style.display = 'block';
+    const footer = document.querySelector('footer'); if (footer) footer.style.display = 'block';
+    const noticesContainer = document.querySelector('.notices-icon-container'); if (noticesContainer) noticesContainer.style.display = 'flex';
+    const sideControls = document.querySelectorAll('.toggle-image, .toggle-sign, .scroll-toggle-button'); sideControls.forEach(el => el.style.display = 'flex');
+    document.querySelectorAll('#config-button, #personal-button, #radar-button, #home-button, #reload-button, #keyword-assignment-button, #password-toggle-button, #versions-button, #info-button').forEach(el => el.style.display = 'block');
+    const gridFilter = document.getElementById('grid-filter-container'); if (gridFilter) gridFilter.style.display = 'flex';
+}
+    
     
 // ===================================================================
 // NOMBRE: updateStartNavigationButtonState 
@@ -18098,25 +18302,28 @@ function animateMarkerAndMap(timestamp) {
     markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
 }
 
-
 // ===================================================================
-// NOMBRE: animateMarkerAndMap (VERSIÓN SIMPLIFICADA Y ROBUSTA)
-// RESUMEN: Ejecuta TODA la lógica de animación (marcador y cámara)
-//          a una frecuencia reducida para garantizar la sincronización
-//          y evitar saltos, mientras se sigue optimizando la memoria.
+// NOMBRE: animateMarkerAndMap (VERSIÓN FINAL CON CAPA DE SÍMBOLO Y FLUIDEZ CORREGIDA)
+// RESUMEN: Interpola el marcador (capa de símbolo) Y la cámara en cada frame visual para máxima suavidad.
+//          La llamada a jumpTo() (costosa) se limita a la mitad de la
+//          frecuencia visual para optimizar la memoria sin introducir saltos.
 // ===================================================================
 function animateMarkerAndMap(timestamp) {
+    const CAMERA_JUMP_INTERVAL_MS = Math.max(MAP_UPDATE_INTERVAL_MS * 2, 66);
+
+    // Bucle principal de animación, siempre activo
     markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
 
     const now = timestamp || performance.now();
     
-    // Mantenemos tu control de FPS para toda la lógica de animación.
+    // Control de FPS para toda la lógica de animación
     if (now - lastMapUpdateTime < MAP_UPDATE_INTERVAL_MS) {
-        return; // Salta el frame si no ha pasado el tiempo necesario.
+        return; 
     }
     lastMapUpdateTime = now;
 
-    if (!initialUserLocationMarker || !navigationMapInstance || isFlying) {
+    const vehicleSource = navigationMapInstance ? navigationMapInstance.getSource('vehicle-source') : null;
+    if (!vehicleSource || !navigationMapInstance || isFlying) {
         return;
     }
 
@@ -18133,19 +18340,36 @@ function animateMarkerAndMap(timestamp) {
     const rotLerpFactor = 1.0 - Math.exp(-clampedDeltaTime * lerpRateRotation);
     const zoomPitchLerpFactor = 1.0 - Math.exp(-clampedDeltaTime * lerpRateZoom);
 
-    // --- CÁLCULOS DE INTERPOLACIÓN (Se calculan siempre para tener los valores listos) ---
-    
-    // Marcador
+    // --- TAREA 1: Animación del SÍMBOLO del coche (Alta Frecuencia) ---
     if (markerAnimationState.currentLngLat && markerAnimationState.targetLngLat) {
         markerAnimationState.currentLngLat.lng += (markerAnimationState.targetLngLat.lng - markerAnimationState.currentLngLat.lng) * posLerpFactor;
         markerAnimationState.currentLngLat.lat += (markerAnimationState.targetLngLat.lat - markerAnimationState.currentLngLat.lat) * posLerpFactor;
     }
+    
     let deltaIconRotation = markerAnimationState.targetIconRotation - markerAnimationState.currentIconRotation;
     if (deltaIconRotation > 180) deltaIconRotation -= 360;
     if (deltaIconRotation < -180) deltaIconRotation += 360;
     markerAnimationState.currentIconRotation += deltaIconRotation * rotLerpFactor;
 
-    // Cámara
+    // Actualizamos la fuente de datos GeoJSON con la nueva posición y rotación
+    vehicleSource.setData({
+        'type': 'Feature',
+        'geometry': {
+            'type': 'Point',
+            'coordinates': [markerAnimationState.currentLngLat.lng, markerAnimationState.currentLngLat.lat]
+        },
+        'properties': {
+            'bearing': markerAnimationState.currentIconRotation // Pasamos la rotación como propiedad
+        }
+    });
+
+    // El groundAnchorMarker (HTML) se actualiza también para mantener la referencia visual en el suelo.
+    if (groundAnchorMarker) {
+        groundAnchorMarker.setLngLat(markerAnimationState.currentLngLat);
+    }
+    
+    // --- TAREA 2: CÁLCULOS de la CÁMARA (Alta Frecuencia) ---
+    // Se calculan los valores interpolados de la cámara en cada frame para que el movimiento sea suave.
     if (shouldCenterOnUser || navigationFollowUser) {
         if (markerAnimationState.currentMapCenter && markerAnimationState.targetLngLat) {
             markerAnimationState.currentMapCenter.lng += (markerAnimationState.targetLngLat.lng - markerAnimationState.currentMapCenter.lng) * posLerpFactor;
@@ -18164,20 +18388,11 @@ function animateMarkerAndMap(timestamp) {
         markerAnimationState.currentMapOffsetY += (markerAnimationState.targetMapOffsetY - markerAnimationState.currentMapOffsetY) * zoomPitchLerpFactor;
     }
 
-    // --- ACTUALIZACIÓN DE LA UI (Se ejecuta siempre para suavidad) ---
-    initialUserLocationMarker.setLngLat(markerAnimationState.currentLngLat);
-    initialUserLocationMarker.setRotation(markerAnimationState.currentIconRotation);
-    if (groundAnchorMarker) {
-        groundAnchorMarker.setLngLat(markerAnimationState.currentLngLat);
-    }
-    
-    // --- ACTUALIZACIÓN DE LA CÁMARA (AHORA CONDICIONAL) ---
-    // [ESTA ES LA CLAVE] Solo llamamos a jumpTo() CADA DOS frames visuales.
-    // Esto reduce la carga a la mitad, pero asegura que el marcador y la cámara
-    // siempre se actualizan con los mismos valores coordinados, eliminando saltos.
-    gpsTickCounter++;
-    if ((shouldCenterOnUser || navigationFollowUser) && (gpsTickCounter % 2 === 0)) {
-        
+    // --- TAREA 3: ACTUALIZACIÓN de la CÁMARA (Baja Frecuencia) ---
+    // La llamada a jumpTo(), que es costosa, solo se ejecuta a la mitad de la frecuencia visual.
+    if ((shouldCenterOnUser || navigationFollowUser) && (now - (markerAnimationState.lastCameraTimestamp || 0) > CAMERA_JUMP_INTERVAL_MS)) {
+        markerAnimationState.lastCameraTimestamp = now;
+
         const canvas = navigationMapInstance.getCanvas();
         const pitchInRadians = (markerAnimationState.currentMapPitch * Math.PI) / 180;
         const cameraHeightAboveCar = 150; 
@@ -18219,7 +18434,7 @@ function animateMarkerAndMap(timestamp) {
         navigationMapInstance.jumpTo(cameraOptions);
     }
 }    
-  
+
     
 // ===================================================================
 // NOMBRE: getRouteStyleProperties (VERSIÓN CORREGIDA)
@@ -20324,6 +20539,82 @@ function resetNavigationState() {
     actualizarContadorRadares(0);
     actualizarContadorTareas(0);
 }
+
+// ===================================================================
+// NOMBRE: resetNavigationState (MODIFICADA - USA LA NUEVA LIMPIEZA MAESTRA)
+// RESUMEN: Reinicia a su estado original TODAS las variables relacionadas
+//          con la navegación, llamando primero a la limpieza visual garantizada.
+// ===================================================================
+function resetNavigationState() {
+    // Llama a la función maestra de limpieza visual para asegurar que no queden artefactos.
+    clearAllRouteVisualsFromMap();
+
+    const autoStartModal = document.getElementById('auto-start-nav-modal');
+    if (autoStartModal) {
+        hideAutoStartNavigationModal();
+        showToast("Inicio automático cancelado: La ruta ha sido modificada/borrada.", "info");
+    }
+
+    // Reseteo de todas las variables de estado a sus valores por defecto.
+    navigationWaypoints = [];
+    navigationCurrentRouteData = null;
+    isNavigating = false;
+    currentRouteNameForSaving = null;
+    
+    lastCarDistanceAlongRouteForNavLogic = 0;
+    lastValidCarDistanceForDisplay = 0;
+    currentLegIndexNav = 0;
+    currentStepIndexNav = 0;
+    previousLegIndexForEta = 0;
+    lastDisplayedManeuverIcon = null;
+    lastProcessedStepIdentifier = null;
+    lastProcessedStepForLock = null;
+
+    tripInitialOverallEtaTime = null;
+    originalTripEtaTime = null; 
+    currentStageInitialExpectedEtaTime = null;
+    accumulatedDeviationMs = 0;
+    accumulatedDistanceBeforeCurrentSegment = 0;
+    navigationStartTimeForStats = null;
+    totalDistanceTravelledForStats = 0;
+    lastPositionForStats = null;
+    maxSpeedDuringTrip = 0;
+    maxSpeedCoordinates = null;
+    maxAltitudeDuringTrip = -Infinity;
+    minAltitudeDuringTrip = Infinity;
+    window.averageSpeedKmh = 0;
+    
+    // Limpieza de cachés de ruta
+    reminderMapObjects = [];
+    radaresEnRutaActual = [];
+    tareasEnRutaActual = [];
+    alternativeRoutesCache.clear();
+    selectedStageRoutes.clear();
+    lastPdrSearchResults = [];
+    currentChargingPointsOnRoute = [];
+    if (window.lastOcmApiResponse) {
+        window.lastOcmApiResponse = null;
+    }
+    
+    isCacheDirty = true;
+    trafficAlertsCache = [];
+    
+    speedMarkerFeatures = [];
+    if (navigationMapInstance && navigationMapInstance.getSource('speed-markers-source')) {
+        navigationMapInstance.getSource('speed-markers-source').setData({
+            type: 'FeatureCollection',
+            features: [] 
+        });
+    }
+
+    isArrivalSequenceStarted = false;
+    hideNavigationUI();
+    hideMapInfoOverlay();
+    clearNavigationGraph();
+    
+    actualizarContadorRadares(0);
+    actualizarContadorTareas(0);
+}    
 
 // ===================================================================
 // NOMBRE: handleDeleteWaypointClick (MODIFICADA - CIERRA MODAL DE INICIO)
