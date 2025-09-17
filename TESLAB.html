@@ -1,4 +1,4 @@
-L19
+M01
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -947,7 +947,7 @@ L19
     let mapTerrainExaggeration = 0.8; 
     let aiConversationHistory = []; 
     let initialUserLocationMarker = null;
-
+    
     const navigationTasks = {
         CRITICAL_VISUALS: {
             id: 'CRITICAL_VISUALS',
@@ -1030,9 +1030,96 @@ L19
         }
     };
 
+// ===================================================================
+// NOMBRE: navigationTasks (MODIFICADO)
+// RESUMEN: Se ajusta la frecuencia de CRITICAL_VISUALS para que se acelere cerca de una maniobra.
+// ===================================================================
+    const navigationTasks = {
+        CRITICAL_VISUALS: {
+            id: 'CRITICAL_VISUALS',
+            handler: (coords, map) => {
+                updateVehicleMarker(coords, map);
+                if (!markerAnimationState.animationFrameId) {
+                    markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
+                }
+            },
+            getFrequency: () => {
+                if (isNavigating && distanceToNextManeuverOSRM < 310) {
+                    return 0; 
+                }
+                return (performanceRatios.criticalUpdate / GPS_BASE_FREQUENCY_HZ) * 1000;
+            },
+            priority: 1,
+            lastRun: 0
+        },
+        ROUTE_PROGRESS: {
+            id: 'ROUTE_PROGRESS',
+            handler: (coords, map) => { if (isNavigating) processRouteProgress(coords, map); },
+            getFrequency: () => {
+                const baseIntervalMs = (performanceRatios.routeProgress / GPS_BASE_FREQUENCY_HZ) * 1000;
+                
+                if (distanceToNextManeuverOSRM < 310) {
+                    return baseIntervalMs / 4;
+                } else {
+                    return baseIntervalMs;
+                }
+            },
+            priority: 2,
+            lastRun: 0
+        },
+        UPDATE_CAMERA_ALTITUDE: {
+            id: 'UPDATE_CAMERA_ALTITUDE',
+            handler: (coords, map) => {
+                const currentMode = mapViewMode || localStorage.getItem(MAP_VIEW_MODE_KEY) || 'relief';
+                if (currentMode !== 'relief' && currentMode !== 'perspective') {
+                    markerAnimationState.targetMapAltitude = null; 
+                    return; 
+                }
+        
+                const terrainElevation = map.queryTerrainElevation({ lng: coords.longitude, lat: coords.latitude });
+                const baseAltitude = terrainElevation !== null ? terrainElevation : smoothedGpsAltitude;
+                const cameraAltitudeOffset = 150; 
+                markerAnimationState.targetMapAltitude = baseAltitude + cameraAltitudeOffset;
+            },
+            getFrequency: () => 3500,
+            priority: 2.5,
+            lastRun: 0
+        }, 
+        TRIP_STATS: {
+            id: 'TRIP_STATS',
+            handler: (coords, map) => updateTripStatistics(coords),
+            getFrequency: () => {
+                const baseIntervalMs = (performanceRatios.tripStats / GPS_BASE_FREQUENCY_HZ) * 1000;
+                
+                if (distanceToNextManeuverOSRM < 310) {
+                    return baseIntervalMs / 2;
+                } else {
+                    return baseIntervalMs;
+                }
+            },
+            priority: 3,
+            lastRun: 0
+        },
+        PERFORMANCE_GRAPH: {
+            id: 'PERFORMANCE_GRAPH',
+            handler: (coords, map) => plotIntervalData(),
+            getFrequency: () => (performanceRatios.performanceGraph / GPS_BASE_FREQUENCY_HZ) * 1000,
+            priority: 4,
+            lastRun: 0
+        },
+        TRAFFIC_ALERTS: {
+            id: 'TRAFFIC_ALERTS',
+            handler: (coords, map) => checkAlertsProximity(),
+            getFrequency: () => (performanceRatios.trafficAlerts / GPS_BASE_FREQUENCY_HZ) * 1000,
+            priority: 5,
+            lastRun: 0
+        }
+    };
+    
+
      const TASKS_BY_PRIORITY = Object.values(navigationTasks)
         .sort((a, b) => a.priority - b.priority);
-
+    
     let announceManeuverWithFlash = true; 
     let maneuverFlashTriggeredId = null; 
     let lastAutoBackupTimestamp = 0;
@@ -1310,6 +1397,203 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
     actualizarContadorTareas(tareasEnRutaActual.length);
 }
 
+// ===================================================================
+// NOMBRE: toggleNavigationState (MODIFICADO)
+// RESUMEN: Se añade la restauración de los FPS de la cámara al detener la navegación.
+async function toggleNavigationState(isRecalculationStop = false, isRecovery = false) {
+    const startNavButton = document.getElementById('start-navigation-button');
+    const startNavImg = startNavButton ? startNavButton.querySelector('img') : null;
+    const mapContainer = document.getElementById('reminders-location-map-div');
+    
+    if (isNavigating) {
+         if (navigationMapInstance && navigationCurrentLocation) {
+            isFlying = true;
+            navigationFollowUser = false;
+            shouldCenterOnUser = false;
+            const targetZoom = 16.5;
+            const targetPitch = 0;
+            const targetBearing = 0;
+            markerAnimationState.targetMapZoom = targetZoom;
+            markerAnimationState.targetMapPitch = targetPitch;
+            markerAnimationState.targetMapBearing = targetBearing;
+            markerAnimationState.currentMapZoom = navigationMapInstance.getZoom();
+            markerAnimationState.currentMapPitch = navigationMapInstance.getPitch();
+            markerAnimationState.currentMapBearing = navigationMapInstance.getBearing();
+            navigationMapInstance.flyTo({ center: [navigationCurrentLocation.longitude, navigationCurrentLocation.latitude], zoom: targetZoom, pitch: targetPitch, bearing: targetBearing, duration: 1500 });
+            navigationMapInstance.once('moveend', () => { isFlying = false; });
+        }
+        
+        clearRecoveryFlag();
+        startMemoryManagement(false);
+        
+        if (isSimulatingGpsLocation) {
+            stopAutomatedRouteSimulation();
+        }
+        if (!isRecalculationStop && !isArrivalSequenceStarted) {
+            if (!document.getElementById('arrival-stats-modal') || document.getElementById('arrival-stats-modal').classList.contains('hidden')) {
+                showArrivalStatsModal();
+            }
+        }
+        isNavigating = false;
+        navigationFollowUser = false;
+        
+        MAP_UPDATE_INTERVAL_MS = originalMapUpdateIntervalMs; // Restaura los FPS al valor por defecto.
+   
+    } else if (isFreeDriveActive) {
+        stopFreeDrive();
+    } else {
+        const hasEnoughWaypointsForRoute = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart).length >= 2;
+        const hasRouteData = navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0];
+        if (hasEnoughWaypointsForRoute && hasRouteData) {
+            isArrivalSequenceStarted = false;
+            hideAutoStartNavigationModal();
+            clearAlternativeRoutesDisplay();
+            
+            const waypointsForRecents = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
+            await Promise.all(waypointsForRecents.map(async (wp) => {
+                if (!wp.address) {
+                    wp.address = await getAddressForWaypoint(wp.lat, wp.lng);
+                }
+            }));
+            const lastWpForName = waypointsForRecents[waypointsForRecents.length - 1];
+            const isMultiStageForName = waypointsForRecents.length > 2;
+            const suggestedName = await getSuggestedRouteName(lastWpForName.lat, lastWpForName.lng, isMultiStageForName, waypointsForRecents.length);
+            
+            let routeForStorage;
+            const finalWaypoint = waypointsForRecents[waypointsForRecents.length - 1];
+
+            if (currentRouteNameForSaving && currentRouteNameForSaving.startsWith("UBICACIÓN: ") && finalWaypoint) {
+                routeForStorage = { name: currentRouteNameForSaving, waypoints: sanitizeWaypointsForStorage([finalWaypoint]) };
+            } else {
+                routeForStorage = { name: currentRouteNameForSaving || suggestedName, waypoints: sanitizeWaypointsForStorage(waypointsForRecents) };
+            }
+            addRouteToRecents(routeForStorage);
+            
+            if (!isRecovery) {
+                clearNavigationGraph();
+                navigationWaypoints.forEach(wp => { 
+                    if(wp) { 
+                        if (wp.type === 'S' || wp.type === 'S_Recalc') { wp.visited = true; } else { wp.visited = false; }
+                    }
+                });
+                tripStartLocationForStats = navigationCurrentLocation ? { ...navigationCurrentLocation } : null;
+                navigationStartTimeForStats = new Date();
+                totalDistanceTravelledForStats = 0;
+                maxSpeedDuringTrip = 0;
+                maxSpeedCoordinates = null;
+                maxAltitudeDuringTrip = -Infinity;
+                minAltitudeDuringTrip = Infinity;
+                window.averageSpeedKmh = 0; 
+                lastPositionForStats = navigationCurrentLocation ? {...navigationCurrentLocation} : null;
+                accumulatedDeviationMs = 0;
+                accumulatedDistanceBeforeCurrentSegment = 0;
+                graphDataPoints = { speed: [], altitude: [] };
+                graphLabels = [];
+                minAverageSpeedInTrip = Infinity;
+                maxAverageSpeedInTrip = -Infinity;
+            }
+
+            const recoveryData = { 
+                isActive: true, 
+                route: routeForStorage,
+                tripStartTime: navigationStartTimeForStats ? navigationStartTimeForStats.getTime() : Date.now(),
+                originalTripEtaTime: originalTripEtaTime ? originalTripEtaTime.getTime() : null,
+                stats: {
+                    totalDistance: totalDistanceTravelledForStats,
+                    maxSpeed: maxSpeedDuringTrip,
+                    maxAltitude: maxAltitudeDuringTrip,
+                    minAltitude: minAltitudeDuringTrip,
+                    maxSpeedCoords: maxSpeedCoordinates
+                },
+                tripContext: {
+                    graphLabels: graphLabels || [],
+                    graphDataPoints: graphDataPoints || { speed: [], altitude: [] },
+                    minAvgSpeed: minAverageSpeedInTrip,
+                    maxAvgSpeed: maxAverageSpeedInTrip,
+                    accumulatedDeviationMs: accumulatedDeviationMs
+                }
+            };
+            localStorage.setItem('boardinggate_nav_recovery_flag', JSON.stringify(recoveryData));
+            
+            navigationWaypoints.forEach(wp => { if (wp && wp.marker) wp.marker.setDraggable(false); });
+            
+            getCurrentLocation(
+                (initialCoords) => { navigationCurrentLocation = initialCoords; updateInitialUserPosition(initialCoords, navigationMapInstance); },
+                (errorMsg) => { showToast(`No se pudo obtener tu ubicación inicial: ${errorMsg}. El mapa se centrará cuando el GPS esté listo.`, "warning", 5000); }
+            );
+            startGpsWatching();
+            const loadingToast = document.getElementById("gps-init-toast"); if (loadingToast) loadingToast.remove(); activeToasts = activeToasts.filter(t => t.id !== "gps-init-toast");
+            
+            isNavigating = true;
+            startMemoryManagement(true); 
+            startDeviationChecker(); 
+            mapHeaderButtonsVisible = false;
+            toggleMapHeaderRowsVisibility(false);
+            
+            const routeData = navigationCurrentRouteData.routes[0];
+            if (routeData) {
+                tripInitialDurationSec = routeData.duration;
+                tripInitialDistanceMeters = routeData.distance;
+                tripInitialOverallEtaTime = new Date(Date.now() + routeData.duration * 1000);
+                if (routeData.legs && routeData.legs.length > 0) {
+                    currentStageInitialExpectedEtaTime = new Date(Date.now() + routeData.legs[0].duration * 1000);
+                }
+                if (!isRecovery) {
+                    originalTripEtaTime = tripInitialOverallEtaTime; 
+                }
+            }
+                  
+            const toastMessage = isRecovery ? "Navegación reanudada." : "Navegación iniciada. Esperando movimiento...";
+            showToast(toastMessage, "success");
+
+            currentGraphMode = localStorage.getItem(GRAPH_STATE_KEY) || 'Desviación ETA';
+            initializeNavigationGraph();
+            const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox'); if (radaresRutaCheckbox && radaresRutaCheckbox.checked) { toggleRadaresRuta(true); }
+            const tareasRutaCheckbox = document.getElementById('tareas-ruta-checkbox'); if (tareasRutaCheckbox && tareasRutaCheckbox.checked) { toggleTareasRuta(true); }
+            if (navigationMapInstance) {
+                shouldCenterOnUser = true; 
+                navigationFollowUser = true;
+                updateLocateMeButtonsUI();
+                const locateMeButton = document.getElementById('locate-me-on-reminders-map');
+                if (locateMeButton) {
+                    const locateMeImg = locateMeButton.querySelector('img');
+                    if (locateMeImg) locateMeImg.src = "PNG/DEJARSEGUIR.PNG";
+                    locateMeButton.title = "Dejar de centrar el mapa en mi posición";
+                }
+                const startCoords = navigationCurrentLocation 
+                    ? [navigationCurrentLocation.longitude, navigationCurrentLocation.latitude] 
+                    : [navigationWaypoints[0].lng, navigationWaypoints[0].lat];
+                const savedViewMode = localStorage.getItem(MAP_VIEW_MODE_KEY) || 'static';
+                const modeDetails = MAP_VIEW_MODES[Object.keys(MAP_VIEW_MODES).find(key => MAP_VIEW_MODES[key].mode === savedViewMode)] || MAP_VIEW_MODES.NORTE;
+                let pitchToUse = 0;
+                if (modeDetails.mode === 'static') {
+                    pitchToUse = 0; 
+                } else {
+                    pitchToUse = mapPitchValue; 
+                }
+                const initialFlyToOptions = { center: startCoords, zoom: 17.5, pitch: pitchToUse, essential: true, duration: 1500 };
+                if ((modeDetails.mode === 'heading' || modeDetails.mode === 'perspective') && navigationCurrentLocation && navigationCurrentLocation.heading !== null) {
+                    initialFlyToOptions.bearing = navigationCurrentLocation.heading;
+                } else {
+                    initialFlyToOptions.bearing = modeDetails.bearing;
+                }
+                navigationMapInstance.flyTo(initialFlyToOptions);
+            }
+        } else {
+            try {
+                const initialCoords = await getCurrentLocationAsync();
+                startFreeDrive(initialCoords);
+            } catch (error) {
+                showToast(`No se pudo obtener la ubicación para iniciar el modo libre: ${error.message}`, "error");
+            }
+        }
+    }
+    updateStartNavigationButtonState();
+    updateNavigationButtonColor();
+    setNavigationMapClickHandler(); 
+    actualizarContadorRadares(radaresEnRutaActual.length);
+    actualizarContadorTareas(tareasEnRutaActual.length);
+}    
 
 // ===================================================================
 // NOMBRE: restoreTripProgress (VERSIÓN FINAL CON OCULTACIÓN DE OVERLAY)
@@ -3693,6 +3977,7 @@ function loadSavedSettings() {
 
     const savedCameraFps = parseInt(localStorage.getItem(PERFORMANCE_CAMERA_FPS_KEY)) || 26;
     MAP_UPDATE_INTERVAL_MS = 1000 / savedCameraFps;
+    originalMapUpdateIntervalMs = MAP_UPDATE_INTERVAL_MS;
     
     loadAndCacheLerpSettings();
  
@@ -6733,6 +7018,34 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
 }  
 
 // ===================================================================
+// NOMBRE: updateInitialUserPosition (MODIFICADA)
+// RESUMEN: Orquestador principal del GPS. Ahora también gestiona los FPS de la cámara.
+function updateInitialUserPosition(coords, mapInstanceToUse) {
+    if (isRecalculatingRoute || !mapInstanceToUse || !coords) return;
+
+    const PROXIMITY_THRESHOLD_FPS = 310;
+    if (isNavigating && distanceToNextManeuverOSRM < PROXIMITY_THRESHOLD_FPS) {
+        MAP_UPDATE_INTERVAL_MS = 1000 / 45; // ~22.22ms para 45 FPS
+    } else {
+        MAP_UPDATE_INTERVAL_MS = originalMapUpdateIntervalMs;
+    }
+
+    const now = performance.now();
+    navigationCurrentLocation = { ...coords };
+    
+    for (const task of TASKS_BY_PRIORITY) { 
+        if (now - task.lastRun >= task.getFrequency()) {
+            task.handler(coords, mapInstanceToUse);
+            task.lastRun = now;
+            
+            if (task.id !== 'CRITICAL_VISUALS') {
+                break;
+            }
+        }
+    }
+}
+    
+// ===================================================================
 // NOMBRE: updateVehicleMarker 
 // RESUMEN: Establece los objetivos del icono y LUEGO llama a updateMapCamera.
 function updateVehicleMarker(coords, mapInstanceToUse) {
@@ -8555,13 +8868,16 @@ function showNavigationMapHelpModal() {
         const savedFps = parseInt(localStorage.getItem(PERFORMANCE_CAMERA_FPS_KEY)) || 26;
         cameraFpsSlider.value = savedFps;
         cameraFpsValue.textContent = `${savedFps} FPS`;
+       
         cameraFpsSlider.addEventListener('input', () => {
             const fps = parseInt(cameraFpsSlider.value);
             cameraFpsValue.textContent = `${fps} FPS`;
-            MAP_UPDATE_INTERVAL_MS = 1000 / fps; 
+            const newInterval = 1000 / fps;
+            MAP_UPDATE_INTERVAL_MS = newInterval; 
+            originalMapUpdateIntervalMs = newInterval; 
             localStorage.setItem(PERFORMANCE_CAMERA_FPS_KEY, fps);
             markCacheAsDirty();
-        });
+        })
     }
 
     const sliders = [
