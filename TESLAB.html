@@ -1,4 +1,4 @@
-V02
+V03
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -2994,6 +2994,7 @@ function updateVehicleIconPerspective() {
         }
     }
 }
+    
     
 // ===================================================================
 // NOMBRE: normalizeOverpassResult 
@@ -8306,10 +8307,9 @@ async function getInitialGpsPositionForMap() {
     }
 }
 
+
 // ===================================================================
-// NOMBRE: showNavigationMapHelpModal (VERSIÓN COMPLETA Y CORREGIDA)
-// RESUMEN: Muestra el modal de ayuda/configuración del mapa con TODOS
-//          los controles, incluyendo el nuevo campo numérico para memoria.
+// NOMBRE: showNavigationMapHelpModal (VERSIÓN COMPLETA Y CORREGIDA CON BOTÓN ADMIN)
 // ===================================================================
 function showNavigationMapHelpModal() {
     const existingHelpModal = document.getElementById('reminders-map-help-modal-instance');
@@ -8330,6 +8330,13 @@ function showNavigationMapHelpModal() {
     const currentLerpPosition = localStorage.getItem(LERP_RATE_POS_KEY) || '0.004';
     const currentLerpRotation = localStorage.getItem(LERP_RATE_ROT_KEY) || '0.001';
     const currentLerpZoom = localStorage.getItem(LERP_RATE_ZOOM_KEY) || '0.001';
+
+    // --> AÑADIDO: Lógica para el botón de administrador
+    const currentUserId = localStorage.getItem('userData_userId');
+    const adminButtonHtml = (currentUserId === 'BoardingGate')
+        ? `<button id="mass-update-btn" class="reset-visuals-btn" style="background-color: #c0392b; margin-top: 15px; width: 100%;">ACTUALIZACIÓN MASIVA</button>`
+        : '';
+    // --> FIN DEL AÑADIDO
     
     helpModal.innerHTML = `
         <style>
@@ -8505,6 +8512,7 @@ function showNavigationMapHelpModal() {
                         <span>Activar Monitor de Recursos (Memoria/FPS)</span>
                     </label>
                     <p style="font-size: 0.8rem; margin-left: 32px; color: #ff9500;">No dejar activado permanentemente, consume recursos adicionales.</p>
+                    ${adminButtonHtml}
                 </div>
             </div>
         </div>
@@ -8514,6 +8522,12 @@ function showNavigationMapHelpModal() {
     const mapModal = document.getElementById('reminders-location-map-modal');
     if (mapModal) {
         mapModal.style.zIndex = 6400;
+    }
+
+    // --> AÑADIDO: Listener para el nuevo botón de administrador
+    const massUpdateButton = helpModal.querySelector('#mass-update-btn');
+    if (massUpdateButton) {
+        massUpdateButton.addEventListener('click', performMassUpdate);
     }
  
     const announceFlashCheckbox = helpModal.querySelector('#announce-maneuver-flash-checkbox');
@@ -12846,7 +12860,119 @@ function drawStaticMarkersOnProgressBar() {
     }
 }
 
+// ===================================================================
+// NOMBRE: performMassUpdate (VERSIÓN CON ACTUALIZACIÓN DE TIMESTAMP)
+async function performMassUpdate() {
+    if (localStorage.getItem('userData_userId') !== 'BoardingGate') {
+        showToast("Acción no permitida.", "error");
+        return;
+    }
 
+    const confirmation = confirm(
+        "¡ACCIÓN IRREVERSIBLE!\n\n" +
+        "Estás a punto de sobreescribir la configuración visual y de rendimiento de TODOS los usuarios con tus valores actuales.\n\n" +
+        "Esto NO afectará a sus rutas, recordatorios o diseño del grid. Solo a los ajustes del mapa (suavizado, FPS, colores, etc.).\n\n" +
+        "¿Estás completamente seguro de que quieres continuar?"
+    );
+
+    if (!confirmation) {
+        showToast("Actualización masiva cancelada.", "info");
+        return;
+    }
+
+    const updateButton = document.getElementById('mass-update-btn');
+    if (updateButton) updateButton.disabled = true;
+
+    showToast("Iniciando actualización masiva...", "info", 0, false, "mass-update-toast");
+
+    try {
+        // 1. Definir las claves de configuración que se van a propagar
+        const keysToUpdate = [
+            'boardinggate_map_saturation', 'boardinggate_map_contrast', MAP_TERRAIN_EXAGGERATION_KEY,
+            PERFORMANCE_CAMERA_FPS_KEY, LERP_RATE_POS_KEY, LERP_RATE_ROT_KEY, LERP_RATE_ZOOM_KEY,
+            PERFORMANCE_RATIO_CRITICAL_KEY, PERFORMANCE_RATIO_ROUTE_KEY, PERFORMANCE_RATIO_ALERTS_KEY,
+            PERFORMANCE_RATIO_STATS_KEY, PERFORMANCE_RATIO_GRAPH_KEY, 'boardinggate_memory_threshold',
+            'boardinggate_announce_maneuver_flash', 'boardinggate_dynamicRadarRadius'
+        ];
+
+        // 2. Obtener la configuración "maestra" del localStorage del administrador
+        const adminSettings = {};
+        keysToUpdate.forEach(key => {
+            const value = localStorage.getItem(key);
+            if (value !== null) {
+                adminSettings[key] = value;
+            }
+        });
+
+        // 3. Obtener todos los documentos de usuario de Firebase
+        showToast("Obteniendo lista de usuarios...", "info", 0, false, "mass-update-toast");
+        const usersCollectionRef = window.collection(window.db, "user_data");
+        const querySnapshot = await window.getDocs(usersCollectionRef);
+        const userDocs = querySnapshot.docs;
+        const totalUsers = userDocs.length;
+
+        // 4. Preparar y ejecutar las actualizaciones por lotes
+        let batch = window.writeBatch(window.db);
+        let operationCount = 0;
+        const batchPromises = [];
+        let usersProcessed = 0;
+        const newTimestamp = new Date().toISOString();
+        for (const doc of userDocs) {
+            if (doc.id === 'BoardingGate') continue; // No actualizar al propio admin
+
+            const userData = doc.data();
+            let cacheData = {};
+
+            try {
+                // Parsear la caché existente del usuario
+                cacheData = JSON.parse(userData.contenidoCacheCompleto || '{}');
+            } catch (e) {
+                console.warn(`Cache corrupta para el usuario ${doc.id}, se omitirá la actualización de este usuario.`);
+                continue; // Saltar al siguiente usuario si su caché está rota
+            }
+
+            // Sobrescribir las claves de configuración con las del admin
+            const updatedCache = { ...cacheData, ...adminSettings };
+            // --> AÑADIDO: También actualizamos el timestamp DENTRO de la caché
+            updatedCache['lastCacheUpdateTimestamp'] = Date.now().toString();
+
+            // Preparar el payload para actualizar en Firebase
+            const updatePayload = {
+                contenidoCacheCompleto: JSON.stringify(updatedCache),
+                fechaBackup: newTimestamp // --> AÑADIDO: Actualizamos la fecha del backup principal
+            };
+
+            batch.update(doc.ref, updatePayload);
+            operationCount++;
+            usersProcessed++;
+
+            // Firestore permite un máximo de 500 operaciones por lote
+            if (operationCount >= 499) {
+                showToast(`Actualizando lote... (${usersProcessed}/${totalUsers})`, "info", 0, false, "mass-update-toast");
+                batchPromises.push(batch.commit());
+                batch = window.writeBatch(window.db);
+                operationCount = 0;
+            }
+        }
+
+        // Enviar el último lote si contiene operaciones
+        if (operationCount > 0) {
+            batchPromises.push(batch.commit());
+        }
+
+        await Promise.all(batchPromises);
+
+        showToast(`¡Éxito! Se actualizaron ${usersProcessed} usuarios.`, "success", 5000);
+
+    } catch (error) {
+        console.error("Error en la actualización masiva:", error);
+        showToast(`Error: ${error.message}`, "error", 10000);
+    } finally {
+        if (updateButton) updateButton.disabled = false;
+        const existingToast = document.getElementById("mass-update-toast");
+        if(existingToast) existingToast.remove();
+    }
+}
     
 // ===================================================================
 // NOMBRE: getAddressForWaypoint 
