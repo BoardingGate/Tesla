@@ -2519,43 +2519,7 @@ class ZoomControl {
         return this._container;
     }
     onRemove() { if (this._container && this._container.parentNode) this._container.parentNode.removeChild(this._container); this._map = undefined; }
-}
-    
-// ===================================================================
-// NOMBRE: CombinedMapControl 
-// RESUMEN: Envuelve los controles de Capas/Vista y Zoom en un único contenedor para que aparezcan juntos.
-class CombinedMapControl {
-    onAdd(map) {
-        this._map = map;
-        this._container = document.createElement('div');
-        this._container.className = 'mapboxgl-ctrl map-combined-controls-wrapper';
-
-        this.layerAndViewControl = new MapLayerAndViewController();
-        const layerControlElement = this.layerAndViewControl.onAdd(map);
-        
-        this.zoomControl = new ZoomControl();
-        const zoomControlElement = this.zoomControl.onAdd(map);
-        
-        if (layerControlElement) {
-            this._container.appendChild(layerControlElement);
-        }
-        if (zoomControlElement) {
-            this._container.appendChild(zoomControlElement);
-        }
-        
-        return this._container;
-    }
-
-    onRemove() {
-        if (this.layerAndViewControl) this.layerAndViewControl.onRemove();
-        if (this.zoomControl) this.zoomControl.onRemove();
-        
-        if (this._container && this._container.parentNode) {
-            this._container.parentNode.removeChild(this._container);
-        }
-        this._map = undefined;
-    }
-}
+}   
     
 // ===================================================================
 // NOMBRE: findGooglePlaceId 
@@ -9614,6 +9578,105 @@ function showSavedLocationsModal(callbackOnClose, callbackOnSelectLocation, opti
     closeButton.addEventListener('click', closeHandler);
     addModalAutoCloseTimer(modal, closeButton, 'saved-locations-modal');
 }
+
+// ===================================================================
+// NOMBRE: handleProgressiveManeuverZoom 
+// RESUMEN: Gestiona el zoom progresivo. Corrige el bug de no retornar
+function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDistanceAlongRouteForNavLogic) {
+    if (isManualZoomActive) return null;
+
+    if (!isNavigating || !navigationMapInstance || !currentStep) {
+        if (isZoomedForManeuver) {
+            isZoomedForManeuver = false;
+            mapPreviousZoomLevelForProgressive = null;
+        }
+        return null;
+    }
+    
+    let ANIMATION_START_DISTANCE = 210;
+    if (navigationMapInstance.getZoom() < 16) {
+        ANIMATION_START_DISTANCE = 250;
+    }
+
+    const route = navigationCurrentRouteData?.routes?.[0];
+    if (!route || !route.geometry || !route.geometry.coordinates || route.geometry.coordinates.length < 2) {
+        return null;
+    }
+    
+    const ZOOM_PEAK_DISTANCE = 50;
+    const HOLD_ZOOM_THRESHOLD = 300; // Aumentamos ligeramente para ser más robusto en encadenamientos.
+    const currentMapLayerName = (localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO").toLowerCase();
+    const isSatelliteWithLabels = currentMapLayerName.includes("satélite") && currentMapLayerName.includes("calles");
+    const MANEUVER_PEAK_ZOOM_LEVEL = Math.min(isSatelliteWithLabels ? 17.5 : 18.5, 19.5);
+    
+    const nextStepInfo = findNextValidStep(route, currentLegIndexNav, currentStepIndexNav);
+    const distanceToNextManeuver = nextStepInfo ? calculateDistanceToEndOfStep(route, nextStepInfo.legIndex, nextStepInfo.stepIndex) - carDistanceAlongRouteForNavLogic : Infinity;
+
+    if (distanceToManeuver < ANIMATION_START_DISTANCE) {
+        if (!isZoomedForManeuver) {
+            isZoomedForManeuver = true;
+            originalMapUpdateIntervalMs = MAP_UPDATE_INTERVAL_MS;
+            MAP_UPDATE_INTERVAL_MS = 1000 / 60; // Aumentamos FPS para la animación.
+            
+            const currentAutoZoomMode = localStorage.getItem(AUTO_ZOOM_MODE_KEY) || 'off';
+            if (currentAutoZoomMode === 'off' && manualZoomLevelMemory !== null) {
+                mapPreviousZoomLevelForProgressive = manualZoomLevelMemory; // Priorizamos el zoom manual explícito.
+            } else {
+                mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
+            }
+            
+            window.pitchBeforeManeuver = navigationMapInstance.getPitch();
+            window.offsetXBeforeManeuver = mapOffsetX;
+            window.offsetYBeforeManeuver = mapOffsetY;
+
+            let dynamicHorizontalTarget = 0;
+            const maneuver = currentStep.maneuver;
+            const instructionText = getManeuverInstructionText(maneuver).toLowerCase();
+            if (instructionText.includes('derecha')) dynamicHorizontalTarget = -5;
+            else if (instructionText.includes('izquierda')) dynamicHorizontalTarget = 5;
+            window.maneuverHorizontalTarget = dynamicHorizontalTarget;
+        }
+
+        let zoomProgress = 0;
+        if (distanceToManeuver <= ZOOM_PEAK_DISTANCE) zoomProgress = 1;
+        else zoomProgress = (ANIMATION_START_DISTANCE - distanceToManeuver) / (ANIMATION_START_DISTANCE - ZOOM_PEAK_DISTANCE);
+        
+        const easedZoomProgress = easeInOutQuad(Math.max(0, Math.min(1, zoomProgress)));
+        const targetZoom = mapPreviousZoomLevelForProgressive + (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * easedZoomProgress;
+        
+        let targetPitch;
+        if (mapViewMode === 'perspective' || mapViewMode === 'relief') {
+            const pitchTarget = window.pitchBeforeManeuver * 0.75;
+            const finalPitchTarget = Math.max(55, pitchTarget);
+            targetPitch = window.pitchBeforeManeuver - ((window.pitchBeforeManeuver - finalPitchTarget) * easedZoomProgress);
+        } else {
+            targetPitch = window.pitchBeforeManeuver + (55 - window.pitchBeforeManeuver) * easedZoomProgress;
+        }
+        
+        return { 
+            zoom: targetZoom, 
+            pitch: targetPitch, 
+            offsetX: window.maneuverHorizontalTarget,
+            offsetY: window.offsetYBeforeManeuver
+        };
+
+    } else if (isZoomedForManeuver && distanceToNextManeuver < HOLD_ZOOM_THRESHOLD) {
+        const pitchTarget = (mapViewMode === 'perspective' || mapViewMode === 'relief') ? window.pitchBeforeManeuver * 0.75 : 55;
+        return {
+            zoom: MANEUVER_PEAK_ZOOM_LEVEL,
+            pitch: Math.max(55, pitchTarget),
+            offsetX: window.maneuverHorizontalTarget,
+            offsetY: window.offsetYBeforeManeuver
+        };
+
+    } else {
+        if (isZoomedForManeuver) {
+            isZoomedForManeuver = false; 
+            MAP_UPDATE_INTERVAL_MS = originalMapUpdateIntervalMs;
+        }
+        return null;
+    }
+}    
     
 // ===================================================================
 // NOMBRE: showRadarSpeedModal
@@ -19395,131 +19458,6 @@ function renderWaypointMarkers() {
             markerElement.textContent = wp.label;
         }
     });
-}    
-
- 
-//=============================================================
-function calculateCompensatedCenter(offsetY, offsetX, pitch, bearing) {
-    if (!navigationCurrentLocation) return null;
-
-    const metersPerPixel = 156543.03 * Math.cos(navigationCurrentLocation.latitude * Math.PI / 180) / Math.pow(2, navigationMapInstance.getZoom());
-
-    const canvas = navigationMapInstance.getCanvas();
-    const pixelOffsetX = canvas.clientWidth * (offsetX / 100);
-    const pixelOffsetY = canvas.clientHeight * (offsetY / 100);
-
-    const horizontalDisplacementMeters = pixelOffsetX * metersPerPixel * -1;
-    const verticalDisplacementMeters = pixelOffsetY * metersPerPixel * -1;
-
-    const totalDistance = Math.sqrt(Math.pow(horizontalDisplacementMeters, 2) + Math.pow(verticalDisplacementMeters, 2));
-    const angleFromScreenTop = Math.atan2(horizontalDisplacementMeters, -verticalDisplacementMeters) * (180 / Math.PI);
-
-    const carPoint = turf.point([navigationCurrentLocation.longitude, navigationCurrentLocation.latitude]);
-    const finalBearingForOffset = bearing + angleFromScreenTop;
-    const cameraAnchorPoint = turf.destination(carPoint, totalDistance / 1000, finalBearingForOffset, { units: 'kilometers' });
-    
-    return cameraAnchorPoint.geometry.coordinates;
-} 
-
-
-// ===================================================================
-// NOMBRE: handleProgressiveManeuverZoom (VERSIÓN FINAL Y ROBUSTA)
-// RESUMEN: Gestiona el zoom progresivo. Corrige el bug de no retornar
-// ===================================================================
-function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDistanceAlongRouteForNavLogic) {
-    if (isManualZoomActive) return null;
-
-    if (!isNavigating || !navigationMapInstance || !currentStep) {
-        if (isZoomedForManeuver) {
-            isZoomedForManeuver = false;
-            mapPreviousZoomLevelForProgressive = null;
-        }
-        return null;
-    }
-    
-    let ANIMATION_START_DISTANCE = 210;
-    if (navigationMapInstance.getZoom() < 16) {
-        ANIMATION_START_DISTANCE = 250;
-    }
-
-    const route = navigationCurrentRouteData?.routes?.[0];
-    if (!route || !route.geometry || !route.geometry.coordinates || route.geometry.coordinates.length < 2) {
-        return null;
-    }
-    
-    const ZOOM_PEAK_DISTANCE = 50;
-    const HOLD_ZOOM_THRESHOLD = 300; // Aumentamos ligeramente para ser más robusto en encadenamientos.
-    const currentMapLayerName = (localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO").toLowerCase();
-    const isSatelliteWithLabels = currentMapLayerName.includes("satélite") && currentMapLayerName.includes("calles");
-    const MANEUVER_PEAK_ZOOM_LEVEL = Math.min(isSatelliteWithLabels ? 17.5 : 18.5, 19.5);
-    
-    const nextStepInfo = findNextValidStep(route, currentLegIndexNav, currentStepIndexNav);
-    const distanceToNextManeuver = nextStepInfo ? calculateDistanceToEndOfStep(route, nextStepInfo.legIndex, nextStepInfo.stepIndex) - carDistanceAlongRouteForNavLogic : Infinity;
-
-    if (distanceToManeuver < ANIMATION_START_DISTANCE) {
-        if (!isZoomedForManeuver) {
-            isZoomedForManeuver = true;
-            originalMapUpdateIntervalMs = MAP_UPDATE_INTERVAL_MS;
-            MAP_UPDATE_INTERVAL_MS = 1000 / 60; // Aumentamos FPS para la animación.
-            
-            const currentAutoZoomMode = localStorage.getItem(AUTO_ZOOM_MODE_KEY) || 'off';
-            if (currentAutoZoomMode === 'off' && manualZoomLevelMemory !== null) {
-                mapPreviousZoomLevelForProgressive = manualZoomLevelMemory; // Priorizamos el zoom manual explícito.
-            } else {
-                mapPreviousZoomLevelForProgressive = navigationMapInstance.getZoom();
-            }
-            
-            window.pitchBeforeManeuver = navigationMapInstance.getPitch();
-            window.offsetXBeforeManeuver = mapOffsetX;
-            window.offsetYBeforeManeuver = mapOffsetY;
-
-            let dynamicHorizontalTarget = 0;
-            const maneuver = currentStep.maneuver;
-            const instructionText = getManeuverInstructionText(maneuver).toLowerCase();
-            if (instructionText.includes('derecha')) dynamicHorizontalTarget = -5;
-            else if (instructionText.includes('izquierda')) dynamicHorizontalTarget = 5;
-            window.maneuverHorizontalTarget = dynamicHorizontalTarget;
-        }
-
-        let zoomProgress = 0;
-        if (distanceToManeuver <= ZOOM_PEAK_DISTANCE) zoomProgress = 1;
-        else zoomProgress = (ANIMATION_START_DISTANCE - distanceToManeuver) / (ANIMATION_START_DISTANCE - ZOOM_PEAK_DISTANCE);
-        
-        const easedZoomProgress = easeInOutQuad(Math.max(0, Math.min(1, zoomProgress)));
-        const targetZoom = mapPreviousZoomLevelForProgressive + (MANEUVER_PEAK_ZOOM_LEVEL - mapPreviousZoomLevelForProgressive) * easedZoomProgress;
-        
-        let targetPitch;
-        if (mapViewMode === 'perspective' || mapViewMode === 'relief') {
-            const pitchTarget = window.pitchBeforeManeuver * 0.75;
-            const finalPitchTarget = Math.max(55, pitchTarget);
-            targetPitch = window.pitchBeforeManeuver - ((window.pitchBeforeManeuver - finalPitchTarget) * easedZoomProgress);
-        } else {
-            targetPitch = window.pitchBeforeManeuver + (55 - window.pitchBeforeManeuver) * easedZoomProgress;
-        }
-        
-        return { 
-            zoom: targetZoom, 
-            pitch: targetPitch, 
-            offsetX: window.maneuverHorizontalTarget,
-            offsetY: window.offsetYBeforeManeuver
-        };
-
-    } else if (isZoomedForManeuver && distanceToNextManeuver < HOLD_ZOOM_THRESHOLD) {
-        const pitchTarget = (mapViewMode === 'perspective' || mapViewMode === 'relief') ? window.pitchBeforeManeuver * 0.75 : 55;
-        return {
-            zoom: MANEUVER_PEAK_ZOOM_LEVEL,
-            pitch: Math.max(55, pitchTarget),
-            offsetX: window.maneuverHorizontalTarget,
-            offsetY: window.offsetYBeforeManeuver
-        };
-
-    } else {
-        if (isZoomedForManeuver) {
-            isZoomedForManeuver = false; 
-            MAP_UPDATE_INTERVAL_MS = originalMapUpdateIntervalMs;
-        }
-        return null;
-    }
 }    
  
 // ===================================================================
