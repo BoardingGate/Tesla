@@ -1,4 +1,4 @@
-V19
+V20
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -8895,7 +8895,11 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
         }
 
         const startLocation = navigationCurrentLocation ? { ...navigationCurrentLocation } : null;
-        resetNavigationState();
+
+        if (!recoveryInfo) {
+              resetNavigationState();
+        }
+        
         currentRouteNameForSaving = routeObject.name;
         const waypointsFromLoadedRoute = routeObject.waypoints;
         
@@ -8976,7 +8980,132 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
         updateStartNavigationButtonState();
         updateNavigationButtonColor();
     }
-}    
+}   
+    
+// ===================================================================
+// NOMBRE: loadRouteFromObject (VERSIÓN CORREGIDA Y DEFINITIVA 2)
+// RESUMEN: Acepta recoveryInfo y pasa la bandera 'isRecovery' a toggleNavigationState.
+//          La corrección clave es que SÓLO llama a resetNavigationState si NO es una recuperación.
+async function loadRouteFromObject(routeObject, autoStartNavigation = false, forceImmediateStart = false, recoveryInfo = null) {
+    if (isRecalculatingRoute) {
+        showToast("Procesando otra ruta, por favor espere.", "warning");
+        return;
+    }
+    
+    // <-- CORRECCIÓN CLAVE: Solo reseteamos el estado si NO es una recuperación.
+    if (!recoveryInfo) {
+        resetNavigationState();
+    }
+    
+    if (!routeObject || !routeObject.waypoints || routeObject.waypoints.length === 0) {
+        showToast("Error: El objeto de la ruta es inválido.", "error");
+        return;
+    }
+
+    isRecalculatingRoute = true;
+    try {
+        if (isFreeDriveActive) {
+            isFreeDrivePaused = true;
+            isFreeDriveActive = false;
+            showToast("Modo Conducción Libre en pausa.", "info");
+            updateStartNavigationButtonState();
+            updateNavigationButtonColor();
+            clearNavigationGraph();
+        }
+
+        const startLocation = navigationCurrentLocation ? { ...navigationCurrentLocation } : null;
+        
+        // Si no es una recuperación, el estado ya está limpio gracias al `if` de arriba.
+        // Si lo es, ahora preservamos los waypoints que ya estaban en memoria.
+        if (!recoveryInfo) {
+            navigationWaypoints = []; 
+        }
+
+        currentRouteNameForSaving = routeObject.name;
+        const waypointsFromLoadedRoute = routeObject.waypoints;
+        
+        const isAiGeneratedRoute = routeObject.name.startsWith("Ruta IA:");
+        
+        if (waypointsFromLoadedRoute.length === 1) {
+            if (startLocation) {
+                const startPoint = { id: Date.now() - 1, lat: startLocation.latitude, lng: startLocation.longitude, type: 'S', marker: null, label: 'S', address: 'Posición Actual (GPS)', visited: true, isCriticalForRecalc: true, isInternal: false, isRecalculatedStart: false };
+                const destinationWp = sanitizeWaypointsForStorage(waypointsFromLoadedRoute)[0];
+                navigationWaypoints = [startPoint, destinationWp];
+            } else {
+                showToast("Señal GPS no disponible. No se puede iniciar ruta a un único destino.", "error");
+                isRecalculatingRoute = false;
+                return;
+            }
+        } else {
+            // Para recuperación o sin GPS, usamos los waypoints tal cual vienen en `routeObject`.
+            // Si es una carga nueva Y hay GPS, añadimos el punto de inicio.
+            if (startLocation && !recoveryInfo) {
+                const startPoint = { id: Date.now() - 1, lat: startLocation.latitude, lng: startLocation.longitude, type: 'S', marker: null, label: 'S', address: 'Posición Actual (GPS)', visited: true, isCriticalForRecalc: true, isInternal: false, isRecalculatedStart: false };
+                
+                const waypointsToProcess = isAiGeneratedRoute 
+                    ? waypointsFromLoadedRoute 
+                    : waypointsFromLoadedRoute.slice(1);
+
+                navigationWaypoints = [startPoint, ...sanitizeWaypointsForStorage(waypointsToProcess)];
+
+            } else {
+                 if (!recoveryInfo) showToast("Señal GPS no disponible. Cargando ruta original...", "warning");
+                navigationWaypoints = sanitizeWaypointsForStorage(waypointsFromLoadedRoute);
+            }
+        }
+        
+        await updateWaypointTypesAndLabels();
+        renderWaypointMarkers();
+
+        if (navigationWaypoints.filter(wp => wp && !wp.isInternal).length >= 2) {
+            try {
+                await recalculateAndDrawRoute(false);
+                
+                setTimeout(() => {
+                    if (navigationMapInstance) {
+                        try {
+                            navigationMapInstance.resize();
+                        } catch(e) {}
+                    }
+                }, 50);
+
+                if (recoveryInfo) {
+                    await restoreTripProgress(recoveryInfo);
+                }
+                
+                if (autoStartNavigation) {
+                    if (forceImmediateStart) {
+                        toggleNavigationState(false, !!recoveryInfo); 
+                    } else {
+                        const routeGeoJSON = navigationMapInstance.getSource('route')._data;
+                        if (routeGeoJSON.geometry && routeGeoJSON.geometry.coordinates.length > 1) {
+                            const bounds = new mapboxgl.LngLatBounds();
+                            routeGeoJSON.geometry.coordinates.forEach(coord => bounds.extend(coord));
+                            if (!bounds.isEmpty()) {
+                                navigationMapInstance.fitBounds(bounds, { padding: 80, animate: true, duration: 1500 });
+                            }
+                        }
+                        const firstDestination = navigationWaypoints.find(wp => wp && !wp.isInternal && wp.type !== 'S' && !wp.visited);
+                        if (firstDestination) { fetchAndDisplayAlternativeRoutes(firstDestination.id); }
+                        showAutoStartNavigationModal();
+                    }
+                }
+            } catch (error) {
+                showToast("No se pudo trazar la ruta. Comprueba la conexión o intenta mover un punto.", "error", 8000);
+                const fallbackCoords = navigationWaypoints.map(wp => [wp.lng, wp.lat]);
+                await drawRouteOnMap({ geometry: { type: 'LineString', coordinates: fallbackCoords } });
+            }
+        
+        }
+    } catch (error) {
+        console.error("Error al cargar la ruta desde el objeto:", error);
+    } finally {
+        isRecalculatingRoute = false;
+        updateStartNavigationButtonState();
+        updateNavigationButtonColor();
+    }
+}
+    
       
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 // NOMBRE: fetchAndRenderChatUsers (VERSIÓN CON ORDENACIÓN AVANZADA Y FECHA ADMIN)
@@ -11410,9 +11539,6 @@ async function sendMessage() {
         sendButton.disabled = false;
     }
 }    
-
-
-
     
 // ===================================================================
 // NOMBRE: handleDragEnd
