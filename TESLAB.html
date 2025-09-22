@@ -1,4 +1,4 @@
-L01
+L02
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -1103,14 +1103,14 @@ L01
         }
     }).join(', ');   
 
-
+    
 // ===================================================================
-// NOMBRE: toggleNavigationState (MODIFICADO)
-// RESUMEN: Se añade la restauración de los FPS de la cámara al detener la navegación.
+// NOMBRE: toggleNavigationState
+// RESUMEN: Gestiona el inicio/fin de la navegación o free drive.
 async function toggleNavigationState(isRecalculationStop = false, isRecovery = false) {
     const startNavButton = document.getElementById('start-navigation-button');
     const startNavImg = startNavButton ? startNavButton.querySelector('img') : null;
-    const mapContainer = document.getElementById('reminders-location-map-div');
+    const mapContainer = document.getElementById('reminders-location-map-modal');
     
     if (isNavigating) {
          if (navigationMapInstance && navigationCurrentLocation) {
@@ -1144,11 +1144,11 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
         isNavigating = false;
         navigationFollowUser = false;
         
-        MAP_UPDATE_INTERVAL_MS = originalMapUpdateIntervalMs; // Restaura los FPS al valor por defecto.
+        MAP_UPDATE_INTERVAL_MS = originalMapUpdateIntervalMs;
    
     } else if (isFreeDriveActive) {
         stopFreeDrive();
-    } else {
+    } else { // Inicio de navegación (o simulación de ruta si no hay routeData y es AI)
         const hasEnoughWaypointsForRoute = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart).length >= 2;
         const hasRouteData = navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0];
         if (hasEnoughWaypointsForRoute && hasRouteData) {
@@ -1201,13 +1201,13 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
                 maxAverageSpeedInTrip = -Infinity;
             }
 
-            const recoveryData = { 
+            const initialRecoveryData = { 
                 isActive: true, 
-                route: routeForStorage,
+                route: routeForStorage, // Ruta original del inicio
                 tripStartTime: navigationStartTimeForStats ? navigationStartTimeForStats.getTime() : Date.now(),
                 originalTripEtaTime: originalTripEtaTime ? originalTripEtaTime.getTime() : null,
                 stats: {
-                    totalDistance: totalDistanceTravelledForStats,
+                    totalDistance: totalDistanceTravelledForStats, // <-- Guardar el 0 inicial aquí
                     maxSpeed: maxSpeedDuringTrip,
                     maxAltitude: maxAltitudeDuringTrip,
                     minAltitude: minAltitudeDuringTrip,
@@ -1216,12 +1216,15 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
                 tripContext: {
                     graphLabels: graphLabels || [],
                     graphDataPoints: graphDataPoints || { speed: [], altitude: [] },
-                    minAvgSpeed: minAverageSpeedInTrip,
-                    maxAvgSpeed: maxAverageSpeedInTrip,
+                    minAverageSpeed: minAverageSpeedInTrip, 
+                    maxAverageSpeed: maxAverageSpeedInTrip, 
                     accumulatedDeviationMs: accumulatedDeviationMs
-                }
+                },
+                currentRouteData: navigationCurrentRouteData, // Guardar la ruta completa inicial
+                navigationWaypoints: sanitizeWaypointsForStorage(navigationWaypoints), // Guardar los waypoints iniciales
+                lastSaveTimestamp: Date.now() // Timestamp del guardado inicial
             };
-            localStorage.setItem('boardinggate_nav_recovery_flag', JSON.stringify(recoveryData));
+            localStorage.setItem('boardinggate_nav_recovery_flag', JSON.stringify(initialRecoveryData));
             
             navigationWaypoints.forEach(wp => { if (wp && wp.marker) wp.marker.setDraggable(false); });
             
@@ -1301,7 +1304,9 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
     setNavigationMapClickHandler(); 
     actualizarContadorRadares(radaresEnRutaActual.length);
     actualizarContadorTareas(tareasEnRutaActual.length);
-}    
+}
+    
+
 
 // ===================================================================
 // NOMBRE: restoreTripProgress 
@@ -1310,6 +1315,17 @@ async function restoreTripProgress(recoveryInfo) {
     if (!navigationCurrentRouteData?.routes?.[0] || !recoveryInfo || !recoveryInfo.tripStartTime) {
         const overlay = document.getElementById('route-recovery-overlay');
         if (overlay) overlay.classList.add('hidden');
+        // Si no hay información de recuperación o ruta, limpiar estadísticas.
+        navigationStartTimeForStats = null;
+        totalDistanceTravelledForStats = 0;
+        accumulatedDistanceBeforeCurrentSegment = 0;
+        maxSpeedDuringTrip = 0;
+        maxSpeedCoordinates = null;
+        maxAltitudeDuringTrip = -Infinity;
+        minAltitudeDuringTrip = Infinity;
+        window.averageSpeedKmh = 0;
+        lastPositionForStats = null;
+        clearNavigationGraph();
         return;
     }
 
@@ -1317,55 +1333,95 @@ async function restoreTripProgress(recoveryInfo) {
         const route = navigationCurrentRouteData.routes[0];
          
         navigationStartTimeForStats = new Date(recoveryInfo.tripStartTime);
-        if (recoveryInfo.originalTripEtaTime) {
-            originalTripEtaTime = new Date(recoveryInfo.originalTripEtaTime);
-        }
+        originalTripEtaTime = recoveryInfo.originalTripEtaTime ? new Date(recoveryInfo.originalTripEtaTime) : null;
         
-        const currentCoords = await getCurrentLocationAsync();
+        const currentCoords = await getCurrentLocationAsync(); // Obtener la posición actual para los cálculos
         
-        if (recoveryInfo.stats) {
-            totalDistanceTravelledForStats = recoveryInfo.stats.totalDistance || 0;
+        const MIN_FRESH_DISTANCE_THRESHOLD_METERS = 40; // 40 metros como umbral para distancia "fresca"
+
+        // --- LÓGICA CLAVE: DETERMINAR SI EL GUARDADO FUE "FRESCO" (CONTROLADO) ---
+        // Si recoveryInfo.stats.totalDistance existe y es > 40m, asumimos guardado CONTROLADO.
+        if (recoveryInfo.stats && typeof recoveryInfo.stats.totalDistance === 'number' && recoveryInfo.stats.totalDistance > MIN_FRESH_DISTANCE_THRESHOLD_METERS) {
+            totalDistanceTravelledForStats = recoveryInfo.stats.totalDistance; // Usar la distancia guardada (fresca)
             accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
+            
             maxSpeedDuringTrip = recoveryInfo.stats.maxSpeed || 0;
             maxAltitudeDuringTrip = recoveryInfo.stats.maxAltitude || -Infinity;
             minAltitudeDuringTrip = recoveryInfo.stats.minAltitude || Infinity;
             maxSpeedCoordinates = recoveryInfo.stats.maxSpeedCoords || null;
+            console.log(`[Recovery] totalDistanceTravelledForStats recuperado de guardado CONTROLADO: ${totalDistanceTravelledForStats.toFixed(1)} km`);
+
+        } else if (currentCoords && route._turfLineString && typeof turf !== 'undefined') {
+            // --- Fallback: Si no hay distancia "fresca", CALCULARLA (cuelgue INCONTROLADO) ---
+            let distanceAlongRoute = 0;
+            const carPoint = turf.point([currentCoords.longitude, currentCoords.latitude]);
+            const nearestPointOnRoute = turf.nearestPointOnLine(route._turfLineString, carPoint, { units: 'meters' });
+            // Solo si el coche está razonablemente cerca de la ruta inicial
+            if (nearestPointOnRoute.properties.dist <= DEVIATION_THRESHOLD_METERS * 2) { 
+                 distanceAlongRoute = nearestPointOnRoute.properties.location;
+            }
+            totalDistanceTravelledForStats = distanceAlongRoute;
+            accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
+            console.log(`[Recovery] totalDistanceTravelledForStats CALCULADO por GPS (cuelgue incontrolado): ${totalDistanceTravelledForStats.toFixed(1)} km`);
+
+            // Inicializar otras estadísticas a cero o default, ya que no son de un guardado "fresco"
+            maxSpeedDuringTrip = 0;
+            maxAltitudeDuringTrip = -Infinity;
+            minAltitudeDuringTrip = Infinity;
+            maxSpeedCoordinates = null;
+
+        } else {
+            // --- Último Fallback: No se pudo obtener la distancia ---
+            totalDistanceTravelledForStats = 0;
+            accumulatedDistanceBeforeCurrentSegment = 0;
+            maxSpeedDuringTrip = 0;
+            maxAltitudeDuringTrip = -Infinity;
+            minAltitudeDuringTrip = Infinity;
+            maxSpeedCoordinates = null;
+            console.warn("[Recovery] No se pudo recuperar/calcular totalDistanceTravelledForStats. Reiniciando a 0.");
         }
         lastPositionForStats = { ...currentCoords };
+        // --- FIN LÓGICA CLAVE ---
 
+        // --- RECUPERAR CONTEXTO DE GRÁFICA (SI ESTÁ DISPONIBLE EN CUALQUIER TIPO DE GUARDADO) ---
         if (recoveryInfo.tripContext) {
             graphLabels = recoveryInfo.tripContext.graphLabels || [];
             graphDataPoints = recoveryInfo.tripContext.graphDataPoints || { speed: [], altitude: [] };
-            minAverageSpeedInTrip = recoveryInfo.tripContext.minAvgSpeed ?? Infinity;
-            maxAverageSpeedInTrip = recoveryInfo.tripContext.maxAvgSpeed ?? -Infinity;
+            minAverageSpeedInTrip = recoveryInfo.tripContext.minAverageSpeed ?? Infinity; 
+            maxAverageSpeedInTrip = recoveryInfo.tripContext.maxAverageSpeed ?? -Infinity; 
             accumulatedDeviationMs = recoveryInfo.tripContext.accumulatedDeviationMs || 0;
+        } else {
+            graphLabels = [];
+            graphDataPoints = { speed: [], altitude: [] };
+            minAverageSpeedInTrip = Infinity;
+            maxAverageSpeedInTrip = -Infinity;
+            accumulatedDeviationMs = 0;
         }
 
         deviationCheckGracePeriodUntil = Date.now() + 10000;
 
-        const carPoint = turf.point([currentCoords.longitude, currentCoords.latitude]);
-        const routeLine = turf.lineString(route.geometry.coordinates);
-        const nearestPointOnRoute = turf.nearestPointOnLine(routeLine, carPoint, { units: 'meters' });
-        const carDistanceAlongRoute = nearestPointOnRoute.properties.location;
-        
-        const timeElapsedS = (Date.now() - recoveryInfo.tripStartTime) / 1000;
+        const timeElapsedS = (Date.now() - navigationStartTimeForStats.getTime()) / 1000;
         if (timeElapsedS > 0 && totalDistanceTravelledForStats > 0) {
             window.averageSpeedKmh = (totalDistanceTravelledForStats / timeElapsedS) * 3.6;
+        } else {
+            window.averageSpeedKmh = 0;
         }
-        lastCarDistanceAlongRouteForNavLogic = carDistanceAlongRoute;
+        lastCarDistanceAlongRouteForNavLogic = totalDistanceTravelledForStats; 
         
+        // Determinar en qué leg/step de la ruta recuperada estamos
         let cumulativeDistance = 0;
         let legFound = false;
         for (let i = 0; i < route.legs.length; i++) {
             const leg = route.legs[i];
             if (!leg || !leg.steps) continue;
             const legTotalDistance = leg.distance || leg.steps.reduce((sum, step) => sum + (step.distance || 0), 0);
-            if (carDistanceAlongRoute <= cumulativeDistance + legTotalDistance) {
+
+            if (totalDistanceTravelledForStats <= cumulativeDistance + legTotalDistance) {
                 currentLegIndexNav = i;
                 let legDistanceTraveled = 0;
                 for (let j = 0; j < leg.steps.length; j++) {
                     const step = leg.steps[j];
-                    if (carDistanceAlongRoute <= cumulativeDistance + legDistanceTraveled + (step.distance || 0)) {
+                    if (totalDistanceTravelledForStats <= cumulativeDistance + legDistanceTraveled + (step.distance || 0)) {
                         currentStepIndexNav = j;
                         legFound = true;
                         break;
@@ -1377,8 +1433,8 @@ async function restoreTripProgress(recoveryInfo) {
             cumulativeDistance += legTotalDistance;
         }
 
-        updateNavigationProgressDisplay(route, carDistanceAlongRoute);
-        updateTurnByTurnDisplay(route, carDistanceAlongRoute);
+        updateNavigationProgressDisplay(route, totalDistanceTravelledForStats);
+        updateTurnByTurnDisplay(route, totalDistanceTravelledForStats);
         
         if (navigationChart) {
             updateChartData();
@@ -1386,9 +1442,17 @@ async function restoreTripProgress(recoveryInfo) {
 
     } catch (error) {
         showToast(`Error al restaurar progreso: ${error.message}. Se continuará desde el inicio.`, "error");
+        // En caso de error crítico al restaurar, reiniciar a cero para evitar estados inconsistentes
         navigationStartTimeForStats = new Date();
         totalDistanceTravelledForStats = 0;
         accumulatedDistanceBeforeCurrentSegment = 0;
+        maxSpeedDuringTrip = 0;
+        maxAltitudeDuringTrip = -Infinity;
+        minAltitudeDuringTrip = Infinity;
+        window.averageSpeedKmh = 0;
+        graphLabels = [];
+        graphDataPoints = { speed: [], altitude: [] };
+        clearNavigationGraph();
     } finally {
         const overlay = document.getElementById('route-recovery-overlay');
         if (overlay) {
@@ -1398,7 +1462,7 @@ async function restoreTripProgress(recoveryInfo) {
         }
     }
 }
-
+    
 // ===================================================================
 //  openNavigationMap 
 // ===================================================================
@@ -6552,8 +6616,6 @@ function updateMapCamera(coords, mapInstanceToUse) {
 // RESUMEN: Gestiona los cálculos y la actualización de la UI de estadísticas de viaje.
 function updateTripStatistics(coords) {
     if (compassAndModeControl) {
-        compassAndModeControl.updateAltitude(coords.altitude);
-
         if (window.lastPositionForSpeedCalc && typeof coords.speed === 'number' && coords.speed !== null) {
             const distM = calculateDistance(window.lastPositionForSpeedCalc.latitude, window.lastPositionForSpeedCalc.longitude, coords.latitude, coords.longitude);
             const timeS = (Date.now() - window.lastPositionForSpeedCalc.time) / 1000;
@@ -6566,6 +6628,7 @@ function updateTripStatistics(coords) {
             if (typeof coords.speed === 'number' && coords.speed !== null && coords.speed >= 0) { window.currentSpeedKmh = coords.speed * 3.6; } else { window.currentSpeedKmh = 0; }
         }
         window.lastPositionForSpeedCalc = { latitude: coords.latitude, longitude: coords.longitude, time: Date.now() };
+
 
         const isTripActive = isNavigating || isFreeDriveActive;
         if (isTripActive) {
@@ -6599,33 +6662,57 @@ function updateTripStatistics(coords) {
                     statsChanged = true;
                 }
             }
+            
+            const CHECK_RECOVERY_SAVE_INTERVAL_MS = 20 * 60 * 1000; 
 
-            if (statsChanged && navigationStartTimeForStats) {
-                const TWENTY_MINUTES_IN_MS = 20 * 60 * 1000;
-                const timeElapsed = Date.now() - navigationStartTimeForStats.getTime();
+            const hasValidRoute = navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0];
+            const isBeyondInitialSave = navigationStartTimeForStats && (Date.now() - navigationStartTimeForStats.getTime() > CHECK_RECOVERY_SAVE_INTERVAL_MS);
+
+            const recoveryFlagJSON = localStorage.getItem('boardinggate_nav_recovery_flag');
+            let recoveryData = {};
+            try {
+                if (recoveryFlagJSON) { recoveryData = JSON.parse(recoveryFlagJSON); }
+            } catch (e) {
+                console.warn("Error parseando recoveryFlagJSON existente, se creará uno nuevo.");
+                recoveryData = {};
+            }
+
+            const lastControlledSave = recoveryData.lastSaveTimestamp || 0;
+            const shouldSaveNow = (isBeyondInitialSave && (Date.now() - lastControlledSave > CHECK_RECOVERY_SAVE_INTERVAL_MS)) || 
+                                  (statsChanged && (Date.now() - lastControlledSave > 5000)); // Si hay cambios y han pasado 5s desde el último guardado.
+
+            if (shouldSaveNow) {
+                recoveryData.isActive = true; 
+                recoveryData.tripStartTime = navigationStartTimeForStats.getTime();
+                recoveryData.originalTripEtaTime = originalTripEtaTime ? originalTripEtaTime.getTime() : null;
                 
-                if (timeElapsed > TWENTY_MINUTES_IN_MS) {
-                    const recoveryFlagJSON = localStorage.getItem('boardinggate_nav_recovery_flag');
-                    if (recoveryFlagJSON) {
-                        try {
-                            const recoveryData = JSON.parse(recoveryFlagJSON);
+                recoveryData.stats = {
+                    maxSpeed: maxSpeedDuringTrip,
+                    maxAltitude: maxAltitudeDuringTrip,
+                    minAltitude: minAltitudeDuringTrip,
+                    maxSpeedCoords: maxSpeedCoordinates
+                };
+                
+                recoveryData.tripContext = {
+                    graphLabels: graphLabels,
+                    graphDataPoints: graphDataPoints,
+                    minAverageSpeed: minAverageSpeedInTrip, 
+                    maxAverageSpeed: maxAverageSpeedInTrip, 
+                    accumulatedDeviationMs: accumulatedDeviationMs
+                };
 
-                            recoveryData.tripStartTime = navigationStartTimeForStats.getTime();
-                            recoveryData.originalTripEtaTime = originalTripEtaTime ? originalTripEtaTime.getTime() : null;
-                            recoveryData.stats = {
-                                totalDistance: totalDistanceTravelledForStats,
-                                maxSpeed: maxSpeedDuringTrip,
-                                maxAltitude: maxAltitudeDuringTrip,
-                                minAltitude: minAltitudeDuringTrip,
-                                maxSpeedCoords: maxSpeedCoordinates
-                            };
-                            
-                            localStorage.setItem('boardinggate_nav_recovery_flag', JSON.stringify(recoveryData));
-                        } catch(e) {
-                            console.error("Error al actualizar el flag de recuperación:", e);
-                        }
-                    }
+                if (isNavigating && hasValidRoute) {
+                    recoveryData.currentRouteData = navigationCurrentRouteData;
+                    recoveryData.navigationWaypoints = sanitizeWaypointsForStorage(navigationWaypoints);
+                } else if (isFreeDriveActive) {
+                    delete recoveryData.currentRouteData;
+                    delete recoveryData.navigationWaypoints;
                 }
+
+                recoveryData.lastSaveTimestamp = Date.now(); 
+
+                localStorage.setItem('boardinggate_nav_recovery_flag', JSON.stringify(recoveryData));
+                console.log("[Recovery Save] Datos de recuperación actualizados (ruta, waypoints, stats puntuales, gráfica).");
             }
         }
         compassAndModeControl.updateCurrentSpeed(window.currentSpeedKmh);
@@ -8769,6 +8856,7 @@ function animateMarkerAndMap(timestamp) {
     markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
 }
     
+
 // ===================================================================
 // NOMBRE: loadRouteFromObject (VERSIÓN CORREGIDA Y DEFINITIVA 2)
 // RESUMEN: Acepta recoveryInfo y pasa la bandera 'isRecovery' a toggleNavigationState.
@@ -8778,7 +8866,7 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
         return;
     }
     
-    if (!recoveryInfo) {
+    if (!recoveryInfo) { 
         resetNavigationState();
     }
     
@@ -8798,79 +8886,88 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
             clearNavigationGraph();
         }
 
-        const startLocation = navigationCurrentLocation ? { ...navigationCurrentLocation } : null;
-        
-        if (!recoveryInfo) {
-            navigationWaypoints = []; 
-        }
+        // --- MODIFICACIÓN CLAVE: Priorizar `recoveryInfo.navigationWaypoints` y `currentRouteData` si existen ---
+        // Esto es para cuando el `recoveryInfo` viene de un guardado periódico o controlado,
+        // que contiene la ruta y waypoints actuales (incluyendo desvíos).
+        if (recoveryInfo && recoveryInfo.navigationWaypoints && recoveryInfo.navigationWaypoints.length > 0 && recoveryInfo.currentRouteData) {
+            navigationWaypoints = recoveryInfo.navigationWaypoints;
+            navigationCurrentRouteData = recoveryInfo.currentRouteData; // Cargar la ruta completa guardada
+            precalculateRouteStepDistances(navigationCurrentRouteData); // Necesario para Turf.js
+            currentRouteNameForSaving = recoveryInfo.route.name; // Usar el nombre de la ruta original del guardado.
+            
+            await drawRouteOnMap(navigationCurrentRouteData.routes[0]); // Dibujar la ruta recuperada.
+            console.log("[Recovery] Ruta y Waypoints recuperados de guardado periódico.");
 
-        currentRouteNameForSaving = routeObject.name;
-        const waypointsFromLoadedRoute = routeObject.waypoints;
-        
-        const isAiGeneratedRoute = routeObject.name.startsWith("Ruta IA:");
-        
-        if (waypointsFromLoadedRoute.length === 1) {
-            if (startLocation) {
-                const startPoint = { id: Date.now() - 1, lat: startLocation.latitude, lng: startLocation.longitude, type: 'S', marker: null, label: 'S', address: 'Posición Actual (GPS)', visited: true, isCriticalForRecalc: true, isInternal: false, isRecalculatedStart: false };
-                const destinationWp = sanitizeWaypointsForStorage(waypointsFromLoadedRoute)[0];
-                navigationWaypoints = [startPoint, destinationWp];
-            } else {
-                showToast("Señal GPS no disponible. No se puede iniciar ruta a un único destino.", "error");
-                isRecalculatingRoute = false;
-                return;
-            }
         } else {
-            if (startLocation && !recoveryInfo) {
-                const startPoint = { id: Date.now() - 1, lat: startLocation.latitude, lng: startLocation.longitude, type: 'S', marker: null, label: 'S', address: 'Posición Actual (GPS)', visited: true, isCriticalForRecalc: true, isInternal: false, isRecalculatedStart: false };
-                
-                const waypointsToProcess = isAiGeneratedRoute 
-                    ? waypointsFromLoadedRoute 
-                    : waypointsFromLoadedRoute.slice(1);
-
-                navigationWaypoints = [startPoint, ...sanitizeWaypointsForStorage(waypointsToProcess)];
-
-            } else {
-                 if (!recoveryInfo) showToast("Señal GPS no disponible. Cargando ruta original...", "warning");
-                navigationWaypoints = sanitizeWaypointsForStorage(waypointsFromLoadedRoute);
+            // Si no hay `recoveryInfo` con ruta completa (ej. cuelgue incontrolado o nueva carga),
+            // usamos la lógica existente para construir los waypoints a partir del `routeObject`.
+            const startLocation = navigationCurrentLocation ? { ...navigationCurrentLocation } : null;
+            if (!recoveryInfo) { // Asegurarse de que no haya waypoints existentes si no hay recuperación
+                navigationWaypoints = []; 
             }
+            currentRouteNameForSaving = routeObject.name;
+            const waypointsFromLoadedRoute = routeObject.waypoints;
+            const isAiGeneratedRoute = routeObject.name.startsWith("Ruta IA:");
+            
+            if (waypointsFromLoadedRoute.length === 1) {
+                if (startLocation) {
+                    const startPoint = { id: Date.now() - 1, lat: startLocation.latitude, lng: startLocation.longitude, type: 'S', marker: null, label: 'S', address: 'Posición Actual (GPS)', visited: true, isCriticalForRecalc: true, isInternal: false, isRecalculatedStart: false };
+                    const destinationWp = sanitizeWaypointsForStorage(waypointsFromLoadedRoute)[0];
+                    navigationWaypoints = [startPoint, destinationWp];
+                } else {
+                    showToast("Señal GPS no disponible. No se puede iniciar ruta a un único destino.", "error");
+                    isRecalculatingRoute = false;
+                    return;
+                }
+            } else {
+                if (startLocation && !recoveryInfo) {
+                    const startPoint = { id: Date.now() - 1, lat: startLocation.latitude, lng: startLocation.longitude, type: 'S', marker: null, label: 'S', address: 'Posición Actual (GPS)', visited: true, isCriticalForRecalc: true, isInternal: false, isRecalculatedStart: false };
+                    
+                    const waypointsToProcess = isAiGeneratedRoute 
+                        ? waypointsFromLoadedRoute 
+                        : waypointsFromLoadedRoute.slice(1);
+
+                    navigationWaypoints = [startPoint, ...sanitizeWaypointsForStorage(waypointsToProcess)];
+
+                } else {
+                     if (!recoveryInfo) showToast("Señal GPS no disponible. Cargando ruta original...", "warning");
+                    navigationWaypoints = sanitizeWaypointsForStorage(waypointsFromLoadedRoute);
+                }
+            }
+            // Recalcular la ruta si no se ha cargado de `recoveryInfo.currentRouteData`
+            await recalculateAndDrawRoute(!!recoveryInfo); // Pasar true si hay recoveryInfo para preservar stats
+            console.log("[Recovery] Ruta recalculada desde waypoints.");
         }
-        
+        // --- FIN MODIFICACIÓN CLAVE ---
+
         await updateWaypointTypesAndLabels();
         renderWaypointMarkers();
 
         if (navigationWaypoints.filter(wp => wp && !wp.isInternal).length >= 2) {
             try {
-                await recalculateAndDrawRoute(false);
-                
-                setTimeout(() => {
-                    if (navigationMapInstance) {
-                        try {
-                            navigationMapInstance.resize();
-                        } catch(e) {}
-                    }
-                }, 50);
-
+                // Ahora, restaurar las estadísticas y el resto DESPUÉS de tener la ruta correcta.
                 if (recoveryInfo) {
                     await restoreTripProgress(recoveryInfo);
                 }
                 
-                if (autoStartNavigation) {
-                    if (forceImmediateStart) {
-                        toggleNavigationState(false, !!recoveryInfo); 
-                    } else {
-                        const routeGeoJSON = navigationMapInstance.getSource('route')._data;
-                        if (routeGeoJSON.geometry && routeGeoJSON.geometry.coordinates.length > 1) {
-                            const bounds = new mapboxgl.LngLatBounds();
-                            routeGeoJSON.geometry.coordinates.forEach(coord => bounds.extend(coord));
-                            if (!bounds.isEmpty()) {
-                                navigationMapInstance.fitBounds(bounds, { padding: 80, animate: true, duration: 1500 });
-                            }
+                // Si autoStartNavigation es true Y no estamos en modo recuperación
+                // (o si es recuperación pero se forzó el inicio inmediato)
+                if (autoStartNavigation && !forceImmediateStart && !isRecovery) {
+                    const routeGeoJSON = navigationMapInstance.getSource('route')._data;
+                    if (routeGeoJSON.geometry && routeGeoJSON.geometry.coordinates.length > 1) {
+                        const bounds = new mapboxgl.LngLatBounds();
+                        routeGeoJSON.geometry.coordinates.forEach(coord => bounds.extend(coord));
+                        if (!bounds.isEmpty()) {
+                            navigationMapInstance.fitBounds(bounds, { padding: 80, animate: true, duration: 1500 });
                         }
-                        const firstDestination = navigationWaypoints.find(wp => wp && !wp.isInternal && wp.type !== 'S' && !wp.visited);
-                        if (firstDestination) { fetchAndDisplayAlternativeRoutes(firstDestination.id); }
-                        showAutoStartNavigationModal();
                     }
+                    const firstDestination = navigationWaypoints.find(wp => wp && !wp.isInternal && wp.type !== 'S' && !wp.visited);
+                    if (firstDestination) { fetchAndDisplayAlternativeRoutes(firstDestination.id); }
+                    showAutoStartNavigationModal();
+                } else if (forceImmediateStart) { // Si se fuerza el inicio inmediato (ej. desde recovery)
+                    toggleNavigationState(false, !!recoveryInfo);
                 }
+
             } catch (error) {
                 showToast("No se pudo trazar la ruta. Comprueba la conexión o intenta mover un punto.", "error", 8000);
                 const fallbackCoords = navigationWaypoints.map(wp => [wp.lng, wp.lat]);
@@ -8885,7 +8982,7 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
         updateStartNavigationButtonState();
         updateNavigationButtonColor();
     }
-}   
+}    
       
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 // NOMBRE: fetchAndRenderChatUsers 
@@ -9200,14 +9297,14 @@ function findNextValidStep(route, currentLeg, currentStep) {
   
 // ===================================================================
 // NOMBRE: initiateControlledReload 
-// ===================================================================
+// RESUMEN: Se asegura de guardar el estado completo para una recarga controlada.
 async function initiateControlledReload() {
     if (isPerformingControlledReload) return;
     isPerformingControlledReload = true; 
 
     try {
         const recoveryFlagJSON = localStorage.getItem('boardinggate_nav_recovery_flag');
-        if (!recoveryFlagJSON) {
+        if (!recoveryFlagJSON) { // Si no hay un flag existente, no podemos actualizarlo.
             isPerformingControlledReload = false;
             return;
         }
@@ -9215,7 +9312,7 @@ async function initiateControlledReload() {
         const recoveryData = JSON.parse(recoveryFlagJSON);
 
         recoveryData.stats = {
-            totalDistance: totalDistanceTravelledForStats,
+            totalDistance: totalDistanceTravelledForStats, // <-- ¡Guardar la distancia actual aquí!
             maxSpeed: maxSpeedDuringTrip,
             maxAltitude: maxAltitudeDuringTrip,
             minAltitude: minAltitudeDuringTrip,
@@ -9228,22 +9325,35 @@ async function initiateControlledReload() {
         recoveryData.tripContext = {
             graphLabels: graphLabels,
             graphDataPoints: graphDataPoints,
-            minAvgSpeed: minAverageSpeedInTrip,
-            maxAvgSpeed: maxAverageSpeedInTrip,
+            minAverageSpeed: minAverageSpeedInTrip,
+            maxAverageSpeed: maxAverageSpeedInTrip,
             accumulatedDeviationMs: accumulatedDeviationMs
         };
 
+        if (navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0]) {
+             recoveryData.currentRouteData = navigationCurrentRouteData;
+             recoveryData.navigationWaypoints = sanitizeWaypointsForStorage(navigationWaypoints);
+        } else {
+             delete recoveryData.currentRouteData;
+             delete recoveryData.navigationWaypoints;
+        }
+
+        recoveryData.lastSaveTimestamp = Date.now(); // Timestamp del guardado controlado.
+
         localStorage.setItem('boardinggate_nav_recovery_flag', JSON.stringify(recoveryData));
 
-        setTimeout(() => {
-            location.reload();
-        }, 1500);
+        setTimeout(() => { location.reload(); }, 1500);
 
     } catch(e) {
-        showToast("Error crítico durante la optimización de memoria.", "error");
+        console.error("Error crítico durante la optimización de memoria (initiateControlledReload):", e);
         isPerformingControlledReload = false;
+    } finally {
+        if (!isPerformingControlledReload) { 
+            isPerformingControlledReload = false;
+        }
     }
 }
+    
     
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 // NOMBRE: openLocationsPreviewMap 
