@@ -1,4 +1,4 @@
-L02
+L03
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -1104,7 +1104,7 @@ L02
     }).join(', ');   
 
     
-// ===================================================================
+ // ===================================================================
 // NOMBRE: toggleNavigationState
 // RESUMEN: Gestiona el inicio/fin de la navegación o free drive.
 async function toggleNavigationState(isRecalculationStop = false, isRecovery = false) {
@@ -1130,7 +1130,7 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
             navigationMapInstance.once('moveend', () => { isFlying = false; });
         }
         
-        clearRecoveryFlag();
+        clearRecoveryFlag(); // Limpiar flag al finalizar un viaje controlado.
         startMemoryManagement(false);
         
         if (isSimulatingGpsLocation) {
@@ -1201,6 +1201,9 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
                 maxAverageSpeedInTrip = -Infinity;
             }
 
+            // --- MODIFICACIÓN CLAVE PARA GUARDADO INICIAL COMPLETO ---
+            // Aquí totalDistanceTravelledForStats es 0 o un valor inicial, lo guardamos.
+            // Esto será el indicador de "no guardado controlado" si es 0 o muy bajo al recuperar.
             const initialRecoveryData = { 
                 isActive: true, 
                 route: routeForStorage, // Ruta original del inicio
@@ -1225,6 +1228,7 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
                 lastSaveTimestamp: Date.now() // Timestamp del guardado inicial
             };
             localStorage.setItem('boardinggate_nav_recovery_flag', JSON.stringify(initialRecoveryData));
+            // --- FIN MODIFICACIÓN CLAVE ---
             
             navigationWaypoints.forEach(wp => { if (wp && wp.marker) wp.marker.setDraggable(false); });
             
@@ -1304,8 +1308,8 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
     setNavigationMapClickHandler(); 
     actualizarContadorRadares(radaresEnRutaActual.length);
     actualizarContadorTareas(tareasEnRutaActual.length);
-}
-    
+}   
+
 
 
 // ===================================================================
@@ -1441,7 +1445,7 @@ async function restoreTripProgress(recoveryInfo) {
         }
 
     } catch (error) {
-        showToast(`Error al restaurar progreso: ${error.message}. Se continuará desde el inicio.`, "error");
+        console.error(`Error en restoreTripProgress: ${error.message}. Se continuará desde el inicio.`, error);
         // En caso de error crítico al restaurar, reiniciar a cero para evitar estados inconsistentes
         navigationStartTimeForStats = new Date();
         totalDistanceTravelledForStats = 0;
@@ -8858,20 +8862,24 @@ function animateMarkerAndMap(timestamp) {
     
 
 // ===================================================================
-// NOMBRE: loadRouteFromObject (VERSIÓN CORREGIDA Y DEFINITIVA 2)
-// RESUMEN: Acepta recoveryInfo y pasa la bandera 'isRecovery' a toggleNavigationState.
+// NOMBRE: loadRouteFromObject (Principal para recuperación y carga de rutas)
+// RESUMEN: Gestiona la carga de rutas, priorizando datos de recuperación si existen y son válidos.
 async function loadRouteFromObject(routeObject, autoStartNavigation = false, forceImmediateStart = false, recoveryInfo = null) {
     if (isRecalculatingRoute) {
         showToast("Procesando otra ruta, por favor espere.", "warning");
         return;
     }
     
+    // Solo reseteamos completamente si NO es una recuperación.
+    // Si hay recoveryInfo, esperamos que el resto de la función lo maneje.
     if (!recoveryInfo) { 
         resetNavigationState();
     }
     
     if (!routeObject || !routeObject.waypoints || routeObject.waypoints.length === 0) {
         showToast("Error: El objeto de la ruta es inválido.", "error");
+        // Asegurarse de limpiar si la ruta base es inválida
+        if (recoveryInfo) clearRecoveryFlag();
         return;
     }
 
@@ -8886,30 +8894,27 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
             clearNavigationGraph();
         }
 
-        // --- MODIFICACIÓN CLAVE: Priorizar `recoveryInfo.navigationWaypoints` y `currentRouteData` si existen ---
-        // Esto es para cuando el `recoveryInfo` viene de un guardado periódico o controlado,
-        // que contiene la ruta y waypoints actuales (incluyendo desvíos).
-        if (recoveryInfo && recoveryInfo.navigationWaypoints && recoveryInfo.navigationWaypoints.length > 0 && recoveryInfo.currentRouteData) {
-            navigationWaypoints = recoveryInfo.navigationWaypoints;
-            navigationCurrentRouteData = recoveryInfo.currentRouteData; // Cargar la ruta completa guardada
-            precalculateRouteStepDistances(navigationCurrentRouteData); // Necesario para Turf.js
-            currentRouteNameForSaving = recoveryInfo.route.name; // Usar el nombre de la ruta original del guardado.
-            
-            await drawRouteOnMap(navigationCurrentRouteData.routes[0]); // Dibujar la ruta recuperada.
-            console.log("[Recovery] Ruta y Waypoints recuperados de guardado periódico.");
+        // --- INICIO DE LA LÓGICA SIMPLIFICADA DE RECUPERACIÓN DE RUTA ---
+        let loadedFromRecoveryCurrentData = false;
+        let routeDataToProcess = null; // Variable para almacenar la ruta Mapbox/OSRM
+        let waypointsToProcessForRecalculation = []; // Waypoints para recalcular si `currentRouteData` falla
 
+        // Prioridad 1: Si hay waypoints guardados en recoveryInfo (del guardado periódico o controlado)
+        if (recoveryInfo && recoveryInfo.navigationWaypoints && recoveryInfo.navigationWaypoints.length > 0) {
+            navigationWaypoints = recoveryInfo.navigationWaypoints; // Usar los waypoints recuperados (con desvíos)
+            currentRouteNameForSaving = recoveryInfo.route.name; 
+            console.log("[Recovery] Waypoints recuperados de guardado periódico/controlado. Recalculando ruta...");
         } else {
-            // Si no hay `recoveryInfo` con ruta completa (ej. cuelgue incontrolado o nueva carga),
-            // usamos la lógica existente para construir los waypoints a partir del `routeObject`.
+            // Prioridad 2: Si no hay waypoints en recoveryInfo, usar los waypoints del routeObject (ruta inicial)
             const startLocation = navigationCurrentLocation ? { ...navigationCurrentLocation } : null;
-            if (!recoveryInfo) { // Asegurarse de que no haya waypoints existentes si no hay recuperación
+            if (!recoveryInfo) { // Si no es una recuperación, empezar con waypoints vacíos
                 navigationWaypoints = []; 
             }
             currentRouteNameForSaving = routeObject.name;
             const waypointsFromLoadedRoute = routeObject.waypoints;
             const isAiGeneratedRoute = routeObject.name.startsWith("Ruta IA:");
             
-            if (waypointsFromLoadedRoute.length === 1) {
+            if (waypointsFromLoadedRoute.length === 1) { 
                 if (startLocation) {
                     const startPoint = { id: Date.now() - 1, lat: startLocation.latitude, lng: startLocation.longitude, type: 'S', marker: null, label: 'S', address: 'Posición Actual (GPS)', visited: true, isCriticalForRecalc: true, isInternal: false, isRecalculatedStart: false };
                     const destinationWp = sanitizeWaypointsForStorage(waypointsFromLoadedRoute)[0];
@@ -8919,71 +8924,69 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
                     isRecalculatingRoute = false;
                     return;
                 }
-            } else {
+            } else { 
                 if (startLocation && !recoveryInfo) {
                     const startPoint = { id: Date.now() - 1, lat: startLocation.latitude, lng: startLocation.longitude, type: 'S', marker: null, label: 'S', address: 'Posición Actual (GPS)', visited: true, isCriticalForRecalc: true, isInternal: false, isRecalculatedStart: false };
-                    
-                    const waypointsToProcess = isAiGeneratedRoute 
-                        ? waypointsFromLoadedRoute 
-                        : waypointsFromLoadedRoute.slice(1);
-
+                    const waypointsToProcess = isAiGeneratedRoute ? waypointsFromLoadedRoute : waypointsFromLoadedRoute.slice(1);
                     navigationWaypoints = [startPoint, ...sanitizeWaypointsForStorage(waypointsToProcess)];
-
                 } else {
-                     if (!recoveryInfo) showToast("Señal GPS no disponible. Cargando ruta original...", "warning");
                     navigationWaypoints = sanitizeWaypointsForStorage(waypointsFromLoadedRoute);
                 }
             }
-            // Recalcular la ruta si no se ha cargado de `recoveryInfo.currentRouteData`
-            await recalculateAndDrawRoute(!!recoveryInfo); // Pasar true si hay recoveryInfo para preservar stats
-            console.log("[Recovery] Ruta recalculada desde waypoints.");
+            console.log("[Recovery] Waypoints construidos. Recalculando ruta...");
         }
-        // --- FIN MODIFICACIÓN CLAVE ---
 
-        await updateWaypointTypesAndLabels();
-        renderWaypointMarkers();
+        // Siempre recalcular la ruta en una recuperación para asegurar la integridad de navigationCurrentRouteData
+        // `recalculateAndDrawRoute` tiene sus propios try/catch y validaciones internas.
+        await recalculateAndDrawRoute(!!recoveryInfo); 
+        // --- FIN DE LA LÓGICA SIMPLIFICADA DE RECUPERACIÓN DE RUTA ---
 
-        if (navigationWaypoints.filter(wp => wp && !wp.isInternal).length >= 2) {
-            try {
-                // Ahora, restaurar las estadísticas y el resto DESPUÉS de tener la ruta correcta.
-                if (recoveryInfo) {
-                    await restoreTripProgress(recoveryInfo);
-                }
-                
-                // Si autoStartNavigation es true Y no estamos en modo recuperación
-                // (o si es recuperación pero se forzó el inicio inmediato)
-                if (autoStartNavigation && !forceImmediateStart && !isRecovery) {
-                    const routeGeoJSON = navigationMapInstance.getSource('route')._data;
-                    if (routeGeoJSON.geometry && routeGeoJSON.geometry.coordinates.length > 1) {
-                        const bounds = new mapboxgl.LngLatBounds();
-                        routeGeoJSON.geometry.coordinates.forEach(coord => bounds.extend(coord));
-                        if (!bounds.isEmpty()) {
-                            navigationMapInstance.fitBounds(bounds, { padding: 80, animate: true, duration: 1500 });
-                        }
-                    }
-                    const firstDestination = navigationWaypoints.find(wp => wp && !wp.isInternal && wp.type !== 'S' && !wp.visited);
-                    if (firstDestination) { fetchAndDisplayAlternativeRoutes(firstDestination.id); }
-                    showAutoStartNavigationModal();
-                } else if (forceImmediateStart) { // Si se fuerza el inicio inmediato (ej. desde recovery)
-                    toggleNavigationState(false, !!recoveryInfo);
-                }
 
-            } catch (error) {
-                showToast("No se pudo trazar la ruta. Comprueba la conexión o intenta mover un punto.", "error", 8000);
-                const fallbackCoords = navigationWaypoints.map(wp => [wp.lng, wp.lat]);
-                await drawRouteOnMap({ geometry: { type: 'LineString', coordinates: fallbackCoords } });
-            }
+        // Si después de todo esto, todavía no tenemos una ruta válida con al menos 2 waypoints,
+        // o `recalculateAndDrawRoute` falló internamente, entonces la recuperación ha fallado.
+        if (navigationWaypoints.filter(wp => wp && !wp.isInternal).length < 2 || !navigationCurrentRouteData?.routes?.[0]) {
+             const errorMsg = "La ruta de recuperación es inválida o incompleta después de recalcular. No se puede reanudar.";
+             console.error(errorMsg);
+             showToast(errorMsg, "error", 8000);
+             clearRecoveryFlag(); 
+             resetNavigationState();
+             isRecalculatingRoute = false;
+             return; 
+        }
+
+        // Ahora, restaurar las estadísticas y el resto DESPUÉS de tener la ruta correcta.
+        if (recoveryInfo) {
+            await restoreTripProgress(recoveryInfo);
+        }
         
+        // (lógica de autoStartNavigation y forceImmediateStart - se mantiene)
+        if (autoStartNavigation && !forceImmediateStart && !isRecovery) {
+            const routeGeoJSON = navigationMapInstance.getSource('route')._data;
+            if (routeGeoJSON.geometry && routeGeoJSON.geometry.coordinates.length > 1) {
+                const bounds = new mapboxgl.LngLatBounds();
+                routeGeoJSON.geometry.coordinates.forEach(coord => bounds.extend(coord));
+                if (!bounds.isEmpty()) {
+                    navigationMapInstance.fitBounds(bounds, { padding: 80, animate: true, duration: 1500 });
+                }
+            }
+            const firstDestination = navigationWaypoints.find(wp => wp && !wp.isInternal && wp.type !== 'S' && !wp.visited);
+            if (firstDestination) { fetchAndDisplayAlternativeRoutes(firstDestination.id); }
+            showAutoStartNavigationModal();
+        } else if (forceImmediateStart) {
+            toggleNavigationState(false, !!recoveryInfo);
         }
     } catch (error) {
-        console.error("Error al cargar la ruta desde el objeto:", error);
+        console.error("Error crítico en loadRouteFromObject:", error);
+        showToast("Error crítico al cargar la ruta. Reinicia la aplicación.", "error", 10000);
+        clearRecoveryFlag(); 
+        resetNavigationState();
     } finally {
         isRecalculatingRoute = false;
         updateStartNavigationButtonState();
         updateNavigationButtonColor();
     }
-}    
-      
+}
+    
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 // NOMBRE: fetchAndRenderChatUsers 
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
@@ -9295,6 +9298,8 @@ function findNextValidStep(route, currentLeg, currentStep) {
     return null;
 }
   
+
+
 // ===================================================================
 // NOMBRE: initiateControlledReload 
 // RESUMEN: Se asegura de guardar el estado completo para una recarga controlada.
@@ -9304,13 +9309,18 @@ async function initiateControlledReload() {
 
     try {
         const recoveryFlagJSON = localStorage.getItem('boardinggate_nav_recovery_flag');
-        if (!recoveryFlagJSON) { // Si no hay un flag existente, no podemos actualizarlo.
+        // Si no hay un flag existente, no podemos actualizarlo para una recarga controlada.
+        // Asumimos que no hay estado previo que guardar para reanudar.
+        if (!recoveryFlagJSON) { 
+            console.warn("[ControlledReload] No hay recoveryFlagJSON previo para actualizar. No se guardará el estado de recuperación.");
             isPerformingControlledReload = false;
             return;
         }
 
         const recoveryData = JSON.parse(recoveryFlagJSON);
 
+        // --- MODIFICACIÓN CLAVE: Asegurarse de que totalDistance SI se guarde aquí ---
+        // Este es un guardado CONTROLADO, por lo tanto, la distancia acumulada es fiable.
         recoveryData.stats = {
             totalDistance: totalDistanceTravelledForStats, // <-- ¡Guardar la distancia actual aquí!
             maxSpeed: maxSpeedDuringTrip,
@@ -9330,6 +9340,7 @@ async function initiateControlledReload() {
             accumulatedDeviationMs: accumulatedDeviationMs
         };
 
+        // También guardar la ruta y waypoints actuales aquí.
         if (navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0]) {
              recoveryData.currentRouteData = navigationCurrentRouteData;
              recoveryData.navigationWaypoints = sanitizeWaypointsForStorage(navigationWaypoints);
@@ -9341,13 +9352,20 @@ async function initiateControlledReload() {
         recoveryData.lastSaveTimestamp = Date.now(); // Timestamp del guardado controlado.
 
         localStorage.setItem('boardinggate_nav_recovery_flag', JSON.stringify(recoveryData));
+        console.log("[Recovery Save] Datos de recuperación (controlado) actualizados y recargando...");
 
+        // Usar setTimeout para permitir que localStorage se actualice completamente antes de recargar.
         setTimeout(() => { location.reload(); }, 1500);
 
     } catch(e) {
         console.error("Error crítico durante la optimización de memoria (initiateControlledReload):", e);
         isPerformingControlledReload = false;
+        // En caso de error, intentar limpiar para evitar bucles.
+        clearRecoveryFlag();
+        showToast("Error en recarga controlada. Reinicia la aplicación manualmente.", "error", 10000);
     } finally {
+        // Asegurarse de resetear la bandera si no se ha recargado, aunque `location.reload()`
+        // en el setTimeout ya evitará que se llegue a esta línea en una recarga exitosa.
         if (!isPerformingControlledReload) { 
             isPerformingControlledReload = false;
         }
