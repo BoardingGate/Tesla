@@ -39,6 +39,7 @@
     <script type="module"> import { initializeApp } from "https://www.gstatic.com/firebasejs/11.9.1/firebase-app.js"; import { getFirestore, doc, setDoc, getDoc, getDocs, deleteDoc, collection, serverTimestamp, where, query, orderBy, limit, addDoc, writeBatch, startAfter, updateDoc, FieldValue, runTransaction } from "https://www.gstatic.com/firebasejs/11.9.1/firebase-firestore.js";  const firebaseConfig = window.APP_CONFIG.firebase; try { const app = initializeApp(firebaseConfig);window.db = getFirestore(app);window.doc = doc;window.setDoc = setDoc;window.getDoc = getDoc;window.collection = collection;window.getDocs = getDocs;window.deleteDoc = deleteDoc;window.serverTimestamp = serverTimestamp; window.where = where; window.query = query; window.orderBy = orderBy; window.limit = limit; window.addDoc = addDoc;window.writeBatch = writeBatch; window.startAfter = startAfter; window.updateDoc = updateDoc; window.FieldValue = FieldValue; window.runTransaction = runTransaction; } catch (e) {  }; </script>
 
     
+    
     <link rel="stylesheet" href="tesla.css">
     
 <!-- REVISAR PERIODICAMENTE CUAL ES LA MÁS RECIENTE API DE MAPBOX -->
@@ -7004,7 +7005,460 @@ async function createAndLoadReturnTrip() {
     }
 }
 
- // ===================================================================
+// ===================================================================
+// NOMBRE: fetchRouteData (VERSIÓN FINAL DEFINITIVA)
+// RESUMEN: Incluye reintentos, solicitud de indicaciones detalladas y
+//          solicitud de idioma español directamente a la API de Mapbox.
+// ===================================================================
+async function fetchRouteData(coordsString, startHeading = null) {
+    const OSRM_PRIMARY_KEY = 'boardinggate_useOsrmAsPrimary';
+    const useOsrmAsPrimary = localStorage.getItem(OSRM_PRIMARY_KEY) === 'true';
+  
+    const osrmService = {
+        name: 'OSRM',
+        buildUrl: (coords) => {
+            return `${OSRM_SERVICE_URL}/driving/${coords}?overview=full&geometries=geojson&steps=true&alternatives=false&annotations=true`;
+        },
+        processResponse: async (response) => {
+            if (!response.ok) {
+                let errorData = { message: `OSRM HTTP error ${response.status}` };
+                try { errorData = await response.json(); } catch (e) {}
+                throw new Error(errorData.code || errorData.message || response.statusText);
+            }
+            const data = await response.json();
+            if (data.code !== 'Ok' || !data.routes || data.routes.length === 0) {
+                throw new Error(data.message || "No se encontraron rutas en OSRM.");
+            }
+            return { routeData: data, serviceUsed: 'OSRM' };
+        }
+    };
+
+    const mapboxService = {
+        name: 'Mapbox',
+        buildUrl: (coords) => {
+            // <-- MODIFICACIÓN CLAVE: Añadidos &banner_instructions=true Y &language=es
+            return `https://api.mapbox.com/directions/v5/mapbox/driving/${coords}?alternatives=false&geometries=geojson&overview=full&steps=true&banner_instructions=true&language=es&access_token=${window.APP_CONFIG.keys.mapbox}`;
+        },
+        processResponse: async (response) => {
+            if (!response.ok) {
+                let errorData = { message: `Mapbox HTTP error ${response.status}` };
+                try { errorData = await response.json(); } catch (e) {}
+                throw new Error(errorData.message || response.statusText);
+            }
+            const data = await response.json();
+            if (data.code !== 'Ok' || !data.routes || data.routes.length === 0) {
+                throw new Error(data.message || "No se encontraron rutas en Mapbox.");
+            }
+            const adaptedRoute = adaptMapboxRouteToOSRMFormat(data.routes[0]);
+            const adaptedWaypoints = data.waypoints.map(wp => ({
+                distance: wp.distance,
+                hint: wp.hint,
+                location: wp.location,
+                name: wp.name,
+            }));
+            const finalData = {
+                code: 'Ok',
+                routes: [adaptedRoute],
+                waypoints: adaptedWaypoints
+            };
+            return { routeData: finalData, serviceUsed: 'Mapbox' };
+        }
+    };
+
+    const buildUrlWithCorrectBearings = (service, coords) => {
+        let baseUrl = service.buildUrl(coords).split('?')[0];
+        let params = new URLSearchParams(service.buildUrl(coords).split('?')[1] || '');
+
+        if (startHeading !== null && !isNaN(startHeading)) {
+            const waypointCount = (coords.match(/;/g) || []).length + 1;
+            let bearingsString = `${Math.round(startHeading)},45`;
+            if (waypointCount > 1) {
+                bearingsString += ';'.repeat(waypointCount - 1);
+            }
+            params.set('bearings', bearingsString);
+        } else {
+            params.delete('bearings'); 
+        }
+        
+        return `${baseUrl}?${params.toString()}`;
+    };
+
+    const primaryService = useOsrmAsPrimary ? osrmService : mapboxService;
+    const fallbackService = useOsrmAsPrimary ? mapboxService : osrmService;
+    
+    const MAX_PRIMARY_RETRIES = 2;
+
+    for (let attempt = 1; attempt <= MAX_PRIMARY_RETRIES; attempt++) {
+        try {
+            const primaryUrl = buildUrlWithCorrectBearings(primaryService, coordsString);
+            const primaryResponse = await fetch(primaryUrl);
+            return await primaryService.processResponse(primaryResponse);
+        } catch (primaryError) {
+            console.warn(`[Route Fetch] Fallo en intento #${attempt} con ${primaryService.name}:`, primaryError);
+
+            if (attempt === MAX_PRIMARY_RETRIES) {
+                showToast(`${primaryService.name} falló tras ${MAX_PRIMARY_RETRIES} intentos. Probando con respaldo...`, "warning", 4000);
+                break;
+            } else {
+                await new Promise(resolve => setTimeout(resolve, 500));
+            }
+        }
+    }
+    
+    try {
+        const fallbackUrl = buildUrlWithCorrectBearings(fallbackService, coordsString);
+        const fallbackResponse = await fetch(fallbackUrl);
+        const fallbackData = await fallbackService.processResponse(fallbackResponse);
+        fallbackData.serviceUsed += ' (Respaldo)';
+        return fallbackData;
+    } catch (fallbackError) {
+        return { error: fallbackError, failedServices: `${primaryService.name} (Fallo), ${fallbackService.name} (Fallo)` };
+    }
+}
+    
+
+// ===================================================================
+// NOMBRE: adaptMapboxRouteToOSRMFormat (VERSIÓN MODIFICADA)
+// RESUMEN: Convierte la respuesta de la API de Mapbox al formato de OSRM,
+//          incluyendo ahora los datos de "bannerInstructions".
+// ===================================================================
+function adaptMapboxRouteToOSRMFormat(mapboxRoute) {
+    const adaptedLegs = mapboxRoute.legs.map(leg => {
+        const adaptedSteps = leg.steps.map(step => {
+            return {
+                distance: step.distance,
+                duration: step.duration,
+                geometry: step.geometry,
+                maneuver: {
+                    bearing_after: step.maneuver.bearing_after,
+                    bearing_before: step.maneuver.bearing_before,
+                    location: step.maneuver.location,
+                    modifier: step.maneuver.modifier,
+                    type: step.maneuver.type,
+                },
+                name: step.name,
+                bannerInstructions: step.bannerInstructions || null // <-- LÍNEA MODIFICADA
+            };
+        });
+        return {
+            distance: leg.distance,
+            duration: leg.duration,
+            steps: adaptedSteps,
+            summary: leg.summary,
+        };
+    });
+    return {
+        distance: mapboxRoute.distance,
+        duration: mapboxRoute.duration,
+        geometry: mapboxRoute.geometry,
+        legs: adaptedLegs,
+    };
+}
+
+// ===================================================================
+// NOMBRE: updateTurnByTurnDisplay (VERSIÓN FINAL CON INDICACIONES COMPLETAS Y ESTILO)
+// RESUMEN: Muestra indicaciones completas, priorizando el campo "instruction" de Mapbox
+//          para obtener la frase completa y traducida directamente desde la API.
+// ===================================================================
+function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
+    const topInfoBar = document.getElementById('navigation-top-info-bar');
+    const intersectionPreviewWindow = document.getElementById('intersection-preview-map-window');
+    const miniNavCard = document.getElementById('mini-nav-info-card'); 
+    const progressBar = document.getElementById('navigation-bottom-progress-bar');
+    const compassControl = document.querySelector('.mapboxgl-ctrl-bottom-left'); 
+
+    if (!route || !topInfoBar || !route.legs || route.legs.length === 0 || !progressBar) {
+        if (topInfoBar) topInfoBar.style.display = 'none';
+        if (miniNavCard) miniNavCard.style.display = 'none'; 
+        if (progressBar) progressBar.classList.remove('scaled-for-maneuver');
+        if (compassControl) compassControl.classList.remove('hidden-for-maneuver');
+        if (intersectionPreviewWindow && !intersectionPreviewWindow.classList.contains('hidden') && intersectionPreviewWindow.dataset.source !== 'click') hideIntersectionPreviewMap();
+        nextManeuverStepForPreview = null;
+        return;
+    }
+
+    if (!isNavigating && (!navigationCurrentRouteData || navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart).length < 2)) {
+        if (topInfoBar) topInfoBar.style.display = 'none';
+        if (miniNavCard) miniNavCard.style.display = 'none'; 
+        if (progressBar) progressBar.classList.remove('scaled-for-maneuver');
+        if (compassControl) compassControl.classList.remove('hidden-for-maneuver');
+        if (intersectionPreviewWindow && !intersectionPreviewWindow.classList.contains('hidden') && intersectionPreviewWindow.dataset.source !== 'click') hideIntersectionPreviewMap();
+        nextManeuverStepForPreview = null;
+        return;
+    }
+
+    const carDistance = Math.min(Math.max(0, carDistanceAlongTheRoute), route.distance);
+    
+    let currentLegIndex = -1, currentStepIndex = -1;
+    let distanceToEndOfCurrentStepForProgress = 0;
+    
+    let searchLegIndex = currentLegIndexNav;
+    let searchStepIndex = currentStepIndexNav;
+
+    if (searchLegIndex >= route.legs.length || 
+        !route.legs[searchLegIndex] || 
+        searchStepIndex >= route.legs[searchLegIndex].steps.length ||
+        (route.legs[searchLegIndex].steps[searchStepIndex].cumulativeDistance || 0) > carDistance) {
+        searchLegIndex = 0;
+        searchStepIndex = 0;
+    }
+
+    let stepFound = false;
+    for (let i = searchLegIndex; i < route.legs.length; i++) {
+        const leg = route.legs[i];
+        if (!leg || !leg.steps) continue;
+        const startStepSearch = (i === searchLegIndex) ? searchStepIndex : 0;
+        for (let j = startStepSearch; j < leg.steps.length; j++) {
+            const step = leg.steps[j];
+            if (step && typeof step.cumulativeDistance === 'number' && (step.cumulativeDistance + (step.distance || 0)) > carDistance) {
+                currentLegIndex = i;
+                currentStepIndex = j;
+                stepFound = true;
+                break;
+            }
+        }
+        if (stepFound) break;
+    }
+
+    if (currentLegIndex === -1) {
+        currentLegIndex = route.legs.length - 1;
+        if (route.legs[currentLegIndex] && route.legs[currentLegIndex].steps) {
+            currentStepIndex = route.legs[currentLegIndex].steps.length - 1;
+        } else {
+            return;
+        }
+    }
+    
+    const currentStepForProgress = route.legs[currentLegIndex].steps[currentStepIndex];
+    distanceToEndOfCurrentStepForProgress = currentStepForProgress.cumulativeDistance + (currentStepForProgress.distance || 0); 
+    
+    currentLegIndexNav = currentLegIndex;
+    currentStepIndexNav = currentStepIndex;
+
+    const waypointsForRequest = navigationWaypoints.filter(wp => wp);
+    
+    let finalStepToShow;
+    let tempLegIdx = currentLegIndex;
+    let tempStepIdx = currentStepIndex + 1;
+
+    while (true) {
+        if (tempLegIdx >= route.legs.length) {
+            finalStepToShow = route.legs[route.legs.length - 1].steps[route.legs[route.legs.length - 1].steps.length - 1];
+            break;
+        }
+        let leg = route.legs[tempLegIdx];
+        if (tempStepIdx >= leg.steps.length) {
+            tempLegIdx++;
+            tempStepIdx = 0;
+            continue;
+        }
+        const candidateStep = leg.steps[tempStepIdx];
+        const isArrival = candidateStep.maneuver.type === 'arrive';
+        const isDeparture = candidateStep.maneuver.type === 'depart';
+        const arrivalWaypoint = isArrival ? waypointsForRequest[tempLegIdx + 1] : null; 
+        const departureWaypoint = isDeparture ? waypointsForRequest[tempLegIdx] : null;
+
+        if ((isArrival && arrivalWaypoint?.isInternal) || (isDeparture && departureWaypoint?.isInternal)) {
+            tempStepIdx++;
+            continue;
+        } else {
+            finalStepToShow = candidateStep;
+            break;
+        }
+    }
+    let nextStepToDisplay = finalStepToShow;
+    nextManeuverStepForPreview = nextStepToDisplay;
+
+    const distanceToNextManeuver = Math.max(0, distanceToEndOfCurrentStepForProgress - carDistance);
+    const distanceIntoCurrentStep = currentStepForProgress.distance - distanceToNextManeuver;
+    const now = Date.now();
+    const infoOverlay = document.getElementById('map-info-overlay');
+    
+    const uniqueManeuverId = `${currentLegIndex}_${currentStepIndex}_${nextStepToDisplay.name}`;
+    if (announceManeuverWithFlash && distanceToNextManeuver < 220 && maneuverFlashTriggeredId !== uniqueManeuverId) {
+        maneuverFlashTriggeredId = uniqueManeuverId;
+        const borderOverlay = document.getElementById('maneuver-flashing-border-overlay');
+        if (borderOverlay) {
+            borderOverlay.classList.remove('hidden');
+            setTimeout(() => {
+                borderOverlay.classList.add('hidden');
+            }, 3000);
+        }
+    }
+
+    const MANEUVER_ZONE_DISTANCE = 210;
+    
+    if (isNavigating) {
+        if (distanceToNextManeuver < MANEUVER_ZONE_DISTANCE) {
+            progressBar.classList.add('scaled-for-maneuver');
+            if (compassControl) compassControl.classList.add('hidden-for-maneuver');
+        } else {
+            progressBar.classList.remove('scaled-for-maneuver');
+            if (compassControl) compassControl.classList.remove('hidden-for-maneuver');
+        }
+    } else {
+        progressBar.classList.remove('scaled-for-maneuver');
+        if (compassControl) compassControl.classList.remove('hidden-for-maneuver');
+    }
+    
+    if (!isProgressBarLocked && !isMapImmersiveModeActive && now > progressBarForceShowUntil) {
+        const shouldHide = distanceToNextManeuver > 1000 && distanceIntoCurrentStep > 100;
+        progressBar.classList.toggle('progress-bar-auto-hidden', shouldHide);
+        if (infoOverlay) {
+            infoOverlay.style.display = shouldHide ? 'none' : 'block';
+        }
+        if (miniNavCard) {
+            if (shouldHide) {
+                const distanceText = distanceToNextManeuver < 1000 ? `${Math.round(distanceToNextManeuver / 5) * 5} m` : `${(distanceToNextManeuver / 1000).toFixed(1)} km`;
+                let etaHtml = '';
+                const remainingDistanceTotal = Math.max(0, route.distance - carDistanceAlongTheRoute);
+                const remainingDurationTotal = route.distance > 0 ? route.duration * (remainingDistanceTotal / route.distance) : 0;
+                const currentFinalEta = new Date(Date.now() + remainingDurationTotal * 1000);
+
+                if (isNavigating && tripInitialOverallEtaTime) {
+                    const etaText = currentFinalEta.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                    const finalDeviationMs = currentFinalEta.getTime() - tripInitialOverallEtaTime.getTime();
+                    const deviationHtml = formatDeviationForMiniCard(finalDeviationMs);
+                    etaHtml = `<div style="font-size: 0.90em; margin-top: 2px; text-align: center; "><span>${etaText}</span><span style="margin-left: 8px;">${deviationHtml}</span></div>`;
+                }
+                const newMiniCardHtml = `<div>${distanceText}</div>${etaHtml}`;
+                if (miniNavCard.innerHTML !== newMiniCardHtml) {
+                    miniNavCard.innerHTML = newMiniCardHtml;
+                }
+                miniNavCard.style.display = 'block';
+            } else {
+                miniNavCard.style.display = 'none';
+            }
+        }
+    } else {
+        progressBar.classList.remove('progress-bar-auto-hidden');
+        if (infoOverlay) {
+            infoOverlay.style.display = 'block';
+        }
+        if (miniNavCard) {
+            miniNavCard.style.display = 'none';
+        }
+    }
+    
+    const turnIconDisplayEl = document.getElementById('turn-icon-display');
+    const maneuverTextEl = document.getElementById('maneuver-text-display');
+    const distanceFormattedEl = document.getElementById('distance-to-turn-formatted');
+    const streetEl = document.getElementById('street-name-display');
+    const progressBarEl = document.getElementById('distance-progress-bar-to-turn');
+
+    if (nextStepToDisplay && nextStepToDisplay.maneuver) {
+        const maneuver = nextStepToDisplay.maneuver;
+        const type = maneuver.type || '';
+        
+        let maneuverText, streetNameText;
+
+        if (type === 'arrive') {
+            const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
+            const isFinalDestination = currentLegIndexNav === (route.legs.length - 1) && actualWaypoints.length > 1;
+
+            if (isFinalDestination) {
+                maneuverText = "Has llegado a tu destino";
+                streetNameText = ""; 
+            } else {
+                const etapaActual = currentLegIndexNav + 1;
+                const totalEtapas = route.legs.length;
+                maneuverText = `Llegando a Etapa ${etapaActual} de ${totalEtapas}`;
+                streetNameText = nextStepToDisplay.name || "";
+            }
+        } else {
+            maneuverText = maneuver.instruction || getManeuverInstructionText(maneuver);
+
+            const banner = nextStepToDisplay.bannerInstructions;
+            if (banner && banner.length > 0 && banner[0].primary) {
+                let bannerPrimaryText = banner[0].primary.text;
+                let bannerSecondaryText = banner[0].secondary ? banner[0].secondary.text : '';
+                let fullBannerText = bannerPrimaryText + (bannerSecondaryText ? `: ${bannerSecondaryText}` : '');
+                
+                streetNameText = `<span style="color: #FFD700; font-weight: bold; font-size: 1.20rem;">${fullBannerText}</span>`;
+            } else {
+                streetNameText = (type === 'depart' || type.includes('roundabout') || type === 'end of road') ? '' : (nextStepToDisplay.name || '');
+            }
+        }
+        
+        if (turnIconDisplayEl) {
+            const iconFilename = getManeuverIconFilename(maneuver);
+            if (iconFilename !== lastDisplayedManeuverIcon) {
+                turnIconDisplayEl.innerHTML = `<img src="https://boardinggate.github.io/Tesla/${iconFilename}" alt="${maneuverText}" style="width: 95%; height: 95%; object-fit: contain;">`;
+                lastDisplayedManeuverIcon = iconFilename;
+            }
+        }
+        
+        const newManeuverText = maneuverText ? `${maneuverText} ` : '';
+        if (maneuverTextEl.textContent !== newManeuverText) {
+            maneuverTextEl.textContent = newManeuverText;
+        }
+        if (streetEl.innerHTML !== streetNameText) {
+            streetEl.innerHTML = streetNameText;
+        }
+        
+        distanceToNextManeuverOSRM = distanceToNextManeuver;
+        const newDistanceText = distanceToNextManeuver < 1000 ? `${Math.round(distanceToNextManeuver / 5) * 5} m` : `${(distanceToNextManeuver / 1000).toFixed(1)} km`;
+        if (distanceFormattedEl.textContent !== newDistanceText) {
+            distanceFormattedEl.textContent = newDistanceText;
+        }
+
+        const progressPercent = (currentStepForProgress.distance > 0) ? ((currentStepForProgress.distance - distanceToNextManeuver) / currentStepForProgress.distance) * 100 : (distanceToNextManeuver === 0 ? 100 : 0);
+        const newWidthPercent = `${Math.min(100, Math.max(0, progressPercent))}%`;
+        if (progressBarEl && progressBarEl.style.width !== newWidthPercent) {
+            progressBarEl.style.width = newWidthPercent;
+        }
+
+        const isRelevantIntersectionManeuver = type !== 'continue' && type !== 'new name' && type !== 'depart' && type !== 'straight';
+        if (isNavigating && distanceToNextManeuver < 800 && distanceToNextManeuver >= 100 && isRelevantIntersectionManeuver && (!intersectionPreviewWindow || intersectionPreviewWindow.classList.contains('hidden') || intersectionPreviewWindow.dataset.source !== 'click') && (currentLegIndex + '_' + currentStepIndex) !== lastAutoShownManeuverId) {
+            showIntersectionPreviewMap(nextStepToDisplay, route, false, 10000);
+            lastAutoShownManeuverId = currentLegIndex + '_' + currentStepIndex;
+        } else if (intersectionPreviewWindow && !intersectionPreviewWindow.classList.contains('hidden') && intersectionPreviewWindow.dataset.source !== 'click' && (distanceToNextManeuver >= 800 || distanceToNextManeuver < 100 || !isRelevantIntersectionManeuver)) {
+            hideIntersectionPreviewMap();
+        }
+
+    } else {
+        if (turnIconDisplayEl) {
+            const iconFilename = 'PNG/arrive.png';
+            if (iconFilename !== lastDisplayedManeuverIcon) {
+                turnIconDisplayEl.innerHTML = `<img src="https://boardinggate.github.io/Tesla/${iconFilename}" style="width:95%; height:95%; object-fit:contain;">`;
+                lastDisplayedManeuverIcon = iconFilename;
+            }
+        }
+        if (maneuverTextEl.textContent !== '') maneuverTextEl.textContent = '';
+        if (streetEl.textContent !== 'Has llegado a tu destino') streetEl.textContent = 'Has llegado a tu destino';
+        if (distanceFormattedEl.textContent !== '0 m') distanceFormattedEl.textContent = '0 m';
+        if (progressBarEl && progressBarEl.style.width !== '100%') progressBarEl.style.width = '100%';
+        
+        distanceToNextManeuverOSRM = Infinity;
+        nextManeuverStepForPreview = null;
+        if (miniNavCard) miniNavCard.style.display = 'none';
+        if (intersectionPreviewWindow && !intersectionPreviewWindow.classList.contains('hidden') && intersectionPreviewWindow.dataset.source !== 'click') hideIntersectionPreviewMap();
+    }
+}    
+
+// ===================================================================
+// NOMBRE: translateBannerText (NUEVA FUNCIÓN)
+// RESUMEN: Traduce términos comunes en inglés de las instrucciones del banner de Mapbox.
+// ===================================================================
+function translateBannerText(text) {
+    if (!text) return '';
+    const translations = {
+        '\\bToll\\b': 'Peaje',
+        '\\bRestricted\\b': 'Restringido',
+        '\\bFerry\\b': 'Ferry',
+        '\\bNorth\\b': 'Norte',
+        '\\bSouth\\b': 'Sur',
+        '\\bEast\\b': 'Este',
+        '\\bWest\\b': 'Oeste'
+    };
+    let translatedText = text;
+    for (const [key, value] of Object.entries(translations)) {
+        translatedText = translatedText.replace(new RegExp(key, 'gi'), value);
+    }
+    return translatedText;
+}
+    
+// ===================================================================
 // NOMBRE: showArrivalStatsModal 
 // RESUMEN: Al finalizar el viaje, añade el marcador de velocidad máxima y
 function showArrivalStatsModal(freeDriveStatsData = null) {
@@ -8700,6 +9154,9 @@ function updateNavigationProgressDisplay(route, carDistanceAlongTheRoute = 0) {
     }
 }
 
+
+
+    
 // ===================================================================
 // NOMBRE: checkForAndExecuteCrashRecovery
 // RESUMEN: Activa el overlay de carga si encuentra una bandera de recuperación.
@@ -10078,292 +10535,7 @@ async function initializeRadarCache() {
     } finally {
         isRadarCacheInitializing = false;
     }
-}
-
-// EN LA FUNCIÓN updateTurnByTurnDisplay
-function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
-    const topInfoBar = document.getElementById('navigation-top-info-bar');
-    const intersectionPreviewWindow = document.getElementById('intersection-preview-map-window');
-    const miniNavCard = document.getElementById('mini-nav-info-card'); 
-    const progressBar = document.getElementById('navigation-bottom-progress-bar');
-    const compassControl = document.querySelector('.mapboxgl-ctrl-bottom-left'); 
-
-    // Si no hay ruta o la barra de progreso no existe, limpiar y salir.
-    if (!route || !topInfoBar || !route.legs || route.legs.length === 0 || !progressBar) {
-        if (topInfoBar) topInfoBar.style.display = 'none';
-        if (miniNavCard) miniNavCard.style.display = 'none'; 
-        if (progressBar) progressBar.classList.remove('scaled-for-maneuver'); // Asegurarse de limpiar
-        if (compassControl) compassControl.classList.remove('hidden-for-maneuver'); // Asegurarse de limpiar
-        if (intersectionPreviewWindow && !intersectionPreviewWindow.classList.contains('hidden') && intersectionPreviewWindow.dataset.source !== 'click') hideIntersectionPreviewMap();
-        nextManeuverStepForPreview = null;
-        return;
-    }
-
-    // Si no estamos navegando una ruta planificada Y no hay datos de ruta válidos, limpiar y salir.
-    // Esto cubre escenarios donde el mapa está abierto pero sin una ruta calculada o waypoints suficientes.
-    if (!isNavigating && (!navigationCurrentRouteData || navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart).length < 2)) {
-        if (topInfoBar) topInfoBar.style.display = 'none';
-        if (miniNavCard) miniNavCard.style.display = 'none'; 
-        if (progressBar) progressBar.classList.remove('scaled-for-maneuver'); // Asegurarse de limpiar
-        if (compassControl) compassControl.classList.remove('hidden-for-maneuver'); // Asegurarse de limpiar
-        if (intersectionPreviewWindow && !intersectionPreviewWindow.classList.contains('hidden') && intersectionPreviewWindow.dataset.source !== 'click') hideIntersectionPreviewMap();
-        nextManeuverStepForPreview = null;
-        return;
-    }
-
-    const carDistance = Math.min(Math.max(0, carDistanceAlongTheRoute), route.distance);
-    
-    let currentLegIndex = -1, currentStepIndex = -1;
-    let distanceToEndOfCurrentStepForProgress = 0;
-    
-    let searchLegIndex = currentLegIndexNav;
-    let searchStepIndex = currentStepIndexNav;
-
-    // Ajustar los índices si el coche se ha movido "hacia atrás" o los índices actuales no son válidos.
-    if (searchLegIndex >= route.legs.length || 
-        !route.legs[searchLegIndex] || 
-        searchStepIndex >= route.legs[searchLegIndex].steps.length ||
-        (route.legs[searchLegIndex].steps[searchStepIndex].cumulativeDistance || 0) > carDistance) {
-        searchLegIndex = 0;
-        searchStepIndex = 0;
-    }
-
-    let stepFound = false;
-    for (let i = searchLegIndex; i < route.legs.length; i++) {
-        const leg = route.legs[i];
-        if (!leg || !leg.steps) continue;
-        const startStepSearch = (i === searchLegIndex) ? searchStepIndex : 0;
-        for (let j = startStepSearch; j < leg.steps.length; j++) {
-            const step = leg.steps[j];
-            if (step && typeof step.cumulativeDistance === 'number' && (step.cumulativeDistance + (step.distance || 0)) > carDistance) {
-                currentLegIndex = i;
-                currentStepIndex = j;
-                stepFound = true;
-                break;
-            }
-        }
-        if (stepFound) break;
-    }
-
-    // Si no se encontró el paso actual, situarse en el último paso de la ruta.
-    if (currentLegIndex === -1) {
-        currentLegIndex = route.legs.length - 1;
-        if (route.legs[currentLegIndex] && route.legs[currentLegIndex].steps) {
-            currentStepIndex = route.legs[currentLegIndex].steps.length - 1;
-        } else {
-            return; // No hay pasos en la ruta.
-        }
-    }
-    
-    const currentStepForProgress = route.legs[currentLegIndex].steps[currentStepIndex];
-    distanceToEndOfCurrentStepForProgress = currentStepForProgress.cumulativeDistance + (currentStepForProgress.distance || 0); 
-    
-    // Actualizar las variables globales de índice de etapa/paso.
-    currentLegIndexNav = currentLegIndex;
-    currentStepIndexNav = currentStepIndex;
-
-    const waypointsForRequest = navigationWaypoints.filter(wp => wp);
-    
-    // Encontrar el próximo paso de maniobra relevante para mostrar.
-    let finalStepToShow;
-    let tempLegIdx = currentLegIndex;
-    let tempStepIdx = currentStepIndex + 1;
-
-    while (true) {
-        if (tempLegIdx >= route.legs.length) {
-            finalStepToShow = route.legs[route.legs.length - 1].steps[route.legs[route.legs.length - 1].steps.length - 1];
-            break;
-        }
-        let leg = route.legs[tempLegIdx];
-        if (tempStepIdx >= leg.steps.length) {
-            tempLegIdx++;
-            tempStepIdx = 0;
-            continue;
-        }
-        const candidateStep = leg.steps[tempStepIdx];
-        const isArrival = candidateStep.maneuver.type === 'arrive';
-        const isDeparture = candidateStep.maneuver.type === 'depart';
-        const arrivalWaypoint = isArrival ? waypointsForRequest[tempLegIdx + 1] : null; 
-        const departureWaypoint = isDeparture ? waypointsForRequest[tempLegIdx] : null;
-
-        // Saltar pasos internos que no son maniobras para el usuario.
-        if ((isArrival && arrivalWaypoint?.isInternal) || (isDeparture && departureWaypoint?.isInternal)) {
-            tempStepIdx++;
-            continue;
-        } else {
-            finalStepToShow = candidateStep;
-            break;
-        }
-    }
-    let nextStepToDisplay = finalStepToShow;
-    nextManeuverStepForPreview = nextStepToDisplay;
-
-    const distanceToNextManeuver = Math.max(0, distanceToEndOfCurrentStepForProgress - carDistance);
-    const distanceIntoCurrentStep = currentStepForProgress.distance - distanceToNextManeuver;
-    const now = Date.now();
-    const infoOverlay = document.getElementById('map-info-overlay');
-    
-    // Lógica para el destello de anuncio de maniobra.
-    const uniqueManeuverId = `${currentLegIndex}_${currentStepIndex}_${nextStepToDisplay.name}`;
-    if (announceManeuverWithFlash && distanceToNextManeuver < 220 && maneuverFlashTriggeredId !== uniqueManeuverId) {
-        maneuverFlashTriggeredId = uniqueManeuverId;
-        const borderOverlay = document.getElementById('maneuver-flashing-border-overlay');
-        if (borderOverlay) {
-            borderOverlay.classList.remove('hidden');
-            setTimeout(() => {
-                borderOverlay.classList.add('hidden');
-            }, 3000);
-        }
-    }
-
-    // --- LÓGICA DE ESCALADO Y VISIBILIDAD DE LA BARRA DE PROGRESO ---
-    const MANEUVER_ZONE_DISTANCE = 210;
-    
-    // Solo aplicar escalado y ocultar la brújula si estamos en modo de navegación DE RUTA
-    if (isNavigating) { // <-- ¡CONDICIÓN CLAVE AÑADIDA!
-        if (distanceToNextManeuver < MANEUVER_ZONE_DISTANCE) {
-            progressBar.classList.add('scaled-for-maneuver');
-            if (compassControl) compassControl.classList.add('hidden-for-maneuver');
-        } else {
-            progressBar.classList.remove('scaled-for-maneuver');
-            if (compassControl) compassControl.classList.remove('hidden-for-maneuver');
-        }
-    } else {
-        // Si no estamos navegando una ruta planificada (ej. Free Drive),
-        // asegurarnos de que no haya escalado y la brújula esté visible.
-        progressBar.classList.remove('scaled-for-maneuver'); // Asegurarse de quitarla siempre.
-        if (compassControl) compassControl.classList.remove('hidden-for-maneuver'); // Asegurarse de mostrarla.
-    }
-    // --- FIN LÓGICA DE ESCALADO Y VISIBILIDAD ---
-    
-    // Lógica de auto-ocultación/mostrado de la barra de progreso.
-    if (!isProgressBarLocked && !isMapImmersiveModeActive && now > progressBarForceShowUntil) {
-        const shouldHide = distanceToNextManeuver > 1000 && distanceIntoCurrentStep > 100;
-        progressBar.classList.toggle('progress-bar-auto-hidden', shouldHide);
-        if (infoOverlay) {
-            infoOverlay.style.display = shouldHide ? 'none' : 'block';
-        }
-        if (miniNavCard) {
-            if (shouldHide) {
-                const distanceText = distanceToNextManeuver < 1000 ? `${Math.round(distanceToNextManeuver / 5) * 5} m` : `${(distanceToNextManeuver / 1000).toFixed(1)} km`;
-                let etaHtml = '';
-                const remainingDistanceTotal = Math.max(0, route.distance - carDistanceAlongTheRoute);
-                const remainingDurationTotal = route.distance > 0 ? route.duration * (remainingDistanceTotal / route.distance) : 0;
-                const currentFinalEta = new Date(Date.now() + remainingDurationTotal * 1000);
-
-                if (isNavigating && tripInitialOverallEtaTime) {
-                    const etaText = currentFinalEta.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-                    const finalDeviationMs = currentFinalEta.getTime() - tripInitialOverallEtaTime.getTime();
-                    const deviationHtml = formatDeviationForMiniCard(finalDeviationMs);
-                    etaHtml = `<div style="font-size: 0.90em; margin-top: 2px; text-align: center; "><span>${etaText}</span><span style="margin-left: 8px;">${deviationHtml}</span></div>`;
-                }
-                const newMiniCardHtml = `<div>${distanceText}</div>${etaHtml}`;
-                if (miniNavCard.innerHTML !== newMiniCardHtml) {
-                    miniNavCard.innerHTML = newMiniCardHtml;
-                }
-                miniNavCard.style.display = 'block';
-            } else {
-                miniNavCard.style.display = 'none';
-            }
-        }
-    } else {
-        progressBar.classList.remove('progress-bar-auto-hidden');
-        if (infoOverlay) {
-            infoOverlay.style.display = 'block';
-        }
-        if (miniNavCard) {
-            miniNavCard.style.display = 'none';
-        }
-    }
-    
-    // --- Actualización de la información de maniobra ---
-    const turnIconDisplayEl = document.getElementById('turn-icon-display');
-    const maneuverTextEl = document.getElementById('maneuver-text-display');
-    const distanceFormattedEl = document.getElementById('distance-to-turn-formatted');
-    const streetEl = document.getElementById('street-name-display');
-    const progressBarEl = document.getElementById('distance-progress-bar-to-turn');
-
-    if (nextStepToDisplay && nextStepToDisplay.maneuver) {
-        const maneuver = nextStepToDisplay.maneuver;
-        const type = maneuver.type || '';
-        
-        let maneuverText, streetNameText;
-
-        if (type === 'arrive') {
-            const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
-            const isFinalDestination = currentLegIndexNav === (route.legs.length - 1) && actualWaypoints.length > 1;
-
-            if (isFinalDestination) {
-                maneuverText = "Has llegado a tu destino";
-                streetNameText = ""; 
-            } else {
-                const etapaActual = currentLegIndexNav + 1;
-                const totalEtapas = route.legs.length;
-                maneuverText = `Llegando a Etapa ${etapaActual} de ${totalEtapas}`;
-                streetNameText = nextStepToDisplay.name || "";
-            }
-        } else {
-            maneuverText = getManeuverInstructionText(maneuver);
-            streetNameText = (type === 'depart' || type.includes('roundabout') || type === 'end of road') ? '' : (nextStepToDisplay.name || '');
-        }
-        
-        if (turnIconDisplayEl) {
-            const iconFilename = getManeuverIconFilename(maneuver);
-            if (iconFilename !== lastDisplayedManeuverIcon) {
-                turnIconDisplayEl.innerHTML = `<img src="https://boardinggate.github.io/Tesla/${iconFilename}" alt="${maneuverText}" style="width: 95%; height: 95%; object-fit: contain;">`;
-                lastDisplayedManeuverIcon = iconFilename;
-            }
-        }
-        
-        const newManeuverText = maneuverText ? `${maneuverText} ` : '';
-        if (maneuverTextEl.textContent !== newManeuverText) {
-            maneuverTextEl.textContent = newManeuverText;
-        }
-        if (streetEl.textContent !== streetNameText) {
-            streetEl.textContent = streetNameText;
-        }
-        
-        distanceToNextManeuverOSRM = distanceToNextManeuver;
-        const newDistanceText = distanceToNextManeuver < 1000 ? `${Math.round(distanceToNextManeuver / 5) * 5} m` : `${(distanceToNextManeuver / 1000).toFixed(1)} km`;
-        if (distanceFormattedEl.textContent !== newDistanceText) {
-            distanceFormattedEl.textContent = newDistanceText;
-        }
-
-        const progressPercent = (currentStepForProgress.distance > 0) ? ((currentStepForProgress.distance - distanceToNextManeuver) / currentStepForProgress.distance) * 100 : (distanceToNextManeuver === 0 ? 100 : 0);
-        const newWidthPercent = `${Math.min(100, Math.max(0, progressPercent))}%`;
-        if (progressBarEl && progressBarEl.style.width !== newWidthPercent) {
-            progressBarEl.style.width = newWidthPercent;
-        }
-
-        const isRelevantIntersectionManeuver = type !== 'continue' && type !== 'new name' && type !== 'depart' && type !== 'straight';
-        if (isNavigating && distanceToNextManeuver < 800 && distanceToNextManeuver >= 100 && isRelevantIntersectionManeuver && (!intersectionPreviewWindow || intersectionPreviewWindow.classList.contains('hidden') || intersectionPreviewWindow.dataset.source !== 'click') && (currentLegIndex + '_' + currentStepIndex) !== lastAutoShownManeuverId) {
-            showIntersectionPreviewMap(nextStepToDisplay, route, false, 10000);
-            lastAutoShownManeuverId = currentLegIndex + '_' + currentStepIndex;
-        } else if (intersectionPreviewWindow && !intersectionPreviewWindow.classList.contains('hidden') && intersectionPreviewWindow.dataset.source !== 'click' && (distanceToNextManeuver >= 800 || distanceToNextManeuver < 100 || !isRelevantIntersectionManeuver)) {
-            hideIntersectionPreviewMap();
-        }
-
-    } else {
-        // Lógica para cuando se ha llegado al destino o no hay más pasos.
-        if (turnIconDisplayEl) {
-            const iconFilename = 'PNG/arrive.png';
-            if (iconFilename !== lastDisplayedManeuverIcon) {
-                turnIconDisplayEl.innerHTML = `<img src="https://boardinggate.github.io/Tesla/${iconFilename}" style="width:95%; height:95%; object-fit:contain;">`;
-                lastDisplayedManeuverIcon = iconFilename;
-            }
-        }
-        if (maneuverTextEl.textContent !== '') maneuverTextEl.textContent = '';
-        if (streetEl.textContent !== 'Has llegado a tu destino') streetEl.textContent = 'Has llegado a tu destino';
-        if (distanceFormattedEl.textContent !== '0 m') distanceFormattedEl.textContent = '0 m';
-        if (progressBarEl && progressBarEl.style.width !== '100%') progressBarEl.style.width = '100%';
-        
-        distanceToNextManeuverOSRM = Infinity;
-        nextManeuverStepForPreview = null;
-        if (miniNavCard) miniNavCard.style.display = 'none';
-        if (intersectionPreviewWindow && !intersectionPreviewWindow.classList.contains('hidden') && intersectionPreviewWindow.dataset.source !== 'click') hideIntersectionPreviewMap();
-    }
-}
-    
+}   
     
 // ===================================================================
 // NOMBRE: deletePollMessage 
@@ -15669,44 +15841,7 @@ function createOtherButtons() {
                 });
             }
         }
-    }
-
-
-// ===================================================================
-// NOMBRE: adaptMapboxRouteToOSRMFormat 
-// RESUMEN: Convierte la respuesta de la API de Mapbox al formato de OSRM.
-function adaptMapboxRouteToOSRMFormat(mapboxRoute) {
-    const adaptedLegs = mapboxRoute.legs.map(leg => {
-        const adaptedSteps = leg.steps.map(step => {
-            return {
-                distance: step.distance,
-                duration: step.duration,
-                geometry: step.geometry,
-                maneuver: {
-                    bearing_after: step.maneuver.bearing_after,
-                    bearing_before: step.maneuver.bearing_before,
-                    location: step.maneuver.location,
-                    modifier: step.maneuver.modifier,
-                    type: step.maneuver.type,
-                },
-                name: step.name,
-            };
-        });
-        return {
-            distance: leg.distance,
-            duration: leg.duration,
-            steps: adaptedSteps,
-            summary: leg.summary,
-        };
-    });
-    return {
-        distance: mapboxRoute.distance,
-        duration: mapboxRoute.duration,
-        geometry: mapboxRoute.geometry,
-        legs: adaptedLegs,
-    };
-}
-    
+    }    
 
 // ===================================================================
 // NOMBRE: startEditMessage 
@@ -18553,103 +18688,6 @@ function stopAutomatedRouteSimulationInternal() {
     }
 }
    
-// ===================================================================
-// NOMBRE: fetchRouteData 
-// RESUMEN: Usa Mapbox por defecto. Si el checkbox "Rutas OSRM" está marcado, usa OSRM como primario.
-// ===================================================================
-async function fetchRouteData(coordsString, startHeading = null) {
-    const OSRM_PRIMARY_KEY = 'boardinggate_useOsrmAsPrimary';
-    const useOsrmAsPrimary = localStorage.getItem(OSRM_PRIMARY_KEY) === 'true';
-  
-    const osrmService = {
-        name: 'OSRM',
-        buildUrl: (coords) => {
-            return `${OSRM_SERVICE_URL}/driving/${coords}?overview=full&geometries=geojson&steps=true&alternatives=false&annotations=true`;
-        },
-        processResponse: async (response) => {
-            if (!response.ok) {
-                let errorData = { message: `OSRM HTTP error ${response.status}` };
-                try { errorData = await response.json(); } catch (e) {}
-                throw new Error(errorData.code || errorData.message || response.statusText);
-            }
-            const data = await response.json();
-            if (data.code !== 'Ok' || !data.routes || data.routes.length === 0) {
-                throw new Error(data.message || "No se encontraron rutas en OSRM.");
-            }
-            return { routeData: data, serviceUsed: 'OSRM' };
-        }
-    };
-
-    const mapboxService = {
-        name: 'Mapbox',
-        buildUrl: (coords) => {
-            return `https://api.mapbox.com/directions/v5/mapbox/driving/${coords}?alternatives=false&geometries=geojson&overview=full&steps=true&access_token=${window.APP_CONFIG.keys.mapbox}`;
-        },
-        processResponse: async (response) => {
-            if (!response.ok) {
-                let errorData = { message: `Mapbox HTTP error ${response.status}` };
-                try { errorData = await response.json(); } catch (e) {}
-                throw new Error(errorData.message || response.statusText);
-            }
-            const data = await response.json();
-            if (data.code !== 'Ok' || !data.routes || data.routes.length === 0) {
-                throw new Error(data.message || "No se encontraron rutas en Mapbox.");
-            }
-            const adaptedRoute = adaptMapboxRouteToOSRMFormat(data.routes[0]);
-            const adaptedWaypoints = data.waypoints.map(wp => ({
-                distance: wp.distance,
-                hint: wp.hint,
-                location: wp.location,
-                name: wp.name,
-            }));
-            const finalData = {
-                code: 'Ok',
-                routes: [adaptedRoute],
-                waypoints: adaptedWaypoints
-            };
-            return { routeData: finalData, serviceUsed: 'Mapbox' };
-        }
-    };
-
-    const buildUrlWithCorrectBearings = (service, coords) => {
-        let baseUrl = service.buildUrl(coords).split('?')[0];
-        let params = new URLSearchParams(service.buildUrl(coords).split('?')[1] || '');
-
-        if (startHeading !== null && !isNaN(startHeading)) {
-            const waypointCount = (coords.match(/;/g) || []).length + 1;
-            let bearingsString = `${Math.round(startHeading)},45`;
-            if (waypointCount > 1) {
-                bearingsString += ';'.repeat(waypointCount - 1);
-            }
-            params.set('bearings', bearingsString);
-        } else {
-            params.delete('bearings'); 
-        }
-        
-        return `${baseUrl}?${params.toString()}`;
-    };
-
-    const primaryService = useOsrmAsPrimary ? osrmService : mapboxService;
-    const fallbackService = useOsrmAsPrimary ? mapboxService : osrmService;
-
-    try {
-        const primaryUrl = buildUrlWithCorrectBearings(primaryService, coordsString);
-        const primaryResponse = await fetch(primaryUrl);
-        return await primaryService.processResponse(primaryResponse);
-    } catch (primaryError) {
-        showToast(`Servicio principal (${primaryService.name}) falló. Intentando con respaldo (${fallbackService.name})...`, "warning", 4000);
-        
-        try {
-            const fallbackUrl = buildUrlWithCorrectBearings(fallbackService, coordsString);
-            const fallbackResponse = await fetch(fallbackUrl);
-            const fallbackData = await fallbackService.processResponse(fallbackResponse);
-            fallbackData.serviceUsed += ' (Respaldo)';
-            return fallbackData;
-        } catch (fallbackError) {
-            return { error: fallbackError, failedServices: `${primaryService.name} (Fallo), ${fallbackService.name} (Fallo)` };
-        }
-    }
-}    
     
 // ===================================================================
 // NOMBRE: handleSimulateGpsPositionClick 
@@ -18717,119 +18755,141 @@ function setNavigationMapClickHandler() {
         if(canvas) canvas.style.cursor = 'crosshair';
     }
 } 
+
 // ===================================================================
-// NOMBRE: showSimulationSpeedModal 
-// RESUMEN: Muestra un modal para que el usuario introduzca la velocidad de simulación y elija el modo, incluyendo ahora una nota sobre cómo simular desvíos.
-function showSimulationSpeedModal(defaultSpeed, callback) {
-    closeOtherModals('simulation-speed-modal');
-    let modal = document.getElementById('simulation-speed-modal');
-    if (modal) modal.remove();
-    modal = document.createElement('div');
-    modal.id = 'simulation-speed-modal';
+// NOMBRE: showSimulationModal (VERSIÓN CORREGIDA CON INDICACIONES COMPLETAS)
+// RESUMEN: Muestra un modal con la lista de maniobras, usando la misma lógica
+async function showSimulationModal() {
+    const canSimulate = (navigationWaypoints.filter(wp => !wp.isInternal && !wp.isRecalculatedStart).length >= 2 && navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0]) ||
+                    (isNavigating && navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0]);
+    if (!canSimulate) {
+        showToast("Se necesitan al menos 2 puntos y una ruta calculada para mostrar las maniobras.", "warning");
+        return;
+    }
+    const route = navigationCurrentRouteData.routes[0];
+    if (!route || !route.legs || route.legs.length === 0) {
+        showToast("Datos de ruta incompletos para mostrar maniobras.", "error");
+        return;
+    }
+    closeOtherModals('simulation-modal');
+    
+    let modal = document.getElementById('simulation-modal');
+    if (!modal) {
+        modal = document.createElement('div');
+        modal.id = 'simulation-modal';
+        document.body.appendChild(modal);
+    }
     modal.innerHTML = `
-        <h2>Velocidad y Modo de Simulación</h2>
-        <div class="filter-group" style="margin-bottom: 20px;">
-            <label id="speed-range-label">Velocidad: ${defaultSpeed} km/h</label>
-            <div class="slider-container single-slider-container" style="height: 25px;">
-                <div class="slider-track"></div>
-                <div class="slider-range" id="speed-slider-range"></div>
-                <div class="slider-thumb" id="speed-thumb" style="left: 0%;"></div>
-            </div>
+        <h2 style="font-size: 1.3rem; font-weight: bold; text-align: center; margin-bottom: 1rem; color: white;">Maniobras de la Ruta</h2>
+        <div class="modal-top-buttons" style="justify-content: flex-start; margin-bottom: 1rem;">
+            <button id="close-simulation-modal" style="flex: 0 0 auto; width: auto; min-width: unset;">Salir <span class="button-countdown-timer unified-countdown-style"></span></button>
         </div>
-        <div class="modal-top-buttons" style="flex-direction: column; gap: 10px;">
-            <button id="confirm-navigation-simulation" style="background-color: #28a745; color: white;">Simular Navegación Normal <span class="button-countdown-timer unified-countdown-style"></span></button>
-            <button id="confirm-freedrive-simulation" style="background-color: #34D399; color: #111827; font-weight: bold;">Recorrer en Modo Free Drive</button>
-            <button id="cancel-simulation-speed" style="background-color: #6c757d; color: white;">Cancelar</button>
-        </div>
-        <!-- AÑADIDO: Párrafo de ayuda para simular desvíos -->
-        <p style="font-size: 0.85rem; color: #444; margin-top: 1.5rem; text-align: left; font-style: italic; border-top: 1px solid #ccc; padding-top: 10px;">
-            (*) Para simular DESVIOS, carga una ruta, luego pulsa simulación y cuando quieras pincha en el mapa para probar un desvio desde ese punto</p>
+        <div id="simulation-content-area"><p>Cargando maniobras...</p></div>
+        <p style="font-size: 0.8rem; color: #8e8e93; text-align: center; margin-top: 1rem; font-style: italic;">Si quiere ver la maniobra pulse encima de una</p>
     `;
-    document.body.appendChild(modal);
+    modal.classList.remove('hidden');
 
-    const speedSliderContainer = modal.querySelector('#speed-thumb').parentElement;
-    const speedThumb = modal.querySelector('#speed-thumb');
-    const speedRange = modal.querySelector('#speed-slider-range');
-    const speedLabel = modal.querySelector('#speed-range-label');
-    const minSpeed = 1;
-    const maxSpeed = 5000;
-    let currentSpeed = defaultSpeed || 90;
-
-    const updateSpeedVisuals = () => {
-        const minLog = Math.log(minSpeed);
-        const maxLog = Math.log(maxSpeed);
-        const percent = (Math.log(currentSpeed) - minLog) / (maxLog - minLog);
-        
-        speedThumb.style.left = `${percent * 100}%`;
-        speedRange.style.width = `${percent * 100}%`;
-        speedLabel.textContent = `Velocidad: ${Math.round(currentSpeed)} km/h`;
+    const closeButton = modal.querySelector('#close-simulation-modal');
+    const closeSimulationModalHandler = () => {
+        if (simulationModalTimer) clearTimeout(simulationModalTimer);
+        clearModalAutoCloseTimer(modal, closeButton, 'simulation-modal');
+        modal.classList.add('hidden');
+        hideIntersectionPreviewMap();
     };
+    closeButton.addEventListener('click', closeSimulationModalHandler);
+    addModalAutoCloseTimer(modal, closeButton, 'simulation-modal', 50000);
 
-    const onSpeedDrag = (e) => {
-        const rect = speedSliderContainer.getBoundingClientRect();
-        const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-        let percent = (clientX - rect.left) / rect.width;
-        percent = Math.max(0, Math.min(1, percent));
-        
-        const minLog = Math.log(minSpeed);
-        const maxLog = Math.log(maxSpeed);
-        currentSpeed = Math.exp(minLog + percent * (maxLog - minLog));
-        
-        updateSpeedVisuals();
-    };
-
-    const startSpeedDrag = (e) => {
-        const moveHandler = (moveEvent) => onSpeedDrag(moveEvent);
-        const endDrag = () => {
-            document.removeEventListener('mousemove', moveHandler);
-            document.removeEventListener('mouseup', endDrag);
-            document.removeEventListener('touchmove', moveHandler);
-            document.removeEventListener('touchend', endDrag);
-        };
-        document.addEventListener('mousemove', moveHandler);
-        document.addEventListener('mouseup', endDrag);
-        document.addEventListener('touchmove', moveHandler);
-        document.addEventListener('touchend', endDrag);
-    };
+    const carDist = lastCarDistanceAlongRouteForNavLogic;
+    let simulationList = document.createElement('ul');
+    let stepsShown = 0;
+    let actualStageCounter = 1;
     
-    speedThumb.addEventListener('mousedown', startSpeedDrag);
-    speedThumb.addEventListener('touchstart', startSpeedDrag);
-    updateSpeedVisuals();
+    const waypointsForRequest = navigationWaypoints.filter(wp => wp);
     
-    const confirmNavBtn = modal.querySelector('#confirm-navigation-simulation');
-    const confirmFreeDriveBtn = modal.querySelector('#confirm-freedrive-simulation');
-    const cancelBtn = modal.querySelector('#cancel-simulation-speed');
+    for (let legIdx = 0; legIdx < route.legs.length; legIdx++) {
+        const leg = route.legs[legIdx];
+        if (!leg || !leg.steps) continue;
+        
+        const legDestinationWaypoint = waypointsForRequest[legIdx + 1];
+        if (legDestinationWaypoint && !legDestinationWaypoint.isInternal) {
+             const stageAddress = legDestinationWaypoint.address || `Etapa ${legDestinationWaypoint.label}`;
+             const stageDistance = leg.distance ? (leg.distance / 1000).toFixed(1) + " km" : "Dist. desc.";
+             const headerLi = document.createElement('li');
+             headerLi.style.cssText = "background-color: #3a3a3c; font-weight: bold; padding: 5px; margin-top:5px; color: #007aff;";
+             headerLi.textContent = `ETAPA ${actualStageCounter}: ${stageAddress} (Total ${stageDistance})`;
+             simulationList.appendChild(headerLi);
+             actualStageCounter++;
+        }
+        
+        for (let stepIdx = 0; stepIdx < leg.steps.length; stepIdx++) {
+            const step = leg.steps[stepIdx];
+            if (!step || !step.maneuver) continue;
+
+            const isArrivalAtInternal = step.maneuver.type === 'arrive' && waypointsForRequest[legIdx + 1]?.isInternal;
+            const isDepartureFromInternal = step.maneuver.type === 'depart' && stepIdx === 0 && legIdx > 0 && waypointsForRequest[legIdx]?.isInternal;
+            if (isArrivalAtInternal || isDepartureFromInternal) continue;
+            
+            const distanceToEndOfThisStep = calculateDistanceToEndOfStep(route, legIdx, stepIdx);
+            if (distanceToEndOfThisStep < carDist) continue;
+            const distanceToThisStepManeuver = Math.max(0, distanceToEndOfThisStep - carDist);
+            
+            const maneuver = step.maneuver;
+            const type = maneuver.type || '';
+            
+            let maneuverText, streetNameText;
+
+            maneuverText = maneuver.instruction || getManeuverInstructionText(maneuver);
+
+            const banner = step.bannerInstructions;
+            if (banner && banner.length > 0 && banner[0].primary) {
+                let bannerPrimaryText = banner[0].primary.text;
+                let bannerSecondaryText = banner[0].secondary ? banner[0].secondary.text : '';
+                let fullBannerText = bannerPrimaryText + (bannerSecondaryText ? `: ${bannerSecondaryText}` : '');
+                
+                streetNameText = ` <strong style="color: #FFD700; font-size: 0.95em;">${fullBannerText}</strong>`;
+            } else {
+                streetNameText = (type === 'depart' || type.includes('roundabout') || type === 'end of road') ? '' : (step.name || '');
+                if (streetNameText) {
+                    streetNameText = ` <strong>${streetNameText}</strong>`;
+                }
+            }
+        
+            let distanceFormatted = (distanceToThisStepManeuver >= 1000) ? `${(distanceToThisStepManeuver / 1000).toFixed(1)} km` : `${Math.round(distanceToThisStepManeuver)} m`;
+            
+            const li = document.createElement('li');
+            li.dataset.legIndex = legIdx;
+            li.dataset.stepIndex = stepIdx;
+            li.style.cursor = 'pointer';
+            
+            const iconContainer = document.createElement('span');
+            iconContainer.className = 'turn-icon-sim';
+            
+            const textContainer = document.createElement('span');
+            textContainer.innerHTML = `${maneuverText}${streetNameText} (${distanceFormatted})`;
+            
+            li.appendChild(iconContainer);
+            li.appendChild(textContainer);
+            simulationList.appendChild(li);
+
+            const iconFilename = getManeuverIconFilename(maneuver);
+            const iconUrl = `https://boardinggate.github.io/Tesla/${iconFilename}`;
+            iconContainer.innerHTML = `<img src="${iconUrl}" alt="Maniobra" style="width:24px; height:24px; object-fit:contain;">`;
+            
+            stepsShown++;
+        }
+    }
     
-    const closeHandler = () => {
-        clearModalAutoCloseTimer(modal, confirmNavBtn, 'simulation-speed-modal');
-        if (modal.parentNode) modal.remove();
-    };
-
-    confirmNavBtn.addEventListener('click', () => {
-        isSimulatingFreeDrive = false; 
-        callback(Math.round(currentSpeed));
-        closeHandler();
-    });
-
-    confirmFreeDriveBtn.addEventListener('click', () => {
-        isSimulatingFreeDrive = true; 
-        callback(Math.round(currentSpeed));
-        closeHandler();
-    });
-
-    cancelBtn.addEventListener('click', () => {
-        showToast("Inicio de simulación cancelado", "info");
-        const simulateGpsButton = document.getElementById('toggle-simulate-gps-button');
-        if (simulateGpsButton) simulateGpsButton.classList.remove('active-simulate-gps-mode');
-        isSimulatingGpsLocation = false;
-        reactivateRealGpsAfterSimulation();
-        setNavigationMapClickHandler();
-        closeHandler();
-    });
-
-    addModalAutoCloseTimer(modal, confirmNavBtn, 'simulation-speed-modal', 30000);
-}    
-
+    const contentArea = modal.querySelector('#simulation-content-area');
+    if (stepsShown > 0) {
+        contentArea.innerHTML = '';
+        contentArea.appendChild(simulationList);
+        contentArea.removeEventListener('click', handleSimulationItemClick);
+        contentArea.addEventListener('click', handleSimulationItemClick);
+    } else {
+        contentArea.innerHTML = "<p>No hay más interacciones futuras en la ruta o estás muy cerca del final.</p>";
+    }
+}
+    
 // ===================================================================
 // NOMBRE: showHelpModal
 // RESUMEN: Muestra el modal de ayuda con ejemplos de uso para crear recordatorios.
@@ -20410,129 +20470,6 @@ async function importRadars() {
     }
 }
 
-// ===================================================================
-// NOMBRE: showSimulationModal 
-// RESUMEN: Muestra un modal con la lista de maniobras de la ruta actual. No inicia ninguna simulación.
-async function showSimulationModal() {
-    const canSimulate = (navigationWaypoints.filter(wp => !wp.isInternal && !wp.isRecalculatedStart).length >= 2 && navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0]) ||
-                    (isNavigating && navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0]);
-    if (!canSimulate) {
-        showToast("Se necesitan al menos 2 puntos y una ruta calculada para mostrar las maniobras.", "warning");
-        return;
-    }
-    const route = navigationCurrentRouteData.routes[0];
-    if (!route || !route.legs || route.legs.length === 0) {
-        showToast("Datos de ruta incompletos para mostrar maniobras.", "error");
-        return;
-    }
-    closeOtherModals('simulation-modal');
-    
-    let modal = document.getElementById('simulation-modal');
-    if (!modal) {
-        modal = document.createElement('div');
-        modal.id = 'simulation-modal';
-        document.body.appendChild(modal);
-    }
-    modal.innerHTML = `
-        <h2 style="font-size: 1.3rem; font-weight: bold; text-align: center; margin-bottom: 1rem; color: white;">Maniobras de la Ruta</h2>
-        <div class="modal-top-buttons" style="justify-content: flex-start; margin-bottom: 1rem;">
-            <button id="close-simulation-modal" style="flex: 0 0 auto; width: auto; min-width: unset;">Salir <span class="button-countdown-timer unified-countdown-style"></span></button>
-        </div>
-        <div id="simulation-content-area"><p>Cargando maniobras...</p></div>
-        <p style="font-size: 0.8rem; color: #8e8e93; text-align: center; margin-top: 1rem; font-style: italic;">Si quiere ver la maniobra pulse encima de una</p>
-    `;
-    modal.classList.remove('hidden');
-
-    const closeButton = modal.querySelector('#close-simulation-modal');
-    const closeSimulationModalHandler = () => {
-        if (simulationModalTimer) clearTimeout(simulationModalTimer);
-        clearModalAutoCloseTimer(modal, closeButton, 'simulation-modal');
-        modal.classList.add('hidden');
-        hideIntersectionPreviewMap();
-    };
-    closeButton.addEventListener('click', closeSimulationModalHandler);
-    addModalAutoCloseTimer(modal, closeButton, 'simulation-modal', 50000);
-
-    const carDist = lastCarDistanceAlongRouteForNavLogic;
-    let simulationList = document.createElement('ul');
-    let stepsShown = 0;
-    let actualStageCounter = 1;
-    
-    const waypointsForRequest = navigationWaypoints.filter(wp => wp);
-    
-    for (let legIdx = 0; legIdx < route.legs.length; legIdx++) {
-        const leg = route.legs[legIdx];
-        if (!leg || !leg.steps) continue;
-        
-        const legDestinationWaypoint = waypointsForRequest[legIdx + 1];
-        if (legDestinationWaypoint && !legDestinationWaypoint.isInternal) {
-             const stageAddress = legDestinationWaypoint.address || `Etapa ${legDestinationWaypoint.label}`;
-             const stageDistance = leg.distance ? (leg.distance / 1000).toFixed(1) + " km" : "Dist. desc.";
-             const headerLi = document.createElement('li');
-             headerLi.style.cssText = "background-color: #3a3a3c; font-weight: bold; padding: 5px; margin-top:5px; color: #007aff;";
-             headerLi.textContent = `ETAPA ${actualStageCounter}: ${stageAddress} (Total ${stageDistance})`;
-             simulationList.appendChild(headerLi);
-             actualStageCounter++;
-        }
-        
-        for (let stepIdx = 0; stepIdx < leg.steps.length; stepIdx++) {
-            const step = leg.steps[stepIdx];
-            if (!step || !step.maneuver) continue;
-
-            const isArrivalAtInternal = step.maneuver.type === 'arrive' && waypointsForRequest[legIdx + 1]?.isInternal;
-            const isDepartureFromInternal = step.maneuver.type === 'depart' && stepIdx === 0 && legIdx > 0 && waypointsForRequest[legIdx]?.isInternal;
-            if (isArrivalAtInternal || isDepartureFromInternal) continue;
-            
-            const distanceToEndOfThisStep = calculateDistanceToEndOfStep(route, legIdx, stepIdx);
-            if (distanceToEndOfThisStep < carDist) continue;
-            const distanceToThisStepManeuver = Math.max(0, distanceToEndOfThisStep - carDist);
-            
-            const maneuver = step.maneuver;
-            const type = maneuver.type || '';
-            
-            const maneuverText = getManeuverInstructionText(maneuver);
-            let streetNameText = step.name || '';
-            if (type === 'arrive' || type === 'depart' || type === 'end of road' || type === 'roundabout' || type === 'rotary') {
-                streetNameText = '';
-            } else if (streetNameText.toLowerCase() === 'continúa' && maneuverText.toLowerCase() !== 'continúa') {
-                streetNameText = '';
-            }
-            
-            let distanceFormatted = (distanceToThisStepManeuver >= 1000) ? `${(distanceToThisStepManeuver / 1000).toFixed(1)} km` : `${Math.round(distanceToThisStepManeuver)} m`;
-            
-            const li = document.createElement('li');
-            li.dataset.legIndex = legIdx;
-            li.dataset.stepIndex = stepIdx;
-            li.style.cursor = 'pointer';
-            
-            const iconContainer = document.createElement('span');
-            iconContainer.className = 'turn-icon-sim';
-            
-            const textContainer = document.createElement('span');
-            textContainer.innerHTML = `${maneuverText}${streetNameText ? ` <strong>${streetNameText}</strong>` : ''} (${distanceFormatted})`;
-            
-            li.appendChild(iconContainer);
-            li.appendChild(textContainer);
-            simulationList.appendChild(li);
-
-            const iconFilename = getManeuverIconFilename(maneuver);
-            const iconUrl = `https://boardinggate.github.io/Tesla/${iconFilename}`;
-            iconContainer.innerHTML = `<img src="${iconUrl}" alt="Maniobra" style="width:24px; height:24px; object-fit:contain;">`;
-            
-            stepsShown++;
-        }
-    }
-    
-    const contentArea = modal.querySelector('#simulation-content-area');
-    if (stepsShown > 0) {
-        contentArea.innerHTML = '';
-        contentArea.appendChild(simulationList);
-        contentArea.removeEventListener('click', handleSimulationItemClick);
-        contentArea.addEventListener('click', handleSimulationItemClick);
-    } else {
-        contentArea.innerHTML = "<p>No hay más interacciones futuras en la ruta o estás muy cerca del final.</p>";
-    }
-}
 // ===================================================================
 // NOMBRE: handleSimulationItemClick 
 // RESUMEN: Maneja el clic en un elemento de la lista de maniobras para mostrar el detalle del mapa.
