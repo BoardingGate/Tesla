@@ -1,4 +1,4 @@
-v05
+v06
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -4154,6 +4154,120 @@ async function toggleRadaresRuta(activo) {
     plotRemindersOnNavigationMap(); 
 }   
 
+// EN TESLAB (25).html
+
+// ===================================================================
+// NOMBRE: toggleRadaresRuta (VERSIÓN CON LÓGICA DE CAMBIO DE MODO)
+// RESUMEN: Gestiona la transición entre radares de ruta y radares dinámicos ("burbuja").
+// ===================================================================
+async function toggleRadaresRuta(activo) {
+    localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(activo));
+    markCacheAsDirty();
+
+    radaresEnRutaActual = []; // Siempre limpiamos el array de radares en ruta.
+
+    if (activo) {
+        // --- CASO 1: EL USUARIO ACTIVA "Radares Ruta" ---
+        console.log("[Radar Logic] 'Radares Ruta' ACTIVADO. Limpiando dinámicos y cargando los del trazado.");
+        
+        // a) Limpiamos los radares dinámicos de "burbuja" que pudieran existir.
+        let reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
+        const originalLength = reminders.length;
+        reminders = reminders.filter(r => !r.isDynamicRadar);
+        if (reminders.length < originalLength) {
+            localStorage.setItem('reminders', JSON.stringify(reminders));
+            isCacheDirty = true; // Forzamos reconstrucción de la caché interna.
+        }
+
+        // b) Procedemos a buscar y cargar SOLO los radares sobre el trazado de la ruta.
+        const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
+        if (actualWaypoints.length < 2) {
+            actualizarYOrdenarEventosEnRuta();
+            plotRemindersOnNavigationMap(); 
+            return;
+        }
+        
+        if (navigationMapInstance && navigationMapInstance.getSource('route') && navigationMapInstance.getSource('route')._data) {
+            try {
+                if (!window.radarsCache) await initializeRadarCache();
+                if (!window.radarsCache) throw new Error("Base de datos de radares no disponible.");
+
+                const routeLineString = turf.lineString(navigationMapInstance.getSource('route')._data.geometry.coordinates);
+                
+                processedRemindersCache.forEach(reminder => {
+                    const isRadarType = (reminder.text.toUpperCase().includes("RADAR") || reminder.excludeFromList);
+                    if (isRadarType && reminder.isLocationEnabled && reminder.locationCoordinates) {
+                        const radarPoint = turf.point([reminder.locationCoordinates.longitude, reminder.locationCoordinates.latitude]);
+                        const nearestPointOnRoute = turf.nearestPointOnLine(routeLineString, radarPoint, { units: 'meters' });
+
+                        if (nearestPointOnRoute.properties.dist <= RUTA_RADAR_PROXIMITY_THRESHOLD) {
+                            radaresEnRutaActual.push({
+                                ...reminder, isFromRuta: true, distanceOnRoute: nearestPointOnRoute.properties.location
+                            });
+                        }
+                    }
+                });
+
+                const intersectingCells = new Set();
+                const routeCoords = routeLineString.geometry.coordinates;
+                for (let i = 0; i < routeCoords.length; i++) {
+                    intersectingCells.add(getGridCellId(routeCoords[i][1], routeCoords[i][0]));
+                }
+                const cellsToSearch = new Set(intersectingCells);
+                intersectingCells.forEach(cellId => {
+                    const [_, latIdx, lonIdx] = cellId.split('_').map(Number);
+                    for (let i = -1; i <= 1; i++) { for (let j = -1; j <= 1; j++) { cellsToSearch.add(`cell_${latIdx + i}_${lonIdx + j}`); } }
+                });
+
+                const candidateRadars = [];
+                cellsToSearch.forEach(cellId => { if (window.radarsSpatialIndex[cellId]) candidateRadars.push(...window.radarsSpatialIndex[cellId]); });
+                const uniqueCandidates = [...new Set(candidateRadars)];
+
+                const savedRadius = parseInt(localStorage.getItem('boardinggate_dynamicRadarRadius'), 10);
+                const radiusToUse = (savedRadius && savedRadius > 0) ? savedRadius : 400;
+                
+                uniqueCandidates.forEach(radar => {
+                    const radarPoint = turf.point([radar.lon, radar.lat]);
+                    const nearestPointOnRoute = turf.nearestPointOnLine(routeLineString, radarPoint, { units: 'meters' });
+
+                    if (nearestPointOnRoute.properties.dist <= RUTA_RADAR_PROXIMITY_THRESHOLD) {
+                        const radarYaExiste = radaresEnRutaActual.some(rem => 
+                            rem.locationCoordinates &&
+                            Math.abs(rem.locationCoordinates.latitude - radar.lat) < COORD_EPSILON &&
+                            Math.abs(rem.locationCoordinates.longitude - radar.lon) < COORD_EPSILON
+                        );
+                        if (!radarYaExiste) {
+                            const now = new Date();
+                            const radarData = {
+                                id: Date.now() + Math.random() + radaresEnRutaActual.length,
+                                text: `<b>RADAR RUTA: ${radar.name}</b>`, type: 'simple', time: '00:01',
+                                date: `${now.getFullYear()}-${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}`,
+                                createdAt: now.toISOString(), managedByUser: false, isLocationEnabled: true,
+                                locationCoordinates: { latitude: radar.lat, longitude: radar.lon },
+                                radiusMeters: radiusToUse, excludeFromList: true, isFromRuta: true,
+                                distanceOnRoute: nearestPointOnRoute.properties.location
+                            };
+                            radaresEnRutaActual.push(radarData);
+                        }
+                    }
+                });
+            } catch (error) {
+                showToast(`Error al procesar radares en ruta: ${error.message}`, "error");
+            }
+        }
+    } else {
+        // --- CASO 2: EL USUARIO DESACTIVA "Radares Ruta" ---
+        console.log("[Radar Logic] 'Radares Ruta' DESACTIVADO. Reactivando radares dinámicos de proximidad.");
+        
+        // a) Llamamos inmediatamente a la función que crea la "burbuja" de radares dinámicos.
+        await updateDynamicRadars(true); // El 'true' evita que se muestre la tostada de "cargando..."
+    }
+    
+    // Al final, actualizamos la UI con lo que corresponda (radares en ruta o la nueva burbuja).
+    actualizarYOrdenarEventosEnRuta();
+    plotRemindersOnNavigationMap(); 
+}   
+    
 // ===================================================================
 // NOMBRE: toggleTareasRuta 
 // ===================================================================
