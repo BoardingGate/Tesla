@@ -1,4 +1,4 @@
-v07
+v04
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -4238,9 +4238,13 @@ function actualizarYOrdenarEventosEnRuta() {
     
 }    
 
-
 // ===================================================================
-// NOMBRE: checkReminders // RESUMEN: Lógica central para verificar recordatorios y radares.
+// NOMBRE: checkReminders (VERSIÓN FINAL Y DEFINITIVA)
+// RESUMEN: Lógica central para verificar recordatorios y radares.
+//          - Si se está navegando y "Radares Ruta" está activo: `checkReminders` ignora
+//            los radares. Su gestión se delega a `processRouteProgress` (que filtra por 10m).
+//          - En cualquier otro caso (no navegando, o navegando con "Radares Ruta" inactivo):
+//            `checkReminders` procesa los radares por su radio de acción individual.
 // ===================================================================
 async function checkReminders() {
     if (reminderCheckIntervalId) {
@@ -4259,49 +4263,73 @@ async function checkReminders() {
     const overdueReminders = [];
     let coords = navigationCurrentLocation;
     if (!coords && processedRemindersCache.some(r => r.isLocationEnabled)) {
+        // Solo intentar obtener la ubicación si hay recordatorios con ubicación y aún no tenemos coords.
         coords = await getCurrentLocationAsync().catch(() => null);
     }
 
     const DYNAMIC_RADAR_REFRESH_INTERVAL = 30 * 60 * 1000; // 30 minutos
 
+    // Actualiza radares dinámicos si no estamos navegando y ha pasado suficiente tiempo
     if (!isNavigating && coords && (now - lastDynamicRadarCheck > DYNAMIC_RADAR_REFRESH_INTERVAL)) {
         updateDynamicRadars(false); 
     }
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               
     let isNearActiveLocationPoint = false;
     let hasPendingOverdueEvents = false;
+    // `culpritFound` ya no es necesario aquí con la lógica revisada
 
+    // Obtener el estado actual del checkbox "Radares Ruta"
     const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
     const isRadaresRutaFeatureActive = radaresRutaCheckbox && radaresRutaCheckbox.checked;
 
     processedRemindersCache.forEach(reminder => {
-        if (reminder.managedByUser) return;
+        if (reminder.managedByUser) return; // Si el usuario ya ha gestionado este recordatorio, lo ignoramos
 
         const timeConditionMet = reminder.dueTimeUTC && reminder.dueTimeUTC <= now;
+        // const isTimeOnlyEvent = !reminder.isLocationEnabled; // No usado directamente en esta lógica refinada
+
+        // Identifica si este recordatorio es de tipo radar
+        // (basado en el texto "RADAR" o en el flag `excludeFromList`, que se usa para radares importados/dinámicos)
         const isRadarType = reminder.text.toUpperCase().includes("RADAR") || reminder.excludeFromList === true;
 
+        // --- LÓGICA PRINCIPAL PARA NOTIFICACIONES DE RADAR (REFINADA Y FINAL) ---
         if (isRadarType) {
+            // Si estamos NAVEGANDO y la función "Radares Ruta" está ACTIVA:
+            // checkReminders IGNORA este radar. Su notificación se delega COMPLETAMENTE a `processRouteProgress`.
+            // Esto asegura que solo los radares que cumplen el filtro de 10m al trazado se notifiquen en este modo.
             if (isNavigating && isRadaresRutaFeatureActive) {
                 return; 
             }
+            // En CUALQUIER OTRO CASO para un radar (no navegando, o navegando con "Radares Ruta" desactivado):
+            // `checkReminders` CONTINÚA PROCESANDO este radar normalmente, basándose en su radio de acción individual.
+            // Esto permite que los radares generales/dinámicos se notifiquen por proximidad individual
+            // si el checkbox de ruta está desactivado (o si no estamos navegando).
         }
-        
+        // --- FIN DE LA LÓGICA PRINCIPAL PARA RADAR REFINADA ---
+
+
+        // Si el recordatorio no es de tipo radar (o es un radar que no fue ignorado por la lógica de arriba),
+        // procedemos con la comprobación de su ubicación y tiempo.
+
         let locationConditionMet = false;
         if (reminder.isLocationEnabled && reminder.locationCoordinates && coords) {
             const distance = calculateDistance(coords.latitude, coords.longitude, reminder.locationCoordinates.latitude, reminder.locationCoordinates.longitude);
             if (distance <= (reminder.radiusMeters || DEFAULT_LOCATION_RADIUS)) {
                 locationConditionMet = true;
+                // Si es un evento de ubicación y ya es hora, lo marcamos para que el intervalo se ajuste.
                 if (timeConditionMet) { isNearActiveLocationPoint = true; }
             }
         }
         
         let shouldNotifyNow = false;
         if (reminder.isLocationEnabled) {
+            // Si la ubicación está activada, notificar si se cumplen las condiciones de tiempo y ubicación
             if (timeConditionMet && locationConditionMet) shouldNotifyNow = true;
         } else {
+            // Si la ubicación NO está activada (recordatorio solo por tiempo), notificar si se cumple la condición de tiempo
             if (timeConditionMet) {
                 shouldNotifyNow = true;
-                hasPendingOverdueEvents = true;
+                hasPendingOverdueEvents = true; // Para ajustar el intervalo
             }
         }
 
@@ -4310,27 +4338,31 @@ async function checkReminders() {
         }
     });
     
+    // Mostrar u ocultar la ventana unificada de recordatorios
     if (overdueReminders.length > 0) {
         displayUnifiedReminderWindow(overdueReminders);
     } else if (isUnifiedWindowVisibleByLogic) {
         hideUnifiedReminderWindow();
     }
     
+    // Lógica para ajustar el intervalo del próximo chequeo de recordatorios
     let newInterval;
     let reason = "";
     
     if (isNavigating) {
-        newInterval = 20000;
+        newInterval = 20000; // Chequear cada 20 segundos si estamos navegando
         reason = "Navegación activa";
     } else if (hasPendingOverdueEvents) {
-        newInterval = 1500;
+        newInterval = 1500; // Chequear más frecuentemente si hay eventos de tiempo vencidos
         reason = "MODO ALERTA (hay eventos DE TIEMPO vencidos)";
     } else if (isNearActiveLocationPoint) {
-        newInterval = 1500;
+        newInterval = 1500; // Chequear más frecuentemente si estamos cerca de un punto de ubicación activo
         reason = "MODO PROXIMIDAD (cerca de un punto ACTIVO)";
     } else {
+        // En modo "eficiente", recalcular el próximo "horizonte de eventos"
         recalculateNextEventHorizon();
         const timeToWake = nextEventHorizon.timestamp - now;
+        // El intervalo mínimo es 3 segundos, máximo 30 segundos, o la mitad del tiempo hasta el próximo evento
         newInterval = timeToWake <= 0 ? 3000 : Math.max(3000, Math.min(30000, timeToWake / 2));
         reason = `MODO EFICIENTE (próximo despertar en ${Math.round(timeToWake/1000)}s)`;
     }
@@ -4338,8 +4370,10 @@ async function checkReminders() {
     const secondsToNextCheck = newInterval / 1000;
     console.log(`%c[INTERVALO] Próximo chequeo en ${secondsToNextCheck} segundos. Razón: ${reason}.`, 'color: #BA55D3;');
     
+    // Establecer el nuevo intervalo para el próximo chequeo
     reminderCheckIntervalId = setInterval(checkReminders, newInterval);
 }
+
     
 // ===================================================================
 // NOMBRE: recalculateNextEventHorizon 
@@ -6080,7 +6114,11 @@ function precalculateRouteStepDistances(routeData) {
             });
         }
         route.totalPrecalculatedDistance = cumulativeDistance;
-        window.optimizationHasFailed = false; //outeData && routeData.routes && routeData.routes[0]) {
+        window.optimizationHasFailed = false; // Marcamos como exitoso
+    
+    } catch (error) {
+        console.error("[PRE-CALC] Error durante el pre-cálculo de distancias:", error);
+        if(routeData && routeData.routes && routeData.routes[0]) {
             delete routeData.routes[0].totalPrecalculatedDistance;
         }
         window.optimizationHasFailed = true;
@@ -6143,14 +6181,6 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
             
             await drawRouteOnMap(newRemainingRoute);
             
-            let reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
-            const originalLength = reminders.length;
-            reminders = reminders.filter(r => !r.isDynamicRadar);
-            if (reminders.length < originalLength) {
-                localStorage.setItem('reminders', JSON.stringify(reminders));
-                markCacheAsDirty(); 
-            }
-            
             if (preserveAccumulatedStats) {
                 accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
             } else {
@@ -6212,7 +6242,7 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
         }
         attempt++; 
     }
-}
+}    
     
 // ===================================================================
 // NOMBRE: checkAndIncrementPoiCount 
@@ -7676,7 +7706,6 @@ function showArrivalStatsModal(freeDriveStatsData = null) {
             showPostArrivalActionModal(); 
           }
 
-        updateDynamicRadars(true);
         mapHeaderButtonsVisible = true;
         toggleMapHeaderRowsVisibility(true);
         updateStartNavigationButtonState();
@@ -8928,90 +8957,6 @@ function resetNavigationState() {
     actualizarContadorRadares(0);
     actualizarContadorTareas(0);
 }
-
-// ===================================================================
-// NOMBRE: resetNavigationState 
-// RESUMEN: Reinicia el estado y reactiva la "burbuja" de radares.
-// ===================================================================
-function resetNavigationState() {
-    clearAllRouteVisualsFromMap();
-
-    const autoStartModal = document.getElementById('auto-start-nav-modal');
-    if (autoStartModal) {
-        hideAutoStartNavigationModal();
-        showToast("Inicio automático cancelado: La ruta ha sido modificada/borrada.", "info");
-    }
-
-    if (initialUserLocationMarker) {
-        try { initialUserLocationMarker.remove(); } catch(e) {}
-        initialUserLocationMarker = null;
-    }
-    if (groundAnchorMarker) {
-        try { groundAnchorMarker.remove(); } catch(e) {}
-        groundAnchorMarker = null;
-    }
-
-    navigationWaypoints = [];
-    navigationCurrentRouteData = null;
-    isNavigating = false;
-    currentRouteNameForSaving = null;
-    
-    lastCarDistanceAlongRouteForNavLogic = 0;
-    lastValidCarDistanceForDisplay = 0;
-    currentLegIndexNav = 0;
-    currentStepIndexNav = 0;
-    previousLegIndexForEta = 0;
-    lastDisplayedManeuverIcon = null;
-    lastProcessedStepIdentifier = null;
-    lastProcessedStepForLock = null;
-
-    tripInitialOverallEtaTime = null;
-    originalTripEtaTime = null; 
-    currentStageInitialExpectedEtaTime = null;
-    accumulatedDeviationMs = 0;
-    accumulatedDistanceBeforeCurrentSegment = 0;
-    navigationStartTimeForStats = null;
-    totalDistanceTravelledForStats = 0;
-    lastPositionForStats = null;
-    maxSpeedDuringTrip = 0;
-    maxSpeedCoordinates = null;
-    maxAltitudeDuringTrip = -Infinity;
-    minAltitudeDuringTrip = Infinity;
-    window.averageSpeedKmh = 0;
-    reminderMapObjects = [];
-    radaresEnRutaActual = [];
-    tareasEnRutaActual = [];
-    alternativeRoutesCache.clear();
-    selectedStageRoutes.clear();
-
-    lastPdrSearchResults = [];
-    currentChargingPointsOnRoute = [];
-    if (window.lastOcmApiResponse) {
-        window.lastOcmApiResponse = null;
-    }
-    
-    isCacheDirty = true;
-    trafficAlertsCache = [];
-    
-    speedMarkerFeatures = [];
-    if (navigationMapInstance && navigationMapInstance.getSource('speed-markers-source')) {
-        navigationMapInstance.getSource('speed-markers-source').setData({
-            type: 'FeatureCollection',
-            features: [] 
-        });
-    }
-
-    isArrivalSequenceStarted = false;
-    hideNavigationUI();
-    hideMapInfoOverlay();
-    clearNavigationGraph();
-    
-    actualizarContadorRadares(0);
-    actualizarContadorTareas(0);
-
-    updateDynamicRadars(true); 
-}
-    
     
 // ===================================================================
 // NOMBRE: updateNavigationProgressDisplay
@@ -9227,8 +9172,9 @@ function updateNavigationProgressDisplay(route, carDistanceAlongTheRoute = 0) {
     }
 }
     
+
 // ===================================================================
-// NOMBRE: checkForAndExecuteCrashRecovery (VERSIÓN CON CARGA DIFERIDA)
+// NOMBRE: checkForAndExecuteCrashRecovery
 // RESUMEN: Carga primero lo esencial (mapa y ruta) y pospone tareas pesadas.
 // ===================================================================
 async function checkForAndExecuteCrashRecovery() {
@@ -9245,7 +9191,6 @@ async function checkForAndExecuteCrashRecovery() {
                 overlay.classList.remove('hidden');
             }
 
-            // Ocultamos la UI principal para dar la sensación de una transición directa al mapa
             const mainContent = document.querySelector('main'); if (mainContent) mainContent.style.display = 'none';
             const footer = document.querySelector('footer'); if (footer) footer.style.display = 'none';
             const noticesContainer = document.querySelector('.notices-icon-container'); if (noticesContainer) noticesContainer.style.display = 'none';
@@ -9254,36 +9199,27 @@ async function checkForAndExecuteCrashRecovery() {
             const gridFilter = document.getElementById('grid-filter-container'); if (gridFilter) gridFilter.style.display = 'none';
             
             try {
-                // Paso 1: Cargar lo visualmente crítico
                 await openNavigationMap(true); 
                 await loadRouteFromObject(recoveryData.route, true, true, recoveryData); 
                 
-                // Paso 2: Posponer tareas pesadas que no son necesarias para el primer renderizado
                 setTimeout(() => {
-                    console.log("[Recovery] Ejecutando tareas pospuestas de carga pesada...");
                     if (navigationMapInstance && navigationMapInstance.isStyleLoaded()) {
-                        // Estas funciones dibujan cientos de elementos y pueden tardar
-                        plotRemindersOnNavigationMap(); // Dibuja todos los recordatorios/radares
-                        processTrafficAlerts();      // Procesa y dibuja las alertas de tráfico
+                        plotRemindersOnNavigationMap(); 
+                        processTrafficAlerts();    
                     }
-                }, 750); // Damos 750ms para que el mapa y la ruta principal se rendericen completamente
-
+                }, 750); 
                 return true;
 
             } catch (recoveryError) {
-                console.error("Error crítico durante la secuencia de recuperación:", recoveryError);
                 clearRecoveryFlag();
-                if (overlay) overlay.classList.add('hidden'); // Ocultar si la recuperación falla
+                if (overlay) overlay.classList.add('hidden'); 
                 showToast("Fallo en la recuperación. Recargando de nuevo...", "error", 2000);
                 setTimeout(() => location.reload(), 2000);
-                return true; // Se considera que se ha ejecutado aunque falle, para evitar bucles
+                return true; 
             }
         }
     } catch (e) {
-        console.warn("Error al parsear la bandera de recuperación:", e);
     }
-
-    // Si la bandera estaba corrupta o inactiva, la limpiamos
     clearRecoveryFlag();
     return false;
 }    
