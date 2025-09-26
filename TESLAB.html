@@ -1,4 +1,4 @@
-v07
+v08
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -3860,6 +3860,107 @@ async function updateDynamicRadars(isInitialLoadCheck = false) {
     } catch (error) {
     }
 }    
+
+// EN TESLAB (25).html
+
+// ===================================================================
+// NOMBRE: updateDynamicRadars (VERSIÓN CORREGIDA - SIN BLOQUEO DE RUTA)
+// RESUMEN: Carga radares dinámicos. Se ha eliminado la condición que
+//          impedía su ejecución si había una ruta cargada.
+// ===================================================================
+async function updateDynamicRadars(isInitialLoadCheck = false) {
+    const nowDate = new Date();
+    const now = nowDate.getTime();
+    const timeSinceLastCheck = now - lastDynamicRadarCheck;
+    if (isInitialLoadCheck) {
+        const hasExistingDynamicRadars = processedRemindersCache.some(r => r.isDynamicRadar === true);
+        if (timeSinceLastCheck < 30 * 60 * 1000 && hasExistingDynamicRadars) return;
+    }
+    lastDynamicRadarCheck = now;
+    if (!isInitialLoadCheck) showToast("Actualizando radares dinámicos...", "info", 3000, false, "radar-update");
+
+    if (!window.radarsCache || !window.radarsSpatialIndex) {
+        await initializeRadarCache();
+        if (!window.radarsCache) {
+            showToast("No se pudo inicializar la base de datos de radares.", "error");
+            return;
+        }
+    }
+    
+    try {
+        let newRadars = [];
+        // Limpiamos SOLO los radares dinámicos antiguos antes de añadir los nuevos.
+        let reminders = JSON.parse(localStorage.getItem('reminders') || '[]').filter(r => !r.isDynamicRadar);
+        
+        let coords = null;
+        if (navigationCurrentLocation && (Date.now() - lastGpsUpdateTime < 30000)) {
+            coords = navigationCurrentLocation;
+        } else {
+            coords = await getCurrentLocationAsync();
+        }
+        if (!coords) throw new Error("Ubicación del vehículo no disponible.");
+
+        const DYNAMIC_RADAR_SEARCH_RADIUS_KM = 45;
+        const candidateRadars = new Set();
+        const R = 6371;
+        const rad = DYNAMIC_RADAR_SEARCH_RADIUS_KM / R;
+        const latRad = coords.latitude * Math.PI / 180;
+        const GRID_SIZE = 0.1;
+
+        const latMin = coords.latitude - (rad * 180 / Math.PI);
+        const latMax = coords.latitude + (rad * 180 / Math.PI);
+        const deltaLon = Math.asin(Math.sin(rad) / Math.cos(latRad));
+        const lonMin = coords.longitude - (deltaLon * 180 / Math.PI);
+        const lonMax = coords.longitude + (deltaLon * 180 / Math.PI);
+        
+        const latIndexMin = Math.floor(latMin / GRID_SIZE);
+        const latIndexMax = Math.floor(latMax / GRID_SIZE);
+        const lonIndexMin = Math.floor(lonMin / GRID_SIZE);
+        const lonIndexMax = Math.floor(lonMax / GRID_SIZE);
+        
+        for (let i = latIndexMin; i <= latIndexMax; i++) {
+            for (let j = lonIndexMin; j <= lonIndexMax; j++) {
+                const cellId = `cell_${i}_${j}`;
+                if (window.radarsSpatialIndex[cellId]) {
+                    window.radarsSpatialIndex[cellId].forEach(radar => candidateRadars.add(radar));
+                }
+            }
+        }
+
+       const savedRadius = parseInt(localStorage.getItem('boardinggate_dynamicRadarRadius'), 10);
+       const radiusToUse = (savedRadius && savedRadius > 0) ? savedRadius : 400;
+
+        candidateRadars.forEach(radar => {
+            const distance = calculateDistance(coords.latitude, coords.longitude, radar.lat, radar.lon);
+            if (distance <= (DYNAMIC_RADAR_SEARCH_RADIUS_KM * 1000)) {
+                newRadars.push({
+                    id: Date.now() + Math.random() + newRadars.length,
+                    text: `<b>RADAR: ${radar.name}</b>`,
+                    type: 'simple', time: '00:01',
+                    date: `${nowDate.getFullYear()}-${(nowDate.getMonth() + 1).toString().padStart(2, '0')}-${nowDate.getDate().toString().padStart(2, '0')}`,
+                    createdAt: nowDate.toISOString(), managedByUser: false,
+                    isLocationEnabled: true, locationCoordinates: { latitude: radar.lat, longitude: radar.lon },
+                    radiusMeters: radiusToUse, excludeFromList: true,
+                    isDynamicRadar: true
+                });
+            }
+        });
+        
+        reminders.push(...newRadars);
+        localStorage.setItem('reminders', JSON.stringify(reminders));
+        markCacheAsDirty();
+        
+        if (isNavigationMapActive) {
+            plotRemindersOnNavigationMap();
+        }
+        updateReminderCount();
+        updateButtonStyles();
+     
+    } catch (error) {
+        console.error("Error al actualizar radares dinámicos:", error);
+    }
+}
+    
     
 // ===================================================================
 // NOMBRE: applyMainUISettings 
@@ -6281,6 +6382,147 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
                 localStorage.setItem('reminders', JSON.stringify(reminders));
                 markCacheAsDirty(); 
             }
+            
+            if (preserveAccumulatedStats) {
+                accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
+            } else {
+                accumulatedDistanceBeforeCurrentSegment = 0;
+                navigationStartTimeForStats = new Date();
+                originalTripEtaTime = null;
+            }
+            
+            lastCarDistanceAlongRouteForNavLogic = 0;
+            currentLegIndexNav = 0;
+            currentStepIndexNav = 0;
+            previousLegIndexForEta = 0;
+            lastProcessedStepIdentifier = null;
+            lastProcessedStepForLock = null;
+            lastDisplayedManeuverIcon = null;
+
+            tripInitialOverallEtaTime = new Date(Date.now() + newRemainingRoute.duration * 1000);
+            if (newRemainingRoute.legs && newRemainingRoute.legs.length > 0) {
+                currentStageInitialExpectedEtaTime = new Date(Date.now() + newRemainingRoute.legs[0].duration * 1000);
+            } else {
+                currentStageInitialExpectedEtaTime = null;
+            }
+            
+            renderWaypointMarkers();
+            updateNavigationProgressDisplay(newRemainingRoute, 0); 
+            drawStaticMarkersOnProgressBar();
+            updateTurnByTurnDisplay(newRemainingRoute, 0);
+            showDestinationName();
+            toggleRadaresRuta(document.getElementById('radares-ruta-checkbox').checked);
+            toggleTareasRuta(document.getElementById('tareas-ruta-checkbox').checked);
+            updateStartNavigationButtonState();
+            updateNavigationButtonColor();
+
+            deviationCheckGracePeriodUntil = Date.now() + 7000;
+            closeModalAndProceed();
+            return;
+            
+        } catch (error) {
+            console.error(`[RECALC] Fallo en intento #${attempt}:`, error);
+            if (attempt === MAX_RETRIES) {
+                showToast("Fallo al recalcular la ruta tras varios intentos. Comprueba tu conexión.", "error");
+                closeModalAndProceed();
+                throw new Error("Fallo al recalcular la ruta tras múltiples intentos.");
+            } else {
+                await new Promise(resolve => setTimeout(resolve, RETRY_CADENCE_MS));
+            }
+        } finally {
+            const existingToast = document.getElementById(toastId);
+            if (existingToast) existingToast.remove();
+            activeToasts = activeToasts.filter(t => t.id !== toastId);
+
+            isRecalculatingRoute = false;
+            isNavigating = wasNavigatingBeforeRecalc; 
+            
+            if (attempt > MAX_RETRIES) { 
+                 updateStartNavigationButtonState();
+                 updateNavigationButtonColor();
+            }
+        }
+        attempt++; 
+    }
+}    
+
+// EN TESLAB (25).html
+
+// ===================================================================
+// NOMBRE: recalculateAndDrawRoute (VERSIÓN CON LÓGICA DE RADARES CONDICIONAL)
+// RESUMEN: Solo limpia los radares dinámicos si el check de "Radares Ruta" está activo.
+// ===================================================================
+async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
+    const RETRY_CADENCE_MS = 3000;
+    const MAX_RETRIES = 5;
+    let attempt = 1;
+
+    while (attempt <= MAX_RETRIES) {
+        isRecalculatingRoute = true;
+        clearAlternativeRoutesDisplay(); 
+        alternativeRoutesCache.clear();
+        selectedStageRoutes.clear();
+        
+        const toastId = `recalc-toast-${Date.now()}`;
+        showToast(`Calculando ruta... (Intento ${attempt}/${MAX_RETRIES})`, "info", 0, false, toastId);
+
+        const wasNavigatingBeforeRecalc = isNavigating;
+
+        try {
+            let waypointsForAPI = [];
+            let currentHeading = null;
+            
+            if (!isNavigating) {
+                waypointsForAPI = [...navigationWaypoints];
+                currentHeading = null;
+            } else { 
+                if (navigationCurrentLocation) {
+                    currentHeading = navigationCurrentLocation.heading;
+                    waypointsForAPI.push({ lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude, isRecalculatedStart: true });
+                    waypointsForAPI.push(...navigationWaypoints.filter(wp => !wp.visited));
+                } else {
+                    waypointsForAPI = [...navigationWaypoints];
+                }
+            }
+            
+            const validWaypoints = waypointsForAPI.filter(wp => wp && typeof wp.lat === 'number' && typeof wp.lng === 'number');
+            if (validWaypoints.length < 2) { 
+                const existingToast = document.getElementById(toastId);
+                if (existingToast) existingToast.remove();
+                isRecalculatingRoute = false;
+                return; 
+            };
+
+            const coordsString = validWaypoints.map(wp => `${wp.lng},${wp.lat}`).join(';');
+            const result = await fetchRouteData(coordsString, currentHeading);
+            if (result.error) throw result.error;
+
+            const newRouteData = result.routeData;
+            const newRemainingRoute = newRouteData.routes[0];
+
+            navigationCurrentRouteData = newRouteData;
+            precalculateRouteStepDistances(navigationCurrentRouteData);
+            
+            await drawRouteOnMap(newRemainingRoute);
+            
+            // ===== INICIO DE LA MODIFICACIÓN =====
+            const isRadaresRutaActive = document.getElementById('radares-ruta-checkbox').checked;
+
+            if (isRadaresRutaActive) {
+                // Si el check está activo, SÍ limpiamos la "burbuja" para mostrar solo los de la ruta.
+                console.log("[Radar Logic] Ruta cargada con check activo. Limpiando radares dinámicos.");
+                let reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
+                const originalLength = reminders.length;
+                reminders = reminders.filter(r => !r.isDynamicRadar);
+                if (reminders.length < originalLength) {
+                    localStorage.setItem('reminders', JSON.stringify(reminders));
+                    markCacheAsDirty();
+                }
+            } else {
+                // Si el check NO está activo, NO hacemos nada. Los radares dinámicos existentes se mantendrán.
+                console.log("[Radar Logic] Ruta cargada con check inactivo. Manteniendo radares dinámicos existentes.");
+            }
+            // ===== FIN DE LA MODIFICACIÓN =====
             
             if (preserveAccumulatedStats) {
                 accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
