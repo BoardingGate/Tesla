@@ -1,4 +1,4 @@
-j44
+v01
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -1217,11 +1217,9 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
                 maxAverageSpeedInTrip = -Infinity;
             }
 
-            const cleanRouteData = sanitizeRouteDataForStorage(navigationCurrentRouteData);
             const recoveryData = { 
                 isActive: true, 
                 route: routeForStorage,
-                fullRouteData: cleanRouteData,
                 tripStartTime: navigationStartTimeForStats ? navigationStartTimeForStats.getTime() : Date.now(),
                 originalTripEtaTime: originalTripEtaTime ? originalTripEtaTime.getTime() : null,
                 stats: {
@@ -2931,49 +2929,7 @@ function updateVehicleIconPerspective() {
         }
     }
 }
-
-// ===================================================================
-// NOMBRE: sanitizeRouteDataForStorage
-// ===================================================================
-function sanitizeRouteDataForStorage(routeData) {
-    if (!routeData || !routeData.routes || !routeData.routes[0]) {
-        return null;
-    }
-
-    try {
-        const cleanData = {
-            code: routeData.code,
-            waypoints: routeData.waypoints.map(wp => ({ ...wp })), // Los waypoints son seguros, una copia superficial es suficiente.
-            routes: routeData.routes.map(route => {
-                const cleanRoute = {
-                    distance: route.distance,
-                    duration: route.duration,
-                    geometry: route.geometry, // El objeto GeoJSON es seguro por definición.
-                    legs: route.legs.map(leg => ({
-                        distance: leg.distance,
-                        duration: leg.duration,
-                        summary: leg.summary,
-                        steps: leg.steps.map(step => ({
-                            distance: step.distance,
-                            duration: step.duration,
-                            geometry: step.geometry,
-                            maneuver: { ...step.maneuver },
-                            name: step.name,
-                            bannerInstructions: step.bannerInstructions || null
-                        }))
-                    }))
-                };
-                return cleanRoute;
-            })
-        };
-        
-        return cleanData;
-
-    } catch (e) {
-        console.error("Error crítico al sanitizar manualmente los datos de la ruta:", e);
-        return null;
-    }
-}
+    
     
 // ===================================================================
 // NOMBRE: normalizeOverpassResult 
@@ -9381,9 +9337,8 @@ function animateMarkerAndMap(timestamp) {
 }
     
 // ===================================================================
-// NOMBRE: loadRouteFromObject (VERSIÓN CON LÓGICA DE RECUPERACIÓN CORREGIDA)
-// RESUMEN: Ahora SÍ se salta la llamada a recalculateAndDrawRoute si tiene los datos completos.
-// ===================================================================
+// NOMBRE: loadRouteFromObject (VERSIÓN CORREGIDA Y DEFINITIVA 2)
+// RESUMEN: Acepta recoveryInfo y pasa la bandera 'isRecovery' a toggleNavigationState.
 async function loadRouteFromObject(routeObject, autoStartNavigation = false, forceImmediateStart = false, recoveryInfo = null) {
     if (isRecalculatingRoute) {
         showToast("Procesando otra ruta, por favor espere.", "warning");
@@ -9399,7 +9354,7 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
         return;
     }
 
-    isRecalculatingRoute = true;  
+    isRecalculatingRoute = true;
     try {
         if (isFreeDriveActive) {
             isFreeDrivePaused = true;
@@ -9410,59 +9365,85 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
             clearNavigationGraph();
         }
 
+        const startLocation = navigationCurrentLocation ? { ...navigationCurrentLocation } : null;
+        
         if (!recoveryInfo) {
             navigationWaypoints = []; 
         }
 
         currentRouteNameForSaving = routeObject.name;
         const waypointsFromLoadedRoute = routeObject.waypoints;
-        navigationWaypoints = sanitizeWaypointsForStorage(waypointsFromLoadedRoute);
+        
+        const isAiGeneratedRoute = routeObject.name.startsWith("Ruta IA:");
+        
+        if (waypointsFromLoadedRoute.length === 1) {
+            if (startLocation) {
+                const startPoint = { id: Date.now() - 1, lat: startLocation.latitude, lng: startLocation.longitude, type: 'S', marker: null, label: 'S', address: 'Posición Actual (GPS)', visited: true, isCriticalForRecalc: true, isInternal: false, isRecalculatedStart: false };
+                const destinationWp = sanitizeWaypointsForStorage(waypointsFromLoadedRoute)[0];
+                navigationWaypoints = [startPoint, destinationWp];
+            } else {
+                showToast("Señal GPS no disponible. No se puede iniciar ruta a un único destino.", "error");
+                isRecalculatingRoute = false;
+                return;
+            }
+        } else {
+            if (startLocation && !recoveryInfo) {
+                const startPoint = { id: Date.now() - 1, lat: startLocation.latitude, lng: startLocation.longitude, type: 'S', marker: null, label: 'S', address: 'Posición Actual (GPS)', visited: true, isCriticalForRecalc: true, isInternal: false, isRecalculatedStart: false };
+                
+                const waypointsToProcess = isAiGeneratedRoute 
+                    ? waypointsFromLoadedRoute 
+                    : waypointsFromLoadedRoute.slice(1);
+
+                navigationWaypoints = [startPoint, ...sanitizeWaypointsForStorage(waypointsToProcess)];
+
+            } else {
+                 if (!recoveryInfo) showToast("Señal GPS no disponible. Cargando ruta original...", "warning");
+                navigationWaypoints = sanitizeWaypointsForStorage(waypointsFromLoadedRoute);
+            }
+        }
         
         await updateWaypointTypesAndLabels();
         renderWaypointMarkers();
 
         if (navigationWaypoints.filter(wp => wp && !wp.isInternal).length >= 2) {
-            
-            if (recoveryInfo && recoveryInfo.fullRouteData) {
-                showToast("Reanudando ruta desde caché...", "info", 2000);
-                navigationCurrentRouteData = recoveryInfo.fullRouteData;
-                
-                if (!navigationCurrentRouteData.routes[0]._turfLineString) {
-                    precalculateRouteStepDistances(navigationCurrentRouteData);
-                }
-
-                await drawRouteOnMap(navigationCurrentRouteData.routes[0]);
-                
-                updateNavigationProgressDisplay(navigationCurrentRouteData.routes[0], 0); 
-                drawStaticMarkersOnProgressBar();
-                updateTurnByTurnDisplay(navigationCurrentRouteData.routes[0], 0);
-                showDestinationName();
-
-            } else {
+            try {
                 await recalculateAndDrawRoute(false);
-            }
-         
-            if (recoveryInfo) {
-                await restoreTripProgress(recoveryInfo);
-            }
-            
-            if (autoStartNavigation) {
-                if (forceImmediateStart) {
-                    toggleNavigationState(false, !!recoveryInfo); 
-                } else {
-                    const routeGeoJSON = navigationMapInstance.getSource('route')._data;
-                    if (routeGeoJSON.geometry && routeGeoJSON.geometry.coordinates.length > 1) {
-                        const bounds = new mapboxgl.LngLatBounds();
-                        routeGeoJSON.geometry.coordinates.forEach(coord => bounds.extend(coord));
-                        if (!bounds.isEmpty()) {
-                            navigationMapInstance.fitBounds(bounds, { padding: 80, animate: true, duration: 1500 });
-                        }
+                
+                setTimeout(() => {
+                    if (navigationMapInstance) {
+                        try {
+                            navigationMapInstance.resize();
+                        } catch(e) {}
                     }
-                    const firstDestination = navigationWaypoints.find(wp => wp && !wp.isInternal && wp.type !== 'S' && !wp.visited);
-                    if (firstDestination) { fetchAndDisplayAlternativeRoutes(firstDestination.id); }
-                    showAutoStartNavigationModal();
+                }, 50);
+
+                if (recoveryInfo) {
+                    await restoreTripProgress(recoveryInfo);
                 }
+                
+                if (autoStartNavigation) {
+                    if (forceImmediateStart) {
+                        toggleNavigationState(false, !!recoveryInfo); 
+                    } else {
+                        const routeGeoJSON = navigationMapInstance.getSource('route')._data;
+                        if (routeGeoJSON.geometry && routeGeoJSON.geometry.coordinates.length > 1) {
+                            const bounds = new mapboxgl.LngLatBounds();
+                            routeGeoJSON.geometry.coordinates.forEach(coord => bounds.extend(coord));
+                            if (!bounds.isEmpty()) {
+                                navigationMapInstance.fitBounds(bounds, { padding: 80, animate: true, duration: 1500 });
+                            }
+                        }
+                        const firstDestination = navigationWaypoints.find(wp => wp && !wp.isInternal && wp.type !== 'S' && !wp.visited);
+                        if (firstDestination) { fetchAndDisplayAlternativeRoutes(firstDestination.id); }
+                        showAutoStartNavigationModal();
+                    }
+                }
+            } catch (error) {
+                showToast("No se pudo trazar la ruta. Comprueba la conexión o intenta mover un punto.", "error", 8000);
+                const fallbackCoords = navigationWaypoints.map(wp => [wp.lng, wp.lat]);
+                await drawRouteOnMap({ geometry: { type: 'LineString', coordinates: fallbackCoords } });
             }
+        
         }
     } catch (error) {
         console.error("Error al cargar la ruta desde el objeto:", error);
@@ -9471,9 +9452,8 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
         updateStartNavigationButtonState();
         updateNavigationButtonColor();
     }
-}
-
-    
+}   
+      
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 // NOMBRE: fetchAndRenderChatUsers 
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
@@ -9786,8 +9766,7 @@ function findNextValidStep(route, currentLeg, currentStep) {
 }
   
 // ===================================================================
-// NOMBRE: initiateControlledReload (VERSIÓN FINAL Y CORRECTA)
-// RESUMEN: Lee la bandera, actualiza TODOS los datos dinámicos (ruta, waypoints, stats) y la vuelve a guardar.
+// NOMBRE: initiateControlledReload 
 // ===================================================================
 async function initiateControlledReload() {
     if (isPerformingControlledReload) return;
@@ -9802,13 +9781,6 @@ async function initiateControlledReload() {
 
         const recoveryData = JSON.parse(recoveryFlagJSON);
 
-        recoveryData.route.waypoints = sanitizeWaypointsForStorage(navigationWaypoints);
-
-        const cleanRouteData = sanitizeRouteDataForStorage(navigationCurrentRouteData);
-        if (cleanRouteData) {
-            recoveryData.fullRouteData = cleanRouteData;
-        }
-        
         recoveryData.stats = {
             totalDistance: totalDistanceTravelledForStats,
             maxSpeed: maxSpeedDuringTrip,
@@ -9828,7 +9800,6 @@ async function initiateControlledReload() {
             accumulatedDeviationMs: accumulatedDeviationMs
         };
 
-    
         localStorage.setItem('boardinggate_nav_recovery_flag', JSON.stringify(recoveryData));
 
         setTimeout(() => {
@@ -9839,7 +9810,7 @@ async function initiateControlledReload() {
         showToast("Error crítico durante la optimización de memoria.", "error");
         isPerformingControlledReload = false;
     }
-}    
+}
     
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 // NOMBRE: openLocationsPreviewMap 
