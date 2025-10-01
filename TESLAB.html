@@ -1,4 +1,4 @@
-m44
+mI01
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -1843,26 +1843,37 @@ async function manageMemoryCycle() {
 }  
     
     
-/**
- * ===================================================================
- * NOMBRE: startMemoryManagement
- * RESUMEN: Inicia o detiene el temporizador para el ciclo de gestión de memoria.
- * ===================================================================
- */
+// ===================================================================
+// NOMBRE: startMemoryManagement (VERSIÓN CON ESTRATEGIA DUAL)
+// RESUMEN: Inicia/detiene los temporizadores para el reinicio ligero (periódico) y la recarga pesada (por umbral).
+// ===================================================================
 let memoryManagementInterval = null;
+let lightRestartInterval = null; // Nuevo temporizador para el reinicio ligero
+
 function startMemoryManagement(start) {
     if (memoryManagementInterval) {
         clearInterval(memoryManagementInterval);
         memoryManagementInterval = null;
     }
-    if (start) {
-        const MEMORY_CHECK_INTERVAL_MS = 1 * 60 * 1000; 
-        setTimeout(manageMemoryCycle, 1000); 
-        memoryManagementInterval = setInterval(manageMemoryCycle, MEMORY_CHECK_INTERVAL_MS);
-    } else {
-  }
-}
+    if (lightRestartInterval) {
+        clearInterval(lightRestartInterval);
+        lightRestartInterval = null;
+    }
 
+    if (start) {
+        const HEAVY_RELOAD_CHECK_INTERVAL_MS = 1 * 60 * 1000; // Cada 1 minuto comprueba el umbral
+        setTimeout(manageMemoryCycle, 1000); 
+        memoryManagementInterval = setInterval(manageMemoryCycle, HEAVY_RELOAD_CHECK_INTERVAL_MS);
+
+        const LIGHT_RESTART_PERIOD_MS = 2 * 60 * 1000; // Cada 12 minutos
+        lightRestartInterval = setInterval(performLightMapRestart, LIGHT_RESTART_PERIOD_MS);
+        
+        console.log(`[Memory Manager] Estrategia dual activada. Reinicio ligero cada ${LIGHT_RESTART_PERIOD_MS / 60000} min. Recarga pesada por umbral del ${memoryReloadThreshold*100}%.`);
+
+    } else {
+        console.log("[Memory Manager] Estrategia de gestión de memoria detenida.");
+    }
+}
     
 // ===================================================================
 //  Clase MapLayerAndViewController 
@@ -2795,6 +2806,116 @@ function toggleEcoModeLabels(shouldShow) {
         areEcoLabelsHidden = true;
         if (panel) panel.classList.add('disabled');
         checkboxes.forEach(cb => cb.disabled = true);
+    }
+}
+
+// ===================================================================
+// NOMBRE: performLightMapRestart (VERSIÓN CON LIMPIEZA EXPLÍCITA DE CAPAS)
+// RESUMEN: Reinicia el mapa de forma agresiva, eliminando capas y fuentes antes de la destrucción final.
+// ===================================================================
+async function performLightMapRestart() {
+    if (!isNavigating && !isFreeDriveActive) return; 
+    if (isRecalculatingRoute) return;
+
+    console.log("%c[Memory Manager] Iniciando reinicio ligero del mapa...", "color: orange; font-weight: bold;");
+    showToast("Optimizando mapa...", "info", 2000);
+
+    const lastKnownLocation = { ...navigationCurrentLocation };
+    const wasFollowing = navigationFollowUser;
+    const lastZoom = navigationMapInstance ? navigationMapInstance.getZoom() : 16;
+    const lastPitch = navigationMapInstance ? navigationMapInstance.getPitch() : 0;
+    const lastBearing = navigationMapInstance ? navigationMapInstance.getBearing() : 0;
+
+    if (navigationMapInstance && navigationMapInstance.isStyleLoaded()) {
+        try {
+            // --- INICIO DE LA MEJORA: LIMPIEZA EXPLÍCITA ---
+            const style = navigationMapInstance.getStyle();
+            if (style && style.layers) {
+                // Es más seguro iterar a la inversa al eliminar elementos de una lista
+                for (let i = style.layers.length - 1; i >= 0; i--) {
+                    const layerId = style.layers[i].id;
+                    try {
+                        if (navigationMapInstance.getLayer(layerId)) {
+                            navigationMapInstance.removeLayer(layerId);
+                        }
+                    } catch (e) { /* Ignorar si ya fue eliminada */ }
+                }
+            }
+            if (style && style.sources) {
+                Object.keys(style.sources).forEach(sourceId => {
+                    try {
+                        if (navigationMapInstance.getSource(sourceId)) {
+                            navigationMapInstance.removeSource(sourceId);
+                        }
+                    } catch (e) { /* Ignorar si ya fue eliminada */ }
+                });
+            }
+            // --- FIN DE LA MEJORA ---
+
+            // Aplicamos un estilo vacío para forzar la descarga de los recursos restantes
+            navigationMapInstance.setStyle({ version: 8, sources: {}, layers: [{ id: 'background', type: 'background', paint: { 'background-color': '#111' } }] });
+            await new Promise(resolve => navigationMapInstance.once('styledata', resolve));
+        } catch (e) {
+            console.warn("Error durante la fase de limpieza, continuando con el reinicio:", e);
+        }
+    }
+    
+    try {
+        await mapboxgl.clearStorage();
+    } catch (e) {
+        console.warn("Error al limpiar el storage de Mapbox:", e);
+    }
+    
+    if (navigationMapInstance) {
+        navigationMapInstance.remove();
+        navigationMapInstance = null;
+    }
+    
+    await wait(150);
+
+    const mapModal = document.getElementById('reminders-location-map-modal');
+    if (mapModal && !mapModal.classList.contains('map-modal-hidden')) {
+        const mapActualContainer = document.getElementById('mapbox-map-actual-container');
+        const savedLayerName = localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO";
+        const finalLayerName = MAP_LEGACY_NAME_MAP[savedLayerName] || savedLayerName;
+        const initialStyle = MAP_STYLES[finalLayerName] || MAP_STYLES["HÍBRIDO"];
+        
+        navigationMapInstance = new mapboxgl.Map({
+            container: mapActualContainer,
+            style: initialStyle,
+            center: [lastKnownLocation.longitude, lastKnownLocation.latitude],
+            zoom: lastZoom,
+            pitch: lastPitch,
+            bearing: lastBearing,
+            attributionControl: false,
+            pixelRatio: window.devicePixelRatio || 1,
+            maxTileCacheSize: 50,
+            antialias: false,
+            preserveDrawingBuffer: false,
+            accessToken: mapboxgl.accessToken,
+            minzoom: 2,
+            maxzoom: 19
+        });
+
+        await new Promise(resolve => navigationMapInstance.once('load', resolve));
+
+        navigationFollowUser = wasFollowing;
+        shouldCenterOnUser = wasFollowing;
+        updateLocateMeButtonsUI();
+
+        await loadAndAddMapImages(navigationMapInstance);
+        await configureMapAtmosphere();
+        await reAddCustomMapLayersAndSources(navigationMapInstance);
+        applyLayerVisibility();
+        plotRemindersOnNavigationMap();
+        displayChargingPointsOnMap();
+        displayAlertsOnMap();
+        renderWaypointMarkers();
+        updateRouteAndCarIconStyle();
+        
+        assignMapButtonListeners(); // Re-asociamos los listeners a los botones del mapa
+        
+        console.log("%c[Memory Manager] Reinicio ligero del mapa completado.", "color: green; font-weight: bold;");
     }
 }
     
@@ -18172,6 +18293,11 @@ function removeWaypointMarkerListeners(marker) {
 function closeNavigationMap(force = false) {
     const aiModal = document.getElementById('ai-route-modal');
     if (aiModal) aiModal.classList.add('hidden');
+
+    if (lightRestartInterval) {
+        clearInterval(lightRestartInterval);
+        lightRestartInterval = null;
+    }
     
     clearRecoveryFlag();
     hideAddressSuggestionsModal();
