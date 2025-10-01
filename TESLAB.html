@@ -1,4 +1,4 @@
-mI09
+mI10
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -1864,7 +1864,7 @@ function startMemoryManagement(start) {
         setTimeout(manageMemoryCycle, 1000); 
         memoryManagementInterval = setInterval(manageMemoryCycle, HEAVY_RELOAD_CHECK_INTERVAL_MS);
 
-        const LIGHT_RESTART_PERIOD_MS = 1 * 30 * 1000;
+        const LIGHT_RESTART_PERIOD_MS = 8 * 60 * 1000;
         lightRestartInterval = setInterval(performLightMapRestart, LIGHT_RESTART_PERIOD_MS);
         
       
@@ -2800,7 +2800,6 @@ async function verifyAndForceRouteRepaint() {
     showToast("Error al redibujar la ruta tras la optimización.", "error");
 }
 
-
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 // NOMBRE: performLightMapRestart (VERSIÓN CON RESTAURACIÓN DE ESTADO DE GRÁFICA)
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
@@ -2845,7 +2844,7 @@ async function performLightMapRestart() {
     }
     
     try {
- //       await mapboxgl.clearStorage();
+        await mapboxgl.clearStorage();
     } catch (e) {
     }
     
@@ -7047,7 +7046,6 @@ function updateVehicleMarker(coords, mapInstanceToUse) {
 // =====================================================================================
 //  updateMapCamera
 // =====================================================================================
-// REEMPLAZA la función updateMapCamera
 function updateMapCamera(coords, mapInstanceToUse) {
     if (!shouldCenterOnUser && !navigationFollowUser) {
         return;
@@ -7070,7 +7068,6 @@ function updateMapCamera(coords, mapInstanceToUse) {
     
     let targetPitch = cameraAdjustments?.pitch ?? ((mapViewMode === 'perspective' || mapViewMode === 'relief') ? mapPitchValue : 0);
     
-    // Lógica específica para el pitch en modo 'RUTA' y 'ECO activo'
     const isEcoActive = currentAutoZoomMode === 'eco' && (window.currentSpeedKmh || 0) > 70 && distanceToNextManeuverOSRM > 2000;
 
     if ((currentAutoZoomMode === 'route' || isEcoActive) && !cameraAdjustments) {
@@ -7109,8 +7106,9 @@ function updateMapCamera(coords, mapInstanceToUse) {
 }
 
 // ===================================================================
-// NOMBRE: updateTripStatistics 
-// RESUMEN: Gestiona los cálculos y la actualización de la UI de estadísticas de viaje.
+// NOMBRE: updateTripStatistics (VERSIÓN CON FILTRO DE ESTABILIZACIÓN INICIAL)
+// RESUMEN: Gestiona estadísticas, aplicando un periodo de gracia para evitar picos de velocidad media.
+// ===================================================================
 function updateTripStatistics(coords) {
     if (compassAndModeControl) {
         compassAndModeControl.updateAltitude(coords.altitude);
@@ -7137,30 +7135,21 @@ function updateTripStatistics(coords) {
                 const distanceMoved = calculateDistance(lastPositionForStats.latitude, lastPositionForStats.longitude, coords.latitude, coords.longitude);
                 totalDistanceTravelledForStats += distanceMoved;
                 const timeElapsedS = (Date.now() - navigationStartTimeForStats.getTime()) / 1000;
-                if (timeElapsedS > 0) {
+
+                if (timeElapsedS > 10 && totalDistanceTravelledForStats > 40) {
                     window.averageSpeedKmh = (totalDistanceTravelledForStats / timeElapsedS) * 3.6;
                 }
              }
             lastPositionForStats = { ...coords };
             
-            let statsChanged = false;
-
             if (window.currentSpeedKmh > maxSpeedDuringTrip) {
                 maxSpeedDuringTrip = window.currentSpeedKmh;
                 if (coords) { maxSpeedCoordinates = { lat: coords.latitude, lng: coords.longitude }; }
-                statsChanged = true;
             }
             if (coords.altitude !== null && !isNaN(coords.altitude)) {
-                if (coords.altitude > maxAltitudeDuringTrip) {
-                    maxAltitudeDuringTrip = coords.altitude;
-                    statsChanged = true;
-                }
-                if (coords.altitude < minAltitudeDuringTrip) {
-                    minAltitudeDuringTrip = coords.altitude;
-                    statsChanged = true;
-                }
+                if (coords.altitude > maxAltitudeDuringTrip) maxAltitudeDuringTrip = coords.altitude;
+                if (coords.altitude < minAltitudeDuringTrip) minAltitudeDuringTrip = coords.altitude;
             }
-
         }
         compassAndModeControl.updateCurrentSpeed(window.currentSpeedKmh);
         compassAndModeControl.updateAverageSpeed(window.averageSpeedKmh);
@@ -7171,6 +7160,56 @@ function updateTripStatistics(coords) {
         }
     }
 }
+
+// ===================================================================
+// NOMBRE: plotIntervalData (VERSIÓN CON FILTRO DE ESTABILIZACIÓN INICIAL)
+// RESUMEN: Añade un punto a la gráfica, pero solo si se ha superado el periodo de gracia inicial.
+// ===================================================================
+function plotIntervalData() {
+    if (!isGraphingActive || !(isNavigating || isFreeDriveActive) || !navigationChart || !navigationStartTimeForStats || !navigationCurrentLocation) {
+        return;
+    }
+    
+    const timeElapsedS = (Date.now() - navigationStartTimeForStats.getTime()) / 1000;
+
+    if (timeElapsedS < 10 || totalDistanceTravelledForStats < 40) {
+        return;
+    }
+
+    const currentAverageSpeed = window.averageSpeedKmh || 0;
+    
+    if (currentAverageSpeed > 1) { 
+        minAverageSpeedInTrip = Math.min(minAverageSpeedInTrip, currentAverageSpeed);
+        maxAverageSpeedInTrip = Math.max(maxAverageSpeedInTrip, currentAverageSpeed);
+        
+        while (graphLabels.length >= maxGraphPoints) {
+            graphLabels.shift();
+            graphDataPoints.speed.shift();
+            graphDataPoints.altitude.shift();
+        }
+
+        const timeLabel = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        graphLabels.push(timeLabel);
+        graphDataPoints.speed.push(currentAverageSpeed);
+    }
+    
+    const currentAltitude = navigationCurrentLocation.altitude || 0;
+    
+    if (graphDataPoints.altitude.length < graphDataPoints.speed.length) {
+        graphDataPoints.altitude.push(currentAltitude);
+    }
+    
+    updateChartData();
+
+    const isCurrentlyStopped = (window.currentSpeedKmh || 0) < 1;
+    if (isCurrentlyStopped) {
+        if (isCarStoppedForGraph) return; 
+        isCarStoppedForGraph = true;
+    } else {
+        isCarStoppedForGraph = false;
+    }
+}
+   
     
 // ===================================================================
 // NOMBRE: processRouteProgress 
@@ -17469,54 +17508,6 @@ function displayUnifiedReminderWindow(overdueReminders) {
     swiperContainer.removeEventListener('scroll', updateReminderIndexDisplay);
     swiperContainer.addEventListener('scroll', updateReminderIndexDisplay);
 }
-  
-// ===================================================================
-// NOMBRE: plotIntervalData 
-// RESUMEN: Añade un nuevo punto de datos a la gráfica a intervalos regulares. La condición de ejecución se ha modificado para permitir que se ejecute tanto en modo Navegación como en modo Free Drive.
-function plotIntervalData() {
-    if (!isGraphingActive || !(isNavigating || isFreeDriveActive) || !navigationChart || !navigationStartTimeForStats || !navigationCurrentLocation) {
-        return;
-    }
-
-    let currentAverageSpeed = 0;
-    const timeElapsedS = (Date.now() - navigationStartTimeForStats.getTime()) / 1000;
-
-    if (timeElapsedS > 0 && totalDistanceTravelledForStats > 0) {
-        const avgSpeedMs = totalDistanceTravelledForStats / timeElapsedS;
-        currentAverageSpeed = avgSpeedMs * 3.6;
-    }
-    
-    if (currentAverageSpeed > 1) { 
-        minAverageSpeedInTrip = Math.min(minAverageSpeedInTrip, currentAverageSpeed);
-        maxAverageSpeedInTrip = Math.max(maxAverageSpeedInTrip, currentAverageSpeed);
-        
-        while (graphLabels.length >= maxGraphPoints) {
-            graphLabels.shift();
-            graphDataPoints.speed.shift();
-            graphDataPoints.altitude.shift();
-        }
-
-        const timeLabel = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-        graphLabels.push(timeLabel);
-        graphDataPoints.speed.push(currentAverageSpeed);
-    }
-    
-    const currentAltitude = navigationCurrentLocation.altitude || 0;
-    
-    if (graphDataPoints.altitude.length < graphDataPoints.speed.length) {
-        graphDataPoints.altitude.push(currentAltitude);
-    }
-    
-    updateChartData();
-
-    const isCurrentlyStopped = (window.currentSpeedKmh || 0) < 1;
-    if (isCurrentlyStopped) {
-        if (isCarStoppedForGraph) return; 
-        isCarStoppedForGraph = true;
-    } else {
-        isCarStoppedForGraph = false;
-    }
-}        
 
 // ===================================================================
 // NOMBRE: updateChartData 
