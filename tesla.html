@@ -38,8 +38,6 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script type="module"> import { initializeApp } from "https://www.gstatic.com/firebasejs/11.9.1/firebase-app.js"; import { getFirestore, doc, setDoc, getDoc, getDocs, deleteDoc, collection, serverTimestamp, where, query, orderBy, limit, addDoc, writeBatch, startAfter, updateDoc, FieldValue, runTransaction } from "https://www.gstatic.com/firebasejs/11.9.1/firebase-firestore.js";  const firebaseConfig = window.APP_CONFIG.firebase; try { const app = initializeApp(firebaseConfig);window.db = getFirestore(app);window.doc = doc;window.setDoc = setDoc;window.getDoc = getDoc;window.collection = collection;window.getDocs = getDocs;window.deleteDoc = deleteDoc;window.serverTimestamp = serverTimestamp; window.where = where; window.query = query; window.orderBy = orderBy; window.limit = limit; window.addDoc = addDoc;window.writeBatch = writeBatch; window.startAfter = startAfter; window.updateDoc = updateDoc; window.FieldValue = FieldValue; window.runTransaction = runTransaction; } catch (e) {  }; </script>
 
-
-    
     
     <link rel="stylesheet" href="tesla.css">
     
@@ -1073,6 +1071,7 @@
     let mapPreviousZoomLevelForProgressive = null;
     let lastKnownAverageAltitude = null;
     let currentAutoZoomMode = 'eco';
+    let isGpsProcessingPaused = false; 
    
     const easeInOutQuad = t => t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
    
@@ -2777,30 +2776,23 @@ function applyLayerVisibility() {
 async function verifyAndForceRouteRepaint() {
     if (!navigationMapInstance) return;
 
-    const maxAttempts = 8;    // Aumentado de 4 a 8
-    const retryDelay = 300; // Aumentado de 250 a 300
+    const maxAttempts = 8;  
+    const retryDelay = 250; 
 
     for (let i = 0; i < maxAttempts; i++) {
         if (!navigationMapInstance || !navigationMapInstance.isStyleLoaded()) {
-            console.warn(`[Map Restart] El mapa se desmontó durante la verificación. Abortando.`);
             return;
         }
 
         const sourceExists = navigationMapInstance.getSource('route');
         const layerExists = navigationMapInstance.getLayer('route');
 
-        // Condición de éxito: tanto la fuente como la capa existen.
         if (sourceExists && layerExists) {
             navigationMapInstance.triggerRepaint();
-            console.log(`[Map Restart] Verificación de ruta OK en intento ${i + 1}. Repintado forzado.`);
             return;
         }
 
-        // Si falló, diagnosticamos y corregimos
-        console.warn(`[Map Restart] Verificación fallida (intento ${i + 1}). Fuente: ${!!sourceExists}, Capa: ${!!layerExists}. Re-intentando...`);
-
         try {
-            // Paso 1: Asegurarse de que la fuente 'route' existe.
             if (!sourceExists) {
                 const routeGeojsonData = (navigationCurrentRouteData?.routes?.[0]?.geometry)
                     ? { type: 'Feature', properties: {}, geometry: navigationCurrentRouteData.routes[0].geometry }
@@ -2809,7 +2801,6 @@ async function verifyAndForceRouteRepaint() {
                 navigationMapInstance.addSource('route', { type: 'geojson', data: routeGeojsonData });
             }
 
-            // Paso 2: Asegurarse de que la capa 'route' existe (puede que la fuente ya existiera pero la capa no).
             if (!navigationMapInstance.getLayer('route')) {
                  navigationMapInstance.addLayer({
                     id: 'route',
@@ -2821,83 +2812,75 @@ async function verifyAndForceRouteRepaint() {
                 });
             }
         } catch(e) {
-            // Ignoramos errores si otro proceso lo añade al mismo tiempo. El siguiente ciclo lo verificará.
-            console.warn(`[Map Restart] Error menor durante el re-intento de añadir capa/fuente: ${e.message}`);
         }
         
         await wait(retryDelay);
     }
 
-    // Si después de todos los intentos sigue fallando, informamos.
-    console.error("[Map Restart] Fallo definitivo al restaurar la capa de ruta después del reinicio ligero.");
     showToast("Error al redibujar la ruta tras la optimización.", "error");
 }
 
+
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
-// NOMBRE: performLightMapRestart (VERSIÓN CON RESTAURACIÓN DE ESTADO DE GRÁFICA)
-// =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
+// NOMBRE: performLightMapRestart (VERSIÓN FINAL CON LÓGICA COMPLETA Y SEGURA)
+// RESUMEN: Implementa el reinicio completo para liberar memoria, incluyendo la
 async function performLightMapRestart() {
     if (!isNavigating && !isFreeDriveActive) return; 
     if (isRecalculatingRoute) return;
+    // --- 1. PAUSAR EL PROCESAMIENTO DEL GPS ---
+    isGpsProcessingPaused = true;
 
-   
     const lastKnownLocation = { ...navigationCurrentLocation };
     const wasFollowing = navigationFollowUser;
     const lastZoom = navigationMapInstance ? navigationMapInstance.getZoom() : 16;
     const lastPitch = navigationMapInstance ? navigationMapInstance.getPitch() : 0;
     const lastBearing = navigationMapInstance ? navigationMapInstance.getBearing() : 0;
-
     const graphCardElement = document.getElementById('navigation-graph-card');
     const wasGraphVisible = graphCardElement && !graphCardElement.classList.contains('hidden');
-    if (initialUserLocationMarker) {
-        initialUserLocationMarker = null;
-    }
-    if (groundAnchorMarker) {
-        groundAnchorMarker = null;
-    }
-
-    if (navigationMapInstance && navigationMapInstance.isStyleLoaded()) {
-        try {
-            const style = navigationMapInstance.getStyle();
-            if (style && style.layers) {
-                for (let i = style.layers.length - 1; i >= 0; i--) {
-                    const layerId = style.layers[i].id;
-                    try { if (navigationMapInstance.getLayer(layerId)) navigationMapInstance.removeLayer(layerId); } catch (e) {}
-                }
-            }
-            if (style && style.sources) {
-                Object.keys(style.sources).forEach(sourceId => {
-                    try { if (navigationMapInstance.getSource(sourceId)) navigationMapInstance.removeSource(sourceId); } catch (e) {}
-                });
-            }
-            navigationMapInstance.setStyle({ version: 8, sources: {}, layers: [{ id: 'background', type: 'background', paint: { 'background-color': '#111' } }] });
-            await new Promise(resolve => navigationMapInstance.once('styledata', resolve));
-        } catch (e) {
-        }
-    }
     
     try {
-        await mapboxgl.clearStorage();
-    } catch (e) {
-    }
-    
-    if (navigationMapInstance) {
-        navigationMapInstance.remove();
-        navigationMapInstance = null;
-    }
-    
-    await wait(270);
+        if (initialUserLocationMarker) initialUserLocationMarker = null;
+        if (groundAnchorMarker) groundAnchorMarker = null;
 
-    const mapModal = document.getElementById('reminders-location-map-modal');
-    if (mapModal && !mapModal.classList.contains('map-modal-hidden')) {
+        if (navigationMapInstance && navigationMapInstance.isStyleLoaded()) {
+            try {
+                const style = navigationMapInstance.getStyle();
+                if (style && style.layers) {
+                    for (let i = style.layers.length - 1; i >= 0; i--) {
+                        const layerId = style.layers[i].id;
+                        try { if (navigationMapInstance.getLayer(layerId)) navigationMapInstance.removeLayer(layerId); } catch (e) {}
+                    }
+                }
+                if (style && style.sources) {
+                    Object.keys(style.sources).forEach(sourceId => {
+                        try { if (navigationMapInstance.getSource(sourceId)) navigationMapInstance.removeSource(sourceId); } catch (e) {}
+                    });
+                }
+                navigationMapInstance.setStyle({ version: 8, sources: {}, layers: [{ id: 'background', type: 'background', paint: { 'background-color': '#111' } }] });
+                await new Promise(resolve => navigationMapInstance.once('styledata', resolve));
+                
+                navigationMapInstance.remove();
+            } catch (e) {
+            }
+        }
+        navigationMapInstance = null;
+        
+        await mapboxgl.clearStorage().catch(e => console.warn("Aviso: mapboxgl.clearStorage() falló, continuando...", e));
+        
+        await wait(280);
+
+        const mapModal = document.getElementById('reminders-location-map-modal');
+        if (!mapModal || mapModal.classList.contains('map-modal-hidden')) {
+            throw new Error("El modal del mapa no está visible, se aborta la reconstrucción.");
+        }
+        
         const mapActualContainer = document.getElementById('mapbox-map-actual-container');
         const savedLayerName = localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO";
         const finalLayerName = MAP_LEGACY_NAME_MAP[savedLayerName] || savedLayerName;
         const initialStyle = MAP_STYLES[finalLayerName] || MAP_STYLES["HÍBRIDO"];
         
         navigationMapInstance = new mapboxgl.Map({
-            container: mapActualContainer,
-            style: initialStyle,
+            container: mapActualContainer, style: initialStyle,
             center: [lastKnownLocation.longitude, lastKnownLocation.latitude],
             zoom: lastZoom, pitch: lastPitch, bearing: lastBearing,
             attributionControl: false, pixelRatio: window.devicePixelRatio || 1,
@@ -2905,10 +2888,8 @@ async function performLightMapRestart() {
             accessToken: mapboxgl.accessToken, minzoom: 2, maxzoom: 19
         });
 
-        const customControls = new CustomMapControlsGroup();
-        window.mapCustomControlsInstance = customControls; 
-        navigationMapInstance.addControl(customControls, 'bottom-right');
-        
+        window.mapCustomControlsInstance = new CustomMapControlsGroup();
+        navigationMapInstance.addControl(window.mapCustomControlsInstance, 'bottom-right');
         compassAndModeControl = new CompassAndStatsControl();
         navigationMapInstance.addControl(compassAndModeControl, 'bottom-left');
 
@@ -2917,7 +2898,7 @@ async function performLightMapRestart() {
         navigationFollowUser = wasFollowing;
         shouldCenterOnUser = wasFollowing;
         updateLocateMeButtonsUI();
-
+        
         await loadAndAddMapImages(navigationMapInstance);
         await configureMapAtmosphere();
         await reAddCustomMapLayersAndSources(navigationMapInstance);
@@ -2927,7 +2908,6 @@ async function performLightMapRestart() {
         displayAlertsOnMap();
         renderWaypointMarkers();
         updateRouteAndCarIconStyle();
-        
         assignMapButtonListeners();
         
         if (wasGraphVisible) {
@@ -2939,11 +2919,13 @@ async function performLightMapRestart() {
         }
         
         await verifyAndForceRouteRepaint();
-
-        console.log("%c[Memory Manager] Reinicio ligero del mapa completado.", "color: green; font-weight: bold;");
+ 
+    } catch (error) {
+        showToast("Error al optimizar mapa. Se recomienda recarga manual.", "error");
+    } finally {
+        isGpsProcessingPaused = false;
     }
-}
-    
+}    
     
 // ===================================================================
 // NOMBRE: findGooglePlaceId 
@@ -2966,11 +2948,9 @@ async function findGooglePlaceId(poiName, lat, lng) {
         if (places && places.length > 0) {
             return places[0].id; 
         } else {
-            console.warn("No se encontró un place_id de Google para:", poiName);
             return null;
         }
     } catch (error) {
-        console.error("Error en la búsqueda de Google Places:", error);
         return null;
     }
 }
@@ -2995,7 +2975,6 @@ async function getGooglePlaceDetails(placeId, fields = null) {
         await place.fetchFields({ fields: fieldsToRequest });
         return place;
     } catch (error) {
-        console.error("Error al obtener detalles de Google Places:", error);
         return null;
     }
 }
@@ -6973,7 +6952,7 @@ function handleDragStartReorder(e) {
 // NOMBRE: updateInitialUserPosition (MODIFICADA)
 // RESUMEN: Orquestador principal del GPS. Ahora también gestiona los FPS de la cámara.
 function updateInitialUserPosition(coords, mapInstanceToUse) {
-    if (isRecalculatingRoute || !mapInstanceToUse || !coords) return;
+    if (isGpsProcessingPaused || isRecalculatingRoute || !mapInstanceToUse || !coords) return;
 
     const speed = (coords.speed || 0) * 3.6; // Convertir m/s a km/h
 
