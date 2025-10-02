@@ -38,6 +38,7 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script type="module"> import { initializeApp } from "https://www.gstatic.com/firebasejs/11.9.1/firebase-app.js"; import { getFirestore, doc, setDoc, getDoc, getDocs, deleteDoc, collection, serverTimestamp, where, query, orderBy, limit, addDoc, writeBatch, startAfter, updateDoc, FieldValue, runTransaction } from "https://www.gstatic.com/firebasejs/11.9.1/firebase-firestore.js";  const firebaseConfig = window.APP_CONFIG.firebase; try { const app = initializeApp(firebaseConfig);window.db = getFirestore(app);window.doc = doc;window.setDoc = setDoc;window.getDoc = getDoc;window.collection = collection;window.getDocs = getDocs;window.deleteDoc = deleteDoc;window.serverTimestamp = serverTimestamp; window.where = where; window.query = query; window.orderBy = orderBy; window.limit = limit; window.addDoc = addDoc;window.writeBatch = writeBatch; window.startAfter = startAfter; window.updateDoc = updateDoc; window.FieldValue = FieldValue; window.runTransaction = runTransaction; } catch (e) {  }; </script>
 
+
     
     
     <link rel="stylesheet" href="tesla.css">
@@ -2770,25 +2771,65 @@ function applyLayerVisibility() {
 }
 
 // ===================================================================
-// NOMBRE: verifyAndForceRouteRepaint (NUEVA FUNCIÓN DE ROBUSTEZ)
-// RESUMEN: Comprueba si la capa de la ruta existe tras un reinicio y fuerza su repintado.
+// NOMBRE: verifyAndForceRouteRepaint (VERSIÓN ROBUSTA CON MÁS REINTENTOS)
+// RESUMEN: Comprueba tenazmente si la ruta existe, la re-añade si es necesario y fuerza su repintado.
 // ===================================================================
 async function verifyAndForceRouteRepaint() {
     if (!navigationMapInstance) return;
 
-    const maxAttempts = 4;
-    const retryDelay = 250;
+    const maxAttempts = 8;    // Aumentado de 4 a 8
+    const retryDelay = 300; // Aumentado de 250 a 300
 
     for (let i = 0; i < maxAttempts; i++) {
-        if (navigationMapInstance.getLayer('route')) {
-            navigationMapInstance.triggerRepaint();
-            return; 
-        } else {
-            await reAddCustomMapLayersAndSources(navigationMapInstance);
+        if (!navigationMapInstance || !navigationMapInstance.isStyleLoaded()) {
+            console.warn(`[Map Restart] El mapa se desmontó durante la verificación. Abortando.`);
+            return;
         }
+
+        const sourceExists = navigationMapInstance.getSource('route');
+        const layerExists = navigationMapInstance.getLayer('route');
+
+        // Condición de éxito: tanto la fuente como la capa existen.
+        if (sourceExists && layerExists) {
+            navigationMapInstance.triggerRepaint();
+            console.log(`[Map Restart] Verificación de ruta OK en intento ${i + 1}. Repintado forzado.`);
+            return;
+        }
+
+        // Si falló, diagnosticamos y corregimos
+        console.warn(`[Map Restart] Verificación fallida (intento ${i + 1}). Fuente: ${!!sourceExists}, Capa: ${!!layerExists}. Re-intentando...`);
+
+        try {
+            // Paso 1: Asegurarse de que la fuente 'route' existe.
+            if (!sourceExists) {
+                const routeGeojsonData = (navigationCurrentRouteData?.routes?.[0]?.geometry)
+                    ? { type: 'Feature', properties: {}, geometry: navigationCurrentRouteData.routes[0].geometry }
+                    : { type: 'FeatureCollection', features: [] };
+                
+                navigationMapInstance.addSource('route', { type: 'geojson', data: routeGeojsonData });
+            }
+
+            // Paso 2: Asegurarse de que la capa 'route' existe (puede que la fuente ya existiera pero la capa no).
+            if (!navigationMapInstance.getLayer('route')) {
+                 navigationMapInstance.addLayer({
+                    id: 'route',
+                    type: 'line',
+                    source: 'route',
+                    minzoom: 1.5, maxzoom: 19,
+                    layout: { 'line-join': 'round', 'line-cap': 'round' },
+                    paint: getRouteStyleProperties()
+                });
+            }
+        } catch(e) {
+            // Ignoramos errores si otro proceso lo añade al mismo tiempo. El siguiente ciclo lo verificará.
+            console.warn(`[Map Restart] Error menor durante el re-intento de añadir capa/fuente: ${e.message}`);
+        }
+        
         await wait(retryDelay);
     }
 
+    // Si después de todos los intentos sigue fallando, informamos.
+    console.error("[Map Restart] Fallo definitivo al restaurar la capa de ruta después del reinicio ligero.");
     showToast("Error al redibujar la ruta tras la optimización.", "error");
 }
 
