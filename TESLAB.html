@@ -1,4 +1,4 @@
-JU52
+JU53
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -6564,6 +6564,8 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
 
             navigationCurrentRouteData = newRouteData;
             precalculateRouteStepDistances(navigationCurrentRouteData);
+
+            generateAndCacheCleanManeuverList(newRemainingRoute, navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart));
             
             await drawRouteOnMap(newRemainingRoute);
             
@@ -7697,33 +7699,38 @@ function adaptMapboxRouteToOSRMFormat(mapboxRoute) {
 } 
 
 // ===================================================================
-// NOMBRE: getCleanManeuverList
-// RESUMEN: Devuelve una lista filtrada de maniobras "reales", omitiendo pasos irrelevantes.
-//          Cachea el resultado en el objeto de la ruta para mayor eficiencia.
+// NOMBRE: generateAndCacheCleanManeuverList (NUEVA FUNCIÓN CENTRAL)
+// RESUMEN: Crea la lista definitiva de maniobras "reales" UNA SOLA VEZ y la cachea.
 // ===================================================================
-function getCleanManeuverList(route) {
-    if (route._cleanSteps) {
-        return route._cleanSteps;
+function generateAndCacheCleanManeuverList(route, actualWaypoints) {
+    if (route._cleanSteps) { // Si ya está cacheada, no hacer nada
+        return;
     }
 
     const cleanSteps = [];
-    const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
-
+    if (!route || !route.legs) {
+        route._cleanSteps = [];
+        return;
+    }
+    
     route.legs.forEach((leg, legIdx) => {
         if (!leg.steps) return;
         for (let stepIdx = 0; stepIdx < leg.steps.length; stepIdx++) {
             const step = leg.steps[stepIdx];
             
+            // Filtro 1: Omitir llegadas/salidas de puntos de paso internos
             const isArrivalAtInternal = step.maneuver.type === 'arrive' && actualWaypoints[legIdx + 1]?.isInternal;
             const isDepartureFromInternal = step.maneuver.type === 'depart' && stepIdx === 0 && legIdx > 0 && actualWaypoints[legIdx]?.isInternal;
             
+            // Filtro 2: Omitir la maniobra final de llegada a destino
             const isFinalArrival = (legIdx === route.legs.length - 1) && (stepIdx === leg.steps.length - 1) && step.maneuver.type === 'arrive';
 
             if (isArrivalAtInternal || isDepartureFromInternal || isFinalArrival) {
                 continue;
             }
 
-            const isShortAndSimple = (step.distance < 30) && (step.maneuver.type === 'continue' || step.maneuver.type === 'new name');
+            // Filtro 3: Omitir "micro-pasos" de preparación (cortos y simples) antes de una maniobra real
+            const isShortAndSimple = (step.distance < 40) && (step.maneuver.type === 'continue' || step.maneuver.type === 'new name');
             if (isShortAndSimple) {
                 const nextStep = leg.steps[stepIdx + 1];
                 if (nextStep) {
@@ -7734,18 +7741,16 @@ function getCleanManeuverList(route) {
                 }
             }
             
+            // Si el paso es válido, lo añadimos a la lista limpia
             cleanSteps.push({ ...step, originalLegIndex: legIdx, originalStepIndex: stepIdx });
         }
     });
     
-    route._cleanSteps = cleanSteps; // Cacheamos el resultado
-    return cleanSteps;
+    route._cleanSteps = cleanSteps; // Cachear el resultado en el objeto de la ruta
 }
-
-
     
 // ===================================================================
-// NOMBRE: updateTurnByTurnDisplay (VERSIÓN FINAL CON LÓGICA UNIFICADA)
+// NOMBRE: updateTurnByTurnDisplay (VERSIÓN FINAL CON LÓGICA CENTRALIZADA)
 // ===================================================================
 function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     const topInfoBar = document.getElementById('navigation-top-info-bar');
@@ -7779,7 +7784,8 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
         return;
     }
 
-    const cleanManeuvers = getCleanManeuverList(route);
+    // <<-- INICIO: LÓGICA DE CONTEO EFICIENTE USANDO LA LISTA PRE-CALCULADA -->>
+    const cleanManeuvers = route._cleanSteps || []; // Obtiene la lista cacheada
     const totalManeuvers = cleanManeuvers.length;
     const carDistance = Math.min(Math.max(0, carDistanceAlongTheRoute), route.distance);
     
@@ -7793,7 +7799,8 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
         }
     }
     const maneuversRemaining = totalManeuvers - maneuversPassed;
-  
+    // <<-- FIN: LÓGICA DE CONTEO EFICIENTE -->>
+
     if (maneuversRemaining > 0) {
         maneuverCounterEl.textContent = maneuversRemaining.toString();
         maneuverCounterEl.style.display = 'flex';
@@ -7801,6 +7808,8 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
         maneuverCounterEl.style.display = 'none';
     }
     
+    // El resto de la lógica para encontrar el paso actual y el siguiente se mantiene,
+    // pero el contador ahora es 100% fiable.
     let currentLegIndex = -1, currentStepIndex = -1;
     let stepFound = false;
     for (let i = 0; i < route.legs.length; i++) {
@@ -7822,18 +7831,43 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     currentLegIndexNav = currentLegIndex;
     currentStepIndexNav = currentStepIndex;
 
-    let nextStepToDisplay = cleanManeuvers.find(step => (step.cumulativeDistance || 0) >= carDistance);
+    let finalStepToShow;
+    let finalStepLegIndex = -1;
+    let tempLegIdx = currentLegIndex;
+    let tempStepIdx = currentStepIndex + 1;
 
-    if (!nextStepToDisplay) {
-        const lastLeg = route.legs[route.legs.length - 1];
-        nextStepToDisplay = lastLeg.steps[lastLeg.steps.length - 1];
+    while (true) {
+        if (tempLegIdx >= route.legs.length) {
+            finalStepToShow = route.legs[route.legs.length - 1].steps[route.legs[route.legs.length - 1].steps.length - 1];
+            finalStepLegIndex = route.legs.length - 1;
+            break;
+        }
+        let leg = route.legs[tempLegIdx];
+        if (!leg.steps || tempStepIdx >= leg.steps.length) {
+            tempLegIdx++;
+            tempStepIdx = 0;
+            continue;
+        }
+        const candidateStep = leg.steps[tempStepIdx];
+        const isArrival = candidateStep.maneuver.type === 'arrive';
+        const arrivalWaypoint = isArrival ? actualWaypoints[tempLegIdx + 1] : null; 
+        if (isArrival && arrivalWaypoint && arrivalWaypoint.isInternal) {
+            tempStepIdx++;
+            continue;
+        } else {
+            finalStepToShow = candidateStep;
+            finalStepLegIndex = tempLegIdx;
+            break;
+        }
     }
-  
+
+    let nextStepToDisplay = finalStepToShow;
     nextManeuverStepForPreview = nextStepToDisplay;
     const distanceToEndOfCurrentStepForProgress = (currentStepForProgress.cumulativeDistance || 0) + (currentStepForProgress.distance || 0);
     const distanceToNextManeuver = Math.max(0, distanceToEndOfCurrentStepForProgress - carDistance);
     const distanceIntoCurrentStep = (currentStepForProgress.distance || 0) - distanceToNextManeuver;
     
+    // ... el resto de la función (lógica de UI) permanece igual ...
     const now = Date.now();
     const infoOverlay = document.getElementById('map-info-overlay');
     const uniqueManeuverId = `${currentLegIndex}_${currentStepIndex}_${nextStepToDisplay.name}`;
@@ -7942,8 +7976,8 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
         let maneuverText, streetNameText;
 
         if (type === 'arrive') {
-            const arrivalWaypoint = actualWaypoints.find(wp => wp.type === 'F');
-            if (arrivalWaypoint && arrivalWaypoint.type === 'intermediate') { // This logic branch is less likely now but kept for safety
+            const arrivalWaypoint = actualWaypoints[finalStepLegIndex + 1] || actualWaypoints[actualWaypoints.length - 1];
+            if (arrivalWaypoint && arrivalWaypoint.type === 'intermediate') {
                 maneuverText = `Llegada a Etapa ${arrivalWaypoint.label} de ${totalStages}`;
                 streetNameText = arrivalWaypoint.address || '';
             } else {
@@ -8035,6 +8069,7 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
         if (intersectionPreviewWindow && !intersectionPreviewWindow.classList.contains('hidden') && intersectionPreviewWindow.dataset.source !== 'click') hideIntersectionPreviewMap();
     }
 }
+
     
 // ===================================================================
 // NOMBRE: showArrivalStatsModal 
@@ -19526,7 +19561,7 @@ function setNavigationMapClickHandler() {
 
 // ===================================================================
 // NOMBRE: showSimulationModal (VERSIÓN CON LÓGICA CENTRALIZADA Y CORRECTA)
-// ===================================================================
+// RESUMEN: Muestra un modal con la lista de maniobras, usando la misma lógica
 async function showSimulationModal() {
     const canSimulate = (navigationWaypoints.filter(wp => !wp.isInternal && !wp.isRecalculatedStart).length >= 2 && navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0]) ||
                     (isNavigating && navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0]);
@@ -19588,6 +19623,7 @@ async function showSimulationModal() {
 
         const legIdx = step.originalLegIndex;
         if (legIdx > currentLegHeaderIndex) {
+            // Encuentra el siguiente waypoint real (no interno) para el encabezado
             const legDestinationWaypoint = waypointsForRequest.find((wp, index) => index > legIdx && wp && !wp.isInternal);
             if(legDestinationWaypoint) {
                 const leg = route.legs[legIdx];
@@ -19652,6 +19688,8 @@ async function showSimulationModal() {
         contentArea.innerHTML = "<p>No hay más interacciones futuras en la ruta o estás muy cerca del final.</p>";
     }
 }
+```
+    
     
 // ===================================================================
 // NOMBRE: showSimulationSpeedModal 
