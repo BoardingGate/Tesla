@@ -1216,6 +1216,55 @@ V01
         }
     }).join(', ');   
 
+//=================================================================='
+// NOMBRE: generateAndCacheCleanManeuverList (Función auxiliar optimizada)
+// RESUMEN: Crea y cachea la lista de maniobras "reales" una sola vez por ruta.
+// ===================================================================
+function generateAndCacheCleanManeuverList(route, actualWaypoints) {
+    if (!route || !route.legs) {
+        route._cleanSteps = [];
+        return;
+    }
+
+    const cleanSteps = [];
+    const significantManeuverTypes = new Set(['turn', 'fork', 'merge', 'roundabout', 'rotary', 'end of road', 'off ramp', 'on ramp', 'use lane']);
+
+    route.legs.forEach((leg, legIdx) => {
+        if (!leg.steps) return;
+
+        for (let stepIdx = 0; stepIdx < leg.steps.length; stepIdx++) {
+            const step = leg.steps[stepIdx];
+            const maneuver = step.maneuver;
+
+            // Filtro 1: Omitir la maniobra final de llegada a destino.
+            if (legIdx === route.legs.length - 1 && stepIdx === leg.steps.length - 1 && maneuver.type === 'arrive') {
+                continue;
+            }
+            // Filtro 2: Omitir maniobras de "depart" que no sean la del inicio absoluto de la ruta.
+            if (maneuver.type === 'depart' && (legIdx > 0 || stepIdx > 0)) {
+                continue;
+            }
+            // Filtro 3: Omitir maniobras de "arrive" en puntos de paso internos (generados automáticamente).
+            const isArrivalAtInternal = maneuver.type === 'arrive' && actualWaypoints[legIdx + 1]?.isInternal;
+            if (isArrivalAtInternal) {
+                continue;
+            }
+            // Filtro 4: Omitir "micro-pasos" de preparación antes de una maniobra real.
+            const isShortTransition = (maneuver.type === 'continue' || maneuver.type === 'new name') && step.distance < 40;
+            if (isShortTransition) {
+                const nextStep = leg.steps[stepIdx + 1];
+                if (nextStep && significantManeuverTypes.has(nextStep.maneuver.type)) {
+                    continue;
+                }
+            }
+            
+            cleanSteps.push({ ...step, originalLegIndex: legIdx, originalStepIndex: stepIdx });
+        }
+    });
+    
+    route._cleanSteps = cleanSteps; // Cachea el resultado directamente en el objeto de la ruta.
+}
+    
 // ===================================================================
 // NOMBRE: handleZoomToggleButtonClick (VERSIÓN CON ACTIVACIÓN DE CAPAS)
 // RESUMEN: Gestiona el zoom y activa todas las capas al alejar para ver la ruta completa.
@@ -6679,6 +6728,7 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
             navigationCurrentRouteData = newRouteData;
             precalculateRouteStepDistances(navigationCurrentRouteData);
 
+            generateAndCacheCleanManeuverList(newRemainingRoute, navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart));
             
             await drawRouteOnMap(newRemainingRoute);
             
@@ -7811,8 +7861,8 @@ function adaptMapboxRouteToOSRMFormat(mapboxRoute) {
     };
 }  
 
-// ===================================================================
-// NOMBRE: updateTurnByTurnDisplay (VERSIÓN FINAL CON LÓGICA CENTRALIZADA)
+//===================================================================
+// NOMBRE: updateTurnByTurnDisplay (VERSIÓN HÍBRIDA OPTIMIZADA)
 // ===================================================================
 function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     const topInfoBar = document.getElementById('navigation-top-info-bar');
@@ -7846,28 +7896,9 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
         return;
     }
 
-    const cleanManeuvers = [];
-    const significantManeuverTypes = new Set(['turn', 'fork', 'merge', 'roundabout', 'rotary', 'end of road', 'off ramp', 'on ramp', 'use lane']);
-    route.legs.forEach((leg, legIdx) => {
-        if (!leg.steps) return;
-        for (let stepIdx = 0; stepIdx < leg.steps.length; stepIdx++) {
-            const step = leg.steps[stepIdx];
-            const maneuver = step.maneuver;
-            if (legIdx === route.legs.length - 1 && stepIdx === leg.steps.length - 1 && maneuver.type === 'arrive') continue;
-            if (maneuver.type === 'depart' && (legIdx > 0 || stepIdx > 0)) continue;
-            const isArrivalAtInternal = maneuver.type === 'arrive' && actualWaypoints[legIdx + 1]?.isInternal;
-            if (isArrivalAtInternal) continue;
-            const isShortTransition = (maneuver.type === 'continue' || maneuver.type === 'new name') && step.distance < 40;
-            if (isShortTransition) {
-                const nextStep = leg.steps[stepIdx + 1];
-                if (nextStep && significantManeuverTypes.has(nextStep.maneuver.type)) continue;
-            }
-            cleanManeuvers.push(step);
-        }
-    });
-
-    const totalManeuvers = cleanManeuvers.length;
+    const cleanManeuvers = route._cleanSteps || []; // Usa la lista cacheada
     const carDistance = Math.min(Math.max(0, carDistanceAlongTheRoute), route.distance);
+    
     let maneuversPassed = 0;
     for (const cleanStep of cleanManeuvers) {
         if ((cleanStep.cumulativeDistance + cleanStep.distance) < carDistance) {
@@ -7876,15 +7907,21 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
             break;
         }
     }
-    const maneuversRemaining = totalManeuvers - maneuversPassed;
-   
+    const maneuversRemaining = cleanManeuvers.length - maneuversPassed;
+
     if (maneuversRemaining > 0) {
-        maneuverCounterEl.textContent = maneuversRemaining.toString();
-        maneuverCounterEl.style.display = 'flex';
+        const newCountStr = maneuversRemaining.toString();
+        if (maneuverCounterEl.textContent !== newCountStr) { // Renderizado inteligente
+            maneuverCounterEl.textContent = newCountStr;
+        }
+        if (maneuverCounterEl.style.display !== 'flex') {
+            maneuverCounterEl.style.display = 'flex';
+        }
     } else {
-        maneuverCounterEl.style.display = 'none';
+        if (maneuverCounterEl.style.display !== 'none') {
+            maneuverCounterEl.style.display = 'none';
+        }
     }
-    
     let currentLegIndex = -1, currentStepIndex = -1;
     let stepFound = false;
     for (let i = 0; i < route.legs.length; i++) {
@@ -7941,7 +7978,6 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     const distanceToEndOfCurrentStepForProgress = (currentStepForProgress.cumulativeDistance || 0) + (currentStepForProgress.distance || 0);
     const distanceToNextManeuver = Math.max(0, distanceToEndOfCurrentStepForProgress - carDistance);
     const distanceIntoCurrentStep = (currentStepForProgress.distance || 0) - distanceToNextManeuver;
-    
     const now = Date.now();
     const infoOverlay = document.getElementById('map-info-overlay');
     const uniqueManeuverId = `${currentLegIndex}_${currentStepIndex}_${nextStepToDisplay.name}`;
@@ -8143,6 +8179,7 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
         if (intersectionPreviewWindow && !intersectionPreviewWindow.classList.contains('hidden') && intersectionPreviewWindow.dataset.source !== 'click') hideIntersectionPreviewMap();
     }
 }
+    
     
 // ===================================================================
 // NOMBRE: showArrivalStatsModal 
