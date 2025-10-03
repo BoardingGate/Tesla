@@ -1,4 +1,4 @@
-JU51
+JU52
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -7696,10 +7696,56 @@ function adaptMapboxRouteToOSRMFormat(mapboxRoute) {
     };
 } 
 
-
 // ===================================================================
-// NOMBRE: updateTurnByTurnDisplay (VERSIÓN FINAL CON VISIBILIDAD CORREGIDA)
-// RESUMEN: Muestra la próxima maniobra y un contador regresivo de maniobras fiable.
+// NOMBRE: getCleanManeuverList
+// RESUMEN: Devuelve una lista filtrada de maniobras "reales", omitiendo pasos irrelevantes.
+//          Cachea el resultado en el objeto de la ruta para mayor eficiencia.
+// ===================================================================
+function getCleanManeuverList(route) {
+    if (route._cleanSteps) {
+        return route._cleanSteps;
+    }
+
+    const cleanSteps = [];
+    const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
+
+    route.legs.forEach((leg, legIdx) => {
+        if (!leg.steps) return;
+        for (let stepIdx = 0; stepIdx < leg.steps.length; stepIdx++) {
+            const step = leg.steps[stepIdx];
+            
+            const isArrivalAtInternal = step.maneuver.type === 'arrive' && actualWaypoints[legIdx + 1]?.isInternal;
+            const isDepartureFromInternal = step.maneuver.type === 'depart' && stepIdx === 0 && legIdx > 0 && actualWaypoints[legIdx]?.isInternal;
+            
+            const isFinalArrival = (legIdx === route.legs.length - 1) && (stepIdx === leg.steps.length - 1) && step.maneuver.type === 'arrive';
+
+            if (isArrivalAtInternal || isDepartureFromInternal || isFinalArrival) {
+                continue;
+            }
+
+            const isShortAndSimple = (step.distance < 30) && (step.maneuver.type === 'continue' || step.maneuver.type === 'new name');
+            if (isShortAndSimple) {
+                const nextStep = leg.steps[stepIdx + 1];
+                if (nextStep) {
+                    const significantTypes = ['turn', 'fork', 'merge', 'roundabout', 'rotary', 'end of road', 'arrive', 'off ramp'];
+                    if (significantTypes.includes(nextStep.maneuver.type)) {
+                        continue; // Es un "pre-paso", lo ignoramos
+                    }
+                }
+            }
+            
+            cleanSteps.push({ ...step, originalLegIndex: legIdx, originalStepIndex: stepIdx });
+        }
+    });
+    
+    route._cleanSteps = cleanSteps; // Cacheamos el resultado
+    return cleanSteps;
+}
+
+
+    
+// ===================================================================
+// NOMBRE: updateTurnByTurnDisplay (VERSIÓN FINAL CON LÓGICA UNIFICADA)
 // ===================================================================
 function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     const topInfoBar = document.getElementById('navigation-top-info-bar');
@@ -7733,163 +7779,61 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
         return;
     }
 
-    if (!route._totalVisibleSteps) {
-        let count = 0;
-        route.legs.forEach((leg, legIdx) => {
-            if (!leg.steps) return;
-            for (let stepIdx = 0; stepIdx < leg.steps.length; stepIdx++) {
-                const step = leg.steps[stepIdx];
-                const isArrivalAtInternal = step.maneuver.type === 'arrive' && actualWaypoints[legIdx + 1]?.isInternal;
-                const isDepartureFromInternal = step.maneuver.type === 'depart' && stepIdx === 0 && legIdx > 0 && actualWaypoints[legIdx]?.isInternal;
-                const isFinalArrival = (legIdx === route.legs.length - 1) && (stepIdx === leg.steps.length - 1) && step.maneuver.type === 'arrive';
-
-                if (isArrivalAtInternal || isDepartureFromInternal || isFinalArrival) {
-                    continue;
-                }
-
-                const isShortAndSimple = (step.distance < 30) && (step.maneuver.type === 'continue' || step.maneuver.type === 'new name');
-                if (isShortAndSimple) {
-                    const nextStep = leg.steps[stepIdx + 1];
-                    if (nextStep) {
-                        const significantTypes = ['turn', 'fork', 'merge', 'roundabout', 'rotary', 'end of road', 'arrive', 'off ramp'];
-                        if (significantTypes.includes(nextStep.maneuver.type)) {
-                            continue;
-                        }
-                    }
-                }
-                
-                count++;
-            }
-        });
-        route._totalVisibleSteps = count;
-    }
-
+    const cleanManeuvers = getCleanManeuverList(route);
+    const totalManeuvers = cleanManeuvers.length;
     const carDistance = Math.min(Math.max(0, carDistanceAlongTheRoute), route.distance);
-    let visibleStepsPassed = 0;
+    
+    let maneuversPassed = 0;
+    for (const cleanStep of cleanManeuvers) {
+        const endOfThisStep = (cleanStep.cumulativeDistance || 0) + (cleanStep.distance || 0);
+        if (endOfThisStep < carDistance) {
+            maneuversPassed++;
+        } else {
+            break;
+        }
+    }
+    const maneuversRemaining = totalManeuvers - maneuversPassed;
+  
+    if (maneuversRemaining > 0) {
+        maneuverCounterEl.textContent = maneuversRemaining.toString();
+        maneuverCounterEl.style.display = 'flex';
+    } else {
+        maneuverCounterEl.style.display = 'none';
+    }
+    
+    let currentLegIndex = -1, currentStepIndex = -1;
+    let stepFound = false;
     for (let i = 0; i < route.legs.length; i++) {
         const leg = route.legs[i];
         if (!leg || !leg.steps) continue;
         for (let j = 0; j < leg.steps.length; j++) {
             const step = leg.steps[j];
-            const endOfThisStep = (step.cumulativeDistance || 0) + (step.distance || 0);
-
-            if (endOfThisStep < carDistance) {
-                const isArrivalAtInternal = step.maneuver.type === 'arrive' && actualWaypoints[i + 1]?.isInternal;
-                const isDepartureFromInternal = step.maneuver.type === 'depart' && j === 0 && i > 0 && actualWaypoints[i]?.isInternal;
-                const isFinalArrival = (i === route.legs.length - 1) && (j === leg.steps.length - 1) && step.maneuver.type === 'arrive';
-
-                if (isArrivalAtInternal || isDepartureFromInternal || isFinalArrival) {
-                    continue;
-                }
-                
-                const isShortAndSimple = (step.distance < 30) && (step.maneuver.type === 'continue' || step.maneuver.type === 'new name');
-                if (isShortAndSimple) {
-                    const nextStep = leg.steps[j + 1];
-                    if (nextStep) {
-                        const significantTypes = ['turn', 'fork', 'merge', 'roundabout', 'rotary', 'end of road', 'arrive', 'off ramp'];
-                        if (significantTypes.includes(nextStep.maneuver.type)) {
-                            continue;
-                        }
-                    }
-                }
-                
-                visibleStepsPassed++;
-
-            } else {
-                break; 
-            }
-        }
-        if ((leg.cumulativeDistance || 0) + (leg.distance || 0) > carDistance) break;
-    }
-    
-    const maneuversRemaining = (route._totalVisibleSteps || 0) - visibleStepsPassed;
-    
-    if (maneuversRemaining > 0) {
-        const newCount = maneuversRemaining.toString();
-        if (maneuverCounterEl.textContent !== newCount) {
-            maneuverCounterEl.textContent = newCount;
-        }
-        if (maneuverCounterEl.style.display !== 'flex') { 
-            maneuverCounterEl.style.display = 'flex';
-        }
-    } else {
-        if (maneuverCounterEl.style.display !== 'none') { 
-            maneuverCounterEl.style.display = 'none';
-        }
-    }
-
-    let currentLegIndex = -1, currentStepIndex = -1;
-    let distanceToEndOfCurrentStepForProgress = 0;
-    let searchLegIndex = currentLegIndexNav;
-    let searchStepIndex = currentStepIndexNav;
-    if (searchLegIndex >= route.legs.length || !route.legs[searchLegIndex] || searchStepIndex >= route.legs[searchLegIndex].steps.length || (route.legs[searchLegIndex].steps[searchStepIndex].cumulativeDistance || 0) > carDistance) {
-        searchLegIndex = 0;
-        searchStepIndex = 0;
-    }
-    let stepFound = false;
-
-    for (let i = searchLegIndex; i < route.legs.length; i++) {
-        const leg = route.legs[i];
-        if (!leg || !leg.steps) continue;
-        const startStepSearch = (i === searchLegIndex) ? searchStepIndex : 0;
-        for (let j = startStepSearch; j < leg.steps.length; j++) {
-            const step = leg.steps[j];
             if (step && typeof step.cumulativeDistance === 'number' && (step.cumulativeDistance + (step.distance || 0)) > carDistance) {
-                currentLegIndex = i;
-                currentStepIndex = j;
-                stepFound = true;
-                break;
+                currentLegIndex = i; currentStepIndex = j; stepFound = true; break;
             }
         }
         if (stepFound) break;
     }
-
     if (currentLegIndex === -1) {
         currentLegIndex = route.legs.length - 1;
-        if (route.legs[currentLegIndex] && route.legs[currentLegIndex].steps) {
-            currentStepIndex = route.legs[currentLegIndex].steps.length - 1;
-        } else { return; }
+        currentStepIndex = route.legs[currentLegIndex].steps.length - 1;
     }
-    
     const currentStepForProgress = route.legs[currentLegIndex].steps[currentStepIndex];
-    distanceToEndOfCurrentStepForProgress = (currentStepForProgress.cumulativeDistance || 0) + (currentStepForProgress.distance || 0); 
     currentLegIndexNav = currentLegIndex;
     currentStepIndexNav = currentStepIndex;
 
-    let finalStepToShow;
-    let finalStepLegIndex = -1;
-    let tempLegIdx = currentLegIndex;
-    let tempStepIdx = currentStepIndex + 1;
+    let nextStepToDisplay = cleanManeuvers.find(step => (step.cumulativeDistance || 0) >= carDistance);
 
-    while (true) {
-        if (tempLegIdx >= route.legs.length) {
-            finalStepToShow = route.legs[route.legs.length - 1].steps[route.legs[route.legs.length - 1].steps.length - 1];
-            finalStepLegIndex = route.legs.length - 1;
-            break;
-        }
-        let leg = route.legs[tempLegIdx];
-        if (tempStepIdx >= leg.steps.length) {
-            tempLegIdx++;
-            tempStepIdx = 0;
-            continue;
-        }
-        const candidateStep = leg.steps[tempStepIdx];
-        const isArrival = candidateStep.maneuver.type === 'arrive';
-        const arrivalWaypoint = isArrival ? actualWaypoints[tempLegIdx + 1] : null; 
-        if (isArrival && arrivalWaypoint && arrivalWaypoint.isInternal) {
-            tempStepIdx++;
-            continue;
-        } else {
-            finalStepToShow = candidateStep;
-            finalStepLegIndex = tempLegIdx;
-            break;
-        }
+    if (!nextStepToDisplay) {
+        const lastLeg = route.legs[route.legs.length - 1];
+        nextStepToDisplay = lastLeg.steps[lastLeg.steps.length - 1];
     }
-
-    let nextStepToDisplay = finalStepToShow;
+  
     nextManeuverStepForPreview = nextStepToDisplay;
+    const distanceToEndOfCurrentStepForProgress = (currentStepForProgress.cumulativeDistance || 0) + (currentStepForProgress.distance || 0);
     const distanceToNextManeuver = Math.max(0, distanceToEndOfCurrentStepForProgress - carDistance);
     const distanceIntoCurrentStep = (currentStepForProgress.distance || 0) - distanceToNextManeuver;
+    
     const now = Date.now();
     const infoOverlay = document.getElementById('map-info-overlay');
     const uniqueManeuverId = `${currentLegIndex}_${currentStepIndex}_${nextStepToDisplay.name}`;
@@ -7998,8 +7942,8 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
         let maneuverText, streetNameText;
 
         if (type === 'arrive') {
-            const arrivalWaypoint = actualWaypoints[finalStepLegIndex + 1];
-            if (arrivalWaypoint && arrivalWaypoint.type === 'intermediate') {
+            const arrivalWaypoint = actualWaypoints.find(wp => wp.type === 'F');
+            if (arrivalWaypoint && arrivalWaypoint.type === 'intermediate') { // This logic branch is less likely now but kept for safety
                 maneuverText = `Llegada a Etapa ${arrivalWaypoint.label} de ${totalStages}`;
                 streetNameText = arrivalWaypoint.address || '';
             } else {
@@ -19581,8 +19525,8 @@ function setNavigationMapClickHandler() {
 } 
 
 // ===================================================================
-// NOMBRE: showSimulationModal (VERSIÓN CON ESTILO Y POSICIÓN AJUSTADOS)
-// RESUMEN: Muestra un modal con la lista de maniobras, usando la misma lógica
+// NOMBRE: showSimulationModal (VERSIÓN CON LÓGICA CENTRALIZADA Y CORRECTA)
+// ===================================================================
 async function showSimulationModal() {
     const canSimulate = (navigationWaypoints.filter(wp => !wp.isInternal && !wp.isRecalculatedStart).length >= 2 && navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0]) ||
                     (isNavigating && navigationCurrentRouteData && navigationCurrentRouteData.routes && navigationCurrentRouteData.routes[0]);
@@ -19631,97 +19575,75 @@ async function showSimulationModal() {
 
     const carDist = lastCarDistanceAlongRouteForNavLogic;
     let simulationList = document.createElement('ul');
-    let stepsShown = 0;
-    let actualStageCounter = 1;
     
+    const cleanManeuvers = getCleanManeuverList(route); // Usamos la misma fuente de verdad
     const waypointsForRequest = navigationWaypoints.filter(wp => wp);
+    let currentLegHeaderIndex = -1;
+
+    cleanManeuvers.forEach(step => {
+        const distanceToEndOfThisStep = (step.cumulativeDistance || 0) + (step.distance || 0);
+        if (distanceToEndOfThisStep < carDist) {
+            return; // Saltar maniobras ya pasadas
+        }
+
+        const legIdx = step.originalLegIndex;
+        if (legIdx > currentLegHeaderIndex) {
+            const legDestinationWaypoint = waypointsForRequest.find((wp, index) => index > legIdx && wp && !wp.isInternal);
+            if(legDestinationWaypoint) {
+                const leg = route.legs[legIdx];
+                const stageAddress = legDestinationWaypoint.address || `Etapa`;
+                const stageDistance = leg.distance ? (leg.distance / 1000).toFixed(1) + " km" : "Dist. desc.";
+                const stageLabel = legDestinationWaypoint.label;
+
+                const headerLi = document.createElement('li');
+                headerLi.style.cssText = "background-color: #3a3a3c; font-weight: bold; padding: 5px; margin-top:5px; color: #007aff;";
+                headerLi.textContent = `ETAPA ${stageLabel}: ${stageAddress} (Total ${stageDistance})`;
+                simulationList.appendChild(headerLi);
+                currentLegHeaderIndex = legIdx;
+            }
+        }
+
+        const distanceToThisStepManeuver = Math.max(0, distanceToEndOfThisStep - carDist);
+        const maneuver = step.maneuver;
+        const type = maneuver.type || '';
+        let maneuverText, streetNameText;
+
+        maneuverText = maneuver.instruction || getManeuverInstructionText(maneuver);
+
+        const banner = step.bannerInstructions;
+        if (banner && banner.length > 0 && banner[0].primary) {
+            let bannerPrimaryText = banner[0].primary.text;
+            let bannerSecondaryText = banner[0].secondary ? banner[0].secondary.text : '';
+            streetNameText = ` <strong style="color: #FFD700; font-size: 0.95em;">${bannerPrimaryText + (bannerSecondaryText ? `: ${bannerSecondaryText}` : '')}</strong>`;
+        } else {
+            streetNameText = (type === 'depart' || type.includes('roundabout') || type === 'end of road') ? '' : (step.name || '');
+            if (streetNameText) {
+                streetNameText = ` <strong>${streetNameText}</strong>`;
+            }
+        }
     
-    for (let legIdx = 0; legIdx < route.legs.length; legIdx++) {
-        const leg = route.legs[legIdx];
-        if (!leg || !leg.steps) continue;
+        let distanceFormatted = (distanceToThisStepManeuver >= 1000) ? `${(distanceToThisStepManeuver / 1000).toFixed(1)} km` : `${Math.round(distanceToThisStepManeuver)} m`;
         
-        const legDestinationWaypoint = waypointsForRequest[legIdx + 1];
-        if (legDestinationWaypoint && !legDestinationWaypoint.isInternal) {
-             const stageAddress = legDestinationWaypoint.address || `Etapa ${legDestinationWaypoint.label}`;
-             const stageDistance = leg.distance ? (leg.distance / 1000).toFixed(1) + " km" : "Dist. desc.";
-             const headerLi = document.createElement('li');
-             headerLi.style.cssText = "background-color: #3a3a3c; font-weight: bold; padding: 5px; margin-top:5px; color: #007aff;";
-             headerLi.textContent = `ETAPA ${actualStageCounter}: ${stageAddress} (Total ${stageDistance})`;
-             simulationList.appendChild(headerLi);
-             actualStageCounter++;
-        }
+        const li = document.createElement('li');
+        li.dataset.legIndex = step.originalLegIndex;
+        li.dataset.stepIndex = step.originalStepIndex;
+        li.style.cursor = 'pointer';
         
-        for (let stepIdx = 0; stepIdx < leg.steps.length; stepIdx++) {
-            const step = leg.steps[stepIdx];
-            if (!step || !step.maneuver) continue;
-
-            const isArrivalAtInternal = step.maneuver.type === 'arrive' && waypointsForRequest[legIdx + 1]?.isInternal;
-            const isDepartureFromInternal = step.maneuver.type === 'depart' && stepIdx === 0 && legIdx > 0 && waypointsForRequest[legIdx]?.isInternal;
-            if (isArrivalAtInternal || isDepartureFromInternal) continue;
-
-            const isShortAndSimple = (step.distance < 30) && (step.maneuver.type === 'continue' || step.maneuver.type === 'new name');
-            if (isShortAndSimple) {
-                const nextStep = leg.steps[stepIdx + 1];
-                if (nextStep) {
-                    const significantTypes = ['turn', 'fork', 'merge', 'roundabout', 'rotary', 'end of road', 'arrive', 'off ramp'];
-                    if (significantTypes.includes(nextStep.maneuver.type)) {
-                        continue; // Omitir este paso, es solo una aproximación.
-                    }
-                }
-            }
-            
-            const distanceToEndOfThisStep = calculateDistanceToEndOfStep(route, legIdx, stepIdx);
-            if (distanceToEndOfThisStep < carDist) continue;
-            const distanceToThisStepManeuver = Math.max(0, distanceToEndOfThisStep - carDist);
-            
-            const maneuver = step.maneuver;
-            const type = maneuver.type || '';
-            
-            let maneuverText, streetNameText;
-
-            maneuverText = maneuver.instruction || getManeuverInstructionText(maneuver);
-
-            const banner = step.bannerInstructions;
-            if (banner && banner.length > 0 && banner[0].primary) {
-                let bannerPrimaryText = banner[0].primary.text;
-                let bannerSecondaryText = banner[0].secondary ? banner[0].secondary.text : '';
-                let fullBannerText = bannerPrimaryText + (bannerSecondaryText ? `: ${bannerSecondaryText}` : '');
-                
-                streetNameText = ` <strong style="color: #FFD700; font-size: 0.95em;">${fullBannerText}</strong>`;
-            } else {
-                streetNameText = (type === 'depart' || type.includes('roundabout') || type === 'end of road') ? '' : (step.name || '');
-                if (streetNameText) {
-                    streetNameText = ` <strong>${streetNameText}</strong>`;
-                }
-            }
+        const iconContainer = document.createElement('span');
+        iconContainer.className = 'turn-icon-sim';
+        const textContainer = document.createElement('span');
+        textContainer.innerHTML = `${maneuverText}${streetNameText} (${distanceFormatted})`;
         
-            let distanceFormatted = (distanceToThisStepManeuver >= 1000) ? `${(distanceToThisStepManeuver / 1000).toFixed(1)} km` : `${Math.round(distanceToThisStepManeuver)} m`;
-            
-            const li = document.createElement('li');
-            li.dataset.legIndex = legIdx;
-            li.dataset.stepIndex = stepIdx;
-            li.style.cursor = 'pointer';
-            
-            const iconContainer = document.createElement('span');
-            iconContainer.className = 'turn-icon-sim';
-            
-            const textContainer = document.createElement('span');
-            textContainer.innerHTML = `${maneuverText}${streetNameText} (${distanceFormatted})`;
-            
-            li.appendChild(iconContainer);
-            li.appendChild(textContainer);
-            simulationList.appendChild(li);
+        li.appendChild(iconContainer);
+        li.appendChild(textContainer);
+        simulationList.appendChild(li);
 
-            const iconFilename = getManeuverIconFilename(maneuver);
-            const iconUrl = `https://boardinggate.github.io/Tesla/${iconFilename}`;
-            iconContainer.innerHTML = `<img src="${iconUrl}" alt="Maniobra" style="width:24px; height:24px; object-fit:contain;">`;
-            
-            stepsShown++;
-        }
-    }
+        const iconFilename = getManeuverIconFilename(maneuver);
+        iconContainer.innerHTML = `<img src="https://boardinggate.github.io/Tesla/${iconFilename}" alt="Maniobra" style="width:24px; height:24px; object-fit:contain;">`;
+    });
     
     const contentArea = modal.querySelector('#simulation-content-area');
-    if (stepsShown > 0) {
+    if (simulationList.children.length > 0) {
         contentArea.innerHTML = '';
         contentArea.appendChild(simulationList);
         contentArea.removeEventListener('click', handleSimulationItemClick);
