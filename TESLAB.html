@@ -1,4 +1,4 @@
-d021
+d022
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -1313,7 +1313,7 @@ function createMinimapInstanceIfNeeded() {
             minimapCarMarker = new mapboxgl.Marker({ 
                 element: carEl, 
                 anchor: 'center', 
-                rotationAlignment: 'viewport'
+                rotationAlignment: 'map'
             })
             .setLngLat([0, 0])
             .addTo(minimapInstance);
@@ -7477,6 +7477,85 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
                 minimapCarMarker.setRotation(coords.heading);
             }
         }     
+    }
+    
+    const speed = (coords.speed || 0) * 3.6;
+
+    if (currentAutoZoomMode === 'eco') {
+        const isEcoActive = speed > 70 && distanceToNextManeuverOSRM > 2000;
+        if (isEcoActive) {
+            MAP_UPDATE_INTERVAL_MS = 1000 / Math.max(5, baseCameraFps - 2); 
+            performanceRatios.criticalUpdate = baseCriticalRatio + 2;
+        } else {
+            MAP_UPDATE_INTERVAL_MS = originalMapUpdateIntervalMs;
+            performanceRatios.criticalUpdate = baseCriticalRatio;
+        }
+    } else {
+        const PROXIMITY_THRESHOLD_FPS = 310;
+        if (isNavigating && distanceToNextManeuverOSRM < PROXIMITY_THRESHOLD_FPS) {
+            MAP_UPDATE_INTERVAL_MS = 1000 / 45;
+        } else {
+            MAP_UPDATE_INTERVAL_MS = originalMapUpdateIntervalMs;
+        }
+        performanceRatios.criticalUpdate = baseCriticalRatio;
+    }
+
+    const now = performance.now();
+    navigationCurrentLocation = { ...coords };
+    
+    for (const task of TASKS_BY_PRIORITY) { 
+        if (now - task.lastRun >= task.getFrequency()) {
+            task.handler(coords, mapInstanceToUse);
+            task.lastRun = now;
+            
+            if (task.id !== 'CRITICAL_VISUALS') {
+                break;
+            }
+        }
+    }
+}
+
+//===================================================================
+// NOMBRE: updateInitialUserPosition (MODIFICADA CON ROTACIÓN ROBUSTA EN MINIMAPA)
+// RESUMEN: Orquestador principal del GPS. Gestiona FPS y la rotación del minimapa con fallback.
+// ===================================================================
+function updateInitialUserPosition(coords, mapInstanceToUse) {
+    if (isRecalculatingRoute || !mapInstanceToUse || !coords) return;
+
+    gpsTickCounter++;
+
+    const minimapUpdatePeriod = 10; // Actualizar cada 10 ticks (aprox 1 vez por segundo si el GPS va a 10Hz)
+    
+    if (gpsTickCounter % minimapUpdatePeriod === 0) {
+        if (minimapInstance && minimapCarMarker) {
+            minimapCarMarker.setLngLat([coords.longitude, coords.latitude]);
+            
+            // --- INICIO LÓGICA DE ROTACIÓN MEJORADA ---
+            let validatedHeading = null;
+            // Prioridad 1: Usar el heading del GPS si es válido.
+            if (coords.heading !== null && typeof coords.heading === 'number' && !isNaN(coords.heading) && coords.heading >= 0) {
+                validatedHeading = coords.heading;
+            } 
+            // Prioridad 2 (Fallback): Calcular el rumbo a partir del movimiento si hay velocidad.
+            else if (window.lastPositionForSpeedCalc && typeof turf !== 'undefined' && (window.currentSpeedKmh || 0) > 3) {
+                _turfLastPoint.geometry.coordinates[0] = window.lastPositionForSpeedCalc.longitude;
+                _turfLastPoint.geometry.coordinates[1] = window.lastPositionForSpeedCalc.latitude;
+                _turfCurrentPoint.geometry.coordinates[0] = coords.longitude;
+                _turfCurrentPoint.geometry.coordinates[1] = coords.latitude;
+                
+                // Solo calculamos si se ha movido una distancia mínima para evitar "saltos"
+                if (turf.distance(_turfLastPoint, _turfCurrentPoint, { units: 'meters' }) > 0.5) {
+                    const bearing = turf.bearing(_turfLastPoint, _turfCurrentPoint);
+                    validatedHeading = (bearing < 0) ? bearing + 360 : bearing;
+                }
+            }
+            
+            // Solo rotamos si tenemos un rumbo válido.
+            if (validatedHeading !== null) {
+                minimapCarMarker.setRotation(validatedHeading);
+            }
+            // --- FIN LÓGICA DE ROTACIÓN MEJORADA ---
+        }
     }
     
     const speed = (coords.speed || 0) * 3.6;
