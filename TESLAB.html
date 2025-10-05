@@ -1,4 +1,4 @@
-d04
+d05
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -1458,6 +1458,160 @@ function closeNavigationMap(force = false) {
 }
 
 // ===================================================================
+// NOMBRE: drawRouteOnMap 
+// RESUMEN: Encapsula la lógica completa de pintado: destruye la ruta antigua
+async function drawRouteOnMap(route) {
+    return new Promise((resolve, reject) => {
+        if (!navigationMapInstance || !navigationMapInstance.isStyleLoaded()) {
+            return reject(new Error("El mapa no está listo para dibujar."));
+        }
+
+        const geojsonData = (route && route.geometry && route.geometry.coordinates.length >= 2) 
+            ? { type: 'Feature', properties: {}, geometry: route.geometry }
+            : { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: [] } };
+
+        const cleanupAndReject = (message) => {
+            clearTimeout(timeoutId);
+            navigationMapInstance.off('sourcedata', onSourceData);
+            reject(new Error(message));
+        };
+        
+        const timeoutId = setTimeout(() => {
+            cleanupAndReject("Timeout esperando la confirmación de renderizado del mapa.");
+        }, 7000);
+
+        const onSourceData = (e) => {
+            if (e.sourceId === 'route' && e.isSourceLoaded) {
+                clearTimeout(timeoutId);
+                navigationMapInstance.off('sourcedata', onSourceData);
+                resolve();
+            }
+        };
+        
+        navigationMapInstance.on('sourcedata', onSourceData);
+
+        try {
+            if (navigationMapInstance.getLayer('route')) {
+                navigationMapInstance.removeLayer('route');
+            }
+            if (navigationMapInstance.getSource('route')) {
+                navigationMapInstance.removeSource('route');
+            }
+
+            navigationMapInstance.addSource('route', { type: 'geojson', data: geojsonData });
+            navigationMapInstance.addLayer({
+                id: 'route',
+                type: 'line',
+                source: 'route',
+                layout: { 'line-join': 'round', 'line-cap': 'round' },
+                minzoom: 1.5, maxzoom: 19, 
+                paint: getRouteStyleProperties()
+            });
+
+            drawRouteOnMinimap();
+            
+           } catch (error) {
+            cleanupAndReject(`Error al añadir capa/fuente: ${error.message}`);
+        }
+    });
+}
+
+//===================================================================
+// NOMBRE: drawRouteOnMinimap (VERSIÓN ROBUSTA CON REINTENTOS)
+// RESUMEN: Dibuja la ruta en el minimapa, reintentando si los datos no están listos.
+//===================================================================
+async function drawRouteOnMinimap() {
+    if (!showRouteMinimapPreference) {
+        const minimapContainer = document.getElementById('minimap-container');
+        if (minimapContainer) minimapContainer.classList.add('hidden');
+        if (minimapInstance) {
+            try { minimapInstance.remove(); } catch(e) {}
+            minimapInstance = null;
+            minimapCarMarker = null;
+        }
+        return;
+    }
+    
+    createMinimapInstanceIfNeeded();
+    if (!minimapInstance) return;
+
+    let route = navigationCurrentRouteData?.routes?.[0];
+    let hasValidGeometry = route && route.geometry && Array.isArray(route.geometry.coordinates) && route.geometry.coordinates.length > 1;
+
+isRecalculatingRoute=true;
+    
+    if (!hasValidGeometry) {
+        const maxRetries = 5;
+        const retryDelay = 200; // 200ms de espera entre intentos
+        for (let i = 0; i < maxRetries; i++) {
+            await wait(retryDelay); // Función de espera que creamos anteriormente
+            route = navigationCurrentRouteData?.routes?.[0]; // Re-evaluar la ruta global
+            hasValidGeometry = route && route.geometry && Array.isArray(route.geometry.coordinates) && route.geometry.coordinates.length > 1;
+            if (hasValidGeometry) {
+                console.log(`[Minimap] Geometría de ruta encontrada en el intento #${i + 1}`);
+                break; // Si la encontramos, salimos del bucle
+            }
+        }
+    }
+
+ isRecalculatingRoute=false;
+  
+    
+    const minimapContainer = document.getElementById('minimap-container');
+
+    if (!hasValidGeometry) {
+        console.warn("[Minimap] No se pudo obtener la geometría de la ruta después de varios intentos. El minimapa permanecerá oculto.");
+        if (minimapContainer) minimapContainer.classList.add('hidden');
+        if (minimapInstance.isStyleLoaded()) {
+            try {
+                const routeSource = minimapInstance.getSource('minimap-route-source');
+                if (routeSource) routeSource.setData({ type: 'Feature', geometry: { type: 'LineString', coordinates: [] } });
+            } catch (e) {}
+        }
+        return;
+    }
+
+  isRecalculatingRoute=true;  
+    
+    const drawContent = () => {
+        const geojsonData = route.geometry;
+        const source = minimapInstance.getSource('minimap-route-source');
+        if (source) source.setData(geojsonData);
+        
+        const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
+        const waypointFeatures = actualWaypoints.map(wp => ({
+            type: 'Feature',
+            geometry: { type: 'Point', coordinates: [wp.lng, wp.lat] }
+        }));
+        const waypointSource = minimapInstance.getSource('minimap-waypoints-source');
+        if (waypointSource) waypointSource.setData({ type: 'FeatureCollection', features: waypointFeatures });
+
+        const bounds = new mapboxgl.LngLatBounds();
+        geojsonData.coordinates.forEach(coord => bounds.extend(coord));
+
+        if (!bounds.isEmpty()) {
+            const padding = { top: 30, bottom: 65, left: 60, right: 30 };
+            minimapInstance.fitBounds(bounds, { padding: padding, duration: 0 });
+        }
+        
+        if (minimapCarMarker && navigationCurrentLocation) {
+            minimapCarMarker.setLngLat([navigationCurrentLocation.longitude, navigationCurrentLocation.latitude]);
+            if (navigationCurrentLocation.heading !== null) {
+                minimapCarMarker.setRotation(navigationCurrentLocation.heading);
+            }
+        }
+    };
+    
+    if (minimapInstance.isStyleLoaded()) {
+        drawContent();
+    } else {
+        minimapInstance.once('load', drawContent);
+    }
+    
+    isRecalculatingRoute=false;
+}
+    
+// ===================================================================
 //  openNavigationMap (VERSIÓN CON MINIMAPA CORREGIDO)
 // ===================================================================
 async function openNavigationMap(isRecovery = false) {
@@ -1988,66 +2142,6 @@ class MapSettingsPanel {
     }
 }
     
-//===================================================================
-// NOMBRE: drawRouteOnMinimap 
-// RESUMEN: Dibuja ruta, waypoints, ajusta vista y posiciona el coche inicial.
-function drawRouteOnMinimap(route) {
-    // 1. Intentar crear la instancia si la preferencia está activa y no existe.
-    createMinimapInstanceIfNeeded();
-
-    // 2. Si después de intentar crearla, no existe o no está cargada, salir.
-    if (!minimapInstance || !minimapInstance.isStyleLoaded()) return;
-
-    const geojsonData = (route && route.geometry) ? route.geometry : { type: 'LineString', coordinates: [] };
-    const source = minimapInstance.getSource('minimap-route-source');
-    if (source) {
-        source.setData(geojsonData);
-    }
-    
-    const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
-    const waypointFeatures = actualWaypoints.map(wp => ({
-        type: 'Feature',
-        geometry: { type: 'Point', coordinates: [wp.lng, wp.lat] }
-    }));
-    const waypointSource = minimapInstance.getSource('minimap-waypoints-source');
-    if (waypointSource) {
-        waypointSource.setData({ type: 'FeatureCollection', features: waypointFeatures });
-    }
-
-    if (geojsonData.coordinates.length > 1) {
-    const bounds = new mapboxgl.LngLatBounds();
-    geojsonData.coordinates.forEach(coord => bounds.extend(coord));
-
-    if (!bounds.isEmpty()) {
-        const minimapContainer = document.getElementById('minimap-container');
-        const width = minimapContainer.offsetWidth;
-        const height = minimapContainer.offsetHeight;
-
-        // --- SOLUCIÓN FINAL CON MÁRGENES DE SEGURIDAD ---
-        // Combinamos un padding grande en los lados invisibles con uno
-        // pequeño y fijo en los lados visibles para crear un margen.
-        const padding = {
-            top: 30,           // Margen de seguridad superior de 35px
-            //bottom: height / 2,  // Ignora la mitad inferior (invisible)
-            bottom: 65,  // Ignora la mitad inferior (invisible)
-            //left: width / 2,     // Ignora la mitad izquierda (invisible)
-            left: 65,     // Ignora la mitad izquierda (invisible)
-            right: 30          // Margen de seguridad derecho de 35px
-        };
-
-        minimapInstance.fitBounds(bounds, {
-            padding: padding,
-            duration: 0
-        });
-        }
-    }
-    if (minimapCarMarker && navigationCurrentLocation) {
-        minimapCarMarker.setLngLat([navigationCurrentLocation.longitude, navigationCurrentLocation.latitude]);
-        if (navigationCurrentLocation.heading !== null) {
-            minimapCarMarker.setRotation(navigationCurrentLocation.heading);
-        }
-    }
-}
 
     
 // ===================================================================
@@ -7384,7 +7478,7 @@ function handleDragStartReorder(e) {
 
 
 // ===================================================================
-// NOMBRE: updateInitialUserPosition (MODIFICADA)
+// NOMBRE: updateInitialUserPosition
 // RESUMEN: Orquestador principal del GPS. Ahora también gestiona los FPS de la cámara.
 function updateInitialUserPosition(coords, mapInstanceToUse) {
     if (isRecalculatingRoute || !mapInstanceToUse || !coords) return;
@@ -8726,66 +8820,6 @@ function showArrivalStatsModal(freeDriveStatsData = null) {
     addModalAutoCloseTimer(modal, acceptButton, 'arrival-stats-modal', 150000);
 }   
 
-// ===================================================================
-// NOMBRE: drawRouteOnMap 
-// RESUMEN: Encapsula la lógica completa de pintado: destruye la ruta antigua
-async function drawRouteOnMap(route) {
-    return new Promise((resolve, reject) => {
-        if (!navigationMapInstance || !navigationMapInstance.isStyleLoaded()) {
-            return reject(new Error("El mapa no está listo para dibujar."));
-        }
-
-        const geojsonData = (route && route.geometry && route.geometry.coordinates.length >= 2) 
-            ? { type: 'Feature', properties: {}, geometry: route.geometry }
-            : { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: [] } };
-
-        const cleanupAndReject = (message) => {
-            clearTimeout(timeoutId);
-            navigationMapInstance.off('sourcedata', onSourceData);
-            reject(new Error(message));
-        };
-        
-        const timeoutId = setTimeout(() => {
-            cleanupAndReject("Timeout esperando la confirmación de renderizado del mapa.");
-        }, 7000);
-
-        const onSourceData = (e) => {
-            if (e.sourceId === 'route' && e.isSourceLoaded) {
-                clearTimeout(timeoutId);
-                navigationMapInstance.off('sourcedata', onSourceData);
-                resolve();
-            }
-        };
-        
-        navigationMapInstance.on('sourcedata', onSourceData);
-
-        try {
-            if (navigationMapInstance.getLayer('route')) {
-                navigationMapInstance.removeLayer('route');
-            }
-            if (navigationMapInstance.getSource('route')) {
-                navigationMapInstance.removeSource('route');
-            }
-
-            navigationMapInstance.addSource('route', { type: 'geojson', data: geojsonData });
-            navigationMapInstance.addLayer({
-                id: 'route',
-                type: 'line',
-                source: 'route',
-                layout: { 'line-join': 'round', 'line-cap': 'round' },
-                minzoom: 1.5, maxzoom: 19, 
-                paint: getRouteStyleProperties()
-            });
-
-            if (minimapInstance && minimapInstance.isStyleLoaded()) {
-                drawRouteOnMinimap(route);
-            }
-            
-           } catch (error) {
-            cleanupAndReject(`Error al añadir capa/fuente: ${error.message}`);
-        }
-    });
-}
     
 // ===================================================================
 // NOMBRE: handleAddRadarHereClick 
