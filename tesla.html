@@ -38,6 +38,7 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script type="module"> import { initializeApp } from "https://www.gstatic.com/firebasejs/11.9.1/firebase-app.js"; import { getFirestore, doc, setDoc, getDoc, getDocs, deleteDoc, collection, serverTimestamp, where, query, orderBy, limit, addDoc, writeBatch, startAfter, updateDoc, FieldValue, runTransaction } from "https://www.gstatic.com/firebasejs/11.9.1/firebase-firestore.js";  const firebaseConfig = window.APP_CONFIG.firebase; try { const app = initializeApp(firebaseConfig);window.db = getFirestore(app);window.doc = doc;window.setDoc = setDoc;window.getDoc = getDoc;window.collection = collection;window.getDocs = getDocs;window.deleteDoc = deleteDoc;window.serverTimestamp = serverTimestamp; window.where = where; window.query = query; window.orderBy = orderBy; window.limit = limit; window.addDoc = addDoc;window.writeBatch = writeBatch; window.startAfter = startAfter; window.updateDoc = updateDoc; window.FieldValue = FieldValue; window.runTransaction = runTransaction; } catch (e) {  }; </script>
 
+
       
     
     <link rel="stylesheet" href="tesla.css">
@@ -56,6 +57,7 @@
 </head>
 
 <style>
+
     
 </style>
     
@@ -1116,6 +1118,7 @@
 
     let minimapInstance = null;
     let minimapCarMarker = null;
+    let memoryCheckGracePeriodUntil = 0;
     
     const easeInOutQuad = t => t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
    
@@ -2480,10 +2483,10 @@ function hideRecoveryScreenshotOverlay() {
         }, 500); 
     }
 }
+  
 
-    
 // ===================================================================
-// NOMBRE: manageMemoryCycle (VERSIÓN CON UMBRAL DINÁMICO)
+// NOMBRE: manageMemoryCycle (CON PERIODO DE GRACIA Y LOGGING)
 // ===================================================================
 async function manageMemoryCycle() {
     if (!isNavigating && !isFreeDriveActive && !automatedSimulationIntervalId) {
@@ -2492,6 +2495,13 @@ async function manageMemoryCycle() {
     if (isPerformingControlledReload) {
         return;
     }
+
+    // --> INICIO DE LA CORRECCIÓN: Comprobar periodo de gracia <--
+    if (Date.now() < memoryCheckGracePeriodUntil) {
+        console.log("[Memory Manager] Comprobación de memoria omitida. Dentro del periodo de gracia post-recuperación.");
+        return;
+    }
+    // --- FIN DE LA CORRECCIÓN ---
 
     if (navigationMapInstance) {
         navigationMapInstance.triggerRepaint();
@@ -2504,14 +2514,14 @@ async function manageMemoryCycle() {
         const MEMORY_THRESHOLD = memoryReloadThreshold; 
 
         if (memoryUsageRatio > MEMORY_THRESHOLD) {
+            console.warn(`[Memory Manager] ¡ALERTA! Uso de memoria (${(memoryUsageRatio * 100).toFixed(1)}%) supera el umbral (${MEMORY_THRESHOLD * 100}%). Iniciando recarga controlada.`);
             initiateControlledReload();
         } else {
             console.log(`[Memory Manager] Uso de memoria (${(memoryUsageRatio * 100).toFixed(1)}%) es aceptable (Umbral: ${MEMORY_THRESHOLD * 100}%).`);
         }
     } else {
     }
-}  
-    
+}    
     
 // ===================================================================
 // NOMBRE: startMemoryManagement (VERSIÓN CON ESTRATEGIA DUAL)
@@ -5221,8 +5231,6 @@ async function checkReminders() {
     reminderCheckIntervalId = setInterval(checkReminders, newInterval);
 }
 
-
-    
     
 // ===================================================================
 // NOMBRE: recalculateNextEventHorizon 
@@ -7424,63 +7432,6 @@ function handleDragStartReorder(e) {
         setTimeout(() => {
             if(draggedStageLi) draggedStageLi.classList.add('dragging');
         }, 0);
-    }
-}
-
-
-// ===================================================================
-// NOMBRE: updateInitialUserPosition
-// RESUMEN: Orquestador principal del GPS. Ahora también gestiona los FPS de la cámara.
-function updateInitialUserPosition(coords, mapInstanceToUse) {
-    if (isRecalculatingRoute || !mapInstanceToUse || !coords) return;
-
-    gpsTickCounter++;
-
-    const minimapUpdatePeriod = performanceRatios.routeProgress * 7;
-    
-    if (gpsTickCounter === 1 || gpsTickCounter % minimapUpdatePeriod === 0) {
-        if (minimapInstance && minimapCarMarker) {
-            minimapCarMarker.setLngLat([coords.longitude, coords.latitude]);
-            
-            if (coords.heading !== null && !isNaN(coords.heading)) {
-                minimapCarMarker.setRotation(coords.heading);
-            }
-        }     
-    }
-    
-    const speed = (coords.speed || 0) * 3.6;
-
-    if (currentAutoZoomMode === 'eco') {
-        const isEcoActive = speed > 70 && distanceToNextManeuverOSRM > 2000;
-        if (isEcoActive) {
-            MAP_UPDATE_INTERVAL_MS = 1000 / Math.max(5, baseCameraFps - 2); 
-            performanceRatios.criticalUpdate = baseCriticalRatio + 2;
-        } else {
-            MAP_UPDATE_INTERVAL_MS = originalMapUpdateIntervalMs;
-            performanceRatios.criticalUpdate = baseCriticalRatio;
-        }
-    } else {
-        const PROXIMITY_THRESHOLD_FPS = 310;
-        if (isNavigating && distanceToNextManeuverOSRM < PROXIMITY_THRESHOLD_FPS) {
-            MAP_UPDATE_INTERVAL_MS = 1000 / 45;
-        } else {
-            MAP_UPDATE_INTERVAL_MS = originalMapUpdateIntervalMs;
-        }
-        performanceRatios.criticalUpdate = baseCriticalRatio;
-    }
-
-    const now = performance.now();
-    navigationCurrentLocation = { ...coords };
-    
-    for (const task of TASKS_BY_PRIORITY) { 
-        if (now - task.lastRun >= task.getFrequency()) {
-            task.handler(coords, mapInstanceToUse);
-            task.lastRun = now;
-            
-            if (task.id !== 'CRITICAL_VISUALS') {
-                break;
-            }
-        }
     }
 }
 
@@ -10246,14 +10197,22 @@ function updateNavigationProgressDisplay(route, carDistanceAlongTheRoute = 0) {
     }
 }
  
+    
+    
 // ===================================================================
-// NOMBRE: checkForAndExecuteCrashRecovery
-// RESUMEN: Gestiona la recuperación, asegurando que la botonera superior
+// NOMBRE: checkForAndExecuteCrashRecovery (CON PERIODO DE GRACIA)
+// RESUMEN: Gestiona la recuperación, estableciendo un periodo de gracia para la comprobación de memoria.
 async function checkForAndExecuteCrashRecovery() {
     const recoveryFlagJSON = localStorage.getItem('boardinggate_nav_recovery_flag');
     if (!recoveryFlagJSON) {
         return false;
     }
+
+    // --> INICIO DE LA CORRECCIÓN: Periodo de gracia para la memoria <--
+    const memoryCheckGracePeriodSeconds = 20;
+    memoryCheckGracePeriodUntil = Date.now() + (memoryCheckGracePeriodSeconds * 1000);
+    console.log(`[Memory Manager] Recuperación en curso. Se ha activado un periodo de gracia de ${memoryCheckGracePeriodSeconds} segundos para la comprobación de memoria.`);
+    // --- FIN DE LA CORRECCIÓN ---
 
     const isControlled = sessionStorage.getItem('isControlledReload') === 'true';
 
@@ -10305,7 +10264,7 @@ async function checkForAndExecuteCrashRecovery() {
     clearRecoveryFlag();
     return false;
 }
-    
+
     
 //==================================================================
 //==================================================================    
