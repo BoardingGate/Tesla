@@ -37,7 +37,6 @@
     <link rel="icon" href="https://boardinggate.github.io/Tesla/th.jpeg" type="image/jpeg">
     <script src="https://cdn.tailwindcss.com"></script>
     <script type="module"> import { initializeApp } from "https://www.gstatic.com/firebasejs/11.9.1/firebase-app.js"; import { getFirestore, doc, setDoc, getDoc, getDocs, deleteDoc, collection, serverTimestamp, where, query, orderBy, limit, addDoc, writeBatch, startAfter, updateDoc, FieldValue, runTransaction } from "https://www.gstatic.com/firebasejs/11.9.1/firebase-firestore.js";  const firebaseConfig = window.APP_CONFIG.firebase; try { const app = initializeApp(firebaseConfig);window.db = getFirestore(app);window.doc = doc;window.setDoc = setDoc;window.getDoc = getDoc;window.collection = collection;window.getDocs = getDocs;window.deleteDoc = deleteDoc;window.serverTimestamp = serverTimestamp; window.where = where; window.query = query; window.orderBy = orderBy; window.limit = limit; window.addDoc = addDoc;window.writeBatch = writeBatch; window.startAfter = startAfter; window.updateDoc = updateDoc; window.FieldValue = FieldValue; window.runTransaction = runTransaction; } catch (e) {  }; </script>
-
       
     
     <link rel="stylesheet" href="tesla.css">
@@ -2380,7 +2379,9 @@ async function restoreTripProgress(recoveryInfo) {
             originalTripEtaTime = new Date(recoveryInfo.originalTripEtaTime);
         }
         
-        const currentCoords = await getCurrentLocationAsync();
+        const currentCoords = (recoveryInfo.simulationState && recoveryInfo.simulationState.isSimulating)
+            ? { latitude: 0, longitude: 0 } // Coordenadas placeholder, se sobreescriben después
+            : await getCurrentLocationAsync();
         
         if (recoveryInfo.stats) {
             if (!recoveryInfo.stats.totalDistance) {
@@ -2411,11 +2412,11 @@ async function restoreTripProgress(recoveryInfo) {
 
         deviationCheckGracePeriodUntil = Date.now() + 10000;
 
-        const carPoint = turf.point([currentCoords.longitude, currentCoords.latitude]);
-        const routeLine = turf.lineString(route.geometry.coordinates);
-        const nearestPointOnRoute = turf.nearestPointOnLine(routeLine, carPoint, { units: 'meters' });
-        const carDistanceAlongRoute = nearestPointOnRoute.properties.location;
+        const carDistanceAlongRoute = (recoveryInfo.simulationState && recoveryInfo.simulationState.isSimulating)
+            ? recoveryInfo.simulationState.distance
+            : turf.nearestPointOnLine(turf.lineString(route.geometry.coordinates), turf.point([currentCoords.longitude, currentCoords.latitude]), { units: 'meters' }).properties.location;
         
+        // ... (resto de la lógica de restauración de progreso, índices de etapa, etc. se mantiene) ...
         const timeElapsedS = (Date.now() - recoveryInfo.tripStartTime) / 1000;
         if (timeElapsedS > 0 && totalDistanceTravelledForStats > 0) {
             window.averageSpeedKmh = (totalDistanceTravelledForStats / timeElapsedS) * 3.6;
@@ -2452,6 +2453,13 @@ async function restoreTripProgress(recoveryInfo) {
             updateChartData();
         }
 
+        await toggleNavigationState(false, true); // El 'true' indica que es una recuperación.
+        
+        if (recoveryInfo.simulationState && recoveryInfo.simulationState.isSimulating) {
+            showToast("Reanudando simulación de ruta...", "success", 3000);
+            startAutomatedRouteSimulation(recoveryInfo.simulationState.speed, recoveryInfo.simulationState.distance);
+        }
+   
     } catch (error) {
         showToast(`Error al restaurar progreso: ${error.message}. Se continuará desde el inicio.`, "error");
         navigationStartTimeForStats = new Date();
@@ -2467,7 +2475,6 @@ async function restoreTripProgress(recoveryInfo) {
         hideRecoveryScreenshotOverlay();
     }
 }    
-
 // ===================================================================
 // NOMBRE: hideRecoveryScreenshotOverlay 
 // RESUMEN: Oculta con una transición suave y elimina el overlay de la captura de pantalla.
@@ -10376,7 +10383,7 @@ function animateMarkerAndMap(timestamp) {
 }
     
 // ===================================================================
-// NOMBRE: loadRouteFromObject (VERSIÓN CORREGIDA Y DEFINITIVA 2)
+// NOMBRE: loadRouteFromObject 
 // RESUMEN: Acepta recoveryInfo y pasa la bandera 'isRecovery' a toggleNavigationState.
 async function loadRouteFromObject(routeObject, autoStartNavigation = false, forceImmediateStart = false, recoveryInfo = null) {
     if (isRecalculatingRoute) {
@@ -10457,12 +10464,12 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
                 }, 50);
 
                 if (recoveryInfo) {
-                    await restoreTripProgress(recoveryInfo);
+                    await restoreTripProgress(recoveryInfo); // Se restaura todo, incluyendo la simulación si procede.
                 }
                 
-                if (autoStartNavigation) {
+                if (autoStartNavigation && !recoveryInfo) { // Evitamos modales si es una recuperación
                     if (forceImmediateStart) {
-                        toggleNavigationState(false, !!recoveryInfo); 
+                        toggleNavigationState(false, false); 
                     } else {
                         const routeGeoJSON = navigationMapInstance.getSource('route')._data;
                         if (routeGeoJSON.geometry && routeGeoJSON.geometry.coordinates.length > 1) {
@@ -10491,7 +10498,165 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
         updateStartNavigationButtonState();
         updateNavigationButtonColor();
     }
-}   
+}
+    
+//==================================================================    
+function startAutomatedRouteSimulation(speedKmph, continueFromDistance = null) {
+    if (!isSimulatingGpsLocation) {
+        isSimulatingGpsLocation = true;
+        if (locationWatchId !== null && navigator.geolocation) {
+            navigator.geolocation.clearWatch(locationWatchId);
+            locationWatchId = null;
+        }
+        const simulateGpsButton = document.getElementById('toggle-simulate-gps-button');
+        if (simulateGpsButton) {
+            simulateGpsButton.classList.add('active-simulate-gps-mode');
+            simulateGpsButton.title = "Desactivar Simulación GPS (Volver a GPS Real)";
+        }
+    }
+    
+    if (automatedSimulationIntervalId) {
+        clearInterval(automatedSimulationIntervalId);
+        automatedSimulationIntervalId = null;
+    }
+    
+    simulationSpeedKmph = speedKmph;
+    currentSimulationSpeedKmph = speedKmph;
+    
+    const route = navigationCurrentRouteData?.routes?.[0];
+    if (!route) {
+        showToast("No hay ruta válida para iniciar la simulación.", "error");
+        stopAutomatedRouteSimulation();
+        return;
+    }
+
+    if (!navigationFollowUser) {
+        navigationFollowUser = true;
+        shouldCenterOnUser = true;
+        updateLocateMeButtonsUI();
+    }
+    
+    if (typeof continueFromDistance === 'number' && continueFromDistance >= 0) {
+        simulatedDistanceAlongRoute = continueFromDistance;
+        
+        const turfLine = turf.lineString(route.geometry.coordinates);
+        const pointOnLine = turf.along(turfLine, simulatedDistanceAlongRoute / 1000, { units: 'kilometers' });
+        if (pointOnLine?.geometry?.coordinates) {
+            const [lng, lat] = pointOnLine.geometry.coordinates;
+            simulatedGpsLocation = { latitude: lat, longitude: lng, accuracy: 5, heading: 0, altitude: (navigationCurrentLocation?.altitude) ?? 0, speed: 0 };
+            processSimulatedGpsPosition(true); // El 'true' fuerza la actualización visual inmediata.
+        }
+
+        showToast(`Reanudando simulación a ${speedKmph.toFixed(0)} km/h.`, "info");
+    } else {
+        wasSimulatingBeforeRecalc = false;
+        simulatedDistanceAlongRoute = 0;
+        navigationStartTimeForStats = new Date(); 
+        totalDistanceTravelledForStats = 0;
+        maxSpeedDuringTrip = 0;
+        const startWaypoint = navigationWaypoints.find(wp => wp.type === 'S' || wp.isRecalculatedStart) || navigationWaypoints[0];
+        lastPositionForStats = { latitude: startWaypoint.lat, longitude: startWaypoint.lng };
+        let initialHeading = 0;
+        if (route.geometry.coordinates.length >= 2) {
+            initialHeading = turf.bearing(turf.point(route.geometry.coordinates[0]), turf.point(route.geometry.coordinates[1]));
+            if (initialHeading < 0) initialHeading += 360;
+        }
+        simulatedGpsLocation = { latitude: startWaypoint.lat, longitude: startWaypoint.lng, accuracy: 5, heading: initialHeading, altitude: (navigationCurrentLocation?.altitude) ?? 0, speed: 0 };
+        maxSpeedCoordinates = { lat: startWaypoint.lat, lng: startWaypoint.lng };
+        processSimulatedGpsPosition(true);
+        showToast(`Simulación automática de ruta iniciada a ${speedKmph.toFixed(0)} km/h.`, "info");
+    }
+    
+    lastCarDistanceAlongRouteForNavLogic = simulatedDistanceAlongRoute;
+    setNavigationMapClickHandler(); 
+
+    let simulationStepIndex = 0;
+    let simulationLegIndex = 0;
+    let tempDistance = 0;
+    for (let i = 0; i < route.legs.length; i++) {
+        let legFound = false;
+        for (let j = 0; j < route.legs[i].steps.length; j++) {
+            tempDistance += route.legs[i].steps[j].distance;
+            if (simulatedDistanceAlongRoute < tempDistance) {
+                simulationLegIndex = i;
+                simulationStepIndex = j;
+                legFound = true;
+                break;
+            }
+        }
+        if (legFound) break;
+    }
+    let distanceToEndOfCurrentStep = calculateDistanceToEndOfStep(route, simulationLegIndex, simulationStepIndex);
+
+    automatedSimulationIntervalId = setInterval(() => {
+        const currentRouteForInterval = navigationCurrentRouteData?.routes?.[0];
+        if (!currentRouteForInterval) {
+            stopAutomatedRouteSimulationInternal();
+            return;
+        }
+        const totalRouteDistance = currentRouteForInterval.distance;
+        const speedMps = (currentSimulationSpeedKmph * 1000) / 3600;
+        const distanceIncrement = speedMps * (SIMULATION_TICK_INTERVAL_MS / 1000);
+        simulatedDistanceAlongRoute += distanceIncrement;
+
+        if (navigationStartTimeForStats) {
+            totalDistanceTravelledForStats = simulatedDistanceAlongRoute;
+        }
+        
+        if (simulatedDistanceAlongRoute > distanceToEndOfCurrentStep) {
+            simulationStepIndex++;
+            if (currentRouteForInterval.legs[simulationLegIndex] && simulationStepIndex >= currentRouteForInterval.legs[simulationLegIndex].steps.length) {
+                simulationStepIndex = 0;
+                simulationLegIndex++;
+            }
+            if (simulationLegIndex < currentRouteForInterval.legs.length && currentRouteForInterval.legs[simulationLegIndex]) {
+                const currentStep = currentRouteForInterval.legs[simulationLegIndex].steps[simulationStepIndex];
+                if (currentStep) { 
+                    const multiplier = getRandomSpeedMultiplierForManeuver(currentStep.maneuver);
+                    currentSimulationSpeedKmph = Math.max(20, Math.min(5000, simulationSpeedKmph * (1 + multiplier)));
+                    distanceToEndOfCurrentStep = calculateDistanceToEndOfStep(currentRouteForInterval, simulationLegIndex, simulationStepIndex);
+                }
+            }
+        }
+        if (simulatedDistanceAlongRoute >= totalRouteDistance) {
+            stopAutomatedRouteSimulationInternal();
+            const endPointCoords = currentRouteForInterval.geometry.coordinates[currentRouteForInterval.geometry.coordinates.length - 1];
+            simulatedGpsLocation = {
+                ...simulatedGpsLocation, latitude: endPointCoords[1], longitude: endPointCoords[0], speed: 0
+            };
+            processSimulatedGpsPosition(true);
+            showToast("Simulación de ruta completada. Modo simulación por clic activo.", "success");
+            const mapDiv = document.getElementById('reminders-location-map-div');
+            if (mapDiv) mapDiv.classList.add('simulating-gps-click-mode'); 
+            if (isNavigating || (!isNavigating && navigationWaypoints.length > 0)) {
+                 showArrivalStatsModal();
+            }
+            setNavigationMapClickHandler();
+            return;
+        }
+        const turfLine = turf.lineString(currentRouteForInterval.geometry.coordinates);
+        const pointOnLine = turf.along(turfLine, simulatedDistanceAlongRoute / 1000, { units: 'kilometers' });
+        if (pointOnLine?.geometry?.coordinates) {
+            const [lng, lat] = pointOnLine.geometry.coordinates;
+            let headingSim = 0;
+            const lookAheadDistance = Math.min(distanceIncrement * 2, totalRouteDistance - simulatedDistanceAlongRoute);
+            if (simulatedDistanceAlongRoute + lookAheadDistance <= totalRouteDistance && lookAheadDistance > 0) {
+                const nextPointOnLine = turf.along(turfLine, (simulatedDistanceAlongRoute + lookAheadDistance) / 1000, { units: 'kilometers' });
+                if (nextPointOnLine?.geometry?.coordinates) {
+                    headingSim = turf.bearing(pointOnLine, nextPointOnLine);
+                    if (headingSim < 0) headingSim += 360;
+                }
+            } else {
+                headingSim = simulatedGpsLocation?.heading || 0;
+            }
+            simulatedGpsLocation = {
+                latitude: lat, longitude: lng, accuracy: 5, heading: headingSim, altitude: (navigationCurrentLocation?.altitude) ?? 0, speed: speedMps
+            };
+            processSimulatedGpsPosition(false);
+        }
+    }, SIMULATION_TICK_INTERVAL_MS);
+    startMemoryManagement(true); 
+}    
       
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 // NOMBRE: fetchAndRenderChatUsers 
@@ -10908,6 +11073,15 @@ async function initiateControlledReload() {
                 recoveryData.tripStartTime = navigationStartTimeForStats ? navigationStartTimeForStats.getTime() : Date.now();
                 recoveryData.originalTripEtaTime = originalTripEtaTime ? originalTripEtaTime.getTime() : null;
                 recoveryData.tripContext = { graphLabels: graphLabels, graphDataPoints: graphDataPoints, minAvgSpeed: minAverageSpeedInTrip, maxAvgSpeed: maxAverageSpeedInTrip, accumulatedDeviationMs: accumulatedDeviationMs };
+
+                if (isSimulatingGpsLocation && automatedSimulationIntervalId) {
+                    recoveryData.simulationState = {
+                        isSimulating: true,
+                        speed: simulationSpeedKmph,
+                        distance: simulatedDistanceAlongRoute
+                    };
+                }
+                
                 localStorage.setItem('boardinggate_nav_recovery_flag', JSON.stringify(recoveryData));
             }
             
@@ -18470,160 +18644,119 @@ function initializeNavigationGraph() {
 // ===================================================================
 // NOMBRE: startAutomatedRouteSimulation (VERSIÓN FINAL CON REINICIO CORRECTO)
 // RESUMEN: Inicia o reanuda la simulación. Gestiona correctamente el=
-function startAutomatedRouteSimulation(speedKmph, continueFromCurrentState = false) {
-    if (!isSimulatingGpsLocation) {
-        isSimulatingGpsLocation = true;
-        if (locationWatchId !== null && navigator.geolocation) {
-            navigator.geolocation.clearWatch(locationWatchId);
-            locationWatchId = null;
-        }
-        const simulateGpsButton = document.getElementById('toggle-simulate-gps-button');
-        if (simulateGpsButton) {
-            simulateGpsButton.classList.add('active-simulate-gps-mode');
-            simulateGpsButton.title = "Desactivar Simulación GPS (Volver a GPS Real)";
-        }
-    }
-    
-    if (automatedSimulationIntervalId) {
-        clearInterval(automatedSimulationIntervalId);
-        automatedSimulationIntervalId = null;
-    }
-    
-    simulationSpeedKmph = speedKmph;
-    currentSimulationSpeedKmph = speedKmph;
-    
-    const route = navigationCurrentRouteData?.routes?.[0];
-    if (!route) {
-        showToast("No hay ruta válida para iniciar la simulación.", "error");
-        stopAutomatedRouteSimulation();
+async function restoreTripProgress(recoveryInfo) {
+    if (!navigationCurrentRouteData?.routes?.[0] || !recoveryInfo || !recoveryInfo.tripStartTime) {
+        const overlay = document.getElementById('route-recovery-overlay');
+        if (overlay) overlay.classList.add('hidden');
         return;
     }
 
-    if (!navigationFollowUser) {
-        navigationFollowUser = true;
-        shouldCenterOnUser = true;
-        updateLocateMeButtonsUI();
-    }
-    
-    if (continueFromCurrentState) {
-        const carPointTurf = turf.point([simulatedGpsLocation.longitude, simulatedGpsLocation.latitude]);
-        const routeLineStringTurf = turf.lineString(route.geometry.coordinates);
-        const nearestPointOnLineTurf = turf.nearestPointOnLine(routeLineStringTurf, carPointTurf, { units: 'meters' });
-        const lineSliceToNearestTurf = turf.lineSlice(turf.point(routeLineStringTurf.geometry.coordinates[0]), nearestPointOnLineTurf, routeLineStringTurf);
-        simulatedDistanceAlongRoute = turf.length(lineSliceToNearestTurf, { units: 'meters' });
-    } else {
-        wasSimulatingBeforeRecalc = false;
-        simulatedDistanceAlongRoute = 0;
-        navigationStartTimeForStats = new Date(); 
-        totalDistanceTravelledForStats = 0;
-        maxSpeedDuringTrip = 0;
-        const startWaypoint = navigationWaypoints.find(wp => wp.type === 'S' || wp.isRecalculatedStart) || navigationWaypoints[0];
-        lastPositionForStats = { latitude: startWaypoint.lat, longitude: startWaypoint.lng };
-        let initialHeading = 0;
-        if (route.geometry.coordinates.length >= 2) {
-            initialHeading = turf.bearing(turf.point(route.geometry.coordinates[0]), turf.point(route.geometry.coordinates[1]));
-            if (initialHeading < 0) initialHeading += 360;
+    try {
+        const route = navigationCurrentRouteData.routes[0];
+         
+        navigationStartTimeForStats = new Date(recoveryInfo.tripStartTime);
+        if (recoveryInfo.originalTripEtaTime) {
+            originalTripEtaTime = new Date(recoveryInfo.originalTripEtaTime);
         }
-        simulatedGpsLocation = { latitude: startWaypoint.lat, longitude: startWaypoint.lng, accuracy: 5, heading: initialHeading, altitude: (navigationCurrentLocation?.altitude) ?? 0, speed: 0 };
-        maxSpeedCoordinates = { lat: startWaypoint.lat, lng: startWaypoint.lng };
-        processSimulatedGpsPosition(true);
-        showToast(`Simulación automática de ruta iniciada a ${speedKmph.toFixed(0)} km/h.`, "info");
-    }
-    
-    lastCarDistanceAlongRouteForNavLogic = simulatedDistanceAlongRoute;
-    setNavigationMapClickHandler(); 
-
-    let simulationStepIndex = 0;
-    let simulationLegIndex = 0;
-    let tempDistance = 0;
-    for (let i = 0; i < route.legs.length; i++) {
-        let legFound = false;
-        for (let j = 0; j < route.legs[i].steps.length; j++) {
-            tempDistance += route.legs[i].steps[j].distance;
-            if (simulatedDistanceAlongRoute < tempDistance) {
-                simulationLegIndex = i;
-                simulationStepIndex = j;
-                legFound = true;
-                break;
-            }
-        }
-        if (legFound) break;
-    }
-    let distanceToEndOfCurrentStep = calculateDistanceToEndOfStep(route, simulationLegIndex, simulationStepIndex);
-
-    automatedSimulationIntervalId = setInterval(() => {
-        const currentRouteForInterval = navigationCurrentRouteData?.routes?.[0];
-        if (!currentRouteForInterval) {
-            stopAutomatedRouteSimulationInternal();
-            return;
-        }
-        const totalRouteDistance = currentRouteForInterval.distance;
-        const speedMps = (currentSimulationSpeedKmph * 1000) / 3600;
-        const distanceIncrement = speedMps * (SIMULATION_TICK_INTERVAL_MS / 1000);
-        simulatedDistanceAlongRoute += distanceIncrement;
-
-        // --- INICIO DE LA CORRECCIÓN CLAVE ---
-        // La distancia para estadísticas ahora es la distancia teórica, no la calculada entre puntos.
-        if (navigationStartTimeForStats) {
-            totalDistanceTravelledForStats = simulatedDistanceAlongRoute;
-        }
-        // --- FIN DE LA CORRECCIÓN CLAVE ---
         
-        if (simulatedDistanceAlongRoute > distanceToEndOfCurrentStep) {
-            simulationStepIndex++;
-            if (currentRouteForInterval.legs[simulationLegIndex] && simulationStepIndex >= currentRouteForInterval.legs[simulationLegIndex].steps.length) {
-                simulationStepIndex = 0;
-                simulationLegIndex++;
-            }
-            if (simulationLegIndex < currentRouteForInterval.legs.length && currentRouteForInterval.legs[simulationLegIndex]) {
-                const currentStep = currentRouteForInterval.legs[simulationLegIndex].steps[simulationStepIndex];
-                if (currentStep) { 
-                    const multiplier = getRandomSpeedMultiplierForManeuver(currentStep.maneuver);
-                    currentSimulationSpeedKmph = Math.max(20, Math.min(5000, simulationSpeedKmph * (1 + multiplier)));
-                    distanceToEndOfCurrentStep = calculateDistanceToEndOfStep(currentRouteForInterval, simulationLegIndex, simulationStepIndex);
-                }
-            }
-        }
-        if (simulatedDistanceAlongRoute >= totalRouteDistance) {
-            stopAutomatedRouteSimulationInternal();
-            const endPointCoords = currentRouteForInterval.geometry.coordinates[currentRouteForInterval.geometry.coordinates.length - 1];
-            simulatedGpsLocation = {
-                ...simulatedGpsLocation, latitude: endPointCoords[1], longitude: endPointCoords[0], speed: 0
-            };
-            processSimulatedGpsPosition(true);
-            showToast("Simulación de ruta completada. Modo simulación por clic activo.", "success");
-            const mapDiv = document.getElementById('reminders-location-map-div');
-            if (mapDiv) mapDiv.classList.add('simulating-gps-click-mode'); 
-            if (isNavigating || (!isNavigating && navigationWaypoints.length > 0)) {
-                 showArrivalStatsModal();
-            }
-            setNavigationMapClickHandler();
-            return;
-        }
-        const turfLine = turf.lineString(currentRouteForInterval.geometry.coordinates);
-        const pointOnLine = turf.along(turfLine, simulatedDistanceAlongRoute / 1000, { units: 'kilometers' });
-        if (pointOnLine?.geometry?.coordinates) {
-            const [lng, lat] = pointOnLine.geometry.coordinates;
-            let headingSim = 0;
-            const lookAheadDistance = Math.min(distanceIncrement * 2, totalRouteDistance - simulatedDistanceAlongRoute);
-            if (simulatedDistanceAlongRoute + lookAheadDistance <= totalRouteDistance && lookAheadDistance > 0) {
-                const nextPointOnLine = turf.along(turfLine, (simulatedDistanceAlongRoute + lookAheadDistance) / 1000, { units: 'kilometers' });
-                if (nextPointOnLine?.geometry?.coordinates) {
-                    headingSim = turf.bearing(pointOnLine, nextPointOnLine);
-                    if (headingSim < 0) headingSim += 360;
-                }
+        const currentCoords = (recoveryInfo.simulationState && recoveryInfo.simulationState.isSimulating)
+            ? { latitude: 0, longitude: 0 } // Coordenadas temporales, se sobreescriben
+            : await getCurrentLocationAsync();
+        
+        if (recoveryInfo.stats) {
+            if (!recoveryInfo.stats.totalDistance) {
+                showToast("Recalculando progreso de distancia tras cuelgue...", "info", 3000);
+                const routeLine = turf.lineString(route.geometry.coordinates);
+                const carPoint = turf.point([currentCoords.longitude, currentCoords.latitude]);
+                const nearestPointOnRoute = turf.nearestPointOnLine(routeLine, carPoint, { units: 'meters' });
+                totalDistanceTravelledForStats = nearestPointOnRoute.properties.location;
             } else {
-                headingSim = simulatedGpsLocation?.heading || 0;
+                totalDistanceTravelledForStats = recoveryInfo.stats.totalDistance;
             }
-            simulatedGpsLocation = {
-                latitude: lat, longitude: lng, accuracy: 5, heading: headingSim, altitude: (navigationCurrentLocation?.altitude) ?? 0, speed: speedMps
-            };
-            processSimulatedGpsPosition(false);
+      
+            accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
+            maxSpeedDuringTrip = recoveryInfo.stats.maxSpeed || 0;
+            maxAltitudeDuringTrip = recoveryInfo.stats.maxAltitude || -Infinity;
+            minAltitudeDuringTrip = recoveryInfo.stats.minAltitude || Infinity;
+            maxSpeedCoordinates = recoveryInfo.stats.maxSpeedCoords || null;
         }
-    }, SIMULATION_TICK_INTERVAL_MS);
-    startMemoryManagement(true); 
-}
-    
+        lastPositionForStats = { ...currentCoords };
+
+        if (recoveryInfo.tripContext) {
+            graphLabels = recoveryInfo.tripContext.graphLabels || [];
+            graphDataPoints = recoveryInfo.tripContext.graphDataPoints || { speed: [], altitude: [] };
+            minAverageSpeedInTrip = recoveryInfo.tripContext.minAvgSpeed ?? Infinity;
+            maxAverageSpeedInTrip = recoveryInfo.tripContext.maxAvgSpeed ?? -Infinity;
+            accumulatedDeviationMs = recoveryInfo.tripContext.accumulatedDeviationMs || 0;
+        }
+
+        deviationCheckGracePeriodUntil = Date.now() + 10000;
+
+        const carDistanceAlongRoute = (recoveryInfo.simulationState && recoveryInfo.simulationState.isSimulating)
+            ? recoveryInfo.simulationState.distance
+            : turf.nearestPointOnLine(turf.lineString(route.geometry.coordinates), turf.point([currentCoords.longitude, currentCoords.latitude]), { units: 'meters' }).properties.location;
+        
+        const timeElapsedS = (Date.now() - recoveryInfo.tripStartTime) / 1000;
+        if (timeElapsedS > 0 && totalDistanceTravelledForStats > 0) {
+            window.averageSpeedKmh = (totalDistanceTravelledForStats / timeElapsedS) * 3.6;
+        }
+        lastCarDistanceAlongRouteForNavLogic = carDistanceAlongRoute;
+        
+        let cumulativeDistance = 0;
+        let legFound = false;
+        for (let i = 0; i < route.legs.length; i++) {
+            const leg = route.legs[i];
+            if (!leg || !leg.steps) continue;
+            const legTotalDistance = leg.distance || leg.steps.reduce((sum, step) => sum + (step.distance || 0), 0);
+            if (carDistanceAlongRoute <= cumulativeDistance + legTotalDistance) {
+                currentLegIndexNav = i;
+                let legDistanceTraveled = 0;
+                for (let j = 0; j < leg.steps.length; j++) {
+                    const step = leg.steps[j];
+                    if (carDistanceAlongRoute <= cumulativeDistance + legDistanceTraveled + (step.distance || 0)) {
+                        currentStepIndexNav = j;
+                        legFound = true;
+                        break;
+                    }
+                    legDistanceTraveled += (step.distance || 0);
+                }
+                if (legFound) break;
+            }
+            cumulativeDistance += legTotalDistance;
+        }
+
+        updateNavigationProgressDisplay(route, carDistanceAlongRoute);
+        updateTurnByTurnDisplay(route, carDistanceAlongRoute);
+        
+        if (navigationChart) {
+            updateChartData();
+        }
+
+        if (recoveryInfo.simulationState && recoveryInfo.simulationState.isSimulating) {
+            showToast("Reanudando simulación de ruta...", "success", 3000);
+            const turfLine = turf.lineString(route.geometry.coordinates);
+            const pointOnLine = turf.along(turfLine, recoveryInfo.simulationState.distance / 1000, { units: 'kilometers' });
+            const [lng, lat] = pointOnLine.geometry.coordinates;
+            simulatedGpsLocation = { latitude: lat, longitude: lng, accuracy: 5, heading: 0, altitude: 0, speed: 0 };
+            
+            startAutomatedRouteSimulation(recoveryInfo.simulationState.speed, recoveryInfo.simulationState.distance);
+        }
+
+    } catch (error) {
+        showToast(`Error al restaurar progreso: ${error.message}. Se continuará desde el inicio.`, "error");
+        navigationStartTimeForStats = new Date();
+        totalDistanceTravelledForStats = 0;
+        accumulatedDistanceBeforeCurrentSegment = 0;
+    } finally {
+        const overlay = document.getElementById('route-recovery-overlay');
+        if (overlay) {
+            setTimeout(() => {
+                overlay.classList.add('hidden');
+            }, 600);
+        }
+        hideRecoveryScreenshotOverlay();
+    }
+}    
 
 // ===================================================================
 // NOMBRE: hideProximityAlert
