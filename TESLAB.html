@@ -1,4 +1,4 @@
-l10
+l11
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -2107,8 +2107,6 @@ class MapSettingsPanel {
     }
 }
     
-
-    
 // ===================================================================
 // NOMBRE: handleZoomToggleButtonClick (VERSIÓN CON ACTIVACIÓN DE CAPAS)
 // RESUMEN: Gestiona el zoom y activa todas las capas al alejar para ver la ruta completa.
@@ -2488,6 +2486,149 @@ async function restoreTripProgress(recoveryInfo) {
         hideRecoveryScreenshotOverlay();
     }
 }    
+
+// ===================================================================
+// NOMBRE: restoreTripProgress (VERSIÓN FINAL CON DETECCIÓN DE DESVÍO EN RECUPERACIÓN)
+// RESUMEN: Restaura el viaje, pero si detecta un desvío significativo, fuerza el recálculo inmediato.
+// ===================================================================
+async function restoreTripProgress(recoveryInfo) {
+    if (!navigationCurrentRouteData?.routes?.[0] || !recoveryInfo || !recoveryInfo.tripStartTime) {
+        const overlay = document.getElementById('route-recovery-overlay');
+        if (overlay) overlay.classList.add('hidden');
+        return;
+    }
+
+    try {
+        const route = navigationCurrentRouteData.routes[0];
+        
+        // --> INICIO DE LA CORRECCIÓN CLAVE <--
+        // Obtener la ubicación GPS real INMEDIATAMENTE.
+        const currentCoords = (recoveryInfo.simulationState && recoveryInfo.simulationState.isSimulating)
+            ? { latitude: 0, longitude: 0 } // No aplica para simulación, se maneja después.
+            : await getCurrentLocationAsync();
+
+        // Calcular la distancia física a la ruta.
+        let physicalDistanceToRoute = 0;
+        if (currentCoords.latitude !== 0) { // Solo si tenemos coordenadas reales
+            const carPoint = turf.point([currentCoords.longitude, currentCoords.latitude]);
+            const routeLine = turf.lineString(route.geometry.coordinates);
+            physicalDistanceToRoute = turf.pointToLineDistance(carPoint, routeLine, { units: 'meters' });
+        }
+        
+        // Si estamos desviados más de 25 metros AL MOMENTO DE RECUPERAR...
+        if (physicalDistanceToRoute > 25 && !(recoveryInfo.simulationState && recoveryInfo.simulationState.isSimulating)) {
+            console.warn(`[Recovery] Desvío de ${physicalDistanceToRoute.toFixed(0)}m detectado durante la recuperación. Se forzará el recálculo.`);
+            showToast("Desvío detectado al reanudar. Recalculando ruta...", "warning");
+            
+            // Forzamos la aparición del modal de recálculo.
+            showDeviationModal(); 
+            
+            // Detenemos la recuperación normal para que el usuario decida.
+            // Limpiamos el overlay y salimos.
+            const overlay = document.getElementById('route-recovery-overlay');
+            if (overlay) overlay.classList.add('hidden');
+            hideRecoveryScreenshotOverlay();
+            return; // Finalizamos la función aquí.
+        }
+        // --- FIN DE LA CORRECCIÓN CLAVE ---
+
+        navigationStartTimeForStats = new Date(recoveryInfo.tripStartTime);
+        if (recoveryInfo.originalTripEtaTime) {
+            originalTripEtaTime = new Date(recoveryInfo.originalTripEtaTime);
+        }
+        
+        if (recoveryInfo.stats) {
+           if (!recoveryInfo.stats.totalDistance){
+                const routeLine = turf.lineString(route.geometry.coordinates);
+                const carPoint = turf.point([currentCoords.longitude, currentCoords.latitude]);
+                const nearestPointOnRoute = turf.nearestPointOnLine(routeLine, carPoint, { units: 'meters' });
+                totalDistanceTravelledForStats = nearestPointOnRoute.properties.location;
+            } else {
+                totalDistanceTravelledForStats = recoveryInfo.stats.totalDistance;
+            }
+      
+            accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
+            maxSpeedDuringTrip = recoveryInfo.stats.maxSpeed || 0;
+            maxAltitudeDuringTrip = recoveryInfo.stats.maxAltitude || -Infinity;
+            minAltitudeDuringTrip = recoveryInfo.stats.minAltitude || Infinity;
+            maxSpeedCoordinates = recoveryInfo.stats.maxSpeedCoords || null;
+        }
+        lastPositionForStats = { ...currentCoords };
+
+        if (recoveryInfo.tripContext) {
+            graphLabels = recoveryInfo.tripContext.graphLabels || [];
+            graphDataPoints = recoveryInfo.tripContext.graphDataPoints || { speed: [], altitude: [] };
+            minAverageSpeedInTrip = recoveryInfo.tripContext.minAvgSpeed ?? Infinity;
+            maxAverageSpeedInTrip = recoveryInfo.tripContext.maxAvgSpeed ?? -Infinity;
+            accumulatedDeviationMs = recoveryInfo.tripContext.accumulatedDeviationMs || 0;
+        }
+        
+        deviationCheckGracePeriodUntil = 0;
+
+        const carDistanceAlongRoute = (recoveryInfo.simulationState && recoveryInfo.simulationState.isSimulating)
+            ? recoveryInfo.simulationState.distance
+            : turf.nearestPointOnLine(turf.lineString(route.geometry.coordinates), turf.point([currentCoords.longitude, currentCoords.latitude]), { units: 'meters' }).properties.location;
+        
+        const timeElapsedS = (Date.now() - recoveryInfo.tripStartTime) / 1000;
+        if (timeElapsedS > 0 && totalDistanceTravelledForStats > 0) {
+            window.averageSpeedKmh = (totalDistanceTravelledForStats / timeElapsedS) * 3.6;
+        }
+        lastCarDistanceAlongRouteForNavLogic = carDistanceAlongRoute;
+        
+        let cumulativeDistance = 0;
+        let legFound = false;
+        for (let i = 0; i < route.legs.length; i++) {
+            const leg = route.legs[i];
+            if (!leg || !leg.steps) continue;
+            const legTotalDistance = leg.distance || leg.steps.reduce((sum, step) => sum + (step.distance || 0), 0);
+            if (carDistanceAlongRoute <= cumulativeDistance + legTotalDistance) {
+                currentLegIndexNav = i;
+                let legDistanceTraveled = 0;
+                for (let j = 0; j < leg.steps.length; j++) {
+                    const step = leg.steps[j];
+                    if (carDistanceAlongRoute <= cumulativeDistance + legDistanceTraveled + (step.distance || 0)) {
+                        currentStepIndexNav = j;
+                        legFound = true;
+                        break;
+                    }
+                    legDistanceTraveled += (step.distance || 0);
+                }
+                if (legFound) break;
+            }
+            cumulativeDistance += legTotalDistance;
+        }
+
+        updateNavigationProgressDisplay(route, carDistanceAlongRoute);
+        updateTurnByTurnDisplay(route, carDistanceAlongRoute);
+        
+        if (navigationChart) {
+            updateChartData();
+        }
+
+        await toggleNavigationState(false, true);
+        
+        if (recoveryInfo.simulationState && recoveryInfo.simulationState.isSimulating) {
+            showToast("Reanudando simulación de ruta...", "success", 3000);
+            startAutomatedRouteSimulation(recoveryInfo.simulationState.speed, recoveryInfo.simulationState.distance);
+        }
+
+    } catch (error) {
+        showToast(`Error al restaurar progreso: ${error.message}. Se continuará desde el inicio.`, "error");
+        navigationStartTimeForStats = new Date();
+        totalDistanceTravelledForStats = 0;
+        accumulatedDistanceBeforeCurrentSegment = 0;
+    } finally {
+        const overlay = document.getElementById('route-recovery-overlay');
+        if (overlay) {
+            setTimeout(() => {
+                overlay.classList.add('hidden');
+            }, 600);
+        }
+        hideRecoveryScreenshotOverlay();
+    }
+}
+
+    
 // ===================================================================
 // NOMBRE: hideRecoveryScreenshotOverlay 
 // RESUMEN: Oculta con una transición suave y elimina el overlay de la captura de pantalla.
