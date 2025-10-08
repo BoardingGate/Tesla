@@ -1,4 +1,4 @@
-l34
+l35
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -11203,8 +11203,60 @@ async function initiateControlledReload() {
     }
 }
 
-// RESUMEN: Guarda estado, espera a que las fuentes se carguen para evitar el desplazamiento del texto,
-//          toma la captura, desmantela los mapas y luego recarga la página.
+    
+// ===================================================================
+// NOMBRE: cloneWithInlineStyles (NUEVA FUNCIÓN AUXILIAR AVANZADA)
+// RESUMEN: Clona un elemento, recorre todos sus descendientes y aplica los
+//          estilos computados del navegador como estilos en línea.
+//          También convierte los <canvas> en <img> para mayor fiabilidad.
+// ===================================================================
+async function cloneWithInlineStyles(originalNode, options = {}) {
+    const { onclone } = options;
+    const clone = originalNode.cloneNode(false);
+
+    const style = window.getComputedStyle(originalNode);
+    if (style.cssText) {
+        clone.style.cssText = style.cssText;
+    }
+
+    // Manejo especial para el canvas del mapa
+    if (originalNode.tagName === 'CANVAS') {
+        try {
+            const img = new Image();
+            img.src = originalNode.toDataURL('image/jpeg', 0.8);
+            img.style.width = originalNode.width + 'px';
+            img.style.height = originalNode.height + 'px';
+            return img;
+        } catch (e) {
+            console.warn("No se pudo clonar el contenido del canvas (probablemente por 'taint'). Se omitirá.", e);
+        }
+    }
+
+    if (onclone) {
+        onclone(originalNode, clone);
+    }
+
+    const children = originalNode.childNodes;
+    for (let i = 0; i < children.length; i++) {
+        const child = children[i];
+        if (child.nodeType === 1) { // Node.ELEMENT_NODE
+            // Ignoramos el script de html2canvas para evitar recursión o errores
+            if (child.tagName === 'SCRIPT' && child.src.includes('html2canvas')) {
+                continue;
+            }
+            const clonedChild = await cloneWithInlineStyles(child, options);
+            clone.appendChild(clonedChild);
+        } else if (child.nodeType === 3) { // Node.TEXT_NODE
+            clone.appendChild(child.cloneNode(false));
+        }
+    }
+    return clone;
+}
+
+// ===================================================================
+// NOMBRE: initiateControlledReload (VERSIÓN 3 - ESTRATEGIA DE CLONADO Y APLANADO)
+// RESUMEN: Utiliza la nueva estrategia de clonar el DOM, aplicar estilos en línea
+//          y luego capturar ese clon para máxima fidelidad visual.
 // ===================================================================
 async function initiateControlledReload() {
     if (isPerformingControlledReload) return;
@@ -11212,6 +11264,7 @@ async function initiateControlledReload() {
 
     const finalizeAndReload = async () => {
         try {
+            // (El resto de esta función interna permanece igual que en la versión anterior)
             const recoveryFlagJSON = localStorage.getItem('boardinggate_nav_recovery_flag');
             if (recoveryFlagJSON) {
                 const recoveryData = JSON.parse(recoveryFlagJSON);
@@ -11238,10 +11291,9 @@ async function initiateControlledReload() {
 
             setTimeout(() => {
                 location.reload();
-            }, 250); 
+            }, 250);
         } catch (e) {
             console.error("Error durante la finalización de la recarga controlada:", e);
-            // Intento de recarga de emergencia aunque falle la limpieza
             await destroyAllMapInstances();
             setTimeout(() => location.reload(), 200);
         }
@@ -11251,64 +11303,79 @@ async function initiateControlledReload() {
         try {
             const elementToCapture = document.body;
             if (typeof html2canvas === 'undefined' || !elementToCapture) {
-                console.warn("html2canvas no está disponible. Procediendo sin captura de pantalla.");
                 sessionStorage.setItem('isControlledReload', 'true');
                 await finalizeAndReload();
                 return;
             }
             
-            // --- INICIO DE LA CORRECCIÓN ---
-            // 1. Esperar a que todas las fuentes estén cargadas y listas.
-            await document.fonts.ready;
+            // --- INICIO DE LA NUEVA ESTRATEGIA ---
             
-            // 2. Dar un pequeño respiro al navegador para que complete el renderizado final.
-            await new Promise(resolve => setTimeout(resolve, 300));
+            // 1. Ocultar el cursor de la captura
+            document.body.style.cursor = 'none';
 
-            // 3. Opciones mejoradas para html2canvas.
-            const canvas = await html2canvas(elementToCapture, {
+            // 2. Crear un clon del body con todos los estilos computados en línea
+            const clonedBody = await cloneWithInlineStyles(elementToCapture);
+            
+            // 3. Añadir el clon fuera de la pantalla para que sea renderizado por el navegador
+            clonedBody.style.position = 'absolute';
+            clonedBody.style.top = '0';
+            clonedBody.style.left = `-${window.innerWidth}px`; // Fuera de la vista
+            document.body.appendChild(clonedBody);
+
+            // 4. Esperar un instante para que el navegador procese el clon
+            await new Promise(resolve => setTimeout(resolve, 200));
+
+            // 5. Tomar la captura del CLON, no del body original
+            const canvas = await html2canvas(clonedBody, {
                 useCORS: true,
                 allowTaint: true,
                 logging: false,
-                scrollY: -window.scrollY // Indicar explícitamente la posición del scroll.
+                // Las opciones de scroll ya no son tan críticas porque el clon es absoluto
+                // pero las mantenemos por si acaso.
+                x: window.scrollX,
+                y: window.scrollY,
+                width: window.innerWidth,
+                height: window.innerHeight
             });
-            // --- FIN DE LA CORRECCIÓN ---
             
-            let dataUrl;
-
+            // 6. Limpiar: eliminar el clon y restaurar el cursor
+            document.body.removeChild(clonedBody);
+            document.body.style.cursor = '';
+            
+            // --- FIN DE LA NUEVA ESTRATEGIA ---
+            
             try {
-                // Intento con JPEG de calidad media, que es más robusto en navegadores con memoria limitada.
-                dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+                const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
                 sessionStorage.setItem('recoveryScreenshot', dataUrl); 
             } catch (e) {
-                console.error("Error al guardar la captura de pantalla JPEG. Se procederá sin captura.", e);
                 sessionStorage.removeItem('recoveryScreenshot');
             }
 
-            // Se establece la bandera DESPUÉS de intentar guardar la imagen
             sessionStorage.setItem('isControlledReload', 'true');
             await finalizeAndReload();
 
         } catch (error) {
-            console.error("Fallo crítico durante el proceso de captura:", error);
-            // Si html2canvas falla, procedemos con la recarga controlada sin captura
+            console.error("Fallo crítico durante el proceso de captura con clonado:", error);
+            document.body.style.cursor = ''; // Asegurarse de restaurar el cursor en caso de error
             sessionStorage.setItem('isControlledReload', 'true');
             sessionStorage.removeItem('recoveryScreenshot');
             await finalizeAndReload();
         }
     };
     
-    // La lógica de esperar al 'render' de Mapbox se mantiene, es una buena práctica.
+    // La lógica de esperar al 'render' de Mapbox se mantiene
     if (navigationMapInstance && navigationMapInstance.isStyleLoaded()) {
-        const safetyTimeout = setTimeout(captureAndProceed, 500); // Aumentado ligeramente por seguridad
+        const safetyTimeout = setTimeout(captureAndProceed, 500);
         navigationMapInstance.once('render', () => {
             clearTimeout(safetyTimeout);
-            setTimeout(captureAndProceed, 150); // Pequeño delay post-render
+            setTimeout(captureAndProceed, 150);
         });
         navigationMapInstance.triggerRepaint();
     } else {
         await captureAndProceed();
     }
-}    
+}
+    
     
 // ===================================================================
 // NOMBRE: hideRecoveryScreenshotOverlay 
