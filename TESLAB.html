@@ -1,4 +1,4 @@
-l68
+l69
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -1142,6 +1142,7 @@ l68
     let minimapInstance = null;
     let minimapCarMarker = null;
     let memoryCheckGracePeriodUntil = 0;
+    let isAddingWaypointsDuringNav = false;
     
     const easeInOutQuad = t => t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
    
@@ -1594,7 +1595,8 @@ isRecalculatingRoute=true;
 }
     
 // ===================================================================
-//  openNavigationMap (VERSIÓN CON MINIMAPA CORREGIDO)
+// NOMBRE: openNavigationMap (MODIFICADA - PERMITE AÑADIR ETAPAS NAVEGANDO)
+// RESUMEN: Abre el mapa de navegación. El listener de clic ahora permite añadir waypoints si el modo de edición en ruta está activo.
 // ===================================================================
 async function openNavigationMap(isRecovery = false) {
     return new Promise(async (resolve, reject) => {
@@ -1825,11 +1827,21 @@ async function openNavigationMap(isRecovery = false) {
                         navigationMapInstance.on('click', async (e) => {
                             if (isAddReminderAtLocationModeActive) { handleMapClickToAddReminder(e); return; }
                             if (isSimulatingGpsLocation) { handleSimulateGpsPositionClick(e); return; }
-                            if (isNavigating) { return; }
+                            
+                            if (isNavigating && !isAddingWaypointsDuringNav) { 
+                                return; 
+                            }
+                            
                             const point = e.point; const lngLat = e.lngLat;
                             const pdrLayers = ['pdr-simple-circle-layer', 'pdr-cards-layer-bg-halo', 'pdr-cards-layer-bg'];
                             const pdrFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: pdrLayers });
-                            if (pdrFeatures.length > 0) { const fullPdrData = window.lastOcmApiResponse.find(p => p.ID === pdrFeatures[0].properties.ocmId); if (fullPdrData) { showChargingPointModal(fullPdrData, pdrFeatures[0].properties.index); } return; }
+                            if (pdrFeatures.length > 0) { 
+                                const fullPdrData = window.lastOcmApiResponse.find(p => p.ID === pdrFeatures[0].properties.ocmId); 
+                                if (fullPdrData) { 
+                                    showChargingPointModal(fullPdrData, pdrFeatures[0].properties.index); 
+                                } 
+                                return; 
+                            }
                             const alertLayers = ['traffic-alerts-layer'];
                             const alertFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: alertLayers });
                             if (alertFeatures.length > 0) {
@@ -1839,9 +1851,11 @@ async function openNavigationMap(isRecovery = false) {
                             const reminderLayers = ['reminders-icons-layer', 'radar-circles-layer'];
                             const reminderFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: reminderLayers });
                             if (reminderFeatures.length > 0) { showReminderActionModal(reminderFeatures[0].properties.reminderId); return; }
+                            
                             const mapboxPoiLayers = ['poi-label'];
                             const features = navigationMapInstance.queryRenderedFeatures(point, { layers: mapboxPoiLayers });
                             const validPoiFeature = features.find(f => f.properties && (f.properties.name || f.properties.name_en || f.properties.text));
+                            
                             if (validPoiFeature) {
                                 const { name, name_en, text, poi_category, category, maki } = validPoiFeature.properties;
                                 const poiName = name || name_en || text;
@@ -1850,7 +1864,9 @@ async function openNavigationMap(isRecovery = false) {
                                 else if (category) { categories = category.split(',').map(c => c.trim()); } 
                                 else if (maki) { categories.push(maki); }
                                 showPoiInfoModal({ properties: { name: poiName, categories: categories }, geometry: validPoiFeature.geometry });
-                            } else { addWaypoint(lngLat); }
+                            } else {
+                                addWaypoint(lngLat); 
+                            }
                         });
                         
                         enablePoiInteractivity(navigationMapInstance);
@@ -2240,6 +2256,34 @@ function handleZoomToggleButtonClick(button) {
     updateAllZoomToggleButtonsVisuals();
 }
 
+
+// ===================================================================
+// NOMBRE: toggleMapControls (NUEVA FUNCIÓN AUXILIAR)
+// RESUMEN: Activa o desactiva los controles de planificación de ruta en el mapa (botones, buscador).
+// ===================================================================
+function toggleMapControls(enabled) {
+    const controls = [
+        document.getElementById('map-location-search-input'),
+        document.getElementById('map-location-search-button'),
+        document.getElementById('clear-map-search-input-button'),
+        document.getElementById('load-saved-route-button'),
+        document.getElementById('reorder-route-stages-button'),
+        document.getElementById('pdrs-ruta-button'),
+        document.getElementById('add-reminder-at-location-button')
+    ];
+
+    controls.forEach(control => {
+        if (control) {
+            control.disabled = !enabled;
+            control.style.opacity = enabled ? '1' : '0.5';
+            control.style.cursor = enabled ? 'pointer' : 'not-allowed';
+        }
+    });
+    
+    setNavigationMapClickHandler();
+}
+
+    
 // ===================================================================
 // NOMBRE: toggleNavigationState (MODIFICADO)
 // RESUMEN: Inicia/detiene la navegación y restaura la visibilidad de capas al finalizar.
@@ -3786,27 +3830,57 @@ async function fetchOverpassData(query) {
     }
 }
  
+
 // ===================================================================
-// NOMBRE: togglePoiCategorySearch 
-// RESUMEN: Si está activo, limpia los resultados. Si no, muestra el modal de categorías.
+// NOMBRE: togglePoiCategorySearch (MODIFICADA - MODO EDICIÓN EN RUTA)
+// RESUMEN: Gestiona el modo de "añadir etapas en ruta" si se está navegando, o la búsqueda normal de POIs si no.
 // ===================================================================
 function togglePoiCategorySearch() {
     const searchButton = document.getElementById('map-location-search-button');
     if (!searchButton) return;
-    if (isPoiSearchActive) {
-        clearPoiSearchResults();
-        const existingModal = document.getElementById('poi-category-modal');
-        if (existingModal) existingModal.remove();
-        isPoiSearchActive = false;
-        searchButton.style.removeProperty('background-color');
-        showToast("Búsqueda de POIs limpiada.", "info");
-    } else {
-        isPoiSearchActive = true;
-        searchButton.style.setProperty('background-color', '#FFD700', 'important');
-        showPoiCategoryModal();
-    }
-}
 
+    if (isNavigating) {
+        isAddingWaypointsDuringNav = !isAddingWaypointsDuringNav;
+
+        if (isAddingWaypointsDuringNav) {
+            searchButton.style.setProperty('background-color', '#FFD700', 'important');
+            showToast("MODO EDICIÓN DE RUTA ACTIVADO. Pulse en el mapa para añadir una etapa.", "info", 5000);
+            
+            triggerManualMapInteraction();
+            
+            showPoiCategoryModal();
+            
+            toggleMapControls(true);
+
+        } else {
+            searchButton.style.removeProperty('background-color');
+            showToast("Modo edición de ruta finalizado. Recalculando...", "success", 4000);
+
+            toggleMapControls(false);
+
+            handleLocateMeClick(true);
+            
+            if (navigationWaypoints.length >= 2) {
+                recalculateAndDrawRoute(true); // Preservar estadísticas
+            }
+        }
+    } else {
+        if (isPoiSearchActive) {
+            clearPoiSearchResults();
+            const existingModal = document.getElementById('poi-category-modal');
+            if (existingModal) existingModal.remove();
+            isPoiSearchActive = false;
+            searchButton.style.removeProperty('background-color');
+            showToast("Búsqueda de POIs limpiada.", "info");
+        } else {
+            isPoiSearchActive = true;
+            searchButton.style.setProperty('background-color', '#FFD700', 'important');
+            showPoiCategoryModal();
+        }
+    }
+    updateStartNavigationButtonState();
+    setNavigationMapClickHandler();
+}
     
 
 // ===================================================================
@@ -4147,8 +4221,8 @@ function updateSmoothedGpsAltitude(newAltitude) {
 }
 
 // ===================================================================
-// NOMBRE: showPoiCategoryModal 
-// RESUMEN: Muestra el modal con categorías y un botón dinámico para buscar el texto tecleado.
+// NOMBRE: showPoiCategoryModal (MODIFICADA - CON AÑADIR MANUAL)
+// RESUMEN: Muestra el modal de categorías y un botón dinámico para buscar el texto tecleado. Incluye la opción de añadir un punto manualmente.
 // ===================================================================
 function showPoiCategoryModal() {
     closeOtherModals('poi-category-modal');
@@ -4160,9 +4234,7 @@ function showPoiCategoryModal() {
         "Vehículo y Carretera": [
             { icon: '🅿️', label: 'Parking', query: 'parking', key: 'amenity:parking' },
             { icon: '🔋', label: 'P. Recarga VE', query: 'estacion de carga', key: 'amenity:charging_station' },
-            // --- INICIO: BOTÓN AÑADIDO ---
             { icon: '🔋+', label: 'PdRs con + info', action: 'open_pdr_filters' },
-            // --- FIN: BOTÓN AÑADIDO ---
             { icon: '🚗', label: 'Tesla', query: 'tesla', key: 'shop:car' },
             { icon: '🔧', label: 'Talleres', query: 'taller mecanico', key: 'shop:car_repair' },
             { icon: '🧼', label: 'Lavado Coches', query: 'lavado de coches', key: 'amenity:car_wash' },
@@ -4214,6 +4286,16 @@ function showPoiCategoryModal() {
         `;
     }
 
+    const addManualButtonHtml = isNavigating ? `
+        <h3 class="poi-group-title" style="color: #FFD700;">Añadir Etapa Manualmente</h3>
+        <div class="poi-category-grid">
+            <button class="poi-category-button" data-action="add_manual" style="background-color: #007aff;">
+                <span class="icon">📍</span>
+                <span>Pulsar en el mapa</span>
+            </button>
+        </div>
+    ` : '';
+    
     let groupsHtml = '';
     for (const groupName in groups) {
         let buttonsHtml = '';
@@ -4247,20 +4329,17 @@ function showPoiCategoryModal() {
             .poi-category-modal-content { 
                 max-height: 90vh; 
                 overflow-y: auto; 
-                width: 95vw; /* Ocupa el 95% del ancho de la pantalla */
-                max-width: 1100px; /* Con un límite máximo generoso */
+                width: 95vw;
+                max-width: 1100px;
             }
-
             .poi-category-grid {
                 display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); /* Crea tantas columnas como quepan */
+                grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
                 gap: 15px;
             }
-
             .poi-category-button .icon {
                 font-family: 'Noto Color Emoji', sans-serif;
             }
-
             .poi-group-title {
                 color: #ffffff;
                 font-size: 1.1rem;
@@ -4299,6 +4378,7 @@ function showPoiCategoryModal() {
                 <h2>Buscar Puntos de Interés</h2>
                 <button class="poi-category-close-btn" title="Salir de la búsqueda de POIs">&times;</button>
             </div>
+            ${addManualButtonHtml}
             ${customSearchHtml}
             ${groupsHtml}
             <p class="poi-search-info-note">(*) Las búsquedas se realizan en el área que esté viendo en ese momento en el mapa, esté o no navegando una ruta. TAMBIÉN PODRÁ BUSCAR CUALQUIER TIPO DE ESTABLECIMIENTO TECLEANDO LO QUE DESEA BUSCAR EN EL CAMPO DE BÚSQUEDA, A CONTINUACIÓN ACCEDIENDO A ESTA PANTALLA Y PULSANDO ARRIBA DEL TODO EL BOTÓN CON EL LITERAL.</p>
@@ -4314,8 +4394,11 @@ function showPoiCategoryModal() {
 
     const closeModalAndDeactivate = () => {
         if (modalOverlay.parentNode) modalOverlay.remove();
-        if (isPoiSearchActive) {
-            togglePoiCategorySearch();
+        
+        if (!isNavigating) {
+             if (isPoiSearchActive) {
+                togglePoiCategorySearch();
+            }
         }
     };
 
@@ -4336,16 +4419,23 @@ function showPoiCategoryModal() {
 
         const action = button.dataset.action;
 
+        if (action === 'add_manual') {
+            if (modalOverlay.parentNode) modalOverlay.remove();
+            return;
+        }
+        
         if (action === 'open_pdr_filters') {
             if (modalOverlay.parentNode) modalOverlay.remove();
-            handlePdrSearchButtonClick();   } else {
+            handlePdrSearchButtonClick();
+        } else {
             const query = button.dataset.query;
             const key = button.dataset.key;
             searchPoisByCategory(query, key);
             if (modalOverlay.parentNode) modalOverlay.remove();
         }
     });
-}    
+}
+    
 // ===================================================================
 // NOMBRE: checkAndMarkWaypointsAsVisited 
 // RESUMEN: Marca la etapa como visitada a 70m y muestra el modal de llegada solo a 20m.
@@ -19042,8 +19132,7 @@ function removeWaypointMarkerListeners(marker) {
         delete element._onPointerUp;
     }
 }
-    
-    
+       
 // ===================================================================
 // NOMBRE: updateStartNavigationButtonState 
 // RESUMEN: Actualiza la visibilidad de los botones de navegación. Iniciar y Simular GPS ahora siempre están visibles.
@@ -19072,8 +19161,14 @@ function updateStartNavigationButtonState() {
     } else {
         if(startNavImg) startNavImg.src = "PNG/INICIARNAVEGACION.PNG";
     }
+    
     saveRouteButton.classList.toggle('hidden', !(!isNavigating && canDisplayRoute));
-    if (reorderBtn) reorderBtn.style.display = (!isNavigating && canDisplayRoute) ? 'inline-flex' : 'none';
+
+    if (reorderBtn) {
+        const canReorder = (!isNavigating && canDisplayRoute) || isAddingWaypointsDuringNav;
+        reorderBtn.style.display = canReorder ? 'inline-flex' : 'none';
+    }
+    
     const canSimulate = (canDisplayRoute || (isNavigating && hasRouteData));
     if(simulateBtn) simulateBtn.style.display = canSimulate ? 'inline-flex' : 'none';
     
@@ -19095,10 +19190,21 @@ function updateStartNavigationButtonState() {
          navigationCurrentRouteData = null;
          hideNavigationUI();
          hideMapInfoOverlay();
+         eliminarRadaresDeRuta();
+         actualizarContadorRadares(0);
+         eliminarTareasDeBarraProgreso();
+         actualizarContadorTareas(0);
+         const radaresCheckbox = document.getElementById('radares-ruta-checkbox');
+         if (radaresCheckbox) {
+             localStorage.setItem(RADARES_RUTA_CHECKED_KEY, String(radaresCheckbox.checked)); 
+         }
+         const tareasCheckbox = document.getElementById('tareas-ruta-checkbox');
+         if (tareasCheckbox) {
+            localStorage.setItem(TAREAS_RUTA_CHECKED_KEY, String(tareasCheckbox.checked));
+         }
     }
     updateNavigationGraphVisibilityAndMode();
-}
-    
+}   
 // ===================================================================
 // NOMBRE: updateNavigationGraphVisibilityAndMode
 // RESUMEN: Actualiza la visibilidad y modo de la gráfica de navegación.
@@ -20349,98 +20455,92 @@ function filterForCheapestPDRs() {
     displayChargingPointsOnMap();
 }
 
-// ===================================================================
-// NOMBRE: addChargingPointToRoute (VERSIÓN CORREGIDA)
-// RESUMEN: Añade un PDR como etapa. Si no hay ruta, crea una nueva. Si se navega, preserva estadísticas.
+//===================================================
+// NOMBRE: addChargingPointToRoute (MODIFICADA - GESTIONA EDICIÓN EN RUTA)
+// RESUMEN: Añade un PDR como etapa. Si no hay ruta, crea una nueva. Si se navega, preserva estadísticas y permite la inserción.
 async function addChargingPointToRoute(pointIndex) {
     const point = currentChargingPointsOnRoute[pointIndex];
     if (!point) return;
 
-    const noRouteLoaded = navigationWaypoints.length === 0;
+    // Si estamos navegando pero no en modo edición, no permitimos añadir.
+    if (isNavigating && !isAddingWaypointsDuringNav) {
+        showToast("Para añadir PDRs durante la navegación, activa primero el modo edición (botón de búsqueda).", "warning");
+        return;
+    }
 
-    if (noRouteLoaded) {
-        if (!navigationCurrentLocation) {
-            showToast("No se puede añadir el punto de carga sin una ubicación GPS inicial.", "error");
-            return;
-        }
+    const newWaypoint = {
+        id: Date.now(),
+        lat: point.lat,
+        lng: point.lon,
+        type: '', 
+        marker: null,
+        label: '',
+        address: point.address || 'Punto de Recarga',
+        visited: false,
+        isCriticalForRecalc: true,
+        isInternal: false,
+        isRecalculatedStart: false
+    };
 
-        const startPoint = {
-            id: Date.now() - 1,
-            lat: navigationCurrentLocation.latitude,
-            lng: navigationCurrentLocation.longitude,
-            type: 'S',
-            marker: null,
-            label: 'S',
-            address: 'Posición Actual (GPS)',
-            visited: true,
-            isCriticalForRecalc: true,
-            isInternal: false,
-            isRecalculatedStart: false
-        };
-
-        const newWaypoint = {
-            id: Date.now(),
-            lat: point.lat,
-            lng: point.lon,
-            type: '',
-            marker: null,
-            label: '',
-            address: point.address || 'Punto de Recarga',
-            visited: false,
-            isCriticalForRecalc: true,
-            isInternal: false,
-            isRecalculatedStart: false
-        };
-
-        navigationWaypoints.push(startPoint, newWaypoint);
-        showToast("Ruta creada desde tu posición hasta el punto de recarga.", "success");
-
-    } else {
+    if (isNavigating) {
         let lastVisitedIndex = -1;
         navigationWaypoints.forEach((wp, index) => {
-            if (wp.visited) {
+            if (wp && wp.visited) {
                 lastVisitedIndex = index;
             }
         });
         const insertIndex = lastVisitedIndex + 1;
-        
-        const newWaypoint = {
-            id: Date.now(),
-            lat: point.lat,
-            lng: point.lon,
-            type: '', 
-            marker: null,
-            label: '',
-            address: point.address || 'Punto de Recarga',
-            visited: false,
-            isCriticalForRecalc: true,
-            isInternal: false,
-            isRecalculatedStart: false
-        };
-
         navigationWaypoints.splice(insertIndex, 0, newWaypoint);
-        showToast(`'${newWaypoint.address}' añadido como etapa. Recalculando...`, "success");
+        showToast(`'${newWaypoint.address}' añadido como próxima etapa.`, "success");
+        
+        await updateWaypointTypesAndLabels();
+        renderWaypointMarkers();
+    
+    } else {
+        const noRouteLoaded = navigationWaypoints.length === 0;
+
+        if (noRouteLoaded) {
+            if (!navigationCurrentLocation) {
+                showToast("No se puede añadir el punto de carga sin una ubicación GPS inicial.", "error");
+                return;
+            }
+
+            const startPoint = {
+                id: Date.now() - 1, lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude,
+                type: 'S', marker: null, label: 'S', address: 'Posición Actual (GPS)',
+                visited: true, isCriticalForRecalc: true, isInternal: false, isRecalculatedStart: false
+            };
+            navigationWaypoints.push(startPoint, newWaypoint);
+            showToast("Ruta creada desde tu posición hasta el punto de recarga.", "success");
+
+        } else {
+            let lastVisitedIndex = -1;
+            navigationWaypoints.forEach((wp, index) => { if (wp.visited) lastVisitedIndex = index; });
+            const insertIndex = lastVisitedIndex + 1;
+            navigationWaypoints.splice(insertIndex, 0, newWaypoint);
+            showToast(`'${newWaypoint.address}' añadido como etapa. Recalculando...`, "success");
+        }
+        
+        updateWaypointTypesAndLabels();
+        renderWaypointMarkers();
+
+        try {
+            await recalculateAndDrawRoute(true);
+            const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+            if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
+                toggleRadaresRuta(true);
+            }
+        } catch (e) {
+            showToast("Error recalculando la ruta tras añadir el punto de recarga.", "error");
+        }
     }
     
-    updateWaypointTypesAndLabels();
-    renderWaypointMarkers();
-
-    try {
-        await recalculateAndDrawRoute(true);
-        
-        clearChargingPoints();
-
-        const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
-        if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
-            toggleRadaresRuta(true);
-        }
-    } catch (e) {
-        showToast("Error recalculando la ruta tras añadir el punto de recarga.", "error");
-    }
-
+    clearChargingPoints();
     updateStartNavigationButtonState();
     updateNavigationButtonColor();
 }
+
+    
 
     // ===================================================================
     // NOMBRE: calculateDistanceToEndOfStep
@@ -20995,19 +21095,16 @@ function handleProgressBarLockToggle() {
     }
 
 // ===================================================================
-// NOMBRE: addWaypoint (MODIFICADA - GESTIONA MODO LIBRE)
-// RESUMEN: Añade un punto de ruta y pausa el modo "Free Drive" si está activo.
+// NOMBRE: addWaypoint (MODIFICADA - GESTIONA MODO LIBRE Y EDICIÓN EN RUTA)
+// RESUMEN: Añade un punto de ruta. Pausa el modo "Free Drive" si está activo y gestiona la inserción de etapas durante la navegación.
 async function addWaypoint(latlng, displayName = null) {
-    if (isNavigating) return;
+    if (isNavigating && !isAddingWaypointsDuringNav) {
+        showToast("Para añadir etapas durante la navegación, primero activa el modo de edición (botón de búsqueda).", "warning");
+        return;
+    }
     
     if (navigationFollowUser) {
-        navigationFollowUser = false;
-        const locateMeButton = document.getElementById('locate-me-on-reminders-map');
-        const locateMeImg = locateMeButton ? locateMeButton.querySelector('img') : null;
-        if (locateMeButton && locateMeImg) {
-            locateMeImg.src = "PNG/ESTASAQUI.PNG";
-            locateMeButton.title = "Mostrar mi posición actual y activar seguimiento";
-        }
+        triggerManualMapInteraction();
         showToast("Seguimiento pausado para añadir puntos.", "info");
     }
 
@@ -21039,37 +21136,54 @@ async function addWaypoint(latlng, displayName = null) {
         isRecalculatedStart: false
     };
 
-    if (navigationWaypoints.length === 0 && navigationCurrentLocation) {
-        const startPoint = {
-            id: Date.now() - 1,
-            lat: navigationCurrentLocation.latitude,
-            lng: navigationCurrentLocation.longitude,
-            type: 'S',
-            marker: null,
-            label: 'S',
-            address: 'Posición Actual (GPS)',
-            visited: true,
-            isCriticalForRecalc: true,
-            isInternal: false,
-            isRecalculatedStart: false
-        };
-        navigationWaypoints.push(startPoint);
-    }
-
-    navigationWaypoints.push(newWaypoint);
-    await updateWaypointTypesAndLabels();
-    renderWaypointMarkers();
-
-    if (navigationWaypoints.filter(wp => wp && !wp.isInternal).length >= 2) {
-        if (navigationWaypoints.filter(wp => wp && !wp.isInternal).length === 2) {
-            showToast("PULSACIÓN LARGA SOBRE LA ETAPA para ELIMINAR, COMPARTIR o BUSCAR RUTAS ALTERNATIVAS. ARRASTRE para RESITUARLA", "instructional", 3000);
+    if (isNavigating) {
+        let lastVisitedIndex = -1;
+        navigationWaypoints.forEach((wp, index) => {
+            if (wp && wp.visited) {
+                lastVisitedIndex = index;
+            }
+        });
+        const insertIndex = lastVisitedIndex + 1;
+        
+        navigationWaypoints.splice(insertIndex, 0, newWaypoint);
+        showToast(`'${newWaypoint.address}' añadido como próxima etapa.`, "success");
+        await updateWaypointTypesAndLabels();
+        renderWaypointMarkers();
+    
+    } else {
+        if (navigationWaypoints.length === 0 && navigationCurrentLocation) {
+            const startPoint = {
+                id: Date.now() - 1,
+                lat: navigationCurrentLocation.latitude,
+                lng: navigationCurrentLocation.longitude,
+                type: 'S',
+                marker: null,
+                label: 'S',
+                address: 'Posición Actual (GPS)',
+                visited: true,
+                isCriticalForRecalc: true,
+                isInternal: false,
+                isRecalculatedStart: false
+            };
+            navigationWaypoints.push(startPoint);
         }
-        recalculateAndDrawRoute();
+
+        navigationWaypoints.push(newWaypoint);
+        await updateWaypointTypesAndLabels();
+        renderWaypointMarkers();
+
+        if (navigationWaypoints.filter(wp => wp && !wp.isInternal).length >= 2) {
+            if (navigationWaypoints.filter(wp => wp && !wp.isInternal).length === 2) {
+                showToast("PULSACIÓN LARGA SOBRE LA ETAPA para ELIMINAR, COMPARTIR o BUSCAR RUTAS ALTERNATIVAS. ARRASTRE para RESITUARLA", "instructional", 3000);
+            }
+            recalculateAndDrawRoute();
+        }
     }
     
     updateStartNavigationButtonState();
     updateNavigationButtonColor();
 }
+    
 
 // ===================================================================
 // NOMBRE: fetchAddressSuggestions (VERSIÓN CORREGIDA CON MANEJO DE "NO RESULTADOS")
