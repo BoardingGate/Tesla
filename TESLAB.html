@@ -1,4 +1,4 @@
-S02
+S03
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -2487,12 +2487,13 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
     actualizarContadorTareas(tareasEnRutaActual.length);
 }   
  
-//===================================================================
-// NOMBRE: restoreTripProgress (MODIFICADA - Reconstrucción de estadísticas)
-// RESUMEN: Restaura el viaje. Si es una recuperación "ligera", reconstruye las estadísticas.
+// ===================================================================
+// NOMBRE: restoreTripProgress (VERSIÓN FINAL CON LÓGICA DE SIMULACIÓN CORREGIDA)
+// RESUMEN: Restaura el viaje, manejando correctamente la recuperación de simulaciones sin usar el GPS.
 // ===================================================================
 async function restoreTripProgress(recoveryInfo) {
     if (!navigationCurrentRouteData?.routes?.[0] || !recoveryInfo) {
+        console.warn("[Recovery] Datos insuficientes para restaurar el progreso del viaje.");
         const overlay = document.getElementById('route-recovery-overlay');
         if (overlay) overlay.classList.add('hidden');
         return;
@@ -2501,57 +2502,46 @@ async function restoreTripProgress(recoveryInfo) {
     try {
         const route = navigationCurrentRouteData.routes[0];
         const isSimulatedRecovery = recoveryInfo.simulationState && recoveryInfo.simulationState.isSimulating;
-        const currentCoords = isSimulatedRecovery ? null : await getCurrentLocationAsync();
         
-        // <-- INICIO: Lógica de reconstrucción para recuperación "ligera" -->
-        if (!recoveryInfo.isRichRecovery && currentCoords) {
-            // Recalculamos la distancia recorrida sobre la nueva geometría de ruta
+        let currentCoords = null;
+        let carDistanceAlongRoute;
+
+        // <-- INICIO: CORRECCIÓN LÓGICA SIMULACIÓN VS. REAL -->
+        if (isSimulatedRecovery) {
+            // Si es una simulación, ignoramos el GPS y usamos los datos guardados.
+            carDistanceAlongRoute = recoveryInfo.simulationState.distance;
+        } else {
+            // Si es un viaje real, obtenemos el GPS y comprobamos el desvío.
+            currentCoords = await getCurrentLocationAsync();
             const carPoint = turf.point([currentCoords.longitude, currentCoords.latitude]);
             const routeLine = turf.lineString(route.geometry.coordinates);
-            const carDistanceAlongRoute = turf.nearestPointOnLine(routeLine, carPoint, { units: 'meters' }).properties.location;
+            carDistanceAlongRoute = turf.nearestPointOnLine(routeLine, carPoint, { units: 'meters' }).properties.location;
             
+            const physicalDistanceToRoute = turf.pointToLineDistance(carPoint, routeLine, { units: 'meters' });
+            if (physicalDistanceToRoute > 25) {
+                console.warn(`[Recovery] Desvío de ${physicalDistanceToRoute.toFixed(0)}m detectado. Forzando recálculo.`);
+                showToast("Desvío detectado al reanudar. Recalculando ruta...", "warning");
+                showDeviationModal();
+                const overlay = document.getElementById('route-recovery-overlay');
+                if (overlay) overlay.classList.add('hidden');
+                hideRecoveryScreenshotOverlay();
+                return;
+            }
+        }
+        // <-- FIN: CORRECCIÓN LÓGICA SIMULACIÓN VS. REAL -->
+
+        // Restaurar tiempos y estadísticas
+        navigationStartTimeForStats = new Date(recoveryInfo.tripStartTime);
+        if (recoveryInfo.originalTripEtaTime) originalTripEtaTime = new Date(recoveryInfo.originalTripEtaTime);
+
+        // Si no es una recuperación "rica", reconstruimos estadísticas
+        if (!recoveryInfo.isRichRecovery) {
             totalDistanceTravelledForStats = carDistanceAlongRoute;
             accumulatedDistanceBeforeCurrentSegment = carDistanceAlongRoute;
-            lastPositionForStats = { ...currentCoords };
-            navigationStartTimeForStats = new Date(recoveryInfo.tripStartTime);
-            if (recoveryInfo.originalTripEtaTime) originalTripEtaTime = new Date(recoveryInfo.originalTripEtaTime);
-
-            // Recalculamos la velocidad media
+            if(currentCoords) lastPositionForStats = { ...currentCoords };
             const timeElapsedS = (Date.now() - recoveryInfo.tripStartTime) / 1000;
-            if (timeElapsedS > 0 && totalDistanceTravelledForStats > 0) {
-                window.averageSpeedKmh = (totalDistanceTravelledForStats / timeElapsedS) * 3.6;
-            } else {
-                window.averageSpeedKmh = 0;
-            }
-            
-            // Reconstruimos la posición en la ruta
-            lastCarDistanceAlongRouteForNavLogic = carDistanceAlongRoute;
-            let cumulativeDistance = 0;
-            let legFound = false;
-            for (let i = 0; i < route.legs.length; i++) {
-                const leg = route.legs[i];
-                if (!leg || !leg.steps) continue;
-                if (carDistanceAlongRoute <= cumulativeDistance + leg.distance) {
-                    currentLegIndexNav = i;
-                    // Lógica para encontrar stepIndex (ya presente en tu código, no la repito)
-                    let legDistanceTraveled = 0;
-                    for (let j = 0; j < leg.steps.length; j++) {
-                        const step = leg.steps[j];
-                        if (carDistanceAlongRoute <= cumulativeDistance + legDistanceTraveled + (step.distance || 0)) {
-                            currentStepIndexNav = j;
-                            legFound = true;
-                            break; 
-                        }
-                        legDistanceTraveled += (step.distance || 0);
-                    }
-                    if (legFound) break;
-                }
-                cumulativeDistance += leg.distance;
-            }
-        } else if (recoveryInfo.isRichRecovery) {
-            // Restauramos los datos "ricos"
-            navigationStartTimeForStats = new Date(recoveryInfo.tripStartTime);
-            if (recoveryInfo.originalTripEtaTime) originalTripEtaTime = new Date(recoveryInfo.originalTripEtaTime);
+            window.averageSpeedKmh = (timeElapsedS > 0 && totalDistanceTravelledForStats > 0) ? (totalDistanceTravelledForStats / timeElapsedS) * 3.6 : 0;
+        } else { // Si es "rica", simplemente las cargamos
             if (recoveryInfo.stats) {
                 totalDistanceTravelledForStats = recoveryInfo.stats.totalDistance || 0;
                 accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
@@ -2560,7 +2550,7 @@ async function restoreTripProgress(recoveryInfo) {
                 minAltitudeDuringTrip = recoveryInfo.stats.minAltitude || Infinity;
                 maxSpeedCoordinates = recoveryInfo.stats.maxSpeedCoords || null;
             }
-            if (currentCoords) lastPositionForStats = { ...currentCoords };
+            if(currentCoords) lastPositionForStats = { ...currentCoords };
             if (recoveryInfo.tripContext) {
                 graphLabels = recoveryInfo.tripContext.graphLabels || [];
                 graphDataPoints = recoveryInfo.tripContext.graphDataPoints || { speed: [], altitude: [] };
@@ -2568,19 +2558,54 @@ async function restoreTripProgress(recoveryInfo) {
                 maxAverageSpeedInTrip = recoveryInfo.tripContext.maxAvgSpeed ?? -Infinity;
                 accumulatedDeviationMs = recoveryInfo.tripContext.accumulatedDeviationMs || 0;
             }
-            const carPoint = turf.point([currentCoords.longitude, currentCoords.latitude]);
-            const routeLine = turf.lineString(route.geometry.coordinates);
-            lastCarDistanceAlongRouteForNavLogic = turf.nearestPointOnLine(routeLine, carPoint, { units: 'meters' }).properties.location;
         }
-        // <-- FIN: Lógica de reconstrucción -->
-
-        deviationCheckGracePeriodUntil = 0;
-        updateNavigationProgressDisplay(route, lastCarDistanceAlongRouteForNavLogic);
-        updateTurnByTurnDisplay(route, lastCarDistanceAlongRouteForNavLogic);
         
+        lastCarDistanceAlongRouteForNavLogic = carDistanceAlongRoute;
+        deviationCheckGracePeriodUntil = 0;
+
+        // Bucle robusto para encontrar la etapa y paso actual
+        let cumulativeDistance = 0;
+        let legFound = false;
+        
+        if (route.legs && route.legs.length > 0) {
+            for (let i = 0; i < route.legs.length; i++) {
+                const leg = route.legs[i];
+                if (!leg || !leg.steps) continue;
+                const legTotalDistance = leg.distance || 0;
+                // Usamos un pequeño margen para evitar errores de redondeo al final de la ruta
+                if (carDistanceAlongRoute <= cumulativeDistance + legTotalDistance + 0.1) {
+                    currentLegIndexNav = i;
+                    let legDistanceTraveled = 0;
+                    for (let j = 0; j < leg.steps.length; j++) {
+                        const step = leg.steps[j];
+                        if (step && carDistanceAlongRoute <= cumulativeDistance + legDistanceTraveled + (step.distance || 0) + 0.1) {
+                            currentStepIndexNav = j;
+                            legFound = true;
+                            break;
+                        }
+                        legDistanceTraveled += (step?.distance || 0);
+                    }
+                    if (legFound) break;
+                }
+                cumulativeDistance += legTotalDistance;
+            }
+        }
+
+        // Safety net: si la distancia es mayor que la ruta, nos situamos al final
+        if (!legFound) {
+            currentLegIndexNav = route.legs.length > 0 ? route.legs.length - 1 : 0;
+            const lastLeg = route.legs[currentLegIndexNav];
+            currentStepIndexNav = (lastLeg && lastLeg.steps.length > 0) ? lastLeg.steps.length - 1 : 0;
+        }
+
+        updateNavigationProgressDisplay(route, carDistanceAlongRoute);
+        updateTurnByTurnDisplay(route, carDistanceAlongRoute);
+        if (navigationChart) updateChartData();
+
         await toggleNavigationState(false, true);
 
         if (isSimulatedRecovery) {
+            showToast("Reanudando simulación de ruta...", "success", 3000);
             startAutomatedRouteSimulation(recoveryInfo.simulationState.speed, recoveryInfo.simulationState.distance);
         }
 
@@ -2599,8 +2624,7 @@ async function restoreTripProgress(recoveryInfo) {
         }
         hideRecoveryScreenshotOverlay();
     }
-}
-    
+}    
 // ===================================================================
 // NOMBRE: manageMemoryCycle (CON PERIODO DE GRACIA Y LOGGING)
 // ===================================================================
