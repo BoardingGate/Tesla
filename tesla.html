@@ -38,7 +38,6 @@
     <script src="https://cdn.tailwindcss.com"></script>
     <script type="module"> import { initializeApp } from "https://www.gstatic.com/firebasejs/11.9.1/firebase-app.js"; import { getFirestore, doc, setDoc, getDoc, getDocs, deleteDoc, collection, serverTimestamp, where, query, orderBy, limit, addDoc, writeBatch, startAfter, updateDoc, FieldValue, runTransaction } from "https://www.gstatic.com/firebasejs/11.9.1/firebase-firestore.js";  const firebaseConfig = window.APP_CONFIG.firebase; try { const app = initializeApp(firebaseConfig);window.db = getFirestore(app);window.doc = doc;window.setDoc = setDoc;window.getDoc = getDoc;window.collection = collection;window.getDocs = getDocs;window.deleteDoc = deleteDoc;window.serverTimestamp = serverTimestamp; window.where = where; window.query = query; window.orderBy = orderBy; window.limit = limit; window.addDoc = addDoc;window.writeBatch = writeBatch; window.startAfter = startAfter; window.updateDoc = updateDoc; window.FieldValue = FieldValue; window.runTransaction = runTransaction; } catch (e) {  }; </script>
 
-      
     
     <link rel="stylesheet" href="tesla.css">
     
@@ -56,7 +55,8 @@
 </head>
 
 <style>
-   
+
+    
 </style>
     
 </head>
@@ -249,8 +249,9 @@
             <div id="reminders-location-map-div">
                 <div id="poi-results-list-container" style="display: none;"></div>
                     <div id="mapbox-map-actual-container"></div>
+                    <button id="force-show-minimap-button" class="hidden">T</button> <!-- <-- AÑADE ESTA LÍNEA AQUÍ -->
                     <div id="mini-nav-info-card"></div>
-                     <div id="map-info-overlay"></div>
+                    <div id="map-info-overlay"></div>
 
 <div id="minimap-container" class="hidden">
     <div id="minimap-map-div"></div>
@@ -1131,6 +1132,7 @@
     let minimapCarMarker = null;
     let memoryCheckGracePeriodUntil = 0;
     let isAddingWaypointsDuringNav = false;
+    let minimapForceShowUntil = 0;
     
     const easeInOutQuad = t => t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
    
@@ -1581,359 +1583,8 @@ isRecalculatingRoute=true;
     
     isRecalculatingRoute=false;
 }
+
     
-// ===================================================================
-// NOMBRE: openNavigationMap (MODIFICADA - PERMITE AÑADIR ETAPAS NAVEGANDO)
-// RESUMEN: Abre el mapa de navegación. El listener de clic ahora permite añadir waypoints si el modo de edición en ruta está activo.
-// ===================================================================
-async function openNavigationMap(isRecovery = false) {
-    return new Promise(async (resolve, reject) => {
-        const { primaryId: userId } = parseUserId(localStorage.getItem('userData_userId'));
-        
-        if (userId && userId.toLowerCase() !== 'boardinggate') {
-            const toastId = "map-access-check";
-            try {
-                const adminDocRef = window.doc(window.db, "user_data", "boardinggate");
-                const userDocRef = window.doc(window.db, "user_data", userId);
-                const [adminSnap, userSnap] = await Promise.all([window.getDoc(adminDocRef), window.getDoc(userDocRef)]);
-                if (userSnap.exists() && userSnap.data().mapAccessEnabled === false) {
-                    showToast("ACCESO DENEGADO A MAPAS TEMPORALMENTE. Contacte con el administrador vía chat", "error", 5000);
-                    reject(new Error("Acceso denegado"));
-                    return;
-                }
-                let maxSessions = Infinity;
-                if (adminSnap.exists() && typeof adminSnap.data().max_monthly_sessions === 'number') {
-                    maxSessions = adminSnap.data().max_monthly_sessions;
-                }
-                let userMonthlyCount = 0;
-                if (userSnap.exists()) {
-                    const userData = userSnap.data();
-                    const now = new Date();
-                    const currentMonthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
-                    if (userData.map_sessions_last_month === currentMonthStr) {
-                        userMonthlyCount = userData.map_sessions_month || 0;
-                    }
-                }
-                const existingToast = document.getElementById(toastId);
-                if (existingToast) existingToast.remove();
-                if (userMonthlyCount >= maxSessions) {
-                    showToast("HA SUPERADO EL NÚMERO MÁXIMO DE SESIONES MENSUALES DE MAPA, consulte con el administrador vía chat", "error", 10000);
-                    reject(new Error("Límite de sesiones alcanzado"));
-                    return;
-                }
-            } catch (error) {
-                const existingToast = document.getElementById(toastId);
-                if (existingToast) existingToast.remove();
-            }
-        }
-                               
-        const mainContent = document.querySelector('main'); if (mainContent) mainContent.style.display = 'none';
-        const footer = document.querySelector('footer'); if (footer) footer.style.display = 'none';
-        const noticesContainer = document.querySelector('.notices-icon-container'); if (noticesContainer) noticesContainer.style.display = 'none';
-        const sideControls = document.querySelectorAll('.toggle-image, .toggle-sign, .scroll-toggle-button'); sideControls.forEach(el => el.style.display = 'none');
-        document.querySelectorAll('#config-button, #personal-button, #radar-button, #home-button, #reload-button, #keyword-assignment-button, #password-toggle-button, #versions-button, #info-button, #accident-alert-button').forEach(el => el.style.display = 'none');
-        const gridFilter = document.getElementById('grid-filter-container'); if (gridFilter) gridFilter.style.display = 'none';
-
-        isNavigationMapActive = true;
-        sessionStorage.setItem('mapContext', 'navigation');
-        closeOtherModals('reminders-location-map-modal');
-        
-        const mapModal = document.getElementById('reminders-location-map-modal');
-        if (!mapModal) { console.error("Error crítico: El modal del mapa no se encuentra en el HTML."); isNavigationMapActive = false; reject(new Error("Modal no encontrado")); return; }
-        
-        mapModal.classList.remove('map-modal-hidden');
-        const mapActualContainer = document.getElementById('mapbox-map-actual-container');
-        
-        const radaresCheckbox = document.getElementById('radares-ruta-checkbox');
-        if (radaresCheckbox) { radaresCheckbox.checked = localStorage.getItem(RADARES_RUTA_CHECKED_KEY) === 'true'; }
-        const tareasCheckbox = document.getElementById('tareas-ruta-checkbox');
-        if (tareasCheckbox) { tareasCheckbox.checked = localStorage.getItem(TAREAS_RUTA_CHECKED_KEY) === 'true'; }
-        const mapboxCheckbox = document.getElementById('mapbox-primary-checkbox');
-        if (mapboxCheckbox) { mapboxCheckbox.checked = localStorage.getItem('boardinggate_useMapboxAsPrimary') === 'true'; }
-        
-        if (navigationMapInstance) {
-            handleLoadOrDeleteRouteClick(null);
-            setNavigationMapClickHandler();
-            setTimeout(() => { if (navigationMapInstance) navigationMapInstance.resize(); }, 520);
-            resolve();
-        } else {
-            try {
-                const STREET_MAP_THEME_KEY = 'boardinggate_streetMapTheme';
-                let savedLayerName = localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO";
-
-                let initialStyle;
-                if (savedLayerName === "CALLES") {
-                    const streetTheme = localStorage.getItem(STREET_MAP_THEME_KEY) || 'dark'; // Oscuro por defecto
-                    initialStyle = (streetTheme === 'light') ? MAP_STYLES.CALLES_LIGHT : MAP_STYLES.CALLES_DARK;
-                } else {
-                    const finalLayerName = MAP_LEGACY_NAME_MAP[savedLayerName] || savedLayerName;
-                    initialStyle = MAP_STYLES[finalLayerName] || MAP_STYLES["HÍBRIDO"];
-                }
-                               
-                if (!isRecovery) { showToast("INICIALIZANDO MAPA...", "info", 0, false, "map-init-toast"); }
-      
-                navigationMapInstance = new mapboxgl.Map({
-                    container: mapActualContainer,
-                    style: initialStyle, 
-                    center: [ -97.1903, 30.3715],
-                    zoom: 2.8, pitch: 0, bearing: 0,
-                    attributionControl: false, 
-                    pixelRatio: window.devicePixelRatio || 1,
-                    maxTileCacheSize: 50,
-                    antialias: false,
-                    preserveDrawingBuffer: true,
-                    accessToken: mapboxgl.accessToken,
-                    minzoom: 2,
-                    maxzoom: 19
-                });
-
-                if (!isRecovery) { setMapImmersiveMode(true); }
-                
-                incrementMapSessionCount();
-                mapSessionStartTime = Date.now();
-                
-                const customControls = new CustomMapControlsGroup();
-                window.mapCustomControlsInstance = customControls; 
-                navigationMapInstance.addControl(customControls, 'bottom-right');
-                
-                compassAndModeControl = new CompassAndStatsControl();
-                navigationMapInstance.addControl(compassAndModeControl, 'bottom-left');
-                
-                if (!navigationMapInstance._interactionListenersAttached) {
-                    const mapCanvas = navigationMapInstance.getCanvasContainer();
-                    let touchStartPos = null, hasMovedEnoughToDrag = false;
-                    const DRAG_THRESHOLD = 10; 
-                    const onTouchStart = (e) => {
-                        if (e.touches && e.touches.length > 1) { handleManualMapInteraction(); return; }
-                        const touch = e.touches ? e.touches[0] : e;
-                        touchStartPos = { x: touch.clientX, y: touch.clientY };
-                        hasMovedEnoughToDrag = false;
-                    };
-                    const onTouchMove = (e) => {
-                        if (hasMovedEnoughToDrag || !touchStartPos || (e.touches && e.touches.length > 1)) return;
-                        const touch = e.touches ? e.touches[0] : e;
-                        const deltaX = Math.abs(touch.clientX - touchStartPos.x);
-                        const deltaY = Math.abs(touch.clientY - touchStartPos.y);
-                        if (deltaX > DRAG_THRESHOLD || deltaY > DRAG_THRESHOLD) { hasMovedEnoughToDrag = true; handleManualMapInteraction(); }
-                    };
-                    const onTouchEnd = () => { touchStartPos = null; hasMovedEnoughToDrag = false; };
-                    mapCanvas.addEventListener('touchstart', onTouchStart, { passive: true });
-                    mapCanvas.addEventListener('touchmove', onTouchMove, { passive: true });
-                    mapCanvas.addEventListener('touchend', onTouchEnd, { passive: true });
-                    navigationMapInstance.on('pitchend', (e) => {
-                        if (e.originalEvent) { 
-                            const newPitch = navigationMapInstance.getPitch();
-                            if (Math.abs(newPitch - mapPitchValue) > 0.1) { mapPitchValue = newPitch; saveSettings(); }
-                        }
-                    });
-                    navigationMapInstance._interactionListenersAttached = true; 
-                }
-
-                navigationMapInstance.on('error', (e) => { if (e.error && e.error.message.includes("Token")) { showToast("Error de Token de Mapbox...", "error", 10000); } });
-                
-                navigationMapInstance.on('load', async function() {
-                    try {
-                        const mapCanvasForGesture = navigationMapInstance.getCanvas();
-                        let longPressTimer = null;
-                        
-                        const handleLongPressStart = (e) => {
-                            const point = e.touches ? e.touches[0] : e;
-                            if (point.clientX < 200 && point.clientY > (window.innerHeight - 250)) {
-                                longPressTimer = setTimeout(() => {
-                                    const compassControl = document.querySelector('.mapboxgl-ctrl-bottom-left');
-                                    if (compassControl && compassControl.classList.contains('hidden-for-maneuver')) {
-                                        compassForceShowUntil = Date.now() + 15000;
-                                        compassControl.classList.remove('hidden-for-maneuver');
-                                        showToast("Controles mostrados temporalmente.", "info");
-                                    }
-                                    longPressTimer = null;
-                                }, 200);
-                            }
-                        };
-                        
-                        const clearLongPress = () => {
-                            if (longPressTimer) {
-                                clearTimeout(longPressTimer);
-                                longPressTimer = null;
-                            }
-                        };
-
-                        mapCanvasForGesture.addEventListener('touchstart', handleLongPressStart, { passive: true });
-                        mapCanvasForGesture.addEventListener('touchmove', clearLongPress);
-                        mapCanvasForGesture.addEventListener('touchend', clearLongPress);
-                        mapCanvasForGesture.addEventListener('touchcancel', clearLongPress);
-                        
-                        mapCanvasForGesture.addEventListener('mousedown', handleLongPressStart);
-                        mapCanvasForGesture.addEventListener('mousemove', clearLongPress);
-                        mapCanvasForGesture.addEventListener('mouseup', clearLongPress);
-                        
-                        if (!intersectionPreviewMap) {
-                            const previewContainer = document.getElementById('intersection-preview-map-container');
-                            if (previewContainer) {
-                                const initialMinimapStyle = MAP_STYLES[localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO"] || MAP_STYLES["HÍBRIDO"];
-                                intersectionPreviewMap = new mapboxgl.Map({ container: previewContainer, style: initialMinimapStyle, interactive: false, attributionControl: false, zoom: 16, pitch: 50, maxTileCacheSize: 8, minzoom:12, maxzoom: 19, maxTileCacheSize: 50, antialias: false,preserveDrawingBuffer: false, });
-                                intersectionPreviewMap.on('load', () => {
-                                    intersectionPreviewMap.addSource('intersection-route', { type: 'geojson', data: { type: 'Feature', geometry: { type: 'LineString', coordinates: [] } } });
-                                    intersectionPreviewMap.addLayer({ id: 'intersection-route-layer', type: 'line', source: 'intersection-route', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': '#ACD10F', 'line-width': 13 } });
-                                    const carEl = document.createElement('div'); carEl.className = 'vehicle-icon-minimap'; carEl.innerHTML = `<img src="PNG/AVANCE.PNG" alt="Coche Mini">`;
-                                    intersectionPreviewCarMarker = new mapboxgl.Marker({ element: carEl, anchor: 'center', rotationAlignment: 'viewport', rotation: -90 }).setLngLat([0, 0]).addTo(intersectionPreviewMap);
-                                    const maneuverEl = document.createElement('div'); maneuverEl.style.cssText = `width: 49px; height: 49px; background-size: contain; background-repeat: no-repeat; background-position: center;`;
-                                    intersectionPreviewManeuverMarker = new mapboxgl.Marker({ element: maneuverEl, anchor: 'center' }).setLngLat([0, 0]).addTo(intersectionPreviewMap);
-                                });
-                            }
-                        }
-                        const lockButton = document.getElementById('toggle-progress-bar-lock');
-                        if (lockButton && !lockButton.dataset.listenerAttached) { lockButton.addEventListener('click', (e) => { e.stopPropagation(); handleProgressBarLockToggle(); }); lockButton.dataset.listenerAttached = 'true'; }
-                        updateProgressBarLockIcon();
-                        const topInfoBar = document.getElementById('navigation-top-info-bar');
-                        if (topInfoBar && !topInfoBar.dataset.listenerAttached) {
-                            topInfoBar.addEventListener('click', (e) => {
-                                e.stopPropagation();
-                                if (nextManeuverStepForPreview && navigationCurrentRouteData?.routes?.[0]) { showIntersectionPreviewMap(nextManeuverStepForPreview, navigationCurrentRouteData.routes[0], true, 10000); } 
-                                else { showToast("No hay una próxima maniobra que mostrar.", "info"); }
-                            });
-                            topInfoBar.dataset.listenerAttached = 'true';
-                        }
-                        
-                        const initToast = document.getElementById("map-init-toast"); if (initToast) initToast.remove();
-
-                        await loadAndAddMapImages(navigationMapInstance);
-                        reAddCustomMapLayersAndSources(navigationMapInstance);
-                        applyLayerVisibility(); 
-                        plotRemindersOnNavigationMap();
-                        await configureMapAtmosphere();
-                        await processTrafficAlerts(); 
-
-                        if (alertRefreshInterval) clearInterval(alertRefreshInterval); 
-                        alertRefreshInterval = setInterval(processTrafficAlerts, ALERT_CHECK_INTERVAL);
-                                        
-                        navigationMapInstance.on('pitch', updateLineWidthsOnPitchChange);
-                        mapPreviousZoomLevelForPDRs = navigationMapInstance.getZoom();
-                        navigationMapInstance.on('zoomend', updateAllIconSizes);
-                        toggleMapHeaderRowsVisibility(mapHeaderButtonsVisible);
-
-                        navigationMapInstance.on('click', async (e) => {
-                            if (isAddReminderAtLocationModeActive) { handleMapClickToAddReminder(e); return; }
-                            if (isSimulatingGpsLocation) { handleSimulateGpsPositionClick(e); return; }
-                            
-                            if (isNavigating && !isAddingWaypointsDuringNav) { 
-                                return; 
-                            }
-                            
-                            const point = e.point; const lngLat = e.lngLat;
-                            const pdrLayers = ['pdr-simple-circle-layer', 'pdr-cards-layer-bg-halo', 'pdr-cards-layer-bg'];
-                            const pdrFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: pdrLayers });
-                            if (pdrFeatures.length > 0) { 
-                                const fullPdrData = window.lastOcmApiResponse.find(p => p.ID === pdrFeatures[0].properties.ocmId); 
-                                if (fullPdrData) { 
-                                    showChargingPointModal(fullPdrData, pdrFeatures[0].properties.index); 
-                                } 
-                                return; 
-                            }
-                            const alertLayers = ['traffic-alerts-layer'];
-                            const alertFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: alertLayers });
-                            if (alertFeatures.length > 0) {
-                                const alertDetailsMap = { 1: 'Accidente de tráfico', 2: 'Coche averiado', 3: 'Control de tráfico / Radar', 4: 'Atasco', 5: 'Peligro indeterminado', 6: 'Carretera en mal estado', 7: 'Obras', 8: 'Vía / Carretera cerrada' };
-                                showToast(alertDetailsMap[alertFeatures[0].properties.code] || 'Alerta de tráfico', 'warning', 4000); return;
-                            }
-                            const reminderLayers = ['reminders-icons-layer', 'radar-circles-layer'];
-                            const reminderFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: reminderLayers });
-                            if (reminderFeatures.length > 0) { showReminderActionModal(reminderFeatures[0].properties.reminderId); return; }
-                            
-                            const mapboxPoiLayers = ['poi-label'];
-                            const features = navigationMapInstance.queryRenderedFeatures(point, { layers: mapboxPoiLayers });
-                            const validPoiFeature = features.find(f => f.properties && (f.properties.name || f.properties.name_en || f.properties.text));
-                            
-                            if (validPoiFeature) {
-                                const { name, name_en, text, poi_category, category, maki } = validPoiFeature.properties;
-                                const poiName = name || name_en || text;
-                                let categories = [];
-                                if (poi_category && Array.isArray(poi_category)) { categories = poi_category; } 
-                                else if (category) { categories = category.split(',').map(c => c.trim()); } 
-                                else if (maki) { categories.push(maki); }
-                                showPoiInfoModal({ properties: { name: poiName, categories: categories }, geometry: validPoiFeature.geometry });
-                            } else {
-                                addWaypoint(lngLat); 
-                            }
-                        });
-                        
-                        enablePoiInteractivity(navigationMapInstance);
-                        setNavigationMapClickHandler();
-                        
-                        let currentPos = await getInitialGpsPositionForMap();
-                        
-                        setMapImmersiveMode(false);
-                        navigationFollowUser = true;
-                        shouldCenterOnUser = true;
-                        updateLocateMeButtonsUI();
-                        toggleMapControls(true);
-                        navigationCurrentLocation = currentPos;
-                        
-                        const initialViewOptions = { center: [currentPos.longitude, currentPos.latitude], zoom: 15.5, essential: true };
-                         
-                        const mode = mapViewMode;
-                        if (mode === 'heading' || mode === 'perspective' || mode === 'relief') { initialViewOptions.bearing = currentPos.heading || 0; }
-                        if (mode === 'perspective' || mode === 'relief') { initialViewOptions.pitch = mapPitchValue; } else { initialViewOptions.pitch = 0; }
-                        
-                        initialViewOptions.pitch = 0;
-                        
-                        if (!isRecovery) {
-                            const globeSpinPromise = new Promise(resolve => {
-                                const startCoords = { lat: 30.3715, lng: -97.1903 }; 
-                                const endCoords = { lat: 40.3748, lng: -3.7354 };   
-                                const duration = 1800;
-                                const totalLngChange = -(360 - (endCoords.lng - startCoords.lng));
-                                const totalLatChange = endCoords.lat - startCoords.lat;
-                                const startTimestamp = performance.now();
-                                function animateSpin(timestamp) {
-                                    const progress = Math.min((timestamp - startTimestamp) / duration, 1);
-                                    const easedProgress = 1 - Math.pow(1 - progress, 3);
-                                    navigationMapInstance.setCenter([startCoords.lng + (totalLngChange * easedProgress), startCoords.lat + (totalLatChange * easedProgress)]);
-                                    if (progress < 1) { requestAnimationFrame(animateSpin); } 
-                                    else { navigationMapInstance.setCenter([endCoords.lng, endCoords.lat]); resolve(); }
-                                }
-                                requestAnimationFrame(animateSpin);
-                            });
-                            await globeSpinPromise;
-                            navigationMapInstance.jumpTo(initialViewOptions); 
-                        } else {
-                            navigationMapInstance.jumpTo(initialViewOptions);
-                        }
-
-                        markerAnimationState.currentMapCenter = navigationMapInstance.getCenter();
-                        markerAnimationState.currentMapZoom = navigationMapInstance.getZoom();
-                        markerAnimationState.currentMapPitch = navigationMapInstance.getPitch();
-                        markerAnimationState.currentMapBearing = navigationMapInstance.getBearing();
-                        markerAnimationState.targetMapCenter = navigationMapInstance.getCenter();
-                        markerAnimationState.targetMapZoom = navigationMapInstance.getZoom();
-                        markerAnimationState.targetMapPitch = navigationMapInstance.getPitch();
-                        markerAnimationState.targetMapBearing = navigationMapInstance.getBearing();
-
-                        updateInitialUserPosition(currentPos, navigationMapInstance);
-                        startGpsWatching();
-                        
-                        resolve();
-                        
-                    } catch (loadError) {
-                        const overlay = document.getElementById('route-recovery-overlay');
-                        if (overlay) overlay.classList.add('hidden');
-                        showToast(`Error crítico al cargar los recursos del mapa: ${loadError.message}`, "error", 10000);
-                        reject(loadError); 
-                    }
-                });
-                
-                navigationMapInstance.on('pitch', updateVehicleIconPerspective);
-    
-            } catch (initError) {
-                 const overlay = document.getElementById('route-recovery-overlay');
-                 if (overlay) overlay.classList.add('hidden');
-                 if (mapActualContainer) mapActualContainer.innerHTML = `<div style="color:red; text-align:center; padding:20px;"><h2>Error al cargar el mapa</h2><p>${initError.message}</p></div>`;
-                 isNavigationMapActive = false;
-                 reject(initError); 
-            }
-        }
-    }); 
-}
     
 // ===================================================================
 // NOMBRE: MapSettingsPanel (VERSIÓN CON SEPARADOR VISUAL)
@@ -2474,16 +2125,16 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
     setNavigationMapClickHandler(); 
     actualizarContadorRadares(radaresEnRutaActual.length);
     actualizarContadorTareas(tareasEnRutaActual.length);
-}
+}   
 
     
-
 // ===================================================================
-// NOMBRE: restoreTripProgress (VERSIÓN FINAL CON DETECCIÓN DE DESVÍO EN RECUPERACIÓN)
-// RESUMEN: Restaura el viaje, pero si detecta un desvío significativo, fuerza el recálculo inmediato.
+// NOMBRE: restoreTripProgress (VERSIÓN FINAL CON LÓGICA DE SIMULACIÓN CORREGIDA)
+// RESUMEN: Restaura el viaje, manejando correctamente la recuperación de simulaciones sin usar el GPS.
 // ===================================================================
 async function restoreTripProgress(recoveryInfo) {
-    if (!navigationCurrentRouteData?.routes?.[0] || !recoveryInfo || !recoveryInfo.tripStartTime) {
+    if (!navigationCurrentRouteData?.routes?.[0] || !recoveryInfo) {
+        console.warn("[Recovery] Datos insuficientes para restaurar el progreso del viaje.");
         const overlay = document.getElementById('route-recovery-overlay');
         if (overlay) overlay.classList.add('hidden');
         return;
@@ -2493,121 +2144,114 @@ async function restoreTripProgress(recoveryInfo) {
         const route = navigationCurrentRouteData.routes[0];
         const isSimulatedRecovery = recoveryInfo.simulationState && recoveryInfo.simulationState.isSimulating;
         
-        const currentCoords = isSimulatedRecovery
-            ? { latitude: 0, longitude: 0 } 
-            : await getCurrentLocationAsync();
+        let currentCoords = null;
+        let carDistanceAlongRoute;
 
-        let physicalDistanceToRoute = 0;
-        if (currentCoords.latitude !== 0) { 
+        // <-- INICIO: CORRECCIÓN LÓGICA SIMULACIÓN VS. REAL -->
+        if (isSimulatedRecovery) {
+            // Si es una simulación, ignoramos el GPS y usamos los datos guardados.
+            carDistanceAlongRoute = recoveryInfo.simulationState.distance;
+        } else {
+            // Si es un viaje real, obtenemos el GPS y comprobamos el desvío.
+            currentCoords = await getCurrentLocationAsync();
             const carPoint = turf.point([currentCoords.longitude, currentCoords.latitude]);
             const routeLine = turf.lineString(route.geometry.coordinates);
-            physicalDistanceToRoute = turf.pointToLineDistance(carPoint, routeLine, { units: 'meters' });
-        }
-        
-        if (physicalDistanceToRoute > 25 && !isSimulatedRecovery) {
-            console.warn(`[Recovery] Desvío de ${physicalDistanceToRoute.toFixed(0)}m detectado durante la recuperación. Se forzará el recálculo.`);
-            showToast("Desvío detectado al reanudar. Recalculando ruta...", "warning");
+            carDistanceAlongRoute = turf.nearestPointOnLine(routeLine, carPoint, { units: 'meters' }).properties.location;
             
-            showDeviationModal(); 
-            
-            const overlay = document.getElementById('route-recovery-overlay');
-            if (overlay) overlay.classList.add('hidden');
-            hideRecoveryScreenshotOverlay();
-            return; 
+            const physicalDistanceToRoute = turf.pointToLineDistance(carPoint, routeLine, { units: 'meters' });
+            if (physicalDistanceToRoute > 25) {
+                console.warn(`[Recovery] Desvío de ${physicalDistanceToRoute.toFixed(0)}m detectado. Forzando recálculo.`);
+                showToast("Desvío detectado al reanudar. Recalculando ruta...", "warning");
+                showDeviationModal();
+                const overlay = document.getElementById('route-recovery-overlay');
+                if (overlay) overlay.classList.add('hidden');
+                hideRecoveryScreenshotOverlay();
+                return;
+            }
         }
+        // <-- FIN: CORRECCIÓN LÓGICA SIMULACIÓN VS. REAL -->
 
+        // Restaurar tiempos y estadísticas
         navigationStartTimeForStats = new Date(recoveryInfo.tripStartTime);
-        if (recoveryInfo.originalTripEtaTime) {
-            originalTripEtaTime = new Date(recoveryInfo.originalTripEtaTime);
-        }
-        
-        if (recoveryInfo.stats) {
-            totalDistanceTravelledForStats = recoveryInfo.stats.totalDistance || 0;
-            accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
-            maxSpeedDuringTrip = recoveryInfo.stats.maxSpeed || 0;
-            maxAltitudeDuringTrip = recoveryInfo.stats.maxAltitude || -Infinity;
-            minAltitudeDuringTrip = recoveryInfo.stats.minAltitude || Infinity;
-            maxSpeedCoordinates = recoveryInfo.stats.maxSpeedCoords || null;
-        }
+        if (recoveryInfo.originalTripEtaTime) originalTripEtaTime = new Date(recoveryInfo.originalTripEtaTime);
 
-        if (isSimulatedRecovery) {
-            accumulatedDistanceBeforeCurrentSegment = 0;
-        }
-       
-       if (isSimulatedRecovery) {
-            // Se asegura de que la "última posición" sea el punto de reanudación, no la ubicación física.
-            const turfLine = turf.lineString(route.geometry.coordinates);
-            const pointOnLine = turf.along(turfLine, recoveryInfo.simulationState.distance / 1000, { units: 'kilometers' });
-            const [lng, lat] = pointOnLine.geometry.coordinates;
-            lastPositionForStats = { latitude: lat, longitude: lng };
-        } else {
-            lastPositionForStats = { ...currentCoords };
+        // Si no es una recuperación "rica", reconstruimos estadísticas
+        if (!recoveryInfo.isRichRecovery) {
+            totalDistanceTravelledForStats = carDistanceAlongRoute;
+            accumulatedDistanceBeforeCurrentSegment = carDistanceAlongRoute;
+            if(currentCoords) lastPositionForStats = { ...currentCoords };
+            const timeElapsedS = (Date.now() - recoveryInfo.tripStartTime) / 1000;
+            window.averageSpeedKmh = (timeElapsedS > 0 && totalDistanceTravelledForStats > 0) ? (totalDistanceTravelledForStats / timeElapsedS) * 3.6 : 0;
+        } else { // Si es "rica", simplemente las cargamos
+            if (recoveryInfo.stats) {
+                totalDistanceTravelledForStats = recoveryInfo.stats.totalDistance || 0;
+                accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
+                maxSpeedDuringTrip = recoveryInfo.stats.maxSpeed || 0;
+                maxAltitudeDuringTrip = recoveryInfo.stats.maxAltitude || -Infinity;
+                minAltitudeDuringTrip = recoveryInfo.stats.minAltitude || Infinity;
+                maxSpeedCoordinates = recoveryInfo.stats.maxSpeedCoords || null;
+            }
+            if(currentCoords) lastPositionForStats = { ...currentCoords };
+            if (recoveryInfo.tripContext) {
+                graphLabels = recoveryInfo.tripContext.graphLabels || [];
+                graphDataPoints = recoveryInfo.tripContext.graphDataPoints || { speed: [], altitude: [] };
+                minAverageSpeedInTrip = recoveryInfo.tripContext.minAvgSpeed ?? Infinity;
+                maxAverageSpeedInTrip = recoveryInfo.tripContext.maxAvgSpeed ?? -Infinity;
+                accumulatedDeviationMs = recoveryInfo.tripContext.accumulatedDeviationMs || 0;
+            }
         }
         
-        if (recoveryInfo.tripContext) {
-            graphLabels = recoveryInfo.tripContext.graphLabels || [];
-            graphDataPoints = recoveryInfo.tripContext.graphDataPoints || { speed: [], altitude: [] };
-            minAverageSpeedInTrip = recoveryInfo.tripContext.minAvgSpeed ?? Infinity;
-            maxAverageSpeedInTrip = recoveryInfo.tripContext.maxAvgSpeed ?? -Infinity;
-            accumulatedDeviationMs = recoveryInfo.tripContext.accumulatedDeviationMs || 0;
-        }
-        
+        lastCarDistanceAlongRouteForNavLogic = carDistanceAlongRoute;
         deviationCheckGracePeriodUntil = 0;
 
-        const carDistanceAlongRoute = isSimulatedRecovery
-            ? recoveryInfo.simulationState.distance
-            : turf.nearestPointOnLine(turf.lineString(route.geometry.coordinates), turf.point([currentCoords.longitude, currentCoords.latitude]), { units: 'meters' }).properties.location;
-        
-        const timeElapsedS = (Date.now() - recoveryInfo.tripStartTime) / 1000;
-        if (timeElapsedS > 0 && totalDistanceTravelledForStats > 0) {
-            window.averageSpeedKmh = (totalDistanceTravelledForStats / timeElapsedS) * 3.6;
-        }
-        lastCarDistanceAlongRouteForNavLogic = carDistanceAlongRoute;
-        
+        // Bucle robusto para encontrar la etapa y paso actual
         let cumulativeDistance = 0;
         let legFound = false;
-        for (let i = 0; i < route.legs.length; i++) {
-            const leg = route.legs[i];
-            if (!leg || !leg.steps) continue;
-            const legTotalDistance = leg.distance || leg.steps.reduce((sum, step) => sum + (step.distance || 0), 0);
-            if (carDistanceAlongRoute <= cumulativeDistance + legTotalDistance) {
-                currentLegIndexNav = i;
-                let legDistanceTraveled = 0;
-                for (let j = 0; j < leg.steps.length; j++) {
-                    const step = leg.steps[j];
-                    if (carDistanceAlongRoute <= cumulativeDistance + legDistanceTraveled + (step.distance || 0)) {
-                        currentStepIndexNav = j;
-                        legFound = true;
-                        break; 
+        
+        if (route.legs && route.legs.length > 0) {
+            for (let i = 0; i < route.legs.length; i++) {
+                const leg = route.legs[i];
+                if (!leg || !leg.steps) continue;
+                const legTotalDistance = leg.distance || 0;
+                // Usamos un pequeño margen para evitar errores de redondeo al final de la ruta
+                if (carDistanceAlongRoute <= cumulativeDistance + legTotalDistance + 0.1) {
+                    currentLegIndexNav = i;
+                    let legDistanceTraveled = 0;
+                    for (let j = 0; j < leg.steps.length; j++) {
+                        const step = leg.steps[j];
+                        if (step && carDistanceAlongRoute <= cumulativeDistance + legDistanceTraveled + (step.distance || 0) + 0.1) {
+                            currentStepIndexNav = j;
+                            legFound = true;
+                            break;
+                        }
+                        legDistanceTraveled += (step?.distance || 0);
                     }
-                    legDistanceTraveled += (step.distance || 0);
+                    if (legFound) break;
                 }
-                if (legFound) break;
+                cumulativeDistance += legTotalDistance;
             }
-            cumulativeDistance += legTotalDistance;
+        }
+
+        // Safety net: si la distancia es mayor que la ruta, nos situamos al final
+        if (!legFound) {
+            currentLegIndexNav = route.legs.length > 0 ? route.legs.length - 1 : 0;
+            const lastLeg = route.legs[currentLegIndexNav];
+            currentStepIndexNav = (lastLeg && lastLeg.steps.length > 0) ? lastLeg.steps.length - 1 : 0;
         }
 
         updateNavigationProgressDisplay(route, carDistanceAlongRoute);
         updateTurnByTurnDisplay(route, carDistanceAlongRoute);
-        
-        if (navigationChart) {
-            updateChartData();
-        }
+        if (navigationChart) updateChartData();
 
         await toggleNavigationState(false, true);
 
         if (isSimulatedRecovery) {
             showToast("Reanudando simulación de ruta...", "success", 3000);
-            const turfLine = turf.lineString(route.geometry.coordinates);
-            const pointOnLine = turf.along(turfLine, recoveryInfo.simulationState.distance / 1000, { units: 'kilometers' });
-            const [lng, lat] = pointOnLine.geometry.coordinates;
-            simulatedGpsLocation = { latitude: lat, longitude: lng, accuracy: 5, heading: 0, altitude: 0, speed: 0 };
-            
             startAutomatedRouteSimulation(recoveryInfo.simulationState.speed, recoveryInfo.simulationState.distance);
         }
 
-
     } catch (error) {
+        console.error("Error al restaurar progreso del viaje:", error);
         showToast(`Error al restaurar progreso: ${error.message}. Se continuará desde el inicio.`, "error");
         navigationStartTimeForStats = new Date();
         totalDistanceTravelledForStats = 0;
@@ -2621,9 +2265,7 @@ async function restoreTripProgress(recoveryInfo) {
         }
         hideRecoveryScreenshotOverlay();
     }
-}
-
-    
+}    
 // ===================================================================
 // NOMBRE: manageMemoryCycle (CON PERIODO DE GRACIA Y LOGGING)
 // ===================================================================
@@ -4643,8 +4285,7 @@ async function updateDynamicRadars(isInitialLoadCheck = false) {
         if (timeSinceLastCheck < 30 * 60 * 1000 && hasExistingDynamicRadars) return;
     }
     lastDynamicRadarCheck = now;
-    if (!isInitialLoadCheck) showToast("Actualizando radares dinámicos...", "info", 3000, false, "radar-update");
-
+        
     if (!window.radarsCache || !window.radarsSpatialIndex) {
         await initializeRadarCache();
         if (!window.radarsCache) {
@@ -6972,14 +6613,14 @@ function precalculateRouteStepDistances(routeData) {
         }
         window.optimizationHasFailed = true;
     }
-}        
-    
+}            
 
+
+//===================================================================
+// NOMBRE: recalculateAndDrawRoute (MODIFICADA - Lógica de recuperación dual)
+// RESUMEN: Contiene la nueva lógica para reconstruir la ruta, diferenciando entre recuperación "rica" y "ligera".
 // ===================================================================
-// NOMBRE: recalculateAndDrawRoute (VERSIÓN CON LÓGICA DE RADARES CONDICIONAL)
-// RESUMEN: Solo limpia los radares dinámicos si el check de "Radares Ruta" está activo.
-// ===================================================================
-async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
+async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recoveryInfo = null) {
     const RETRY_CADENCE_MS = 3000;
     const MAX_RETRIES = 5;
     let attempt = 1;
@@ -6998,8 +6639,48 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
         try {
             let waypointsForAPI = [];
             let currentHeading = null;
-            
-            if (!isNavigating) {
+
+            // <-- INICIO: NUEVA LÓGICA DE RECUPERACIÓN DUAL -->
+            if (recoveryInfo) {
+                const currentPos = await getGpsWithRetries();
+                currentHeading = currentPos.heading;
+                
+                // Si NO es una recuperación rica (crash), reconstruimos el estado 'visited'.
+                if (!recoveryInfo.isRichRecovery) {
+                    const tempRouteUrl = `${OSRM_SERVICE_URL}/driving/${navigationWaypoints.map(wp => `${wp.lng},${wp.lat}`).join(';')}?overview=full&geometries=geojson&steps=true`;
+                    const tempRouteResponse = await fetch(tempRouteUrl);
+                    const tempRouteData = await tempRouteResponse.json();
+                    
+                    if (tempRouteData.code === 'Ok' && tempRouteData.routes.length > 0) {
+                        const originalRouteLine = turf.lineString(tempRouteData.routes[0].geometry.coordinates);
+                        const carPoint = turf.point([currentPos.longitude, currentPos.latitude]);
+                        const carDistanceAlongOriginalRoute = turf.nearestPointOnLine(originalRouteLine, carPoint, { units: 'meters' }).properties.location;
+                        
+                        let cumulativeDistance = 0;
+                        tempRouteData.routes[0].legs.forEach((leg, legIndex) => {
+                            if (navigationWaypoints[legIndex + 1]) {
+                                if (cumulativeDistance + leg.distance < carDistanceAlongOriginalRoute) {
+                                    navigationWaypoints[legIndex + 1].visited = true;
+                                }
+                                cumulativeDistance += leg.distance;
+                            }
+                        });
+                    }
+                }
+                
+                let lastVisitedIndex = -1;
+                navigationWaypoints.forEach((wp, index) => {
+                    if (wp && wp.visited && !wp.isInternal) {
+                        lastVisitedIndex = index;
+                    }
+                });
+                
+                const waypointsBefore = navigationWaypoints.slice(0, lastVisitedIndex + 1);
+                const waypointsAfter = navigationWaypoints.slice(lastVisitedIndex + 1);
+                const invisibleWaypoint = { lat: currentPos.latitude, lng: currentPos.longitude, isInternal: true };
+                waypointsForAPI = [...waypointsBefore, invisibleWaypoint, ...waypointsAfter];
+
+            } else if (!isNavigating) {
                 waypointsForAPI = [...navigationWaypoints];
                 currentHeading = null;
             } else { 
@@ -7011,6 +6692,7 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
                     waypointsForAPI = [...navigationWaypoints];
                 }
             }
+            // <-- FIN: LÓGICA DE RECUPERACIÓN DUAL -->
             
             const validWaypoints = waypointsForAPI.filter(wp => wp && typeof wp.lat === 'number' && typeof wp.lng === 'number');
             if (validWaypoints.length < 2) { 
@@ -7037,7 +6719,6 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
             const isRadaresRutaActive = document.getElementById('radares-ruta-checkbox').checked;
 
             if (isRadaresRutaActive) {
-                console.log("[Radar Logic] Ruta cargada con check activo. Limpiando radares dinámicos.");
                 let reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
                 const originalLength = reminders.length;
                 reminders = reminders.filter(r => !r.isDynamicRadar);
@@ -7045,8 +6726,6 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false) {
                     localStorage.setItem('reminders', JSON.stringify(reminders));
                     markCacheAsDirty();
                 }
-            } else {
-                console.log("[Radar Logic] Ruta cargada con check inactivo. Manteniendo radares dinámicos existentes.");
             }
             
             if (preserveAccumulatedStats) {
@@ -8190,10 +7869,190 @@ function adaptMapboxRouteToOSRMFormat(mapboxRoute) {
     };
 }  
 
-
-//===================================================================
-// NOMBRE: updateTurnByTurnDisplay (VERSIÓN HÍBRIDA OPTIMIZADA CON CONTADOR CORREGIDO)
 // ===================================================================
+// NOMBRE: openNavigationMap (VERSIÓN FINAL CON BOTÓN "T" Y ESTADO MANUAL)
+// RESUMEN: Abre el mapa de navegación y añade el listener al nuevo botón "T".
+// ===================================================================
+async function openNavigationMap(isRecovery = false) {
+    return new Promise(async (resolve, reject) => {
+        const { primaryId: userId } = parseUserId(localStorage.getItem('userData_userId'));
+        
+        if (userId && userId.toLowerCase() !== 'boardinggate') {
+            const toastId = "map-access-check";
+            try {
+                const adminDocRef = window.doc(window.db, "user_data", "boardinggate");
+                const userDocRef = window.doc(window.db, "user_data", userId);
+                const [adminSnap, userSnap] = await Promise.all([window.getDoc(adminDocRef), window.getDoc(userDocRef)]);
+                if (userSnap.exists() && userSnap.data().mapAccessEnabled === false) {
+                    showToast("ACCESO DENEGADO A MAPAS TEMPORALMENTE. Contacte con el administrador vía chat", "error", 5000);
+                    reject(new Error("Acceso denegado"));
+                    return;
+                }
+                let maxSessions = Infinity;
+                if (adminSnap.exists() && typeof adminSnap.data().max_monthly_sessions === 'number') {
+                    maxSessions = adminSnap.data().max_monthly_sessions;
+                }
+                let userMonthlyCount = 0;
+                if (userSnap.exists()) {
+                    const userData = userSnap.data();
+                    const now = new Date();
+                    const currentMonthStr = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+                    if (userData.map_sessions_last_month === currentMonthStr) {
+                        userMonthlyCount = userData.map_sessions_month || 0;
+                    }
+                }
+                const existingToast = document.getElementById(toastId);
+                if (existingToast) existingToast.remove();
+                if (userMonthlyCount >= maxSessions) {
+                    showToast("HA SUPERADO EL NÚMERO MÁXIMO DE SESIONES MENSUALES DE MAPA, consulte con el administrador vía chat", "error", 10000);
+                    reject(new Error("Límite de sesiones alcanzado"));
+                    return;
+                }
+            } catch (error) {
+                console.warn("No se pudo verificar el límite de sesiones de mapa:", error.message);
+                const existingToast = document.getElementById(toastId);
+                if (existingToast) existingToast.remove();
+            }
+        }
+                               
+        const mainContent = document.querySelector('main'); if (mainContent) mainContent.style.display = 'none';
+        const footer = document.querySelector('footer'); if (footer) footer.style.display = 'none';
+        const noticesContainer = document.querySelector('.notices-icon-container'); if (noticesContainer) noticesContainer.style.display = 'none';
+        const sideControls = document.querySelectorAll('.toggle-image, .toggle-sign, .scroll-toggle-button'); sideControls.forEach(el => el.style.display = 'none');
+        document.querySelectorAll('#config-button, #personal-button, #radar-button, #home-button, #reload-button, #keyword-assignment-button, #password-toggle-button, #versions-button, #info-button, #accident-alert-button').forEach(el => el.style.display = 'none');
+        const gridFilter = document.getElementById('grid-filter-container'); if (gridFilter) gridFilter.style.display = 'none';
+
+        isNavigationMapActive = true;
+        sessionStorage.setItem('mapContext', 'navigation');
+        closeOtherModals('reminders-location-map-modal');
+        
+        const mapModal = document.getElementById('reminders-location-map-modal');
+        if (!mapModal) { console.error("Error crítico: El modal del mapa no se encuentra en el HTML."); isNavigationMapActive = false; reject(new Error("Modal no encontrado")); return; }
+        
+        mapModal.classList.remove('map-modal-hidden');
+        const mapActualContainer = document.getElementById('mapbox-map-actual-container');
+        
+        // <-- INICIO: LÓGICA DEL BOTÓN "T" CON TEMPORIZADOR -->
+        const minimapTriggerButton = document.getElementById('force-show-minimap-button');
+        if (minimapTriggerButton && !minimapTriggerButton.listenerAdded) {
+            minimapTriggerButton.addEventListener('click', (e) => {
+                e.stopPropagation();
+                if (showRouteMinimapPreference) {
+                    minimapForceShowUntil = Date.now() + 30000; // Mostrar durante 30 segundos
+                    updateTurnByTurnDisplay(navigationCurrentRouteData?.routes?.[0], lastCarDistanceAlongRouteForNavLogic);
+                }
+            });
+            minimapTriggerButton.listenerAdded = true;
+        }
+     
+        const radaresCheckbox = document.getElementById('radares-ruta-checkbox');
+        if (radaresCheckbox) { radaresCheckbox.checked = localStorage.getItem(RADARES_RUTA_CHECKED_KEY) === 'true'; }
+        const tareasCheckbox = document.getElementById('tareas-ruta-checkbox');
+        if (tareasCheckbox) { tareasCheckbox.checked = localStorage.getItem(TAREAS_RUTA_CHECKED_KEY) === 'true'; }
+        const mapboxCheckbox = document.getElementById('mapbox-primary-checkbox');
+        if (mapboxCheckbox) { mapboxCheckbox.checked = localStorage.getItem('boardinggate_useMapboxAsPrimary') === 'true'; }
+        
+        if (navigationMapInstance) {
+            handleLoadOrDeleteRouteClick(null);
+            setNavigationMapClickHandler();
+            setTimeout(() => { if (navigationMapInstance) navigationMapInstance.resize(); }, 520);
+            resolve();
+        } else {
+            try {
+                const STREET_MAP_THEME_KEY = 'boardinggate_streetMapTheme';
+                let savedLayerName = localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO";
+
+                let initialStyle;
+                if (savedLayerName === "CALLES") {
+                    const streetTheme = localStorage.getItem(STREET_MAP_THEME_KEY) || 'dark';
+                    initialStyle = (streetTheme === 'light') ? MAP_STYLES.CALLES_LIGHT : MAP_STYLES.CALLES_DARK;
+                } else {
+                    const finalLayerName = MAP_LEGACY_NAME_MAP[savedLayerName] || savedLayerName;
+                    initialStyle = MAP_STYLES[finalLayerName] || MAP_STYLES["HÍBRIDO"];
+                }
+                               
+                if (!isRecovery) { showToast("INICIALIZANDO MAPA...", "info", 0, false, "map-init-toast"); }
+      
+                navigationMapInstance = new mapboxgl.Map({
+                    container: mapActualContainer,
+                    style: initialStyle, 
+                    center: [ -97.1903, 30.3715],
+                    zoom: 2.8, pitch: 0, bearing: 0,
+                    attributionControl: false, 
+                    pixelRatio: window.devicePixelRatio || 1,
+                    maxTileCacheSize: 50,
+                    antialias: false,
+                    preserveDrawingBuffer: true,
+                    accessToken: mapboxgl.accessToken,
+                    minzoom: 2,
+                    maxzoom: 19
+                });
+
+                if (!isRecovery) { setMapImmersiveMode(true); }
+                
+                incrementMapSessionCount();
+                mapSessionStartTime = Date.now();
+                
+                const customControls = new CustomMapControlsGroup();
+                window.mapCustomControlsInstance = customControls; 
+                navigationMapInstance.addControl(customControls, 'bottom-right');
+                
+                compassAndModeControl = new CompassAndStatsControl();
+                navigationMapInstance.addControl(compassAndModeControl, 'bottom-left');
+                
+                if (!navigationMapInstance._interactionListenersAttached) {
+                    const mapCanvas = navigationMapInstance.getCanvasContainer();
+                    let touchStartPos = null, hasMovedEnoughToDrag = false;
+                    const DRAG_THRESHOLD = 10; 
+                    const onTouchStart = (e) => { if (e.touches && e.touches.length > 1) { handleManualMapInteraction(); return; } const touch = e.touches ? e.touches[0] : e; touchStartPos = { x: touch.clientX, y: touch.clientY }; hasMovedEnoughToDrag = false; };
+                    const onTouchMove = (e) => { if (hasMovedEnoughToDrag || !touchStartPos || (e.touches && e.touches.length > 1)) return; const touch = e.touches ? e.touches[0] : e; const deltaX = Math.abs(touch.clientX - touchStartPos.x); const deltaY = Math.abs(touch.clientY - touchStartPos.y); if (deltaX > DRAG_THRESHOLD || deltaY > DRAG_THRESHOLD) { hasMovedEnoughToDrag = true; handleManualMapInteraction(); } };
+                    const onTouchEnd = () => { touchStartPos = null; hasMovedEnoughToDrag = false; };
+                    mapCanvas.addEventListener('touchstart', onTouchStart, { passive: true });
+                    mapCanvas.addEventListener('touchmove', onTouchMove, { passive: true });
+                    mapCanvas.addEventListener('touchend', onTouchEnd, { passive: true });
+                    navigationMapInstance.on('pitchend', (e) => { if (e.originalEvent) { const newPitch = navigationMapInstance.getPitch(); if (Math.abs(newPitch - mapPitchValue) > 0.1) { mapPitchValue = newPitch; saveSettings(); } } });
+                    navigationMapInstance._interactionListenersAttached = true; 
+                }
+
+                navigationMapInstance.on('error', (e) => { if (e.error && e.error.message.includes("Token")) { showToast("Error de Token de Mapbox...", "error", 10000); } });
+                
+                navigationMapInstance.on('load', async function() {
+                    try {
+                        const mapCanvasForGesture = navigationMapInstance.getCanvas();
+                        let longPressTimer = null;
+                        const handleLongPressStart = (e) => { const point = e.touches ? e.touches[0] : e; if (point.clientX < 200 && point.clientY > (window.innerHeight - 250)) { longPressTimer = setTimeout(() => { const compassControl = document.querySelector('.mapboxgl-ctrl-bottom-left'); if (compassControl && compassControl.classList.contains('hidden-for-maneuver')) { compassForceShowUntil = Date.now() + 15000; compassControl.classList.remove('hidden-for-maneuver'); showToast("Controles mostrados temporalmente.", "info"); } longPressTimer = null; }, 350); } };
+                        const clearLongPress = () => { if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; } };
+                        mapCanvasForGesture.addEventListener('touchstart', handleLongPressStart, { passive: true }); mapCanvasForGesture.addEventListener('touchmove', clearLongPress); mapCanvasForGesture.addEventListener('touchend', clearLongPress); mapCanvasForGesture.addEventListener('touchcancel', clearLongPress); mapCanvasForGesture.addEventListener('mousedown', handleLongPressStart); mapCanvasForGesture.addEventListener('mousemove', clearLongPress); mapCanvasForGesture.addEventListener('mouseup', clearLongPress);
+                        if (!intersectionPreviewMap) { const previewContainer = document.getElementById('intersection-preview-map-container'); if (previewContainer) { const initialMinimapStyle = MAP_STYLES[localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO"] || MAP_STYLES["HÍBRIDO"]; intersectionPreviewMap = new mapboxgl.Map({ container: previewContainer, style: initialMinimapStyle, interactive: false, attributionControl: false, zoom: 16, pitch: 50, maxTileCacheSize: 8, minzoom:12, maxzoom: 19, maxTileCacheSize: 50, antialias: false,preserveDrawingBuffer: false, }); intersectionPreviewMap.on('load', () => { intersectionPreviewMap.addSource('intersection-route', { type: 'geojson', data: { type: 'Feature', geometry: { type: 'LineString', coordinates: [] } } }); intersectionPreviewMap.addLayer({ id: 'intersection-route-layer', type: 'line', source: 'intersection-route', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': '#ACD10F', 'line-width': 13 } }); const carEl = document.createElement('div'); carEl.className = 'vehicle-icon-minimap'; carEl.innerHTML = `<img src="PNG/AVANCE.PNG" alt="Coche Mini">`; intersectionPreviewCarMarker = new mapboxgl.Marker({ element: carEl, anchor: 'center', rotationAlignment: 'viewport', rotation: -90 }).setLngLat([0, 0]).addTo(intersectionPreviewMap); const maneuverEl = document.createElement('div'); maneuverEl.style.cssText = `width: 49px; height: 49px; background-size: contain; background-repeat: no-repeat; background-position: center;`; intersectionPreviewManeuverMarker = new mapboxgl.Marker({ element: maneuverEl, anchor: 'center' }).setLngLat([0, 0]).addTo(intersectionPreviewMap); }); } }
+                        const lockButton = document.getElementById('toggle-progress-bar-lock'); if (lockButton && !lockButton.dataset.listenerAttached) { lockButton.addEventListener('click', (e) => { e.stopPropagation(); handleProgressBarLockToggle(); }); lockButton.dataset.listenerAttached = 'true'; } updateProgressBarLockIcon();
+                        const topInfoBar = document.getElementById('navigation-top-info-bar'); if (topInfoBar && !topInfoBar.dataset.listenerAttached) { topInfoBar.addEventListener('click', (e) => { e.stopPropagation(); if (nextManeuverStepForPreview && navigationCurrentRouteData?.routes?.[0]) { showIntersectionPreviewMap(nextManeuverStepForPreview, navigationCurrentRouteData.routes[0], true, 10000); } else { showToast("No hay una próxima maniobra que mostrar.", "info"); } }); topInfoBar.dataset.listenerAttached = 'true'; }
+                        const initToast = document.getElementById("map-init-toast"); if (initToast) initToast.remove();
+                        await loadAndAddMapImages(navigationMapInstance); reAddCustomMapLayersAndSources(navigationMapInstance); applyLayerVisibility(); plotRemindersOnNavigationMap(); await configureMapAtmosphere(); await processTrafficAlerts(); 
+                        if (alertRefreshInterval) clearInterval(alertRefreshInterval); alertRefreshInterval = setInterval(processTrafficAlerts, ALERT_CHECK_INTERVAL);
+                        navigationMapInstance.on('pitch', updateVehicleIconPerspective); mapPreviousZoomLevelForPDRs = navigationMapInstance.getZoom(); navigationMapInstance.on('zoomend', updateAllIconSizes); toggleMapHeaderRowsVisibility(mapHeaderButtonsVisible);
+                        navigationMapInstance.on('click', async (e) => { if (isAddReminderAtLocationModeActive) { handleMapClickToAddReminder(e); return; } if (isSimulatingGpsLocation) { handleSimulateGpsPositionClick(e); return; } if (isNavigating && !isAddingWaypointsDuringNav) { return; } const point = e.point; const lngLat = e.lngLat; const pdrLayers = ['pdr-simple-circle-layer', 'pdr-cards-layer-bg-halo', 'pdr-cards-layer-bg']; const pdrFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: pdrLayers }); if (pdrFeatures.length > 0) { const fullPdrData = window.lastOcmApiResponse.find(p => p.ID === pdrFeatures[0].properties.ocmId); if (fullPdrData) { showChargingPointModal(fullPdrData, pdrFeatures[0].properties.index); } return; } const alertLayers = ['traffic-alerts-layer']; const alertFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: alertLayers }); if (alertFeatures.length > 0) { const alertDetailsMap = { 1: 'Accidente de tráfico', 2: 'Coche averiado', 3: 'Control de tráfico / Radar', 4: 'Atasco', 5: 'Peligro indeterminado', 6: 'Carretera en mal estado', 7: 'Obras', 8: 'Vía / Carretera cerrada' }; showToast(alertDetailsMap[alertFeatures[0].properties.code] || 'Alerta de tráfico', 'warning', 4000); return; } const reminderLayers = ['reminders-icons-layer', 'radar-circles-layer']; const reminderFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: reminderLayers }); if (reminderFeatures.length > 0) { showReminderActionModal(reminderFeatures[0].properties.reminderId); return; } const mapboxPoiLayers = ['poi-label']; const features = navigationMapInstance.queryRenderedFeatures(point, { layers: mapboxPoiLayers }); const validPoiFeature = features.find(f => f.properties && (f.properties.name || f.properties.name_en || f.properties.text)); if (validPoiFeature) { const { name, name_en, text, poi_category, category, maki } = validPoiFeature.properties; const poiName = name || name_en || text; let categories = []; if (poi_category && Array.isArray(poi_category)) { categories = poi_category; } else if (category) { categories = category.split(',').map(c => c.trim()); } else if (maki) { categories.push(maki); } showPoiInfoModal({ properties: { name: poiName, categories: categories }, geometry: validPoiFeature.geometry }); } else { addWaypoint(lngLat); } });
+                        enablePoiInteractivity(navigationMapInstance); setNavigationMapClickHandler();
+                        let currentPos = await getInitialGpsPositionForMap();
+                        setMapImmersiveMode(false); navigationFollowUser = true; shouldCenterOnUser = true; updateLocateMeButtonsUI(); toggleMapControls(true); navigationCurrentLocation = currentPos;
+                        const initialViewOptions = { center: [currentPos.longitude, currentPos.latitude], zoom: 15.5, essential: true };
+                        const mode = mapViewMode; if (mode === 'heading' || mode === 'perspective' || mode === 'relief') { initialViewOptions.bearing = currentPos.heading || 0; } if (mode === 'perspective' || mode === 'relief') { initialViewOptions.pitch = mapPitchValue; } else { initialViewOptions.pitch = 0; }
+                        initialViewOptions.pitch = 0;
+                        if (!isRecovery) { const globeSpinPromise = new Promise(resolve => { const startCoords = { lat: 30.3715, lng: -97.1903 }; const endCoords = { lat: 40.3748, lng: -3.7354 }; const duration = 1800; const totalLngChange = -(360 - (endCoords.lng - startCoords.lng)); const totalLatChange = endCoords.lat - startCoords.lat; const startTimestamp = performance.now(); function animateSpin(timestamp) { const progress = Math.min((timestamp - startTimestamp) / duration, 1); const easedProgress = 1 - Math.pow(1 - progress, 3); navigationMapInstance.setCenter([startCoords.lng + (totalLngChange * easedProgress), startCoords.lat + (totalLatChange * easedProgress)]); if (progress < 1) { requestAnimationFrame(animateSpin); } else { navigationMapInstance.setCenter([endCoords.lng, endCoords.lat]); resolve(); } } requestAnimationFrame(animateSpin); }); await globeSpinPromise; navigationMapInstance.jumpTo(initialViewOptions); } else { navigationMapInstance.jumpTo(initialViewOptions); }
+                        markerAnimationState.currentMapCenter = navigationMapInstance.getCenter(); markerAnimationState.currentMapZoom = navigationMapInstance.getZoom(); markerAnimationState.currentMapPitch = navigationMapInstance.getPitch(); markerAnimationState.currentMapBearing = navigationMapInstance.getBearing(); markerAnimationState.targetMapCenter = navigationMapInstance.getCenter(); markerAnimationState.targetMapZoom = navigationMapInstance.getZoom(); markerAnimationState.targetMapPitch = navigationMapInstance.getPitch(); markerAnimationState.targetMapBearing = navigationMapInstance.getBearing();
+                        updateInitialUserPosition(currentPos, navigationMapInstance); startGpsWatching();
+                        resolve();
+                    } catch (loadError) { const overlay = document.getElementById('route-recovery-overlay'); if (overlay) overlay.classList.add('hidden'); showToast(`Error crítico al cargar los recursos del mapa: ${loadError.message}`, "error", 10000); reject(loadError); }
+                });
+                navigationMapInstance.on('pitch', updateVehicleIconPerspective);
+            } catch (initError) { const overlay = document.getElementById('route-recovery-overlay'); if (overlay) overlay.classList.add('hidden'); if (mapActualContainer) mapActualContainer.innerHTML = `<div style="color:red; text-align:center; padding:20px;"><h2>Error al cargar el mapa</h2><p>${initError.message}</p></div>`; isNavigationMapActive = false; reject(initError); }
+        }
+    }); 
+}
+    
+//===================================================================
+// NOMBRE: updateTurnByTurnDisplay (VERSIÓN FINAL CON LÓGICA DE BOTÓN "T" CORRECTA)
+// RESUMEN: Gestiona la visibilidad de la UI de navegación. La lógica del minimapa, la mini-tarjeta y el botón "T" ha sido corregida y unificada.
+//===================================================================
 function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     const topInfoBar = document.getElementById('navigation-top-info-bar');
     const intersectionPreviewWindow = document.getElementById('intersection-preview-map-window');
@@ -8201,27 +8060,17 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     const progressBar = document.getElementById('navigation-bottom-progress-bar');
     const compassControl = document.querySelector('.mapboxgl-ctrl-bottom-left'); 
     const maneuverCounterEl = document.getElementById('maneuver-counter-display');
-    
     const minimapContainer = document.getElementById('minimap-container');
-  
+    const showMinimapButton = document.getElementById('force-show-minimap-button');
+
     const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
     const totalStages = actualWaypoints.length > 1 ? actualWaypoints.length - 1 : 1;
 
-    if (!route || !topInfoBar || !route.legs || route.legs.length === 0 || !progressBar || !maneuverCounterEl) {
+    if (!route || !topInfoBar || !route.legs || route.legs.length === 0 || !progressBar || !maneuverCounterEl || (!isNavigating && (!navigationCurrentRouteData || actualWaypoints.length < 2))) {
         if (topInfoBar) topInfoBar.style.display = 'none';
         if (miniNavCard) miniNavCard.style.display = 'none'; 
-        if (minimapContainer) minimapContainer.classList.add('hidden'); // <-- AÑADIDO: Ocultar si no hay ruta
-        if (progressBar) progressBar.classList.remove('scaled-for-maneuver');
-        if (compassControl) compassControl.classList.remove('hidden-for-maneuver');
-        if (intersectionPreviewWindow && !intersectionPreviewWindow.classList.contains('hidden') && intersectionPreviewWindow.dataset.source !== 'click') hideIntersectionPreviewMap();
-        if (maneuverCounterEl) maneuverCounterEl.style.display = 'none';
-        nextManeuverStepForPreview = null;
-        return;
-    }
-    if (!isNavigating && (!navigationCurrentRouteData || actualWaypoints.length < 2)) {
-        if (topInfoBar) topInfoBar.style.display = 'none';
-        if (miniNavCard) miniNavCard.style.display = 'none';
-        if (minimapContainer) minimapContainer.classList.add('hidden'); // <-- AÑADIDO: Ocultar si no hay ruta
+        if (minimapContainer) minimapContainer.classList.add('hidden');
+        if (showMinimapButton) showMinimapButton.classList.add('hidden');
         if (progressBar) progressBar.classList.remove('scaled-for-maneuver');
         if (compassControl) compassControl.classList.remove('hidden-for-maneuver');
         if (intersectionPreviewWindow && !intersectionPreviewWindow.classList.contains('hidden') && intersectionPreviewWindow.dataset.source !== 'click') hideIntersectionPreviewMap();
@@ -8232,85 +8081,24 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
 
     const cleanManeuvers = route._cleanSteps || [];
     const carDistance = Math.min(Math.max(0, carDistanceAlongTheRoute), route.distance);
-    
     let maneuversPassed = 0;
-    for (const cleanStep of cleanManeuvers) {
-        if ((cleanStep.cumulativeDistance + cleanStep.distance) < carDistance) {
-            maneuversPassed++;
-        } else {
-            break;
-        }
-    }
-    
+    for (const cleanStep of cleanManeuvers) { if ((cleanStep.cumulativeDistance + cleanStep.distance) < carDistance) { maneuversPassed++; } else { break; } }
     const totalIntermediateActions = Math.max(0, cleanManeuvers.length - 2);
     const passedIntermediateActions = Math.max(0, maneuversPassed - 1);
     const actionsRemaining = totalIntermediateActions - passedIntermediateActions;
-    
-    if (actionsRemaining > 0) {
-        const newCountStr = actionsRemaining.toString();
-        if (maneuverCounterEl.textContent !== newCountStr) {
-            maneuverCounterEl.textContent = newCountStr;
-        }
-        if (maneuverCounterEl.style.display !== 'flex') {
-            maneuverCounterEl.style.display = 'flex';
-        }
-    } else {
-        if (maneuverCounterEl.style.display !== 'none') {
-            maneuverCounterEl.style.display = 'none';
-        }
-    }
-    
+    if (actionsRemaining > 0) { const newCountStr = actionsRemaining.toString(); if (maneuverCounterEl.textContent !== newCountStr) { maneuverCounterEl.textContent = newCountStr; } if (maneuverCounterEl.style.display !== 'flex') { maneuverCounterEl.style.display = 'flex'; } } else { if (maneuverCounterEl.style.display !== 'none') { maneuverCounterEl.style.display = 'none'; } }
     let currentLegIndex = -1, currentStepIndex = -1;
     let stepFound = false;
-    for (let i = 0; i < route.legs.length; i++) {
-        const leg = route.legs[i];
-        if (!leg || !leg.steps) continue;
-        for (let j = 0; j < leg.steps.length; j++) {
-            const step = leg.steps[j];
-            if (step && typeof step.cumulativeDistance === 'number' && (step.cumulativeDistance + (step.distance || 0)) > carDistance) {
-                currentLegIndex = i; currentStepIndex = j; stepFound = true; break;
-            }
-        }
-        if (stepFound) break;
-    }
-    if (currentLegIndex === -1) {
-        currentLegIndex = route.legs.length - 1;
-        currentStepIndex = route.legs[currentLegIndex].steps.length - 1;
-    }
+    for (let i = 0; i < route.legs.length; i++) { const leg = route.legs[i]; if (!leg || !leg.steps) continue; for (let j = 0; j < leg.steps.length; j++) { const step = leg.steps[j]; if (step && typeof step.cumulativeDistance === 'number' && (step.cumulativeDistance + (step.distance || 0)) > carDistance) { currentLegIndex = i; currentStepIndex = j; stepFound = true; break; } } if (stepFound) break; }
+    if (currentLegIndex === -1) { currentLegIndex = route.legs.length - 1; currentStepIndex = route.legs[currentLegIndex].steps.length - 1; }
     const currentStepForProgress = route.legs[currentLegIndex].steps[currentStepIndex];
     currentLegIndexNav = currentLegIndex;
     currentStepIndexNav = currentStepIndex;
-
     let finalStepToShow;
     let finalStepLegIndex = -1;
     let tempLegIdx = currentLegIndex;
     let tempStepIdx = currentStepIndex + 1;
-
-    while (true) {
-        if (tempLegIdx >= route.legs.length) {
-            finalStepToShow = route.legs[route.legs.length - 1].steps[route.legs[route.legs.length - 1].steps.length - 1];
-            finalStepLegIndex = route.legs.length - 1;
-            break;
-        }
-        let leg = route.legs[tempLegIdx];
-        if (!leg.steps || tempStepIdx >= leg.steps.length) {
-            tempLegIdx++;
-            tempStepIdx = 0;
-            continue;
-        }
-        const candidateStep = leg.steps[tempStepIdx];
-        const isArrival = candidateStep.maneuver.type === 'arrive';
-        const arrivalWaypoint = isArrival ? actualWaypoints[tempLegIdx + 1] : null; 
-        if (isArrival && arrivalWaypoint && arrivalWaypoint.isInternal) {
-            tempStepIdx++;
-            continue;
-        } else {
-            finalStepToShow = candidateStep;
-            finalStepLegIndex = tempLegIdx;
-            break;
-        }
-    }
-
+    while (true) { if (tempLegIdx >= route.legs.length) { finalStepToShow = route.legs[route.legs.length - 1].steps[route.legs[route.legs.length - 1].steps.length - 1]; finalStepLegIndex = route.legs.length - 1; break; } let leg = route.legs[tempLegIdx]; if (!leg.steps || tempStepIdx >= leg.steps.length) { tempLegIdx++; tempStepIdx = 0; continue; } const candidateStep = leg.steps[tempStepIdx]; const isArrival = candidateStep.maneuver.type === 'arrive'; const arrivalWaypoint = isArrival ? actualWaypoints[tempLegIdx + 1] : null; if (isArrival && arrivalWaypoint && arrivalWaypoint.isInternal) { tempStepIdx++; continue; } else { finalStepToShow = candidateStep; finalStepLegIndex = tempLegIdx; break; } }
     let nextStepToDisplay = finalStepToShow;
     nextManeuverStepForPreview = nextStepToDisplay;
     const distanceToEndOfCurrentStepForProgress = (currentStepForProgress.cumulativeDistance || 0) + (currentStepForProgress.distance || 0);
@@ -8319,119 +8107,49 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     const now = Date.now();
     const infoOverlay = document.getElementById('map-info-overlay');
     const uniqueManeuverId = `${currentLegIndex}_${currentStepIndex}_${nextStepToDisplay.name}`;
-    if (announceManeuverWithFlash && distanceToNextManeuver < 220 && maneuverFlashTriggeredId !== uniqueManeuverId) {
-        maneuverFlashTriggeredId = uniqueManeuverId;
-        const borderOverlay = document.getElementById('maneuver-flashing-border-overlay');
-        if (borderOverlay) {
-            borderOverlay.classList.remove('hidden');
-            setTimeout(() => {
-                borderOverlay.classList.add('hidden');
-            }, 3000);
-        }
-    }
+    if (announceManeuverWithFlash && distanceToNextManeuver < 220 && maneuverFlashTriggeredId !== uniqueManeuverId) { maneuverFlashTriggeredId = uniqueManeuverId; const borderOverlay = document.getElementById('maneuver-flashing-border-overlay'); if (borderOverlay) { borderOverlay.classList.remove('hidden'); setTimeout(() => { borderOverlay.classList.add('hidden'); }, 3000); } }
     const MANEUVER_ZONE_DISTANCE = 210;
-    if (isNavigating) {
-        if (distanceToNextManeuver < MANEUVER_ZONE_DISTANCE) {
-            progressBar.classList.add('scaled-for-maneuver');
-            if (compassControl && Date.now() > compassForceShowUntil) {
-                compassControl.classList.add('hidden-for-maneuver');
-            }
-        } else {
-            progressBar.classList.remove('scaled-for-maneuver');
-            if (compassControl) compassControl.classList.remove('hidden-for-maneuver');
-        }
-    } else {
-        progressBar.classList.remove('scaled-for-maneuver');
-        if (compassControl) compassControl.classList.remove('hidden-for-maneuver');
+    if (isNavigating) { if (distanceToNextManeuver < MANEUVER_ZONE_DISTANCE) { progressBar.classList.add('scaled-for-maneuver'); if (compassControl && Date.now() > compassForceShowUntil) { compassControl.classList.add('hidden-for-maneuver'); } } else { progressBar.classList.remove('scaled-for-maneuver'); if (compassControl) compassControl.classList.remove('hidden-for-maneuver'); } } else { progressBar.classList.remove('scaled-for-maneuver'); if (compassControl) compassControl.classList.remove('hidden-for-maneuver'); }
+
+    const shouldHideMainBar = !isProgressBarLocked && !isMapImmersiveModeActive && now > progressBarForceShowUntil && distanceToNextManeuver > 1000 && distanceIntoCurrentStep > 100;
+    const isForcedVisible = Date.now() < minimapForceShowUntil;
+
+    // 1. Visibilidad de la barra de progreso principal (se oculta en tramos largos)
+    progressBar.classList.toggle('progress-bar-auto-hidden', shouldHideMainBar);
+
+    // 2. Visibilidad de la mini-tarjeta (aparece cuando la principal se oculta)
+    miniNavCard.style.display = shouldHideMainBar ? 'flex' : 'none';
+
+    // 3. Visibilidad del minimapa (aparece si se fuerza con 'T' O si la mini-tarjeta está visible)
+    const shouldShowMinimap = (shouldHideMainBar || isForcedVisible) && showRouteMinimapPreference;
+    if (minimapContainer) {
+        minimapContainer.classList.toggle('hidden', !shouldShowMinimap);
     }
-    if (!isProgressBarLocked && !isMapImmersiveModeActive && now > progressBarForceShowUntil) {
-        const shouldHide = distanceToNextManeuver > 1000 && distanceIntoCurrentStep > 100;
-        progressBar.classList.toggle('progress-bar-auto-hidden', shouldHide);
-        if (infoOverlay) {
-            infoOverlay.style.display = shouldHide ? 'none' : 'block';
-        }
-        if (miniNavCard) {
-            if (shouldHide) {
-                let mainInfoEl = miniNavCard.querySelector('#mini-card-main-info');
-                let roadSignEl = miniNavCard.querySelector('#mini-card-road-sign');
-                if (!mainInfoEl || !roadSignEl) {
-                    miniNavCard.innerHTML = `<div id="mini-card-road-sign" style="display: none;"></div><div id="mini-card-main-info"></div>`;
-                    mainInfoEl = miniNavCard.querySelector('#mini-card-main-info');
-                    roadSignEl = miniNavCard.querySelector('#mini-card-road-sign');
-                }
-                const distanceText = distanceToNextManeuver < 1000 ? `${Math.round(distanceToNextManeuver / 5) * 5} m` : `${(distanceToNextManeuver / 1000).toFixed(1)} km`;
-                let etaHtml = '';
-                const remainingDistanceTotal = Math.max(0, route.distance - carDistanceAlongTheRoute);
-                const remainingDurationTotal = route.distance > 0 ? route.duration * (remainingDistanceTotal / route.distance) : 0;
-                const currentFinalEta = new Date(Date.now() + remainingDurationTotal * 1000);
-                if (isNavigating && tripInitialOverallEtaTime) {
-                    const etaText = currentFinalEta.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-                    const finalDeviationMs = currentFinalEta.getTime() - tripInitialOverallEtaTime.getTime();
-                    const deviationHtml = formatDeviationForMiniCard(finalDeviationMs);
-                    etaHtml = `<div style="font-size: 0.90em; margin-top: 2px; text-align: center; "><span>${etaText}</span><span style="margin-left: 8px;">${deviationHtml}</span></div>`;
-                }
-                const newMiniCardHtml = `<div>${distanceText}</div>${etaHtml}`;
-                if (mainInfoEl.innerHTML !== newMiniCardHtml) {
-                    mainInfoEl.innerHTML = newMiniCardHtml;
-                }
-                let rawRoadSignText = '';
-                let displayRoadSign = false;
-                const banner = nextStepToDisplay.bannerInstructions;
-                if (banner && banner.length > 0 && banner[0].primary) {
-                    let bannerPrimaryText = banner[0].primary.text;
-                    let bannerSecondaryText = banner[0].secondary ? banner[0].secondary.text : '';
-                    rawRoadSignText = bannerPrimaryText + (bannerSecondaryText ? `: ${bannerSecondaryText}` : '');
-                    const containsNumber = /\d/.test(rawRoadSignText);
-                    const wordCount = rawRoadSignText.split(/\s+/).length;
-                    if (containsNumber || wordCount <= 3) {
-                        displayRoadSign = true;
-                    }
-                }
-                const newRoadSignText = displayRoadSign ? rawRoadSignText : '';
-                if (roadSignEl.textContent !== newRoadSignText) {
-                    roadSignEl.textContent = newRoadSignText;
-                }
-                const newDisplay = newRoadSignText ? 'block' : 'none';
-                if (roadSignEl.style.display !== newDisplay) {
-                    roadSignEl.style.display = newDisplay;
-                }
-                miniNavCard.style.display = 'flex';
-                
-                // --> CORRECCIÓN CLAVE: Asegurarse de que el minimapa se crea y muestra aquí
-                if (showRouteMinimapPreference) {
-                    createMinimapInstanceIfNeeded(); // Garantiza que la instancia existe si es necesaria.
-                    if (minimapContainer && minimapInstance) { 
-                        minimapContainer.classList.remove('hidden');
-                        minimapInstance.resize(); 
-                    }
-                } else {
-                     if (minimapContainer) {
-                        minimapContainer.classList.add('hidden');
-                     }
-                }
-                // --- FIN DE LA CORRECCIÓN ---
-              
-            } else {
-                miniNavCard.style.display = 'none';
-                
-                if (minimapContainer) {
-                    minimapContainer.classList.add('hidden');
-                }
-            }
-        }
-    } else {
-        progressBar.classList.remove('progress-bar-auto-hidden');
-        if (infoOverlay) {
-            infoOverlay.style.display = 'block';
-        }
-        if (miniNavCard) {
-            miniNavCard.style.display = 'none';
-        }
-        if (minimapContainer) {
-            minimapContainer.classList.add('hidden');
-        }
+
+    // 4. Visibilidad del botón 'T' (el inverso del minimapa)
+    if (showMinimapButton) {
+        const shouldShowTButton = showRouteMinimapPreference && !shouldShowMinimap;
+        showMinimapButton.classList.toggle('hidden', !shouldShowTButton);
     }
-    
+
+    if (miniNavCard.style.display === 'flex') {
+        let mainInfoEl = miniNavCard.querySelector('#mini-card-main-info');
+        let roadSignEl = miniNavCard.querySelector('#mini-card-road-sign');
+        if (!mainInfoEl) { miniNavCard.innerHTML = `<div id="mini-card-road-sign" style="display: none;"></div><div id="mini-card-main-info"></div>`; mainInfoEl = miniNavCard.querySelector('#mini-card-main-info'); roadSignEl = miniNavCard.querySelector('#mini-card-road-sign');}
+        const distanceText = distanceToNextManeuver < 1000 ? `${Math.round(distanceToNextManeuver / 5) * 5} m` : `${(distanceToNextManeuver / 1000).toFixed(1)} km`;
+        let etaHtml = '';
+        const remainingDistanceTotal = Math.max(0, route.distance - carDistanceAlongTheRoute);
+        const remainingDurationTotal = route.distance > 0 ? route.duration * (remainingDistanceTotal / route.distance) : 0;
+        const currentFinalEta = new Date(Date.now() + remainingDurationTotal * 1000);
+        if (isNavigating && tripInitialOverallEtaTime) {
+            const etaText = currentFinalEta.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            const finalDeviationMs = currentFinalEta.getTime() - tripInitialOverallEtaTime.getTime();
+            const deviationHtml = formatDeviationForMiniCard(finalDeviationMs);
+            etaHtml = `<div style="font-size: 0.90em; margin-top: 2px; text-align: center; "><span>${etaText}</span><span style="margin-left: 8px;">${deviationHtml}</span></div>`;
+        }
+        mainInfoEl.innerHTML = `<div>${distanceText}</div>${etaHtml}`;
+    }
+ 
     const turnIconDisplayEl = document.getElementById('turn-icon-display');
     const maneuverTextEl = document.getElementById('maneuver-text-display');
     const distanceFormattedEl = document.getElementById('distance-to-turn-formatted');
@@ -8442,7 +8160,6 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     if (nextStepToDisplay && nextStepToDisplay.maneuver) {
         const maneuver = nextStepToDisplay.maneuver;
         const type = maneuver.type || '';
-        
         let maneuverText, streetNameText;
 
         if (type === 'arrive') {
@@ -8473,11 +8190,9 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
                 lastDisplayedManeuverIcon = iconFilename;
             }
         }
-        
         if (maneuverTextEl.textContent !== maneuverText) {
             maneuverTextEl.textContent = maneuverText;
         }
-
         if (streetNameText) {
             if (streetEl.textContent !== streetNameText) {
                 streetEl.textContent = streetNameText;
@@ -8491,19 +8206,16 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
                 streetNameLine.style.display = 'none';
             }
         }
-        
         distanceToNextManeuverOSRM = distanceToNextManeuver;
         const newDistanceText = distanceToNextManeuver < 1000 ? `${Math.round(distanceToNextManeuver / 5) * 5} m` : `${(distanceToNextManeuver / 1000).toFixed(1)} km`;
         if (distanceFormattedEl.textContent !== newDistanceText) {
             distanceFormattedEl.textContent = newDistanceText;
         }
-
         const progressPercent = (currentStepForProgress.distance > 0) ? ((currentStepForProgress.distance - distanceToNextManeuver) / currentStepForProgress.distance) * 100 : (distanceToNextManeuver === 0 ? 100 : 0);
         const newWidthPercent = `${Math.min(100, Math.max(0, progressPercent))}%`;
         if (progressBarFillEl && progressBarFillEl.style.width !== newWidthPercent) {
             progressBarFillEl.style.width = newWidthPercent;
         }
-
         const isRelevantIntersectionManeuver = type !== 'continue' && type !== 'new name' && type !== 'depart' && type !== 'straight';
         if (isNavigating && distanceToNextManeuver < 800 && distanceToNextManeuver >= 100 && isRelevantIntersectionManeuver && (!intersectionPreviewWindow || intersectionPreviewWindow.classList.contains('hidden') || intersectionPreviewWindow.dataset.source !== 'click') && (currentLegIndex + '_' + currentStepIndex) !== lastAutoShownManeuverId) {
             showIntersectionPreviewMap(nextStepToDisplay, route, false, 10000);
@@ -8511,7 +8223,6 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
         } else if (intersectionPreviewWindow && !intersectionPreviewWindow.classList.contains('hidden') && intersectionPreviewWindow.dataset.source !== 'click' && (distanceToNextManeuver >= 800 || distanceToNextManeuver < 100 || !isRelevantIntersectionManeuver)) {
             hideIntersectionPreviewMap();
         }
-
     } else {
         if (turnIconDisplayEl) {
             const iconFilename = 'PNG/arrive.png';
@@ -8532,16 +8243,14 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
         if (progressBarFillEl && progressBarFillEl.style.width !== '100%') {
             progressBarFillEl.style.width = '100%';
         }
-        
         distanceToNextManeuverOSRM = Infinity;
         nextManeuverStepForPreview = null;
         if (miniNavCard) miniNavCard.style.display = 'none';
-        if (minimapContainer) {
-            minimapContainer.classList.add('hidden');
-        }
+        if (minimapContainer) minimapContainer.classList.add('hidden');
+        if (showMinimapButton) showMinimapButton.classList.add('hidden');
         if (intersectionPreviewWindow && !intersectionPreviewWindow.classList.contains('hidden') && intersectionPreviewWindow.dataset.source !== 'click') hideIntersectionPreviewMap();
     }
-}
+}    
     
 // ===================================================================
 // NOMBRE: showArrivalStatsModal 
@@ -10498,10 +10207,11 @@ function animateMarkerAndMap(timestamp) {
     
     markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
 }
-    
+      
+//===================================================================
+// NOMBRE: loadRouteFromObject (MODIFICADA - Pasa `recoveryInfo`)
+// RESUMEN: Carga la ruta y delega la lógica de recuperación a `recalculateAndDrawRoute` y `restoreTripProgress`.
 // ===================================================================
-// NOMBRE: loadRouteFromObject 
-// RESUMEN: Acepta recoveryInfo y pasa la bandera 'isRecovery' a toggleNavigationState.
 async function loadRouteFromObject(routeObject, autoStartNavigation = false, forceImmediateStart = false, recoveryInfo = null) {
     if (isRecalculatingRoute) {
         showToast("Procesando otra ruta, por favor espere.", "warning");
@@ -10527,64 +10237,29 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
             updateNavigationButtonColor();
             clearNavigationGraph();
         }
-
-        const startLocation = navigationCurrentLocation ? { ...navigationCurrentLocation } : null;
         
-        if (!recoveryInfo) {
-            navigationWaypoints = []; 
-        }
-
+        navigationWaypoints = sanitizeWaypointsForStorage(routeObject.waypoints);
         currentRouteNameForSaving = routeObject.name;
-        const waypointsFromLoadedRoute = routeObject.waypoints;
-        
-        const isAiGeneratedRoute = routeObject.name.startsWith("Ruta IA:");
-        
-        if (waypointsFromLoadedRoute.length === 1) {
-            if (startLocation) {
-                const startPoint = { id: Date.now() - 1, lat: startLocation.latitude, lng: startLocation.longitude, type: 'S', marker: null, label: 'S', address: 'Posición Actual (GPS)', visited: true, isCriticalForRecalc: true, isInternal: false, isRecalculatedStart: false };
-                const destinationWp = sanitizeWaypointsForStorage(waypointsFromLoadedRoute)[0];
-                navigationWaypoints = [startPoint, destinationWp];
-            } else {
-                showToast("Señal GPS no disponible. No se puede iniciar ruta a un único destino.", "error");
-                isRecalculatingRoute = false;
-                return;
-            }
-        } else {
-            if (startLocation && !recoveryInfo) {
-                const startPoint = { id: Date.now() - 1, lat: startLocation.latitude, lng: startLocation.longitude, type: 'S', marker: null, label: 'S', address: 'Posición Actual (GPS)', visited: true, isCriticalForRecalc: true, isInternal: false, isRecalculatedStart: false };
-                
-                const waypointsToProcess = isAiGeneratedRoute 
-                    ? waypointsFromLoadedRoute 
-                    : waypointsFromLoadedRoute.slice(1);
-
-                navigationWaypoints = [startPoint, ...sanitizeWaypointsForStorage(waypointsToProcess)];
-
-            } else {
-                 if (!recoveryInfo) showToast("Señal GPS no disponible. Cargando ruta original...", "warning");
-                navigationWaypoints = sanitizeWaypointsForStorage(waypointsFromLoadedRoute);
-            }
-        }
         
         await updateWaypointTypesAndLabels();
         renderWaypointMarkers();
 
         if (navigationWaypoints.filter(wp => wp && !wp.isInternal).length >= 2) {
             try {
-                await recalculateAndDrawRoute(false);
+                // <-- MODIFICADO: Pasamos el `recoveryInfo` completo al recálculo -->
+                await recalculateAndDrawRoute(false, recoveryInfo);
                 
                 setTimeout(() => {
                     if (navigationMapInstance) {
-                        try {
-                            navigationMapInstance.resize();
-                        } catch(e) {}
+                        try { navigationMapInstance.resize(); } catch(e) {}
                     }
                 }, 50);
 
                 if (recoveryInfo) {
-                    await restoreTripProgress(recoveryInfo); // Se restaura todo, incluyendo la simulación si procede.
+                    await restoreTripProgress(recoveryInfo); 
                 }
                 
-                if (autoStartNavigation && !recoveryInfo) { // Evitamos modales si es una recuperación
+                if (autoStartNavigation && !recoveryInfo) {
                     if (forceImmediateStart) {
                         toggleNavigationState(false, false); 
                     } else {
@@ -10616,8 +10291,8 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
         updateNavigationButtonColor();
     }
 }
-    
 
+    
 //===============================================
 // NOMBRE: startAutomatedRouteSimulation (VERSIÓN CON LÓGICA DE RECUPERACIÓN CORREGIDA)
 // RESUMEN: Inicia o reanuda una simulación automática. No resetea las estadísticas si está reanudando.
@@ -11197,9 +10872,10 @@ async function waitForMapStyleLoad(mapInstance) {
     }
 }
     
-//===================================================================
-// NOMBRE: initiateControlledReload (VERSIÓN ASÍNCRONA CON LIMPIEZA FORZADA)
-// RESUMEN: Guarda estado, desmantela y destruye los mapas, y luego recarga la página.
+
+// ===================================================================
+// NOMBRE: initiateControlledReload (MODIFICADA - Guarda estado completo)
+// RESUMEN: Guarda el estado completo del viaje, incluyendo waypoints visitados y estadísticas.
 //===================================================================
 async function initiateControlledReload() {
     if (isPerformingControlledReload) return;
@@ -11210,6 +10886,9 @@ async function initiateControlledReload() {
             const recoveryFlagJSON = localStorage.getItem('boardinggate_nav_recovery_flag');
             if (recoveryFlagJSON) {
                 const recoveryData = JSON.parse(recoveryFlagJSON);
+                
+                recoveryData.route.waypoints = sanitizeWaypointsForStorage(navigationWaypoints);
+
                 if (navigationCurrentLocation) {
                     recoveryData.lastKnownLocation = navigationCurrentLocation;
                 }
@@ -11226,6 +10905,8 @@ async function initiateControlledReload() {
                     };
                 }
                 
+                recoveryData.isRichRecovery = true;
+                
                 localStorage.setItem('boardinggate_nav_recovery_flag', JSON.stringify(recoveryData));
             }
             
@@ -11235,6 +10916,7 @@ async function initiateControlledReload() {
                 location.reload();
             }, 250); 
         } catch (e) {
+            console.error("Error durante la finalización de la recarga controlada:", e);
             await destroyAllMapInstances();
             setTimeout(() => location.reload(), 200);
         }
@@ -11244,6 +10926,7 @@ async function initiateControlledReload() {
         try {
             const elementToCapture = document.body;
             if (typeof html2canvas === 'undefined' || !elementToCapture) {
+                console.warn("html2canvas no está disponible. Recargando sin captura.");
                 await finalizeAndReload();
                 return;
             }
@@ -11252,11 +10935,9 @@ async function initiateControlledReload() {
             let dataUrl;
 
             try {
-                // --- INTENTO 1: PNG de alta calidad ---
                 dataUrl = canvas.toDataURL('image/jpeg', 1.0);
                 sessionStorage.setItem('recoveryScreenshot', dataUrl); 
             } catch (e) {
-                // --- INTENTO 2 (FALLBACK): JPEG de alta calidad ---
                 try {
                     dataUrl = canvas.toDataURL('image/jpeg', 0.80);
                     sessionStorage.setItem('recoveryScreenshot', dataUrl);
@@ -11266,12 +10947,11 @@ async function initiateControlledReload() {
                 }
             }
 
-            // Se establece la bandera DESPUÉS de intentar guardar la imagen
             sessionStorage.setItem('isControlledReload', 'true');
             await finalizeAndReload();
 
         } catch (error) {
-            // Si html2canvas falla, procedemos con la recarga controlada sin captura
+            console.error("Error en html2canvas:", error);
             sessionStorage.setItem('isControlledReload', 'true');
             sessionStorage.removeItem('recoveryScreenshot');
             await finalizeAndReload();
@@ -11289,6 +10969,9 @@ async function initiateControlledReload() {
         await captureAndProceed();
     }
 }
+
+
+    
 
     
 // ===================================================================
@@ -13284,7 +12967,7 @@ function showAutoStartNavigationModal() {
             /* Colores específicos para cada botón */
             #start-route-now-button { background-color: #28a745; }
             #start-and-add-reminder-button { background-color: #9E7608; }
-            #midpoint-reminder-button { background-color: #ff9500; } /* Naranja para diferenciarlo */
+            #midpoint-reminder-button { background-color: #9C690C; } 
             #cancel-start-nav { background-color: #6c757d; }
         </style>
         <p class="auto-start-title">Ruta Calculada</p>
@@ -23633,7 +23316,7 @@ window.iniciarGuiaInteractivaCompleta = function() {
                 },
                 { 
                     element: '#reminders-location-map-div', 
-                    popover: { title: 'Gestos en el Mapa', description: 'Puedes interactuar directamente: <strong>Pellizca para hacer zoom</strong>, <strong>arrastra con dos dedos para inclinar (pitch)</strong> y <strong>gira con dos dedos para rotar</strong>. Un <strong>toque simple</strong> en cualquier sitio fija una ETAPA de la ruta que podrá arrastrar si necesita resituarlo, si pulsa sobre un POI (punto de interés) se abre una ventana con información. IMPORTANTE, recuerda también QUE PUEDES DICTAR en cualquier campo de texto, simplemente seleccionándolo y pulsando el botón de COMANDOS DE VOZ del volante', side: "top", align: 'start' } 
+                    popover: { title: 'Gestos en el Mapa', description: 'Puedes interactuar directamente: <strong>Pellizca para hacer zoom</strong>, <strong>arrastra con dos dedos para inclinar (pitch)</strong> y <strong>gira con dos dedos para rotar</strong>. Un <strong>toque simple</strong> en cualquier sitio fija una ETAPA de la ruta que podrá arrastrar si necesita resituarlo, si pulsa sobre un POI (punto de interés) se abre una ventana con información. IMPORTANTE, recuerda también QUE PUEDES DICTAR en cualquier campo de texto, simplemente seleccionándolo y pulsando el botón de COMANDOS DE VOZ del volante. Podrás forzar la visualización del espacio de la brújula y demás datos asociados dando ahí una pulsación. También podrás hacer lo mismo con el minimapa del trayecto completo de la ruta, pulsando en la esquina superior derecha.', side: "top", align: 'start' } 
                 },
                 { 
                     element: '#toggle-map-header-buttons-panel', 
