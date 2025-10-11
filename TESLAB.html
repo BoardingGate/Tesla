@@ -1,4 +1,4 @@
-S17
+S18
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -10235,10 +10235,9 @@ function animateMarkerAndMap(timestamp) {
     markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
 }
       
-
 // ===================================================================
-// NOMBRE: loadRouteFromObject (MODIFICADA - Pasa `recoveryInfo`)
-// RESUMEN: Carga la ruta y delega la lógica de recuperación a `recalculateAndDrawRoute` y `restoreTripProgress`.
+// NOMBRE: loadRouteFromObject (VERSIÓN FINAL CON LÓGICA DE GPS EFICIENTE)
+// RESUMEN: Carga la ruta, priorizando la última ubicación GPS conocida antes de realizar una nueva consulta.
 // ===================================================================
 async function loadRouteFromObject(routeObject, autoStartNavigation = false, forceImmediateStart = false, recoveryInfo = null) {
     if (isRecalculatingRoute) {
@@ -10250,7 +10249,7 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
         resetNavigationState();
     }
     
-    if (!routeObject || !routeObject.waypoints || routeObject.waypoints.length === 0) {
+    if (!routeObject || !routeObject.waypoints || !routeObject.waypoints.length === 0) {
         showToast("Error: El objeto de la ruta es inválido.", "error");
         return;
     }
@@ -10266,46 +10265,45 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
             clearNavigationGraph();
         }
         
-        // <<< INICIO DE LA CORRECCIÓN >>>
         if (recoveryInfo) {
-            // MODO RECUPERACIÓN: Se preservan los waypoints originales para que la lógica de recuperación los procese.
             navigationWaypoints = sanitizeWaypointsForStorage(routeObject.waypoints);
         } else {
-            // MODO DE CARGA NORMAL: Se sustituye el punto de partida por la ubicación GPS actual.
-            showToast("Obteniendo tu ubicación actual...", "info", 0, false, "gps-load-route");
-            try {
-                const currentPos = await getCurrentLocationAsync();
-                const existingToast = document.getElementById("gps-load-route");
-                if (existingToast) existingToast.remove();
+            let startPointPosition = null;
 
-                const startPoint = {
-                    id: Date.now() - 1,
-                    lat: currentPos.latitude,
-                    lng: currentPos.longitude,
-                    type: 'S',
-                    marker: null,
-                    label: 'S',
-                    address: 'Posición Actual (GPS)',
-                    visited: true, // Se marca como visitado inmediatamente.
-                    isCriticalForRecalc: true,
-                    isInternal: false,
-                    isRecalculatedStart: false
-                };
-
-                // Se toman los waypoints de la ruta guardada, omitiendo el primero (el antiguo punto de partida).
-                const remainingWaypoints = routeObject.waypoints.slice(1);
-
-                navigationWaypoints = [startPoint, ...sanitizeWaypointsForStorage(remainingWaypoints)];
-
-            } catch (error) {
-                const existingToast = document.getElementById("gps-load-route");
-                if (existingToast) existingToast.remove();
-                showToast(`No se pudo obtener la ubicación GPS para iniciar la ruta: ${error.message}`, "error");
-                isRecalculatingRoute = false;
-                return; 
+            // 1. Intentar usar la última posición conocida si es reciente (menos de 5 segundos).
+            if (navigationCurrentLocation && (Date.now() - lastGpsUpdateTime < 5000)) {
+                startPointPosition = navigationCurrentLocation;
+            } else {
+                showToast("Obteniendo tu ubicación actual...", "info", 0, false, "gps-load-route");
+                try {
+                    startPointPosition = await getCurrentLocationAsync();
+                    const existingToast = document.getElementById("gps-load-route");
+                    if (existingToast) existingToast.remove();
+                } catch (error) {
+                    const existingToast = document.getElementById("gps-load-route");
+                    if (existingToast) existingToast.remove();
+                    showToast(`No se pudo obtener la ubicación GPS para iniciar la ruta: ${error.message}`, "error");
+                    isRecalculatingRoute = false;
+                    return; 
+                }
             }
+            
+            const startPoint = {
+                id: Date.now() - 1,
+                lat: startPointPosition.latitude,
+                lng: startPointPosition.longitude,
+                type: 'S',
+                marker: null,
+                label: 'S',
+                address: 'Posición Actual (GPS)',
+                visited: true,
+                isCriticalForRecalc: true,
+                isInternal: false,
+                isRecalculatedStart: false
+            };
+            const remainingWaypoints = routeObject.waypoints.slice(1);
+            navigationWaypoints = [startPoint, ...sanitizeWaypointsForStorage(remainingWaypoints)];
         }
-        // <<< FIN DE LA CORRECCIÓN >>>
         
         currentRouteNameForSaving = routeObject.name;
         
@@ -10314,7 +10312,6 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
 
         if (navigationWaypoints.filter(wp => wp && !wp.isInternal).length >= 2) {
             try {
-                // Se pasa `recoveryInfo` para que esta función también sepa cómo actuar.
                 await recalculateAndDrawRoute(false, recoveryInfo); 
                 
                 setTimeout(() => {
