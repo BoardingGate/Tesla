@@ -1,4 +1,4 @@
-do15
+do16
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -1239,67 +1239,94 @@ do15
         }
     }).join(', ');   
 
-//===================================================================
-/**
- * Añade una capa de edificios 3D al mapa si el estilo actual lo soporta.
- * Se encarga de la limpieza y el orden correcto de las capas.
- * @param {mapboxgl.Map} mapInstance - La instancia del mapa de Mapbox.
- */
-async function add3DBuildingsLayer(mapInstance) {
-    if (!mapInstance || !mapInstance.isStyleLoaded()) {
+
+// ===================================================================
+// NOMBRE: configureMapAtmosphere (VERSIÓN FINAL Y ROBUSTA CON GARANTÍAS)
+// RESUMEN: Gestiona terreno, niebla y edificios 3D en la secuencia correcta.
+// ===================================================================
+async function configureMapAtmosphere() {
+    if (!navigationMapInstance) {
         return;
     }
 
-    const layerId = '3d-buildings';
-
-    if (mapInstance.getLayer(layerId)) {
-        try {
-            mapInstance.removeLayer(layerId);
-        } catch (e) {
-            console.warn(`No se pudo eliminar la capa de edificios existente: ${e.message}`);
-        }
-    }
-
-    if (!mapInstance.getSource('composite')) {
-        return; // Salimos si no es compatible (ej. Satélite Puro).
-    }
-    
-    const layers = mapInstance.getStyle().layers;
-    let firstSymbolId;
-    for (const layer of layers) {
-        if (layer.type === 'symbol') {
-            firstSymbolId = layer.id;
-            break;
-        }
-    }
-
-    // 4. Añadir la capa de extrusión con la configuración correcta.
     try {
-        mapInstance.addLayer({
-            'id': layerId,
-            'source': 'composite',
-            'source-layer': 'building',
-            'filter': ['==', 'extrude', 'true'],
-            'type': 'fill-extrusion',
-            'minzoom': 14,
-            'paint': {
-                'fill-extrusion-color': '#fffae3',
-                'fill-extrusion-height': [
-                    'interpolate',
-                    ['linear'],
-                    ['zoom'],
-                    14, 0,
-                    15, ['get', 'height']
-                ],
-                'fill-extrusion-base': ['get', 'min_height'],
-                'fill-extrusion-opacity': 0.95
+        await waitForMapStyleLoad(navigationMapInstance);
+     
+        const buildingsLayerId = '3d-buildings';
+
+        // 1. Limpieza inicial: eliminamos todo lo relacionado con 3D para empezar de cero.
+        if (navigationMapInstance.getLayer(buildingsLayerId)) {
+            navigationMapInstance.removeLayer(buildingsLayerId);
+        }
+        if (navigationMapInstance.getTerrain()) {
+            navigationMapInstance.setTerrain(null);
+        }
+        navigationMapInstance.setFog(null);
+        
+        const currentMode = mapViewMode || localStorage.getItem(MAP_VIEW_MODE_KEY) || 'relief';
+
+        // 2. Solo procedemos si el modo de vista es 3D.
+        if (currentMode === 'relief' || currentMode === 'perspective') {
+            
+            // 3. Aseguramos que la fuente de datos de elevación (DEM) exista.
+            if (!navigationMapInstance.getSource('mapbox-dem')) {
+                navigationMapInstance.addSource('mapbox-dem', {
+                    'type': 'raster-dem',
+                    'url': 'mapbox://mapbox.terrain-rgb',
+                    'tileSize': 512,
+                    'maxzoom': 14
+                });
+                // Esperamos a que la fuente se cargue por completo.
+                await new Promise(resolve => {
+                    const onSourceData = (e) => {
+                        if (e.sourceId === 'mapbox-dem' && e.isSourceLoaded) {
+                            navigationMapInstance.off('sourcedata', onSourceData);
+                            resolve();
+                        }
+                    };
+                    navigationMapInstance.on('sourcedata', onSourceData);
+                });
             }
-        }, 
-        firstSymbolId // Este segundo argumento es CRUCIAL para el orden de las capas.
-        );
+
+            // 4. Establecemos el terreno y la niebla.
+            const exaggeration = (currentMode === 'relief') ? mapTerrainExaggeration : 0.0;
+            navigationMapInstance.setTerrain({ 'source': 'mapbox-dem', 'exaggeration': exaggeration });
+            navigationMapInstance.setFog({
+                'range': [0.9, 10], 'color': '#d8e2e8', 'horizon-blend': 0.1,
+                'high-color': '#58636B', 'space-color': '#B3E3FF', 'star-intensity': 0.15
+            });
+
+            await new Promise(resolve => navigationMapInstance.once('terrain', resolve));
+
+            if (navigationMapInstance.getSource('composite')) {
+                const layers = navigationMapInstance.getStyle().layers;
+                let firstSymbolId;
+                for (const layer of layers) {
+                    if (layer.type === 'symbol') {
+                        firstSymbolId = layer.id;
+                        break;
+                    }
+                }
+                navigationMapInstance.addLayer({
+                    'id': buildingsLayerId,
+                    'source': 'composite',
+                    'source-layer': 'building',
+                    'filter': ['==', 'extrude', 'true'],
+                    'type': 'fill-extrusion',
+                    'minzoom': 14,
+                    'paint': {
+                        'fill-extrusion-color': '#fffae3',
+                        'fill-extrusion-height': ['interpolate', ['linear'], ['zoom'], 14, 0, 15, ['get', 'height']],
+                        'fill-extrusion-base': ['get', 'min_height'],
+                        'fill-extrusion-opacity': 0.75
+                    }
+                }, firstSymbolId);
+            }
+        }
     } catch (error) {
     }
 }
+    
 //===================================================================
 // NOMBRE: generateAndCacheCleanManeuverList (VERSIÓN CORREGIDA Y DEFINITIVA)
 // RESUMEN: Crea y cachea la lista de maniobras "reales" una sola vez por ruta,
@@ -8135,8 +8162,6 @@ async function openNavigationMap(isRecovery = false) {
                         plotRemindersOnNavigationMap(); 
                         await configureMapAtmosphere();
                         
-                        await add3DBuildingsLayer(navigationMapInstance);
-                        
                         await processTrafficAlerts(); 
                         if (alertRefreshInterval) clearInterval(alertRefreshInterval); 
                         alertRefreshInterval = setInterval(processTrafficAlerts, ALERT_CHECK_INTERVAL);
@@ -12576,8 +12601,7 @@ async function reAddCustomMapLayersAndSources(mapInstance) {
     } catch (e) {
         console.error("Error al re-añadir capas de ruta/velocidad:", e);
     }
-    await add3DBuildingsLayer(mapInstance);
-}
+ }
     
 
 // ===================================================================
@@ -19360,62 +19384,7 @@ async function waitForMapStyleLoad(mapInstance) {
     if (!mapInstance.isStyleLoaded()) {
         throw new Error("El estilo del mapa no se cargó después de varios intentos.");
     }
-}    
-// ===================================================================
-// NOMBRE: configureMapAtmosphere (VERSIÓN FINAL CON VERIFICADOR)
-// RESUMEN: Gestiona el terreno y la niebla, esperando activamente a que el mapa esté listo.
-async function configureMapAtmosphere() {
-   
-    if (!navigationMapInstance) {
-        return;
-    }
-
-    try {
-        await waitForMapStyleLoad(navigationMapInstance);
-     
-        const currentMode = mapViewMode || localStorage.getItem(MAP_VIEW_MODE_KEY) || 'relief';
-
-        if (currentMode === 'relief' || currentMode === 'perspective') {
-     
-            if (!navigationMapInstance.getSource('mapbox-dem')) {
-                navigationMapInstance.addSource('mapbox-dem', {
-                    'type': 'raster-dem',
-                    'url': 'mapbox://mapbox.terrain-rgb',
-                    'tileSize': 512,
-                    'maxzoom': 14,
-                    'overdraw': 4 // EN PRUEBA CARGA 2 TESELAS MAS
-                });
-                await new Promise(resolve => {
-                    const onSourceData = (e) => {
-                        if (e.sourceId === 'mapbox-dem' && e.isSourceLoaded) {
-                            navigationMapInstance.off('sourcedata', onSourceData);
-                            resolve();
-                        }
-                    };
-                    navigationMapInstance.on('sourcedata', onSourceData);
-                });
-            } else {
-            }
-            
-            await wait(500); // Aumentamos la pausa para dar más margen al navegador del coche.
-
-            const exaggeration = (currentMode === 'relief') ? mapTerrainExaggeration : 0.0;
-            navigationMapInstance.setTerrain({ 'source': 'mapbox-dem', 'exaggeration': exaggeration });
-            
-            navigationMapInstance.setFog({
-                'range': [0.9, 10], 'color': '#d8e2e8', 'horizon-blend': 0.1,
-                'high-color': '#58636B', 'space-color': '#B3E3FF', 'star-intensity': 0.15
-            });
-
-        } else {
-            navigationMapInstance.setTerrain(null);
-            navigationMapInstance.setFog(null);
-        }
-        
-    } catch (error) {
-    }
-}
-
+}      
     
 // ===================================================================
 // NOMBRE: hideAutoStartNavigationModal (MODIFICADA)
