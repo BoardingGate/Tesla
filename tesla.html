@@ -56,7 +56,8 @@
 
 <style>
 
-    
+
+   
 </style>
     
 </head>
@@ -1200,6 +1201,115 @@
         }
     }).join(', ');   
 
+
+// ===================================================================
+// NOMBRE: add3DBuildingsLayer (VERSIÓN FINAL Y ROBUSTA)
+// RESUMEN: Añade la capa de edificios 3D si es compatible, colocándola correctamente.
+// ===================================================================
+async function add3DBuildingsLayer(mapInstance) {
+    if (!mapInstance || !mapInstance.isStyleLoaded()) {
+        return;
+    }
+
+    const layerId = '3d-buildings';
+    if (mapInstance.getLayer(layerId)) {
+        try { mapInstance.removeLayer(layerId); } catch (e) {}
+    }
+
+    if (!mapInstance.getSource('composite')) {
+        return; // El estilo actual no tiene datos de edificios.
+    }
+    
+    const layers = mapInstance.getStyle().layers;
+    let firstSymbolId;
+    for (const layer of layers) {
+        if (layer.type === 'symbol') {
+            firstSymbolId = layer.id;
+            break;
+        }
+    }
+
+    try {
+        mapInstance.addLayer({
+            'id': layerId,
+            'source': 'composite',
+            'source-layer': 'building',
+            'filter': ['==', 'extrude', 'true'],
+            'type': 'fill-extrusion',
+            'minzoom': 14,
+            'paint': {
+                'fill-extrusion-color': '#fafae3',
+                'fill-extrusion-height': ['interpolate', ['linear'], ['zoom'], 14, 0, 15, ['get', 'height']],
+                'fill-extrusion-base': ['get', 'min_height'],
+                'fill-extrusion-opacity': 0.75
+            }
+        }, firstSymbolId);
+    } catch (error) {
+    }
+}
+
+    
+// ===================================================================
+// NOMBRE: configureMapAtmosphere (VERSIÓN SIMPLIFICADA PARA TERRENO)
+// ===================================================================
+async function configureMapAtmosphere() {
+    if (!navigationMapInstance) return;
+    await waitForMapStyleLoad(navigationMapInstance);
+
+    if (navigationMapInstance.getTerrain()) {
+        navigationMapInstance.setTerrain(null);
+    }
+    navigationMapInstance.setFog(null);
+
+    const currentMode = mapViewMode || localStorage.getItem(MAP_VIEW_MODE_KEY) || 'relief';
+
+    if (currentMode === 'relief' || currentMode === 'perspective') {
+        if (!navigationMapInstance.getSource('mapbox-dem')) {
+            navigationMapInstance.addSource('mapbox-dem', {
+                'type': 'raster-dem',
+                'url': 'mapbox://mapbox.terrain-rgb',
+                'tileSize': 512,
+                'maxzoom': 14
+            });
+        }
+        
+        const exaggeration = (currentMode === 'relief') ? mapTerrainExaggeration : 0.0;
+        navigationMapInstance.setTerrain({ 'source': 'mapbox-dem', 'exaggeration': exaggeration });
+        
+        navigationMapInstance.setFog({
+            'range': [0.9, 10], 'color': '#d8e2e8', 'horizon-blend': 0.1,
+            'high-color': '#58636B', 'space-color': '#B3E3FF', 'star-intensity': 0.15
+        });
+        setMapLighting(navigationMapInstance);
+    }
+}
+
+// ===================================================================
+    // NOMBRE: setMapLighting (NUEVA FUNCIÓN)
+    // RESUMEN: Configura la iluminación global del mapa para dar profundidad a los edificios y terreno.
+    // ===================================================================
+    function setMapLighting(mapInstance) {
+        if (!mapInstance || !mapInstance.isStyleLoaded()) {
+            return;
+        }
+
+        try {
+            // Configuración para simular un sol de tarde/atardecer
+            mapInstance.setLight({
+                anchor: 'map', // La luz se mueve con el mapa
+                position: [
+                    1.5,  // Distancia radial: un poco alejada para sombras definidas
+                    210,  // Ángulo azimutal: desde el Suroeste (el sol se pone en el Oeste)
+                    45    // Ángulo polar: a media altura en el cielo
+                ],
+                color: '#FFDDBB', // Un color cálido anaranjado
+                intensity: 0.7   // Una intensidad moderada
+            });
+        } catch (error) {
+            console.error("Error al configurar la iluminación del mapa:", error);
+        }
+    }    
+
 //===================================================================
 // NOMBRE: generateAndCacheCleanManeuverList (VERSIÓN CORREGIDA Y DEFINITIVA)
 // RESUMEN: Crea y cachea la lista de maniobras "reales" una sola vez por ruta,
@@ -1592,6 +1702,9 @@ async function drawRouteOnMinimap() {
 // ===================================================================
 // NOMBRE: MapSettingsPanel (VERSIÓN CON SEPARADOR VISUAL)
 // ===================================================================
+// ===================================================================
+// REEMPLAZA ESTA CLASE COMPLETA (VERSIÓN CON ORQUESTACIÓN SECUENCIAL)
+// ===================================================================
 class MapSettingsPanel {
     constructor(map) {
         this._map = map;
@@ -1670,18 +1783,27 @@ class MapSettingsPanel {
             markCacheAsDirty();
             this._map.setStyle(finalStyleUrl);
             
-            this._map.once('style.load', () => {
-                this._map.once('idle', async () => {
-                    await loadAndAddMapImages(this._map);
-                    await reAddCustomMapLayersAndSources(this._map);
-                    await configureMapAtmosphere();
-                    applyLayerVisibility();
-                    plotRemindersOnNavigationMap();
-                    displayChargingPointsOnMap();
-                    displayAlertsOnMap();
-                    renderWaypointMarkers();
-                    updateRouteAndCarIconStyle();
-                });
+            this._map.once('style.load', async () => {
+                // Secuencia garantizada:
+                // 1. Configurar el terreno y esperar a que esté listo.
+                await configureMapAtmosphere();
+                setMapLighting(this._map);
+                
+                // 2. Esperar a que el mapa termine de procesar el terreno y esté inactivo.
+                await new Promise(resolve => this._map.once('idle', resolve));
+                
+                // 3. Ahora que el terreno está activo, añadir los edificios.
+                await add3DBuildingsLayer(this._map);
+                
+                // 4. Continuar con el resto de capas y datos.
+                await loadAndAddMapImages(this._map);
+                await reAddCustomMapLayersAndSources(this._map);
+                applyLayerVisibility();
+                plotRemindersOnNavigationMap();
+                displayChargingPointsOnMap();
+                displayAlertsOnMap();
+                renderWaypointMarkers();
+                updateRouteAndCarIconStyle();
             });
         };
         
@@ -1835,6 +1957,7 @@ class MapSettingsPanel {
         return fragment;
     }
 }
+    
 // ===================================================================
 // NOMBRE: handleZoomToggleButtonClick (VERSIÓN CON ACTIVACIÓN DE CAPAS)
 // RESUMEN: Gestiona el zoom y activa todas las capas al alejar para ver la ruta completa.
@@ -7872,8 +7995,8 @@ function adaptMapboxRouteToOSRMFormat(mapboxRoute) {
 }  
 
 // ===================================================================
-// NOMBRE: openNavigationMap (VERSIÓN FINAL CON BOTÓN "T" Y ESTADO MANUAL)
-// RESUMEN: Abre el mapa de navegación y añade el listener al nuevo botón "T".
+// NOMBRE: openNavigationMap (VERSIÓN CON CARGA SECUENCIAL CORREGIDA Y DEFINITIVA)
+// RESUMEN: Abre el mapa y orquesta la carga de capas en la secuencia correcta.
 // ===================================================================
 async function openNavigationMap(isRecovery = false) {
     return new Promise(async (resolve, reject) => {
@@ -7934,13 +8057,12 @@ async function openNavigationMap(isRecovery = false) {
         mapModal.classList.remove('map-modal-hidden');
         const mapActualContainer = document.getElementById('mapbox-map-actual-container');
         
-        // <-- INICIO: LÓGICA DEL BOTÓN "T" CON TEMPORIZADOR -->
         const minimapTriggerButton = document.getElementById('force-show-minimap-button');
         if (minimapTriggerButton && !minimapTriggerButton.listenerAdded) {
             minimapTriggerButton.addEventListener('click', (e) => {
                 e.stopPropagation();
                 if (showRouteMinimapPreference) {
-                    minimapForceShowUntil = Date.now() + 30000; // Mostrar durante 30 segundos
+                    minimapForceShowUntil = Date.now() + 30000;
                     updateTurnByTurnDisplay(navigationCurrentRouteData?.routes?.[0], lastCarDistanceAlongRouteForNavLogic);
                 }
             });
@@ -8029,19 +8151,41 @@ async function openNavigationMap(isRecovery = false) {
                         const lockButton = document.getElementById('toggle-progress-bar-lock'); if (lockButton && !lockButton.dataset.listenerAttached) { lockButton.addEventListener('click', (e) => { e.stopPropagation(); handleProgressBarLockToggle(); }); lockButton.dataset.listenerAttached = 'true'; } updateProgressBarLockIcon();
                         const topInfoBar = document.getElementById('navigation-top-info-bar'); if (topInfoBar && !topInfoBar.dataset.listenerAttached) { topInfoBar.addEventListener('click', (e) => { e.stopPropagation(); if (nextManeuverStepForPreview && navigationCurrentRouteData?.routes?.[0]) { showIntersectionPreviewMap(nextManeuverStepForPreview, navigationCurrentRouteData.routes[0], true, 10000); } else { showToast("No hay una próxima maniobra que mostrar.", "info"); } }); topInfoBar.dataset.listenerAttached = 'true'; }
                         const initToast = document.getElementById("map-init-toast"); if (initToast) initToast.remove();
-                        await loadAndAddMapImages(navigationMapInstance); reAddCustomMapLayersAndSources(navigationMapInstance); applyLayerVisibility(); plotRemindersOnNavigationMap(); await configureMapAtmosphere(); await processTrafficAlerts(); 
-                        if (alertRefreshInterval) clearInterval(alertRefreshInterval); alertRefreshInterval = setInterval(processTrafficAlerts, ALERT_CHECK_INTERVAL);
-                        navigationMapInstance.on('pitch', updateVehicleIconPerspective); mapPreviousZoomLevelForPDRs = navigationMapInstance.getZoom(); navigationMapInstance.on('zoomend', updateAllIconSizes); toggleMapHeaderRowsVisibility(mapHeaderButtonsVisible);
+                        
+                        // --- LÓGICA SECUENCIAL PARA LA CARGA INICIAL ---
+                        await loadAndAddMapImages(navigationMapInstance);
+                        await configureMapAtmosphere();
+                        await new Promise(resolve => navigationMapInstance.once('idle', resolve));
+                        await add3DBuildingsLayer(navigationMapInstance);
+                        
+                        reAddCustomMapLayersAndSources(navigationMapInstance); 
+                        applyLayerVisibility(); 
+                        plotRemindersOnNavigationMap();
+                        
+                        await processTrafficAlerts(); 
+                        if (alertRefreshInterval) clearInterval(alertRefreshInterval); 
+                        alertRefreshInterval = setInterval(processTrafficAlerts, ALERT_CHECK_INTERVAL);
+                        navigationMapInstance.on('pitch', updateVehicleIconPerspective); 
+                        mapPreviousZoomLevelForPDRs = navigationMapInstance.getZoom(); 
+                        navigationMapInstance.on('zoomend', updateAllIconSizes); 
+                        toggleMapHeaderRowsVisibility(mapHeaderButtonsVisible);
                         navigationMapInstance.on('click', async (e) => { if (isAddReminderAtLocationModeActive) { handleMapClickToAddReminder(e); return; } if (isSimulatingGpsLocation) { handleSimulateGpsPositionClick(e); return; } if (isNavigating && !isAddingWaypointsDuringNav) { return; } const point = e.point; const lngLat = e.lngLat; const pdrLayers = ['pdr-simple-circle-layer', 'pdr-cards-layer-bg-halo', 'pdr-cards-layer-bg']; const pdrFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: pdrLayers }); if (pdrFeatures.length > 0) { const fullPdrData = window.lastOcmApiResponse.find(p => p.ID === pdrFeatures[0].properties.ocmId); if (fullPdrData) { showChargingPointModal(fullPdrData, pdrFeatures[0].properties.index); } return; } const alertLayers = ['traffic-alerts-layer']; const alertFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: alertLayers }); if (alertFeatures.length > 0) { const alertDetailsMap = { 1: 'Accidente de tráfico', 2: 'Coche averiado', 3: 'Control de tráfico / Radar', 4: 'Atasco', 5: 'Peligro indeterminado', 6: 'Carretera en mal estado', 7: 'Obras', 8: 'Vía / Carretera cerrada' }; showToast(alertDetailsMap[alertFeatures[0].properties.code] || 'Alerta de tráfico', 'warning', 4000); return; } const reminderLayers = ['reminders-icons-layer', 'radar-circles-layer']; const reminderFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: reminderLayers }); if (reminderFeatures.length > 0) { showReminderActionModal(reminderFeatures[0].properties.reminderId); return; } const mapboxPoiLayers = ['poi-label']; const features = navigationMapInstance.queryRenderedFeatures(point, { layers: mapboxPoiLayers }); const validPoiFeature = features.find(f => f.properties && (f.properties.name || f.properties.name_en || f.properties.text)); if (validPoiFeature) { const { name, name_en, text, poi_category, category, maki } = validPoiFeature.properties; const poiName = name || name_en || text; let categories = []; if (poi_category && Array.isArray(poi_category)) { categories = poi_category; } else if (category) { categories = category.split(',').map(c => c.trim()); } else if (maki) { categories.push(maki); } showPoiInfoModal({ properties: { name: poiName, categories: categories }, geometry: validPoiFeature.geometry }); } else { addWaypoint(lngLat); } });
-                        enablePoiInteractivity(navigationMapInstance); setNavigationMapClickHandler();
+                        enablePoiInteractivity(navigationMapInstance); 
+                        setNavigationMapClickHandler();
                         let currentPos = await getInitialGpsPositionForMap();
-                        setMapImmersiveMode(false); navigationFollowUser = true; shouldCenterOnUser = true; updateLocateMeButtonsUI(); toggleMapControls(true); navigationCurrentLocation = currentPos;
+                        setMapImmersiveMode(false); 
+                        navigationFollowUser = true; 
+                        shouldCenterOnUser = true; 
+                        updateLocateMeButtonsUI(); 
+                        toggleMapControls(true); 
+                        navigationCurrentLocation = currentPos;
                         const initialViewOptions = { center: [currentPos.longitude, currentPos.latitude], zoom: 15.5, essential: true };
                         const mode = mapViewMode; if (mode === 'heading' || mode === 'perspective' || mode === 'relief') { initialViewOptions.bearing = currentPos.heading || 0; } if (mode === 'perspective' || mode === 'relief') { initialViewOptions.pitch = mapPitchValue; } else { initialViewOptions.pitch = 0; }
                         initialViewOptions.pitch = 0;
                         if (!isRecovery) { const globeSpinPromise = new Promise(resolve => { const startCoords = { lat: 30.3715, lng: -97.1903 }; const endCoords = { lat: 40.3748, lng: -3.7354 }; const duration = 1800; const totalLngChange = -(360 - (endCoords.lng - startCoords.lng)); const totalLatChange = endCoords.lat - startCoords.lat; const startTimestamp = performance.now(); function animateSpin(timestamp) { const progress = Math.min((timestamp - startTimestamp) / duration, 1); const easedProgress = 1 - Math.pow(1 - progress, 3); navigationMapInstance.setCenter([startCoords.lng + (totalLngChange * easedProgress), startCoords.lat + (totalLatChange * easedProgress)]); if (progress < 1) { requestAnimationFrame(animateSpin); } else { navigationMapInstance.setCenter([endCoords.lng, endCoords.lat]); resolve(); } } requestAnimationFrame(animateSpin); }); await globeSpinPromise; navigationMapInstance.jumpTo(initialViewOptions); } else { navigationMapInstance.jumpTo(initialViewOptions); }
                         markerAnimationState.currentMapCenter = navigationMapInstance.getCenter(); markerAnimationState.currentMapZoom = navigationMapInstance.getZoom(); markerAnimationState.currentMapPitch = navigationMapInstance.getPitch(); markerAnimationState.currentMapBearing = navigationMapInstance.getBearing(); markerAnimationState.targetMapCenter = navigationMapInstance.getCenter(); markerAnimationState.targetMapZoom = navigationMapInstance.getZoom(); markerAnimationState.targetMapPitch = navigationMapInstance.getPitch(); markerAnimationState.targetMapBearing = navigationMapInstance.getBearing();
-                        updateInitialUserPosition(currentPos, navigationMapInstance); startGpsWatching();
+                        updateInitialUserPosition(currentPos, navigationMapInstance); 
+                        startGpsWatching();
                         resolve();
                     } catch (loadError) { const overlay = document.getElementById('route-recovery-overlay'); if (overlay) overlay.classList.add('hidden'); showToast(`Error crítico al cargar los recursos del mapa: ${loadError.message}`, "error", 10000); reject(loadError); }
                 });
@@ -12452,10 +12596,11 @@ async function reAddCustomMapLayersAndSources(mapInstance) {
             layout: { 'text-field': ['get', 'speedText'], 'text-font': ['Open Sans Bold', 'Arial Unicode MS Bold'], 'text-size': 20, 'text-allow-overlap': true }, 
             paint: { 'text-color': 'white' } 
         }, 'custom-layers-anchor'); 
+
     } catch (e) {
         console.error("Error al re-añadir capas de ruta/velocidad:", e);
     }
-}
+ }
     
 
 // ===================================================================
@@ -19238,62 +19383,7 @@ async function waitForMapStyleLoad(mapInstance) {
     if (!mapInstance.isStyleLoaded()) {
         throw new Error("El estilo del mapa no se cargó después de varios intentos.");
     }
-}    
-// ===================================================================
-// NOMBRE: configureMapAtmosphere (VERSIÓN FINAL CON VERIFICADOR)
-// RESUMEN: Gestiona el terreno y la niebla, esperando activamente a que el mapa esté listo.
-async function configureMapAtmosphere() {
-   
-    if (!navigationMapInstance) {
-        return;
-    }
-
-    try {
-        await waitForMapStyleLoad(navigationMapInstance);
-     
-        const currentMode = mapViewMode || localStorage.getItem(MAP_VIEW_MODE_KEY) || 'relief';
-
-        if (currentMode === 'relief' || currentMode === 'perspective') {
-     
-            if (!navigationMapInstance.getSource('mapbox-dem')) {
-                navigationMapInstance.addSource('mapbox-dem', {
-                    'type': 'raster-dem',
-                    'url': 'mapbox://mapbox.terrain-rgb',
-                    'tileSize': 512,
-                    'maxzoom': 14,
-                    'overdraw': 4 // EN PRUEBA CARGA 2 TESELAS MAS
-                });
-                await new Promise(resolve => {
-                    const onSourceData = (e) => {
-                        if (e.sourceId === 'mapbox-dem' && e.isSourceLoaded) {
-                            navigationMapInstance.off('sourcedata', onSourceData);
-                            resolve();
-                        }
-                    };
-                    navigationMapInstance.on('sourcedata', onSourceData);
-                });
-            } else {
-            }
-            
-            await wait(500); // Aumentamos la pausa para dar más margen al navegador del coche.
-
-            const exaggeration = (currentMode === 'relief') ? mapTerrainExaggeration : 0.0;
-            navigationMapInstance.setTerrain({ 'source': 'mapbox-dem', 'exaggeration': exaggeration });
-            
-            navigationMapInstance.setFog({
-                'range': [0.9, 10], 'color': '#d8e2e8', 'horizon-blend': 0.1,
-                'high-color': '#58636B', 'space-color': '#B3E3FF', 'star-intensity': 0.15
-            });
-
-        } else {
-            navigationMapInstance.setTerrain(null);
-            navigationMapInstance.setFog(null);
-        }
-        
-    } catch (error) {
-    }
-}
-
+}      
     
 // ===================================================================
 // NOMBRE: hideAutoStartNavigationModal (MODIFICADA)
