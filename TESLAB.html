@@ -1805,9 +1805,6 @@ async function drawRouteOnMinimap() {
 // ===================================================================
 // NOMBRE: MapSettingsPanel (VERSIÓN CON SEPARADOR VISUAL)
 // ===================================================================
-// ===================================================================
-// REEMPLAZA ESTA CLASE COMPLETA (VERSIÓN CON ORQUESTACIÓN SECUENCIAL)
-// ===================================================================
 class MapSettingsPanel {
     constructor(map) {
         this._map = map;
@@ -2060,7 +2057,267 @@ class MapSettingsPanel {
         return fragment;
     }
 }
+
+
+// ===================================================================
+// REEMPLAZA ESTA CLASE COMPLETA (VERSIÓN CON ORQUESTACIÓN SECUENCIAL)
+// ===================================================================
+class MapSettingsPanel {
+    constructor(map) {
+        this._map = map;
+        this.layerVisibilityKey = 'boardinggate_map_layer_visibility';
+        this.streetMapThemeKey = 'boardinggate_streetMapTheme';
+        this.layerGroups = {
+            poblaciones: {
+                label: 'Poblaciones',
+                layers: ['settlement-major-label', 'settlement-minor-label', 'settlement-subdivision-label']
+            },
+            pois: {
+                label: 'Negocios/POIs',
+                layers: ['poi-label', 'transit-label', 'airport-label']
+            },
+            carreteras: {
+                label: 'Carreteras/Calles',
+                layers: ['road-label']
+            },
+            geografia: {
+                label: 'Geografía/Natural',
+                layers: ['natural-label', 'water-point-label', 'water-line-label', 'waterway-label']
+            },
+        };
+    }
+
+    createPanelContent() {
+        const fragment = document.createDocumentFragment();
+        
+        const layerSelectorContainer = document.createElement('div');
+        layerSelectorContainer.className = 'map-layer-selector';
+
+        const baseMapOptions = ["HÍBRIDO", "SATÉLITE", "CALLES"];
+        let savedLayerName = localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO";
+        
+        if (MAP_LEGACY_NAME_MAP[savedLayerName]) {
+            savedLayerName = MAP_LEGACY_NAME_MAP[savedLayerName];
+            localStorage.setItem(ACTIVE_MAP_LAYER_KEY, savedLayerName);
+        }
+        if (savedLayerName === "CALLES_LIGHT" || savedLayerName === "CALLES_DARK") {
+             savedLayerName = "CALLES";
+        }
+        if (!baseMapOptions.includes(savedLayerName)) {
+            savedLayerName = "HÍBRIDO";
+        }
+
+        const streetThemeCheckboxContainer = document.createElement('div');
+        streetThemeCheckboxContainer.id = 'street-theme-checkbox-container';
+        streetThemeCheckboxContainer.style.marginLeft = '30px';
+        streetThemeCheckboxContainer.innerHTML = `
+            <label style="display: flex; align-items: center; gap: 8px;">
+                <input type="checkbox" id="street-theme-checkbox">
+                <span>Tono Oscuro</span>
+            </label>
+        `;
+        const streetThemeCheckbox = streetThemeCheckboxContainer.querySelector('#street-theme-checkbox');
+        const savedTheme = localStorage.getItem(this.streetMapThemeKey) || 'dark'; 
+        streetThemeCheckbox.checked = savedTheme === 'dark';
+
+        const updateStyle = () => {
+            const selectedRadio = layerSelectorContainer.querySelector('input[name="map-style-selector"]:checked');
+            if (!selectedRadio) return;
+
+            const baseStyle = selectedRadio.value;
+            let finalStyleUrl;
+            let finalLayerNameForStorage = baseStyle;
+
+            if (baseStyle === "CALLES") {
+                const isDark = streetThemeCheckbox.checked;
+                finalStyleUrl = isDark ? MAP_STYLES.CALLES_DARK : MAP_STYLES.CALLES_LIGHT;
+                localStorage.setItem(this.streetMapThemeKey, isDark ? 'dark' : 'light');
+            } else {
+                 finalStyleUrl = MAP_STYLES[baseStyle];
+            }
+            
+            localStorage.setItem(ACTIVE_MAP_LAYER_KEY, finalLayerNameForStorage);
+            markCacheAsDirty();
+
+            this._map.setStyle(finalStyleUrl, { diff: false });
+            
+            this._map.once('style.load', async () => {
+                
+                // 1. Cargar imágenes base
+                await loadAndAddMapImages(this._map);
+
+                // 2. Configurar el terreno y la iluminación
+                await configureMapAtmosphere();
+                setMapLighting(this._map);
+                
+                // 3. Esperar a que el mapa termine de procesar el terreno y esté inactivo (muy importante)
+                await new Promise(resolve => this._map.once('idle', resolve));
+                
+                // 4. Ahora que el terreno está listo, añadir los edificios 3D
+                await add3DBuildingsLayer(this._map);
+                
+                // 5. Re-añadir el resto de capas personalizadas (rutas, marcadores, etc.)
+                await reAddCustomMapLayersAndSources(this._map);
+                applyLayerVisibility();
+                plotRemindersOnNavigationMap();
+                displayChargingPointsOnMap();
+                displayAlertsOnMap();
+                renderWaypointMarkers();
+                updateRouteAndCarIconStyle();
+            });
+        };
+        
+        baseMapOptions.forEach(name => {
+            const optionContainer = document.createElement('div');
+            const label = document.createElement('label');
+            const input = document.createElement('input');
+            input.type = 'radio';
+            input.name = 'map-style-selector';
+            input.value = name;
+            if (name === savedLayerName) {
+                input.checked = true;
+            }
+            label.appendChild(input);
+            label.appendChild(document.createTextNode(` ${name}`));
+            optionContainer.appendChild(label);
+            
+            if (name === "CALLES") {
+                optionContainer.appendChild(streetThemeCheckboxContainer);
+            }
+            layerSelectorContainer.appendChild(optionContainer);
+
+            input.addEventListener('change', () => {
+                streetThemeCheckboxContainer.style.display = (input.value === 'CALLES' && input.checked) ? 'block' : 'none';
+                updateStyle();
+            });
+        });
+        
+        streetThemeCheckbox.addEventListener('change', updateStyle);
+        streetThemeCheckboxContainer.style.display = (savedLayerName === 'CALLES') ? 'block' : 'none';
+
+        const viewSelector = document.createElement('div');
+        viewSelector.className = 'map-view-selector';
+        const viewModes = { 'NORTE': { pitch: 0, bearing: 0, mode: 'static' }, 'AVANCE': { pitch: 0, bearing: null, mode: 'heading' }, '3D': { pitch: 62, bearing: null, mode: 'perspective' }, '3D RELIEVE': { pitch: 73, bearing: null, mode: 'relief' } };
+        const savedViewMode = localStorage.getItem(MAP_VIEW_MODE_KEY) || 'relief';
+        Object.keys(viewModes).forEach(name => {
+            const label = document.createElement('label'); const input = document.createElement('input');
+            input.type = 'radio'; input.name = 'map-view-selector'; const modeDetails = viewModes[name];
+            input.value = modeDetails.mode; if (modeDetails.mode === savedViewMode) input.checked = true;
+            input.onchange = async () => {
+                if (!input.checked) return; isPitchManuallyFlattened = false; 
+                const selectedModeValue = input.value;
+                const newModeDetails = Object.values(viewModes).find(m => m.mode === selectedModeValue);
+                const newModeName = Object.keys(viewModes).find(key => viewModes[key].mode === selectedModeValue);
+                if (newModeDetails) {
+                    mapViewMode = newModeDetails.mode; localStorage.setItem(MAP_VIEW_MODE_KEY, mapViewMode); markCacheAsDirty(); showToast(`Modo Vista: ${newModeName}`, 'info');
+                    await configureMapAtmosphere();
+                    const easeOptions = { bearing: newModeDetails.bearing };
+                    if (navigationCurrentLocation && newModeDetails.bearing === null && navigationCurrentLocation.heading !== null) { easeOptions.bearing = navigationCurrentLocation.heading; }
+                    if (newModeDetails.mode === 'perspective' || newModeDetails.mode === 'relief') { easeOptions.pitch = mapPitchValue; } else { easeOptions.pitch = newModeDetails.pitch; }
+                    this._map.easeTo(easeOptions);
+                    if (navigationCurrentLocation) { updateInitialUserPosition(navigationCurrentLocation, this._map); }
+                }
+            };
+            label.appendChild(input); label.appendChild(document.createTextNode(` ${name}`)); viewSelector.appendChild(label);
+        });
+
+        const visibilitySelector = document.createElement('div');
+        visibilitySelector.className = 'map-layer-visibility-selector';
+        const title = document.createElement('h3');
+        title.textContent = 'VISIBILIDAD DE CAPAS';
+        visibilitySelector.appendChild(title);
+        
+        let visibilitySettings = {};
+        try {
+            visibilitySettings = JSON.parse(localStorage.getItem(this.layerVisibilityKey)) || {};
+        } catch (e) {
+            visibilitySettings = {};
+        }
+
+        Object.keys(this.layerGroups).forEach(groupKey => {
+            const group = this.layerGroups[groupKey];
+            const isChecked = visibilitySettings[groupKey] !== false;
+            const label = document.createElement('label');
+            label.className = 'layer-visibility-toggle';
+            const input = document.createElement('input');
+            input.type = 'checkbox'; input.id = `vis-toggle-${groupKey}`; input.dataset.groupKey = groupKey;
+            input.checked = isChecked;
+            input.addEventListener('change', (e) => {
+                const key = e.target.dataset.groupKey;
+                const checked = e.target.checked;
+                visibilitySettings[key] = checked;
+                localStorage.setItem(this.layerVisibilityKey, JSON.stringify(visibilitySettings));
+                markCacheAsDirty();
+                applyLayerVisibility();
+            });
+            label.appendChild(input);
+            label.appendChild(document.createTextNode(` ${group.label}`));
+            visibilitySelector.appendChild(label);
+        });
+
+        const routeMinimapControl = document.createElement('div');
+        routeMinimapControl.className = 'route-minimap-toggle-container';
+        routeMinimapControl.style.marginTop = '10px';
+        routeMinimapControl.style.borderTop = '1px solid #444';
+        routeMinimapControl.style.paddingTop = '10px';
+        routeMinimapControl.innerHTML = `
+            <label class="layer-visibility-toggle">
+                <input type="checkbox" id="route-minimap-toggle-checkbox">
+                <span>Ver Minimapa de Ruta</span>
+            </label>
+        `;
+        
+        const routeMinimapCheckbox = routeMinimapControl.querySelector('#route-minimap-toggle-checkbox');
+        routeMinimapCheckbox.checked = showRouteMinimapPreference;
+        routeMinimapCheckbox.addEventListener('change', (e) => {
+            e.stopPropagation();
+            showRouteMinimapPreference = e.target.checked;
+            localStorage.setItem(SHOW_ROUTE_MINIMAP_KEY, showRouteMinimapPreference);
+            markCacheAsDirty();
+        
+            const minimapContainer = document.getElementById('minimap-container');
+        
+            if (showRouteMinimapPreference) {
+                const miniNavCard = document.getElementById('mini-nav-info-card');
+                const shouldBeVisible = miniNavCard && miniNavCard.style.display === 'flex';
+                if (minimapContainer) {
+                    minimapContainer.classList.toggle('hidden', !shouldBeVisible);
+                }
+            } else {
+                if (minimapContainer) {
+                    minimapContainer.classList.add('hidden');
+                }
+                if (minimapInstance) {
+                    try {
+                        minimapInstance.remove();
+                    } catch(e) {}
+                    minimapInstance = null;
+                    minimapCarMarker = null;
+                }
+            }
+            showToast(`Minimapa de ruta ${showRouteMinimapPreference ? 'ACTIVADO' : 'DESACTIVADO'}`, 'info');
+        });
+        visibilitySelector.appendChild(routeMinimapControl);
     
+        const ecoNote = document.createElement('p');
+        ecoNote.className = 'eco-note';
+        ecoNote.textContent = '(*) El Modo ECO/RUTA anulará esta configuración temporalmente.';
+        visibilitySelector.appendChild(ecoNote);
+        
+        const separator = (className = 'separator') => {
+            const sep = document.createElement('div'); sep.className = className; return sep;
+        };
+        
+        fragment.appendChild(layerSelectorContainer);
+        fragment.appendChild(separator());
+        fragment.appendChild(viewSelector);
+        fragment.appendChild(separator());
+        fragment.appendChild(visibilitySelector);
+
+        return fragment;
+    }
+}  
+
 // ===================================================================
 // NOMBRE: handleZoomToggleButtonClick (VERSIÓN CON ACTIVACIÓN DE CAPAS)
 // RESUMEN: Gestiona el zoom y activa todas las capas al alejar para ver la ruta completa.
