@@ -1,4 +1,4 @@
-V12
+V13
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -5374,16 +5374,19 @@ async function proceedWithRecalculation(action) {
     await recalculateAndDrawRoute(true);
 }
 
-//===================================================================
-// NOMBRE: recalculateAndDrawRoute (VERSIÓN "MOTOR" - SIMPLE Y CORRECTA)
-// RESUMEN: Esta función ahora actúa como un "motor" que siempre confía en el
-//          array global `navigationWaypoints` como la única fuente de la verdad.
-//          La lógica compleja para manejar desvíos ya ha sido aplicada a ese array.
-//===================================================================
+/ ===================================================================
+// NOMBRE: recalculateAndDrawRoute (VERSIÓN FINAL CON RECUPERACIÓN VISUAL)
+// ===================================================================
 async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recoveryInfo = null) {
     const RETRY_CADENCE_MS = 3000;
     const MAX_RETRIES = 5;
     let attempt = 1;
+
+    // Si no es una recuperación, guardamos la ruta actual. Si es recuperación, usaremos la guardada en `recoveryInfo`.
+    const previousRoute = recoveryInfo ? { geometry: recoveryInfo.previousRouteGeometry } : navigationCurrentRouteData?.routes?.[0];
+    const previousRouteDistance = recoveryInfo ? recoveryInfo.lastCarDistanceAlongRoute : lastCarDistanceAlongRouteForNavLogic;
+
+    const wasNavigatingBeforeRecalc = isNavigating;
 
     while (attempt <= MAX_RETRIES) {
         isRecalculatingRoute = true;
@@ -5394,11 +5397,20 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recover
         const toastId = `recalc-toast-${Date.now()}`;
         showToast(`Calculando ruta... (Intento ${attempt}/${MAX_RETRIES})`, "info", 0, false, toastId);
 
-        const wasNavigatingBeforeRecalc = isNavigating;
-
         try {
-            // Usa directamente el array global `navigationWaypoints` como la fuente de la verdad.
-            const waypointsForAPI = navigationWaypoints; 
+            const recalcStartPoint = {
+                id: Date.now(),
+                lat: navigationCurrentLocation.latitude,
+                lng: navigationCurrentLocation.longitude,
+                address: 'Posición de Recálculo',
+                isRecalculatedStart: true,
+                visited: true
+            };
+            const futureWaypoints = navigationWaypoints.filter(wp => 
+                wp && !wp.visited && !wp.isInternal && !wp.isRecalculatedStart
+            );
+            const waypointsForAPI = [recalcStartPoint, ...futureWaypoints];
+            
             let currentHeading = navigationCurrentLocation ? navigationCurrentLocation.heading : null;
             
             const validWaypoints = waypointsForAPI.filter(wp => wp && typeof wp.lat === 'number' && typeof wp.lng === 'number');
@@ -5416,11 +5428,31 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recover
             const newRouteData = result.routeData;
             const newRemainingRoute = newRouteData.routes[0];
 
+            const visualRoute = JSON.parse(JSON.stringify(newRemainingRoute));
+
+            // --- LÓGICA DE UNIÓN MEJORADA ---
+            if (previousRoute && previousRoute.geometry && previousRouteDistance > 0) {
+                try {
+                    const previousRouteLine = turf.lineString(previousRoute.geometry.coordinates);
+                    const startOfOldRoute = turf.point(previousRouteLine.geometry.coordinates[0]);
+                    const pointOnOldRoute = turf.along(previousRouteLine, previousRouteDistance / 1000, { units: 'kilometers' });
+                    const pastSegment = turf.lineSlice(startOfOldRoute, pointOnOldRoute, previousRouteLine);
+                    
+                    const pastCoords = pastSegment.geometry.coordinates;
+                    const newCoords = visualRoute.geometry.coordinates;
+                    
+                    visualRoute.geometry.coordinates = [...pastCoords.slice(0, -1), ...newCoords];
+                } catch (e) {
+                    console.warn("No se pudo reconstruir el tramo pasado de la ruta. Error:", e);
+                }
+            }
+            // --- FIN LÓGICA DE UNIÓN ---
+
             navigationCurrentRouteData = newRouteData;
             precalculateRouteStepDistances(navigationCurrentRouteData);
             generateAndCacheCleanManeuverList(newRemainingRoute, navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart));
             
-            await drawRouteOnMap(newRemainingRoute);
+            await drawRouteOnMap(visualRoute);
             
             let carDistanceOnNewLine = 0;
             let startLegIndex = 0;
@@ -5519,12 +5551,13 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recover
         }
         attempt++; 
     }
-}
-    
+}    
+
+
 // ===================================================================
-// NOMBRE: initiateControlledReload (VERSIÓN CORRECTA QUE GUARDA EL HISTORIAL COMPLETO)
+// NOMBRE: initiateControlledReload (VERSIÓN FINAL CON ESTADO DE PROGRESO)
 // RESUMEN: Guarda el estado completo del viaje, incluyendo la lista `navigationWaypoints`
-//          que ya contiene todos los puntos de desvío permanentes.
+//          y la distancia exacta recorrida para una reconstrucción visual perfecta.
 //===================================================================
 async function initiateControlledReload() {
     if (isPerformingControlledReload) return;
@@ -5536,10 +5569,17 @@ async function initiateControlledReload() {
             if (recoveryFlagJSON) {
                 const recoveryData = JSON.parse(recoveryFlagJSON);
                 
-                // Simplemente guardamos la lista de waypoints actual, que ya es la "fuente de la verdad"
-                // y contiene todos los puntos de desvío.
                 recoveryData.route.waypoints = sanitizeWaypointsForStorage(navigationWaypoints);
                 
+                // --- INICIO DE LA CORRECCIÓN ---
+                // Guardamos la distancia exacta recorrida para reconstruir la ruta visual
+                recoveryData.lastCarDistanceAlongRoute = lastCarDistanceAlongRouteForNavLogic;
+                // Guardamos la ruta completa actual para tener la geometría 'pasada'
+                if(navigationCurrentRouteData?.routes?.[0]) {
+                    recoveryData.previousRouteGeometry = navigationCurrentRouteData.routes[0].geometry;
+                }
+                // --- FIN DE LA CORRECCIÓN ---
+
                 if (navigationCurrentLocation) {
                     recoveryData.lastKnownLocation = navigationCurrentLocation;
                 }
