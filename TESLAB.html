@@ -6918,12 +6918,11 @@ function precalculateRouteStepDistances(routeData) {
     }
 }            
 
-
 //===================================================================
-// NOMBRE: recalculateAndDrawRoute (VERSIÓN MODIFICADA - CON LÓGICA DE DESVÍO MEJORADA)
-// RESUMEN: Contiene la nueva lógica para reconstruir la ruta tras un desvío,
-//          insertando un punto de paso invisible en la ubicación actual para forzar
-//          una ruta continua que preserve el trazado ya recorrido.
+// NOMBRE: recalculateAndDrawRoute (VERSIÓN FINAL DEFINITIVA)
+// RESUMEN: Contiene la lógica completa para recalcular la ruta tras un desvío o recuperación,
+//          preservando el estado del viaje (posición del coche y estadísticas) al
+//          calcular la nueva posición sobre la geometría recalculada.
 //===================================================================
 async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recoveryInfo = null) {
     const RETRY_CADENCE_MS = 3000;
@@ -6987,7 +6986,7 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recover
                 waypointsForAPI = [...navigationWaypoints];
                 currentHeading = null;
             
-            } else { // Este es el path para un desvío estándar durante la navegación
+            } else { 
                 if (navigationCurrentLocation) {
                     currentHeading = navigationCurrentLocation.heading;
 
@@ -7005,7 +7004,6 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recover
                     waypointsForAPI = [...waypointsBefore, invisibleWaypoint, ...waypointsAfter];
                 
                 } else {
-                    // Fallback improbable, pero seguro
                     waypointsForAPI = [...navigationWaypoints];
                 }
             }
@@ -7032,29 +7030,58 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recover
             
             await drawRouteOnMap(newRemainingRoute);
             
-            const isRadaresRutaActive = document.getElementById('radares-ruta-checkbox').checked;
+            let carDistanceOnNewLine = 0;
+            let startLegIndex = 0;
+            let startStepIndex = 0;
 
-            if (isRadaresRutaActive) {
-                let reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
-                const originalLength = reminders.length;
-                reminders = reminders.filter(r => !r.isDynamicRadar);
-                if (reminders.length < originalLength) {
-                    localStorage.setItem('reminders', JSON.stringify(reminders));
-                    markCacheAsDirty();
+            if ((isNavigating || recoveryInfo) && navigationCurrentLocation) {
+                const carPoint = turf.point([navigationCurrentLocation.longitude, navigationCurrentLocation.latitude]);
+                const newRouteLine = turf.lineString(newRemainingRoute.geometry.coordinates);
+                carDistanceOnNewLine = turf.nearestPointOnLine(newRouteLine, carPoint, { units: 'meters' }).properties.location;
+    
+                // Ahora, encuentra la etapa y el paso correctos para esta nueva distancia
+                let cumulativeDistance = 0;
+                let legFound = false;
+                for (let i = 0; i < newRemainingRoute.legs.length; i++) {
+                    const leg = newRemainingRoute.legs[i];
+                    if (!leg) continue;
+                    if (carDistanceOnNewLine <= cumulativeDistance + leg.distance + 0.1) {
+                        startLegIndex = i;
+                        let legDistanceTraveled = 0;
+                        for (let j = 0; j < leg.steps.length; j++) {
+                            const step = leg.steps[j];
+                            if (carDistanceOnNewLine <= cumulativeDistance + legDistanceTraveled + step.distance + 0.1) {
+                                startStepIndex = j;
+                                legFound = true;
+                                break;
+                            }
+                            legDistanceTraveled += step.distance;
+                        }
+                        if (legFound) break;
+                    }
+                    cumulativeDistance += leg.distance;
                 }
             }
-            
+
             if (preserveAccumulatedStats) {
-                accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
+                // Las estadísticas como tiempo de inicio y km totales ya se mantienen.
+                // No es necesario tocarlas.
             } else {
                 accumulatedDistanceBeforeCurrentSegment = 0;
                 navigationStartTimeForStats = new Date();
                 originalTripEtaTime = null;
             }
             
-            lastCarDistanceAlongRouteForNavLogic = 0;
-            currentLegIndexNav = 0;
-            currentStepIndexNav = 0;
+            // Actualizamos el estado de navegación con los valores calculados, en lugar de resetear a cero.
+            lastCarDistanceAlongRouteForNavLogic = carDistanceOnNewLine;
+            currentLegIndexNav = startLegIndex;
+            currentStepIndexNav = startStepIndex;
+            
+            // Si estábamos simulando, actualizamos también la distancia de la simulación.
+            if (wasSimulatingBeforeRecalc || (isSimulatingGpsLocation && automatedSimulationIntervalId)) {
+                simulatedDistanceAlongRoute = carDistanceOnNewLine;
+            }
+           
             previousLegIndexForEta = 0;
             lastProcessedStepIdentifier = null;
             lastProcessedStepForLock = null;
@@ -7066,13 +7093,13 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recover
             } else {
                 currentStageInitialExpectedEtaTime = null;
             }
-
+            
             rebuildProcessedRemindersCache();
             
             renderWaypointMarkers();
-            updateNavigationProgressDisplay(newRemainingRoute, 0); 
+            updateNavigationProgressDisplay(newRemainingRoute, lastCarDistanceAlongRouteForNavLogic); 
             drawStaticMarkersOnProgressBar();
-            updateTurnByTurnDisplay(newRemainingRoute, 0);
+            updateTurnByTurnDisplay(newRemainingRoute, lastCarDistanceAlongRouteForNavLogic);
             showDestinationName();
             toggleRadaresRuta(document.getElementById('radares-ruta-checkbox').checked);
             toggleTareasRuta(document.getElementById('tareas-ruta-checkbox').checked);
@@ -7108,7 +7135,6 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recover
         attempt++; 
     }
 }
-    
     
 // ===================================================================
 // NOMBRE: checkAndIncrementPoiCount 
