@@ -1,4 +1,4 @@
-V07
+V08
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -8714,9 +8714,11 @@ function handleAddRadarHereClick(button) {
     });
 }
 
-// ===================================================================
-// RESUMEN: Gestiona la lógica de omisión de etapas y luego dispara el recálculo.
-//          Ya NO modifica la lista de waypoints directamente; esa responsabilidad
+/ ===================================================================
+// NOMBRE: proceedWithRecalculation (VERSIÓN CON PUNTOS DE DESVÍO PERMANENTES)
+// RESUMEN: Al confirmar un desvío, añade la ubicación actual como un waypoint
+//          permanente, invisible y visitado a la lista de `navigationWaypoints`.
+//          Esto asegura que la historia del desvío se preserve en futuros recálculos y recargas.
 // ===================================================================
 async function proceedWithRecalculation(action) {
     if (!isNavigating || !navigationCurrentLocation) {
@@ -8724,7 +8726,33 @@ async function proceedWithRecalculation(action) {
         return;
     }
 
-    // Gestiona la lógica para omitir etapas si el usuario lo eligió
+    // 1. Añadir el punto de desvío actual a la lista de waypoints de forma permanente
+    const deviationWaypoint = {
+        id: Date.now() + Math.random(),
+        lat: navigationCurrentLocation.latitude,
+        lng: navigationCurrentLocation.longitude,
+        type: 'internal',
+        label: '',
+        address: 'Punto de desvío',
+        visited: true, // Se marca como visitado inmediatamente
+        isInternal: true,
+        isDeviationPoint: true, // Nueva bandera para identificarlo y hacerlo invisible
+        isRecalculatedStart: false,
+        isCriticalForRecalc: true
+    };
+    
+    let lastVisitedIndex = -1;
+    navigationWaypoints.forEach((wp, index) => {
+        // Buscamos el último punto visitado, sea una etapa real o un desvío anterior
+        if (wp && wp.visited) {
+            lastVisitedIndex = index;
+        }
+    });
+    
+    // Insertamos el nuevo punto de desvío justo después del último punto conocido
+    navigationWaypoints.splice(lastVisitedIndex + 1, 0, deviationWaypoint);
+
+    // 2. Lógica para omitir etapas (si el usuario lo eligió)
     if (action === 'skip_one') {
         const nextUnvisitedStageIndex = navigationWaypoints.findIndex(wp => wp && !wp.isInternal && !wp.isRecalculatedStart && !wp.visited && wp.type !== 'S' && wp.type !== 'S_Recalc' && wp.type !== 'F');
         if (nextUnvisitedStageIndex !== -1) {
@@ -8756,10 +8784,11 @@ async function proceedWithRecalculation(action) {
         }
     }
     
-    // Simplemente llama a la función de recálculo, que ahora es responsable de construir la lista de waypoints
+    // 3. Proceder con el recálculo usando la lista de waypoints ahora modificada
     await recalculateAndDrawRoute(true);
-}    
+}
 
+    
 // ===================================================================
 // NOMBRE: renderWaypointMarkers (VERSIÓN OPTIMIZADA - CON PUNTOS DE DESVÍO INVISIBLES)
 // RESUMEN: Actualiza los marcadores de etapa, pero ignora explícitamente la creación
@@ -8898,11 +8927,11 @@ function renderWaypointMarkers() {
 }
 
 //===================================================================
-// NOMBRE: recalculateAndDrawRoute (VERSIÓN RESTAURADA Y DEFINITIVA)
-// RESUMEN: Vuelve a la estructura robusta que diferencia entre escenarios.
-//          Al detectar un desvío, construye una lista de waypoints temporal que
-//          incluye la posición actual como punto invisible, garantizando una ruta continua
-//          y la preservación del estado de navegación/simulación.
+// NOMBRE: recalculateAndDrawRoute (VERSIÓN SIMPLIFICADA Y ROBUSTA)
+// RESUMEN: Esta función ahora actúa como un "motor" que siempre confía en el
+//          array global `navigationWaypoints` como la fuente de la verdad.
+//          La lógica compleja para manejar desvíos ya ha sido aplicada a ese array
+//          por otras funciones (`proceedWithRecalculation`, `initiateControlledReload`).
 //===================================================================
 async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recoveryInfo = null) {
     const RETRY_CADENCE_MS = 3000;
@@ -8921,82 +8950,26 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recover
         const wasNavigatingBeforeRecalc = isNavigating;
 
         try {
-            let waypointsForAPI = [];
-            let currentHeading = null;
-            
-            // ===================================================================
-            // INICIO DE LA LÓGICA DE ESCENARIOS
-            // ===================================================================
+            // La única lógica de construcción de waypoints que queda es para el caso especial de recuperación.
+            // Para todos los demás casos (planificación, desvío), simplemente usamos el array global.
+            let waypointsForAPI = navigationWaypoints; 
+            let currentHeading = navigationCurrentLocation ? navigationCurrentLocation.heading : null;
+
             if (recoveryInfo) {
-                // ESCENARIO 1: Recuperación tras recarga de página
+                // Solo en recuperación construimos una lista especial para asegurar la máxima precisión
                 const currentPos = await getGpsWithRetries();
                 currentHeading = currentPos.heading;
-                
-                if (!recoveryInfo.isRichRecovery) {
-                    const tempRouteUrl = `${OSRM_SERVICE_URL}/driving/${navigationWaypoints.map(wp => `${wp.lng},${wp.lat}`).join(';')}?overview=full&geometries=geojson&steps=true`;
-                    const tempRouteResponse = await fetch(tempRouteUrl);
-                    const tempRouteData = await tempRouteResponse.json();
-                    
-                    if (tempRouteData.code === 'Ok' && tempRouteData.routes.length > 0) {
-                        const originalRouteLine = turf.lineString(tempRouteData.routes[0].geometry.coordinates);
-                        const carPoint = turf.point([currentPos.longitude, currentPos.latitude]);
-                        const carDistanceAlongOriginalRoute = turf.nearestPointOnLine(originalRouteLine, carPoint, { units: 'meters' }).properties.location;
-                        
-                        let cumulativeDistance = 0;
-                        tempRouteData.routes[0].legs.forEach((leg, legIndex) => {
-                            if (navigationWaypoints[legIndex + 1]) {
-                                if (cumulativeDistance + leg.distance < carDistanceAlongOriginalRoute) {
-                                    navigationWaypoints[legIndex + 1].visited = true;
-                                }
-                                cumulativeDistance += leg.distance;
-                            }
-                        });
-                    }
-                }
-                
                 let lastVisitedIndex = -1;
                 navigationWaypoints.forEach((wp, index) => {
                     if (wp && wp.visited && !wp.isInternal) {
                         lastVisitedIndex = index;
                     }
                 });
-                
                 const waypointsBefore = navigationWaypoints.slice(0, lastVisitedIndex + 1);
                 const waypointsAfter = navigationWaypoints.slice(lastVisitedIndex + 1);
                 const invisibleWaypoint = { lat: currentPos.latitude, lng: currentPos.longitude, isInternal: true };
                 waypointsForAPI = [...waypointsBefore, invisibleWaypoint, ...waypointsAfter];
-
-            } else if (!isNavigating) {
-                // ESCENARIO 2: Planificación de ruta (no se está navegando)
-                waypointsForAPI = [...navigationWaypoints];
-                currentHeading = null;
-            
-            } else {
-                // ESCENARIO 3: Desvío durante la navegación
-                if (navigationCurrentLocation) {
-                    currentHeading = navigationCurrentLocation.heading;
-
-                    let lastVisitedIndex = -1;
-                    navigationWaypoints.forEach((wp, index) => {
-                        if (wp && wp.visited && !wp.isInternal) {
-                            lastVisitedIndex = index;
-                        }
-                    });
-                    
-                    const waypointsBefore = navigationWaypoints.slice(0, lastVisitedIndex + 1);
-                    const waypointsAfter = navigationWaypoints.slice(lastVisitedIndex + 1);
-                    const invisibleWaypoint = { lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude, isInternal: true };
-                    
-                    waypointsForAPI = [...waypointsBefore, invisibleWaypoint, ...waypointsAfter];
-                
-                } else {
-                    // Fallback improbable
-                    waypointsForAPI = [...navigationWaypoints];
-                }
             }
-            // ===================================================================
-            // FIN DE LA LÓGICA DE ESCENARIOS
-            // ===================================================================
             
             const validWaypoints = waypointsForAPI.filter(wp => wp && typeof wp.lat === 'number' && typeof wp.lng === 'number');
             if (validWaypoints.length < 2) { 
@@ -9116,8 +9089,7 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recover
         }
         attempt++; 
     }
-}
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              
+}                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          
 
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 // NOMBRE: findChargingPointsOnRoute 
