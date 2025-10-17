@@ -1,4 +1,4 @@
-V06
+V07
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -8715,10 +8715,8 @@ function handleAddRadarHereClick(button) {
 }
 
 // ===================================================================
-// NOMBRE: proceedWithRecalculation (VERSIÓN CON PUNTOS DE DESVÍO PERMANENTES)
-// RESUMEN: Al confirmar un desvío, añade la ubicación actual como un waypoint
-//          permanente, invisible y visitado a la lista de `navigationWaypoints`.
-//          Esto asegura que la historia del desvío se preserve en futuros recálculos y recargas.
+// RESUMEN: Gestiona la lógica de omisión de etapas y luego dispara el recálculo.
+//          Ya NO modifica la lista de waypoints directamente; esa responsabilidad
 // ===================================================================
 async function proceedWithRecalculation(action) {
     if (!isNavigating || !navigationCurrentLocation) {
@@ -8726,31 +8724,7 @@ async function proceedWithRecalculation(action) {
         return;
     }
 
-    // 1. Añadir el punto de desvío actual a la lista de waypoints de forma permanente
-    const deviationWaypoint = {
-        id: Date.now() + Math.random(),
-        lat: navigationCurrentLocation.latitude,
-        lng: navigationCurrentLocation.longitude,
-        type: 'internal',
-        label: '',
-        address: 'Punto de desvío',
-        visited: true, // Se marca como visitado inmediatamente
-        isInternal: true,
-        isDeviationPoint: true, // Nueva bandera para identificarlo
-        isRecalculatedStart: false,
-        isCriticalForRecalc: true
-    };
-    
-    let lastVisitedIndex = -1;
-    navigationWaypoints.forEach((wp, index) => {
-        if (wp && wp.visited && !wp.isInternal) {
-            lastVisitedIndex = index;
-        }
-    });
-    // Insertamos el punto de desvío después del último waypoint real visitado
-    navigationWaypoints.splice(lastVisitedIndex + 1, 0, deviationWaypoint);
-
-    // 2. Lógica para omitir etapas (si el usuario lo eligió)
+    // Gestiona la lógica para omitir etapas si el usuario lo eligió
     if (action === 'skip_one') {
         const nextUnvisitedStageIndex = navigationWaypoints.findIndex(wp => wp && !wp.isInternal && !wp.isRecalculatedStart && !wp.visited && wp.type !== 'S' && wp.type !== 'S_Recalc' && wp.type !== 'F');
         if (nextUnvisitedStageIndex !== -1) {
@@ -8782,9 +8756,9 @@ async function proceedWithRecalculation(action) {
         }
     }
     
-    // 3. Proceder con el recálculo
+    // Simplemente llama a la función de recálculo, que ahora es responsable de construir la lista de waypoints
     await recalculateAndDrawRoute(true);
-}
+}    
 
 // ===================================================================
 // NOMBRE: renderWaypointMarkers (VERSIÓN OPTIMIZADA - CON PUNTOS DE DESVÍO INVISIBLES)
@@ -8924,8 +8898,11 @@ function renderWaypointMarkers() {
 }
 
 //===================================================================
-// NOMBRE: recalculateAndDrawRoute (VERSIÓN SIMPLIFICADA)
-// RESUMEN: La lógica de desvío ahora es manejada por `proceedWithRecalculation`,
+// NOMBRE: recalculateAndDrawRoute (VERSIÓN RESTAURADA Y DEFINITIVA)
+// RESUMEN: Vuelve a la estructura robusta que diferencia entre escenarios.
+//          Al detectar un desvío, construye una lista de waypoints temporal que
+//          incluye la posición actual como punto invisible, garantizando una ruta continua
+//          y la preservación del estado de navegación/simulación.
 //===================================================================
 async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recoveryInfo = null) {
     const RETRY_CADENCE_MS = 3000;
@@ -8934,25 +8911,99 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recover
 
     while (attempt <= MAX_RETRIES) {
         isRecalculatingRoute = true;
-        clearAlternativeRoutesDisplay();
+        clearAlternativeRoutesDisplay(); 
         alternativeRoutesCache.clear();
         selectedStageRoutes.clear();
-
+        
         const toastId = `recalc-toast-${Date.now()}`;
         showToast(`Calculando ruta... (Intento ${attempt}/${MAX_RETRIES})`, "info", 0, false, toastId);
 
         const wasNavigatingBeforeRecalc = isNavigating;
 
         try {
-            let waypointsForAPI = navigationWaypoints; // <-- SIMPLIFICACIÓN: Usa siempre el array global
-            let currentHeading = navigationCurrentLocation ? navigationCurrentLocation.heading : null;
+            let waypointsForAPI = [];
+            let currentHeading = null;
+            
+            // ===================================================================
+            // INICIO DE LA LÓGICA DE ESCENARIOS
+            // ===================================================================
+            if (recoveryInfo) {
+                // ESCENARIO 1: Recuperación tras recarga de página
+                const currentPos = await getGpsWithRetries();
+                currentHeading = currentPos.heading;
+                
+                if (!recoveryInfo.isRichRecovery) {
+                    const tempRouteUrl = `${OSRM_SERVICE_URL}/driving/${navigationWaypoints.map(wp => `${wp.lng},${wp.lat}`).join(';')}?overview=full&geometries=geojson&steps=true`;
+                    const tempRouteResponse = await fetch(tempRouteUrl);
+                    const tempRouteData = await tempRouteResponse.json();
+                    
+                    if (tempRouteData.code === 'Ok' && tempRouteData.routes.length > 0) {
+                        const originalRouteLine = turf.lineString(tempRouteData.routes[0].geometry.coordinates);
+                        const carPoint = turf.point([currentPos.longitude, currentPos.latitude]);
+                        const carDistanceAlongOriginalRoute = turf.nearestPointOnLine(originalRouteLine, carPoint, { units: 'meters' }).properties.location;
+                        
+                        let cumulativeDistance = 0;
+                        tempRouteData.routes[0].legs.forEach((leg, legIndex) => {
+                            if (navigationWaypoints[legIndex + 1]) {
+                                if (cumulativeDistance + leg.distance < carDistanceAlongOriginalRoute) {
+                                    navigationWaypoints[legIndex + 1].visited = true;
+                                }
+                                cumulativeDistance += leg.distance;
+                            }
+                        });
+                    }
+                }
+                
+                let lastVisitedIndex = -1;
+                navigationWaypoints.forEach((wp, index) => {
+                    if (wp && wp.visited && !wp.isInternal) {
+                        lastVisitedIndex = index;
+                    }
+                });
+                
+                const waypointsBefore = navigationWaypoints.slice(0, lastVisitedIndex + 1);
+                const waypointsAfter = navigationWaypoints.slice(lastVisitedIndex + 1);
+                const invisibleWaypoint = { lat: currentPos.latitude, lng: currentPos.longitude, isInternal: true };
+                waypointsForAPI = [...waypointsBefore, invisibleWaypoint, ...waypointsAfter];
 
+            } else if (!isNavigating) {
+                // ESCENARIO 2: Planificación de ruta (no se está navegando)
+                waypointsForAPI = [...navigationWaypoints];
+                currentHeading = null;
+            
+            } else {
+                // ESCENARIO 3: Desvío durante la navegación
+                if (navigationCurrentLocation) {
+                    currentHeading = navigationCurrentLocation.heading;
+
+                    let lastVisitedIndex = -1;
+                    navigationWaypoints.forEach((wp, index) => {
+                        if (wp && wp.visited && !wp.isInternal) {
+                            lastVisitedIndex = index;
+                        }
+                    });
+                    
+                    const waypointsBefore = navigationWaypoints.slice(0, lastVisitedIndex + 1);
+                    const waypointsAfter = navigationWaypoints.slice(lastVisitedIndex + 1);
+                    const invisibleWaypoint = { lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude, isInternal: true };
+                    
+                    waypointsForAPI = [...waypointsBefore, invisibleWaypoint, ...waypointsAfter];
+                
+                } else {
+                    // Fallback improbable
+                    waypointsForAPI = [...navigationWaypoints];
+                }
+            }
+            // ===================================================================
+            // FIN DE LA LÓGICA DE ESCENARIOS
+            // ===================================================================
+            
             const validWaypoints = waypointsForAPI.filter(wp => wp && typeof wp.lat === 'number' && typeof wp.lng === 'number');
-            if (validWaypoints.length < 2) {
+            if (validWaypoints.length < 2) { 
                 const existingToast = document.getElementById(toastId);
                 if (existingToast) existingToast.remove();
                 isRecalculatingRoute = false;
-                return;
+                return; 
             };
 
             const coordsString = validWaypoints.map(wp => `${wp.lng},${wp.lat}`).join(';');
@@ -8964,7 +9015,6 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recover
 
             navigationCurrentRouteData = newRouteData;
             precalculateRouteStepDistances(navigationCurrentRouteData);
-
             generateAndCacheCleanManeuverList(newRemainingRoute, navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart));
             
             await drawRouteOnMap(newRemainingRoute);
@@ -9002,7 +9052,7 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recover
             }
 
             if (preserveAccumulatedStats) {
-                // Mantener estadísticas
+                // No se tocan las estadísticas
             } else {
                 accumulatedDistanceBeforeCurrentSegment = 0;
                 navigationStartTimeForStats = new Date();
@@ -9030,7 +9080,6 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recover
             }
             
             rebuildProcessedRemindersCache();
-            
             renderWaypointMarkers();
             updateNavigationProgressDisplay(newRemainingRoute, lastCarDistanceAlongRouteForNavLogic); 
             drawStaticMarkersOnProgressBar();
@@ -9040,13 +9089,9 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recover
             toggleTareasRuta(document.getElementById('tareas-ruta-checkbox').checked);
             updateStartNavigationButtonState();
             updateNavigationButtonColor();
-
             deviationCheckGracePeriodUntil = Date.now() + 7000;
             
-            // Si la llamada venía de un desvío, closeModalAndProceed ya fue llamada. Si no, se llama aquí.
-            if (!isDeviationModalActive) {
-                closeModalAndProceed(carDistanceOnNewLine);
-            }
+            closeModalAndProceed(carDistanceOnNewLine);
             return;
             
         } catch (error) {
@@ -9062,10 +9107,8 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recover
             const existingToast = document.getElementById(toastId);
             if (existingToast) existingToast.remove();
             activeToasts = activeToasts.filter(t => t.id !== toastId);
-
             isRecalculatingRoute = false;
             isNavigating = wasNavigatingBeforeRecalc; 
-            
             if (attempt > MAX_RETRIES) { 
                  updateStartNavigationButtonState();
                  updateNavigationButtonColor();
@@ -9074,7 +9117,6 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recover
         attempt++; 
     }
 }
-
                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               
 
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
