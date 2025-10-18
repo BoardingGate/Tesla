@@ -1,4 +1,3 @@
-
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -2082,11 +2081,11 @@ function toggleMapControls(enabled) {
     setNavigationMapClickHandler();
 }
 
-    
-// ===================================================================
-// NOMBRE: toggleNavigationState (MODIFICADO)
-// RESUMEN: Inicia/detiene la navegación y restaura la visibilidad de capas al finalizar.
-// ===================================================================
+
+// =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+// NOMBRE: toggleNavigationState (MODIFICADO - GUARDA RUTAS MANUALES EN RECIENTES)
+// RESUMEN: Ahora detecta si la ruta es manual y la guarda en el historial de recientes antes de iniciar la navegación.
+// =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 async function toggleNavigationState(isRecalculationStop = false, isRecovery = false) {
     const startNavButton = document.getElementById('start-navigation-button');
     const startNavImg = startNavButton ? startNavButton.querySelector('img') : null;
@@ -2138,24 +2137,23 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
             clearAlternativeRoutesDisplay();
             
             const waypointsForRecents = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
-            await Promise.all(waypointsForRecents.map(async (wp) => {
-                if (!wp.address) {
-                    wp.address = await getAddressForWaypoint(wp.lat, wp.lng);
-                }
-            }));
-            const lastWpForName = waypointsForRecents[waypointsForRecents.length - 1];
-            const isMultiStageForName = waypointsForRecents.length > 2;
-            const suggestedName = await getSuggestedRouteName(lastWpForName.lat, lastWpForName.lng, isMultiStageForName, waypointsForRecents.length);
             
-            let routeForStorage;
-            const finalWaypoint = waypointsForRecents[waypointsForRecents.length - 1];
-
-            if (currentRouteNameForSaving && currentRouteNameForSaving.startsWith("UBICACIÓN: ") && finalWaypoint) {
-                routeForStorage = { name: currentRouteNameForSaving, waypoints: sanitizeWaypointsForStorage([finalWaypoint]) };
-            } else {
-                routeForStorage = { name: currentRouteNameForSaving || suggestedName, waypoints: sanitizeWaypointsForStorage(waypointsForRecents) };
+            // Si la ruta no tiene un nombre guardado (es manual), lo generamos y la añadimos a recientes.
+            if (!currentRouteNameForSaving) {
+                await Promise.all(waypointsForRecents.map(async (wp) => {
+                    if (!wp.address) {
+                        wp.address = await getAddressForWaypoint(wp.lat, wp.lng);
+                    }
+                }));
+                const lastWpForName = waypointsForRecents[waypointsForRecents.length - 1];
+                const isMultiStageForName = waypointsForRecents.length > 2;
+                const suggestedName = await getSuggestedRouteName(lastWpForName.lat, lastWpForName.lng, isMultiStageForName, waypointsForRecents.length);
+                const routeForStorage = { 
+                    name: suggestedName, 
+                    waypoints: sanitizeWaypointsForStorage(waypointsForRecents) 
+                };
+                addRouteToRecents(routeForStorage);
             }
-            addRouteToRecents(routeForStorage);
             
             if (!isRecovery) {
                 clearNavigationGraph();
@@ -2185,7 +2183,10 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
 
             const recoveryData = { 
                 isActive: true, 
-                route: routeForStorage,
+                route: { // Guardamos la ruta que se está navegando para la recuperación
+                    name: currentRouteNameForSaving || 'Ruta Manual',
+                    waypoints: sanitizeWaypointsForStorage(waypointsForRecents)
+                },
                 tripStartTime: navigationStartTimeForStats ? navigationStartTimeForStats.getTime() : Date.now(),
                 originalTripEtaTime: originalTripEtaTime ? originalTripEtaTime.getTime() : null,
                 stats: {
@@ -2285,8 +2286,7 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
     setNavigationMapClickHandler(); 
     actualizarContadorRadares(radaresEnRutaActual.length);
     actualizarContadorTareas(tareasEnRutaActual.length);
-}   
-
+}
     
 // ===================================================================
 // NOMBRE: restoreTripProgress (VERSIÓN FINAL CON LÓGICA DE SIMULACIÓN CORREGIDA)
@@ -10483,8 +10483,9 @@ function animateMarkerAndMap(timestamp) {
 }
 
 // ===================================================================
-// NOMBRE: loadRouteFromObject (VERSIÓN FINAL CON LÓGICA DE "UBICACIÓN" CORREGIDA)
-// RESUMEN: Carga la ruta, detectando si es un destino único para crear una ruta desde la posición actual hasta ese punto.
+// NOMBRE: loadRouteFromObject (VERSIÓN FINAL CON LÓGICA DE DESTINO ÚNICO CORREGIDA)
+// RESUMEN: Carga la ruta, detectando si es un destino único para crear una ruta desde la posición actual hasta ese punto,
+// y maneja correctamente las rutas de solo dos puntos.
 // ===================================================================
 async function loadRouteFromObject(routeObject, autoStartNavigation = false, forceImmediateStart = false, recoveryInfo = null) {
     if (isRecalculatingRoute) {
@@ -10548,15 +10549,14 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
                 isRecalculatedStart: false
             };
             
-            const isSingleDestinationRoute = routeObject.name && routeObject.name.startsWith("UBICACIÓN: ") && routeObject.waypoints.length === 1;
-
-            if (isSingleDestinationRoute) {
-                // Si es una ruta de ubicación, creamos una nueva ruta desde el GPS hasta ese único punto.
-                const destinationWaypoint = routeObject.waypoints[0];
-                navigationWaypoints = [startPoint, ...sanitizeWaypointsForStorage([destinationWaypoint])];
+            const waypointsFromSavedRoute = routeObject.waypoints;
+            
+            if (waypointsFromSavedRoute.length === 1) {
+                // Caso: Es un destino único (ej. "CASA", "TRABAJO" o un POI guardado).
+                navigationWaypoints = [startPoint, ...sanitizeWaypointsForStorage(waypointsFromSavedRoute)];
             } else {
-                // Lógica original para rutas de múltiples etapas: se reemplaza el primer punto por el GPS.
-                const remainingWaypoints = routeObject.waypoints.slice(1);
+                // Caso: Es una ruta con múltiples etapas. Se reemplaza el punto de partida original.
+                const remainingWaypoints = waypointsFromSavedRoute.slice(1);
                 navigationWaypoints = [startPoint, ...sanitizeWaypointsForStorage(remainingWaypoints)];
             }
         }
@@ -10611,7 +10611,7 @@ async function loadRouteFromObject(routeObject, autoStartNavigation = false, for
         updateStartNavigationButtonState();
         updateNavigationButtonColor();
     }
-}    
+}
     
 // ===================================================================
 // NOMBRE: startAutomatedRouteSimulation (VERSIÓN CON LÓGICA DE RECUPERACIÓN CORREGIDA)
@@ -22988,7 +22988,7 @@ Analiza la petición del usuario y decide qué capacidad usar. Actúa con decisi
 }
 
 // ===================================================================
-// NOMBRE: renderAiResponse (CORREGIDA - CON INSERCIÓN EN RUTA ACTIVA)
+// NOMBRE: renderAiResponse 
 // RESUMEN: Procesa la respuesta de la IA. Si se está navegando, inserta los nuevos puntos en la ruta actual. Si no, carga una nueva ruta.
 // ===================================================================
 function renderAiResponse(aiText, originalUserPrompt) {
@@ -23071,7 +23071,7 @@ function renderAiResponse(aiText, originalUserPrompt) {
             } else {
                 const finalRouteName = routeTitle ? `Ruta IA: ${routeTitle}` : `Ruta IA: ${new Date().toLocaleDateString()}`;
                 const routeObject = { name: finalRouteName, waypoints: waypoints };
-                
+                addRouteToRecents(routeObject);
                 loadRouteFromObject(routeObject, true);
                 if(aiModal) aiModal.classList.add('hidden');
             }
