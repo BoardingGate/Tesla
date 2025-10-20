@@ -234,6 +234,12 @@
                 </button>
                  <button id="toggle-simulate-gps-button" class="reminders-map-button-action" title="Activar/Desactivar Simulación GPS (recorrido o clic)"><img src="PNG/GPS.PNG" alt="Simular Recorrido"></button>
                 <button id="simulate-route-button" class="reminders-map-button-action" title="Simular interacciones de ruta"><img src="PNG/SIMULAR.PNG" alt="Simular Ruta"></button>
+                
+                 <button id="range-calculator-button" class="reminders-map-button-action" title="Calcular radio de acción">
+                    <img src="PNG/radio.png" alt="Calcular Radio">
+                </button>
+
+                 
              </div>
              <div class="button-row" id="search-row-map-header"> 
                 <button id="ai-route-planner-button" class="reminders-map-button-action" title="Asistente IA para crear rutas">  <img src="PNG/IA.PNG" alt="Asistente IA"></button>
@@ -621,6 +627,46 @@
         <p class="recovery-text">Reanudando navegación...</p>
     </div>    
     
+</div>
+
+<div id="range-calc-modal" class="hidden">
+    <div class="range-calc-content">
+        <h2>Calculador de Radio de Acción</h2>
+        <div class="modal-body">
+            <div class="form-group">
+                <label for="rc-capacity">Capacidad Batería (kWh):</label>
+                <input type="number" id="rc-capacity" value="75" step="0.1">
+            </div>
+            <div class="form-group">
+                <label for="rc-charge">% Carga Actual:</label>
+                <input type="number" id="rc-charge" value="80" min="0" max="100">
+            </div>
+            <div class="form-group">
+                <label for="rc-consumption">Consumo Medio (Wh/km):</label>
+                <input type="number" id="rc-consumption" value="165">
+            </div>
+            <div class="form-group">
+                <label for="rc-reserve">% Reserva en Destino:</label>
+                <input type="number" id="rc-reserve" value="10" min="0" max="100">
+            </div>
+            <div class="form-group checkbox-group">
+                <input type="checkbox" id="rc-round-trip">
+                <label for="rc-round-trip">Calcular Ida y Vuelta</label>
+            </div>
+            <div class="form-group info-text-group" style="grid-column: 1 / -1;">
+                <p style="font-size: 0.8rem; color: #8e8e93; text-align: center; margin-top: 0.5rem;">
+                    (*) Si tiene una ruta cargada se estima el radio desde la salida, 
+                    sino puede indicar el punto de salida de cálculo dando una pulsación 
+                    larga en el mapa (puede pulsar en varios sitios en la misma sesión). 
+                    El cálculo es una estimación que tiene en cuenta el desnivel del terreno. 
+                </p>
+            </div>
+        </div>
+        <div class="modal-footer">
+            <button id="rc-start-calculation">Situar punto y Calcular</button>
+            <button id="rc-cancel">Cancelar</button>
+        </div>
+    </div>
 </div>
 
     
@@ -1136,7 +1182,11 @@
     let memoryCheckGracePeriodUntil = 0;
     let isAddingWaypointsDuringNav = false;
     let minimapForceShowUntil = 0;
-    
+
+    let isRangeCalcModeActive = false;
+    let longPressTimer = null;
+    let currentRangeCalcParams = {};
+
     const easeInOutQuad = t => t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
    
     const managedKeys = [ 
@@ -3283,7 +3333,261 @@ function applyLayerVisibility() {
     });
 }
 
+//=========== FUNCIONES CALCULO RADIO CONSUMO ======================
+//=========== FUNCIONES CALCULO RADIO CONSUMO ======================    
+function toggleRangeCalcMode() {
+    if (isRangeCalcModeActive) {
+        deactivateRangeCalcMode();
+    } else {
+        showRangeCalcModal();
+    }
+}
+
+
+function activateRangeCalcMode() {
+    isRangeCalcModeActive = true;
+    const button = document.getElementById('range-calculator-button');
+    if (button) button.classList.add('active');
+    
+    const hasRoute = navigationWaypoints.filter(wp => wp && !wp.isInternal).length >= 2;
+    if (!hasRoute) {
+        showToast("Modo 'Radio de Acción' activado. Haz una PULSACIÓN LARGA en el mapa para fijar el punto de partida.", "info", 6000);
+    }
+}
+
+
+function clearRangeCircleFromMap() {
+    if (navigationMapInstance) {
+        if (navigationMapInstance.getLayer('range-polygon-layer')) {
+            navigationMapInstance.removeLayer('range-polygon-layer');
+        }
+        if (navigationMapInstance.getLayer('range-polygon-outline')) {
+            navigationMapInstance.removeLayer('range-polygon-outline');
+        }
+        if (navigationMapInstance.getSource('range-polygon-source')) {
+            navigationMapInstance.removeSource('range-polygon-source');
+        }
+    }
+}
+
+async function calculateAndDrawRangeCircle(startPoint) {
+    if (!startPoint) {
+        showToast("Punto de partida no definido.", "error");
+        return;
+    }
+    showToast("Calculando radio de acción (considerando desnivel y carreteras)...", "info", 0, false, "range-calc-toast");
+    clearRangeCircleFromMap();
+
+    // LEEMOS LOS PARÁMETROS DE LA VARIABLE GLOBAL, NO DE LOCALSTORAGE
+    const params = currentRangeCalcParams;
+
+    // *** LÍNEA DE DEPURACIÓN: Comprueba en la consola de Eruda qué valores se están usando ***
+    console.log("Calculando rango con los siguientes parámetros:", params);
+
+    const usableChargePercent = params.charge - params.reserve;
+    if (usableChargePercent <= 0) {
+        showToast("No hay suficiente carga para calcular un radio de acción.", "warning");
+        document.getElementById("range-calc-toast")?.remove();
+        return;
+    }
+    
+    // 1. CALCULAR LA ENERGÍA TOTAL DISPONIBLE
+    const totalAvailableEnergyKWh = params.capacity * (usableChargePercent / 100);
+    
+    // 2. AJUSTAR EL PRESUPUESTO DE ENERGÍA SI ES IDA Y VUELTA (LA LÓGICA CORRECTA)
+    let energyBudgetForCalc = totalAvailableEnergyKWh;
+    if (params.isRoundTrip) {
+        energyBudgetForCalc = totalAvailableEnergyKWh / 2;
+    }
+    
+    const consumptionKwhPerKm = params.consumptionWhKm / 1000;
+    const tortuosityFactor = 1.50;
+    const theoreticalRoadRangeKm = (consumptionKwhPerKm > 0) ? (energyBudgetForCalc / consumptionKwhPerKm) : 0;
+    const baseRangeKm = theoreticalRoadRangeKm / tortuosityFactor;
+
+    if (baseRangeKm <= 0) {
+        showToast("Con los parámetros actuales, el rango de acción es cero.", "warning");
+        document.getElementById("range-calc-toast")?.remove();
+        return;
+    }
+    
+    const startPointTurf = turf.point([startPoint.lng, startPoint.lat]);
+    const numRays = 50;
+    const sampleIntervalKm = 2;
+    const elevationFactor = 1.5;
+    const regenerationFactor = 0.65;
+
+    const rayPromises = [];
+    
+    for (let i = 0; i < numRays; i++) {
+        const bearing = i * (360 / numRays);
+        
+        const processRay = async () => {
+            let lastValidPoint = startPointTurf;
+            let totalPositiveElevation = 0;
+            let totalNegativeElevation = 0;
+            let lastElevation = navigationMapInstance.queryTerrainElevation({ lng: startPoint.lng, lat: startPoint.lat });
+
+            for (let dist = sampleIntervalKm; dist <= baseRangeKm * 1.5; dist += sampleIntervalKm) {
+                const currentPoint = turf.destination(startPointTurf, dist, bearing, { units: 'kilometers' });
+                const currentCoords = currentPoint.geometry.coordinates;
+                const currentElevation = navigationMapInstance.queryTerrainElevation({ lng: currentCoords[0], lat: currentCoords[1] });
+                
+                if (currentElevation !== null && lastElevation !== null) {
+                    const elevationChange = currentElevation - lastElevation;
+                    if (elevationChange > 0) {
+                        totalPositiveElevation += elevationChange;
+                    } else {
+                        totalNegativeElevation += Math.abs(elevationChange);
+                    }
+                }
+                lastElevation = currentElevation;
+
+                const roadDistanceKm = dist * tortuosityFactor;
+                const consumptionDistanceKWh = roadDistanceKm * consumptionKwhPerKm;
+                const consumptionElevationKWh = ((totalPositiveElevation / 100) * elevationFactor) - ((totalNegativeElevation / 100) * elevationFactor * regenerationFactor);
+                const totalConsumptionKWh = consumptionDistanceKWh + consumptionElevationKWh;
+                
+                if (totalConsumptionKWh > energyBudgetForCalc) {
+                    return lastValidPoint.geometry.coordinates;
+                }
+                lastValidPoint = currentPoint;
+            }
+            return lastValidPoint.geometry.coordinates;
+        };
+        rayPromises.push(processRay());
+    }
+
+    const points = await Promise.all(rayPromises);
+    points.push(points[0]); // Cerrar el polígono
+
+    const rangePolygon = turf.polygon([points]);
+    
+    document.getElementById("range-calc-toast")?.remove();
+    showToast("Radio de acción calculado.", "success");
+    drawRangePolygon(rangePolygon);
+}
+    
+function showRangeCalcModal() {
+    closeOtherModals('range-calc-modal');
+    const modal = document.getElementById('range-calc-modal');
+    if (!modal) return;
+
+    deactivateRangeCalcMode();
+
+    // Cargar valores guardados
+    document.getElementById('rc-capacity').value = localStorage.getItem('rc_capacity') || '75';
+    document.getElementById('rc-charge').value = localStorage.getItem('rc_charge') || '80';
+    document.getElementById('rc-consumption').value = localStorage.getItem('rc_consumption') || '165';
+    document.getElementById('rc-reserve').value = localStorage.getItem('rc_reserve') || '10';
+    document.getElementById('rc-round-trip').checked = localStorage.getItem('rc_round_trip') === 'true';
+    
+    modal.classList.remove('hidden');
+
+    document.getElementById('rc-start-calculation').onclick = () => {
+        // 1. Recoger todos los parámetros en un objeto
+        const params = {
+            capacity: parseFloat(document.getElementById('rc-capacity').value),
+            charge: parseFloat(document.getElementById('rc-charge').value),
+            consumptionWhKm: parseFloat(document.getElementById('rc-consumption').value),
+            reserve: parseFloat(document.getElementById('rc-reserve').value),
+            isRoundTrip: document.getElementById('rc-round-trip').checked
+        };
+
+        if (isNaN(params.capacity) || isNaN(params.charge) || isNaN(params.consumptionWhKm) || isNaN(params.reserve)) {
+            showToast("Por favor, rellena todos los campos con valores numéricos.", "error");
+            return;
+        }
+
+        // 2. Guardar en localStorage para la próxima vez
+        localStorage.setItem('rc_capacity', params.capacity);
+        localStorage.setItem('rc_charge', params.charge);
+        localStorage.setItem('rc_consumption', params.consumptionWhKm);
+        localStorage.setItem('rc_reserve', params.reserve);
+        localStorage.setItem('rc_round_trip', params.isRoundTrip);
+        
+        // 3. Guardar en la variable global para uso inmediato
+        currentRangeCalcParams = params;
+        
+        modal.classList.add('hidden');
+        setMapImmersiveMode(true);
+
+        const hasRoute = navigationWaypoints.filter(wp => wp && !wp.isInternal).length >= 2;
+        if (hasRoute) {
+            const startPoint = navigationWaypoints[0];
+            showToast("Calculando radio desde el inicio de la ruta actual...", "info");
+            calculateAndDrawRangeCircle({ lat: startPoint.lat, lng: startPoint.lng }); // Ya no pasamos params aquí, los cogerá de la variable global
+        } else {
+            activateRangeCalcMode();
+        }
+    };
+
+    document.getElementById('rc-cancel').onclick = () => {
+        modal.classList.add('hidden');
+    };
+}
+    
+function deactivateRangeCalcMode() {
+    isRangeCalcModeActive = false;
+    const button = document.getElementById('range-calculator-button');
+    if (button) button.classList.remove('active');
+    clearRangeCircleFromMap();
+    
+    setMapImmersiveMode(false); // Desactiva el modo inmersivo al salir
    
+    showToast("Modo 'Radio de Acción' desactivado.", "info");
+}
+
+function drawRangePolygon(polygonGeoJSON) {
+    if (!navigationMapInstance || !navigationMapInstance.isStyleLoaded()) return;
+
+    navigationMapInstance.addSource('range-polygon-source', {
+        type: 'geojson',
+        data: polygonGeoJSON
+    });
+
+    navigationMapInstance.addLayer({
+        id: 'range-polygon-layer',
+        type: 'fill',
+        source: 'range-polygon-source',
+        paint: {
+            'fill-color': '#FFD700',
+            'fill-opacity': 0.25
+        }
+    });
+
+    navigationMapInstance.addLayer({
+        id: 'range-polygon-outline',
+        type: 'line',
+        source: 'range-polygon-source',
+        paint: {
+            'line-color': '#FFD700',
+            'line-width': 2,
+            'line-opacity': 0.7
+        }
+    });
+
+    const coordinates = polygonGeoJSON.geometry.coordinates[0];
+    const bounds = new mapboxgl.LngLatBounds(
+        coordinates[0],
+        coordinates[0]
+    );
+
+    for (const coord of coordinates) {
+        bounds.extend(coord);
+    }
+
+    if (!bounds.isEmpty()) {
+        navigationMapInstance.fitBounds(bounds, {
+            padding: { top: 80, bottom: 80, left: 80, right: 80 }, // Añade un margen
+            duration: 1000 // Animación suave
+        });
+    }
+ }
+//=========== FIN FUNCIONES CALCULO RADIO CONSUMO ======================
+//=========== FUNCIONES CALCULO RADIO CONSUMO ======================
+
+    
 // ===================================================================
 // NOMBRE: findGooglePlaceId 
 // RESUMEN: Busca un lugar usando texto/coordenadas para obtener su place_id.
@@ -8204,10 +8508,8 @@ function adaptMapboxRouteToOSRMFormat(mapboxRoute) {
     };
 }  
 
-// ===================================================================
-// NOMBRE: openNavigationMap (VERSIÓN CON CARGA SECUENCIAL CORREGIDA Y DEFINITIVA)
-// RESUMEN: Abre el mapa y orquesta la carga de capas en la secuencia correcta.
-// ===================================================================
+//===============================================================
+//=============================================================
 async function openNavigationMap(isRecovery = false) {
     return new Promise(async (resolve, reject) => {
         const { primaryId: userId } = parseUserId(localStorage.getItem('userData_userId'));
@@ -8352,11 +8654,60 @@ async function openNavigationMap(isRecovery = false) {
                 
                 navigationMapInstance.on('load', async function() {
                     try {
-                        const mapCanvasForGesture = navigationMapInstance.getCanvas();
-                        let longPressTimer = null;
+                        const mapCanvasLP = navigationMapInstance.getCanvas();
+                        let pressTimerLP = null;
+                        let pressStartCoords = null;
+
+                        const handleLongPressAction = (lngLat) => {
+                            if (isRangeCalcModeActive) {
+                                calculateAndDrawRangeCircle(lngLat);
+                            }
+                        };
+                        
+                        const startPress = (e) => {
+                            clearTimeout(pressTimerLP);
+                            const point = e.touches ? e.touches[0] : e;
+                            pressStartCoords = { x: point.clientX, y: point.clientY };
+                            
+                            pressTimerLP = setTimeout(() => {
+                                // El temporizador se disparó, es una pulsación larga
+                                const lngLat = navigationMapInstance.unproject([pressStartCoords.x - mapCanvasLP.getBoundingClientRect().left, pressStartCoords.y - mapCanvasLP.getBoundingClientRect().top]);
+                                handleLongPressAction(lngLat);
+                                pressTimerLP = null;
+                                pressStartCoords = null;
+                            }, 500); // 500ms
+                        };
+                        
+                        const cancelPress = (e) => {
+                            if(pressStartCoords && pressTimerLP) {
+                                const point = e.touches ? e.touches[0] : e;
+                                if (point) { // touchend no tiene touches
+                                    const deltaX = Math.abs(point.clientX - pressStartCoords.x);
+                                    const deltaY = Math.abs(point.clientY - pressStartCoords.y);
+                                    if (deltaX > 10 || deltaY > 10) { // Si se mueve, cancela
+                                        clearTimeout(pressTimerLP);
+                                        pressTimerLP = null;
+                                        pressStartCoords = null;
+                                    }
+                                }
+                            }
+                            if (e.type === 'mouseup' || e.type === 'touchend') {
+                                clearTimeout(pressTimerLP);
+                            }
+                        };
+
+                        mapCanvasLP.addEventListener('mousedown', startPress);
+                        mapCanvasLP.addEventListener('mouseup', cancelPress);
+                        mapCanvasLP.addEventListener('mousemove', cancelPress);
+                        mapCanvasLP.addEventListener('touchstart', startPress, { passive: false });
+                        mapCanvasLP.addEventListener('touchend', cancelPress);
+                        mapCanvasLP.addEventListener('touchmove', cancelPress, { passive: false });
+                        // ### FIN DE LA LÓGICA DE PULSACIÓN LARGA ###
+
+                        const longPressTimerForCompass = null;
                         const handleLongPressStart = (e) => { const point = e.touches ? e.touches[0] : e; if (point.clientX < 200 && point.clientY > (window.innerHeight - 250)) { longPressTimer = setTimeout(() => { const compassControl = document.querySelector('.mapboxgl-ctrl-bottom-left'); if (compassControl && compassControl.classList.contains('hidden-for-maneuver')) { compassForceShowUntil = Date.now() + 15000; compassControl.classList.remove('hidden-for-maneuver'); showToast("Controles mostrados temporalmente.", "info"); } longPressTimer = null; }, 350); } };
                         const clearLongPress = () => { if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; } };
-                        mapCanvasForGesture.addEventListener('touchstart', handleLongPressStart, { passive: true }); mapCanvasForGesture.addEventListener('touchmove', clearLongPress); mapCanvasForGesture.addEventListener('touchend', clearLongPress); mapCanvasForGesture.addEventListener('touchcancel', clearLongPress); mapCanvasForGesture.addEventListener('mousedown', handleLongPressStart); mapCanvasForGesture.addEventListener('mousemove', clearLongPress); mapCanvasForGesture.addEventListener('mouseup', clearLongPress);
+                        mapCanvasLP.addEventListener('touchstart', handleLongPressStart, { passive: true }); mapCanvasLP.addEventListener('touchmove', clearLongPress); mapCanvasLP.addEventListener('touchend', clearLongPress); mapCanvasLP.addEventListener('touchcancel', clearLongPress); mapCanvasLP.addEventListener('mousedown', handleLongPressStart); mapCanvasLP.addEventListener('mousemove', clearLongPress); mapCanvasLP.addEventListener('mouseup', clearLongPress);
                         if (!intersectionPreviewMap) { const previewContainer = document.getElementById('intersection-preview-map-container'); if (previewContainer) { const initialMinimapStyle = MAP_STYLES[localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO"] || MAP_STYLES["HÍBRIDO"]; intersectionPreviewMap = new mapboxgl.Map({ container: previewContainer, style: initialMinimapStyle, interactive: false, attributionControl: false, zoom: 16, pitch: 50, maxTileCacheSize: 8, minzoom:12, maxzoom: 19, maxTileCacheSize: 50, antialias: false,preserveDrawingBuffer: false, }); intersectionPreviewMap.on('load', () => { intersectionPreviewMap.addSource('intersection-route', { type: 'geojson', data: { type: 'Feature', geometry: { type: 'LineString', coordinates: [] } } }); intersectionPreviewMap.addLayer({ id: 'intersection-route-layer', type: 'line', source: 'intersection-route', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': '#ACD10F', 'line-width': 13 } }); const carEl = document.createElement('div'); carEl.className = 'vehicle-icon-minimap'; carEl.innerHTML = `<img src="PNG/AVANCE.PNG" alt="Coche Mini">`; intersectionPreviewCarMarker = new mapboxgl.Marker({ element: carEl, anchor: 'center', rotationAlignment: 'viewport', rotation: -90 }).setLngLat([0, 0]).addTo(intersectionPreviewMap); const maneuverEl = document.createElement('div'); maneuverEl.style.cssText = `width: 49px; height: 49px; background-size: contain; background-repeat: no-repeat; background-position: center;`; intersectionPreviewManeuverMarker = new mapboxgl.Marker({ element: maneuverEl, anchor: 'center' }).setLngLat([0, 0]).addTo(intersectionPreviewMap); }); } }
                         const lockButton = document.getElementById('toggle-progress-bar-lock'); if (lockButton && !lockButton.dataset.listenerAttached) { lockButton.addEventListener('click', (e) => { e.stopPropagation(); handleProgressBarLockToggle(); }); lockButton.dataset.listenerAttached = 'true'; } updateProgressBarLockIcon();
                         const topInfoBar = document.getElementById('navigation-top-info-bar'); if (topInfoBar && !topInfoBar.dataset.listenerAttached) { topInfoBar.addEventListener('click', (e) => { e.stopPropagation(); if (nextManeuverStepForPreview && navigationCurrentRouteData?.routes?.[0]) { showIntersectionPreviewMap(nextManeuverStepForPreview, navigationCurrentRouteData.routes[0], true, 10000); } else { showToast("No hay una próxima maniobra que mostrar.", "info"); } }); topInfoBar.dataset.listenerAttached = 'true'; }
@@ -12667,6 +13018,10 @@ function assignMapButtonListeners() {
                     document.getElementById('cancel-help-choice-btn').onclick = () => {
                         choiceModal.remove();
                     };
+                    break;
+
+                 case 'range-calculator-button':
+                    toggleRangeCalcMode();
                     break;
                     
                  case 'map-location-search-button': 
