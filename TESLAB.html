@@ -1,4 +1,4 @@
-L03
+L04
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -3516,16 +3516,17 @@ async function calculateAndDrawRangeCircle(startPoint) {
     }
     
     const availableEnergyKWh = capacity * (usableChargePercent / 100);
-    const baseRangeKm = (availableEnergyKWh / (consumptionWhKm / 1000)) * 100 / 100;
+    const consumptionKWhKm = consumptionWhKm / 1000;
+    let baseRangeKm = availableEnergyKWh / consumptionKWhKm; // Rango en terreno plano
+    
+    const tortuosityFactor = 1.3; // Estimamos que la ruta por carretera es un 30% más larga que la línea recta.
     
     const startPointTurf = turf.point([startPoint.lng, startPoint.lat]);
-    const numRays = 16; // 16 rayos para un buen balance
+    const numRays = 16;
     const sampleIntervalKm = 2; // Muestrear cada 2km
     const elevationFactor = 1.2; // kWh consumidos por 100m de ascenso
     const regenerationFactor = 0.65; // 65% de energía recuperada en descensos
 
-    const finalPolygonPoints = [];
-    
     const rayPromises = [];
     
     for (let i = 0; i < numRays; i++) {
@@ -3537,8 +3538,9 @@ async function calculateAndDrawRangeCircle(startPoint) {
             let totalNegativeElevation = 0;
             let lastElevation = navigationMapInstance.queryTerrainElevation({ lng: startPoint.lng, lat: startPoint.lat });
 
-            for (let dist = sampleIntervalKm; dist <= baseRangeKm * 1.5; dist += sampleIntervalKm) {
-                const currentPoint = turf.destination(startPointTurf, dist, bearing, { units: 'kilometers' });
+            // Iteramos un poco más allá del rango base para tener margen
+            for (let distStraightLine = sampleIntervalKm; distStraightLine <= baseRangeKm * 1.2; distStraightLine += sampleIntervalKm) {
+                const currentPoint = turf.destination(startPointTurf, distStraightLine, bearing, { units: 'kilometers' });
                 const currentCoords = currentPoint.geometry.coordinates;
                 const currentElevation = navigationMapInstance.queryTerrainElevation({ lng: currentCoords[0], lat: currentCoords[1] });
                 
@@ -3552,20 +3554,23 @@ async function calculateAndDrawRangeCircle(startPoint) {
                 }
                 lastElevation = currentElevation;
 
-                const consumptionDistanceKWh = (dist / 100) * (consumptionWhKm / 1000);
+                const roadDistanceKm = distStraightLine * tortuosityFactor; // Distancia estimada por carretera
+                
+                const consumptionDistanceKWh = roadDistanceKm * consumptionKWhKm;
                 const consumptionElevationKWh = ((totalPositiveElevation / 100) * elevationFactor) - ((totalNegativeElevation / 100) * elevationFactor * regenerationFactor);
                 let totalConsumptionKWh = consumptionDistanceKWh + consumptionElevationKWh;
 
                 if (isRoundTrip) {
-                    totalConsumptionKWh *= (1 + 0.125); // Penalización del 12.5% por la vuelta
+                    // La penalización del 12.5% se aplica al consumo total estimado para la ida
+                    totalConsumptionKWh *= (1 + 0.125); 
                 }
                 
-                if (totalConsumptionKWh > availableEnergyKWh) {
-                    return lastValidPoint.geometry.coordinates; // Se ha superado el rango, devolvemos el último punto válido
+                if (totalConsumptionKWh > availableEnergyKWh / (isRoundTrip ? 2 : 1)) {
+                    return lastValidPoint.geometry.coordinates;
                 }
                 lastValidPoint = currentPoint;
             }
-            return lastValidPoint.geometry.coordinates; // Si no se supera, devolvemos el punto más lejano
+            return lastValidPoint.geometry.coordinates;
         };
         rayPromises.push(processRay());
     }
@@ -3578,7 +3583,7 @@ async function calculateAndDrawRangeCircle(startPoint) {
     document.getElementById("range-calc-toast")?.remove();
     showToast("Radio de acción calculado.", "success");
     drawRangePolygon(rangePolygon);
-}
+}    
 
 function showRangeCalcModal() {
     closeOtherModals('range-calc-modal');
@@ -8614,6 +8619,8 @@ function adaptMapboxRouteToOSRMFormat(mapboxRoute) {
     };
 }  
 
+//===============================================================
+//=============================================================
 async function openNavigationMap(isRecovery = false) {
     return new Promise(async (resolve, reject) => {
         const { primaryId: userId } = parseUserId(localStorage.getItem('userData_userId'));
@@ -8758,61 +8765,60 @@ async function openNavigationMap(isRecovery = false) {
                 
                 navigationMapInstance.on('load', async function() {
                     try {
-                        const mapCanvas = navigationMapInstance.getCanvas();
-                        let pressStartX, pressStartY, isDraggingForLongPress;
+                        const mapCanvasLP = navigationMapInstance.getCanvas();
+                        let pressTimerLP = null;
+                        let pressStartCoords = null;
 
-                        const handleLongPress = (e) => {
+                        const handleLongPressAction = (lngLat) => {
                             if (isRangeCalcModeActive) {
-                                // e es el evento original (mousedown o touchstart)
-                                const point = e.touches ? e.touches[0] : e;
-                                const rect = mapCanvas.getBoundingClientRect();
-                                const mapCoords = navigationMapInstance.unproject([point.clientX - rect.left, point.clientY - rect.top]);
-                                calculateAndDrawRangeCircle(mapCoords);
+                                calculateAndDrawRangeCircle(lngLat);
                             }
                         };
                         
-                        const startLongPressTimer = (e) => {
-                            isDraggingForLongPress = false;
+                        const startPress = (e) => {
+                            clearTimeout(pressTimerLP);
                             const point = e.touches ? e.touches[0] : e;
-                            pressStartX = point.clientX;
-                            pressStartY = point.clientY;
-                            clearTimeout(longPressTimer);
-                            longPressTimer = setTimeout(() => {
-                                if (!isDraggingForLongPress) {
-                                    handleLongPress(e);
-                                }
-                            }, 500); // 500ms para una pulsación larga
+                            pressStartCoords = { x: point.clientX, y: point.clientY };
+                            
+                            pressTimerLP = setTimeout(() => {
+                                // El temporizador se disparó, es una pulsación larga
+                                const lngLat = navigationMapInstance.unproject([pressStartCoords.x - mapCanvasLP.getBoundingClientRect().left, pressStartCoords.y - mapCanvasLP.getBoundingClientRect().top]);
+                                handleLongPressAction(lngLat);
+                                pressTimerLP = null;
+                                pressStartCoords = null;
+                            }, 500); // 500ms
                         };
                         
-                        const clearLongPressTimer = (e) => {
-                            clearTimeout(longPressTimer);
-                        };
-
-                        const checkDragForLongPress = (e) => {
-                            if (longPressTimer) {
+                        const cancelPress = (e) => {
+                            if(pressStartCoords && pressTimerLP) {
                                 const point = e.touches ? e.touches[0] : e;
-                                const deltaX = Math.abs(point.clientX - pressStartX);
-                                const deltaY = Math.abs(point.clientY - pressStartY);
-                                if (deltaX > 5 || deltaY > 5) {
-                                    isDraggingForLongPress = true;
-                                    clearTimeout(longPressTimer);
+                                if (point) { // touchend no tiene touches
+                                    const deltaX = Math.abs(point.clientX - pressStartCoords.x);
+                                    const deltaY = Math.abs(point.clientY - pressStartCoords.y);
+                                    if (deltaX > 10 || deltaY > 10) { // Si se mueve, cancela
+                                        clearTimeout(pressTimerLP);
+                                        pressTimerLP = null;
+                                        pressStartCoords = null;
+                                    }
                                 }
+                            }
+                            if (e.type === 'mouseup' || e.type === 'touchend') {
+                                clearTimeout(pressTimerLP);
                             }
                         };
 
-                        mapCanvas.addEventListener('mousedown', startLongPressTimer);
-                        mapCanvas.addEventListener('mouseup', clearLongPressTimer);
-                        mapCanvas.addEventListener('mousemove', checkDragForLongPress);
-                        
-                        mapCanvas.addEventListener('touchstart', startLongPressTimer, { passive: false });
-                        mapCanvas.addEventListener('touchend', clearLongPressTimer);
-                        mapCanvas.addEventListener('touchmove', checkDragForLongPress, { passive: false });
-                        mapCanvas.addEventListener('touchcancel', clearLongPressTimer);
-              
+                        mapCanvasLP.addEventListener('mousedown', startPress);
+                        mapCanvasLP.addEventListener('mouseup', cancelPress);
+                        mapCanvasLP.addEventListener('mousemove', cancelPress);
+                        mapCanvasLP.addEventListener('touchstart', startPress, { passive: false });
+                        mapCanvasLP.addEventListener('touchend', cancelPress);
+                        mapCanvasLP.addEventListener('touchmove', cancelPress, { passive: false });
+                        // ### FIN DE LA LÓGICA DE PULSACIÓN LARGA ###
+
                         const longPressTimerForCompass = null;
                         const handleLongPressStart = (e) => { const point = e.touches ? e.touches[0] : e; if (point.clientX < 200 && point.clientY > (window.innerHeight - 250)) { longPressTimer = setTimeout(() => { const compassControl = document.querySelector('.mapboxgl-ctrl-bottom-left'); if (compassControl && compassControl.classList.contains('hidden-for-maneuver')) { compassForceShowUntil = Date.now() + 15000; compassControl.classList.remove('hidden-for-maneuver'); showToast("Controles mostrados temporalmente.", "info"); } longPressTimer = null; }, 350); } };
                         const clearLongPress = () => { if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; } };
-                        mapCanvas.addEventListener('touchstart', handleLongPressStart, { passive: true }); mapCanvas.addEventListener('touchmove', clearLongPress); mapCanvas.addEventListener('touchend', clearLongPress); mapCanvas.addEventListener('touchcancel', clearLongPress); mapCanvas.addEventListener('mousedown', handleLongPressStart); mapCanvas.addEventListener('mousemove', clearLongPress); mapCanvas.addEventListener('mouseup', clearLongPress);
+                        mapCanvasLP.addEventListener('touchstart', handleLongPressStart, { passive: true }); mapCanvasLP.addEventListener('touchmove', clearLongPress); mapCanvasLP.addEventListener('touchend', clearLongPress); mapCanvasLP.addEventListener('touchcancel', clearLongPress); mapCanvasLP.addEventListener('mousedown', handleLongPressStart); mapCanvasLP.addEventListener('mousemove', clearLongPress); mapCanvasLP.addEventListener('mouseup', clearLongPress);
                         if (!intersectionPreviewMap) { const previewContainer = document.getElementById('intersection-preview-map-container'); if (previewContainer) { const initialMinimapStyle = MAP_STYLES[localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || "HÍBRIDO"] || MAP_STYLES["HÍBRIDO"]; intersectionPreviewMap = new mapboxgl.Map({ container: previewContainer, style: initialMinimapStyle, interactive: false, attributionControl: false, zoom: 16, pitch: 50, maxTileCacheSize: 8, minzoom:12, maxzoom: 19, maxTileCacheSize: 50, antialias: false,preserveDrawingBuffer: false, }); intersectionPreviewMap.on('load', () => { intersectionPreviewMap.addSource('intersection-route', { type: 'geojson', data: { type: 'Feature', geometry: { type: 'LineString', coordinates: [] } } }); intersectionPreviewMap.addLayer({ id: 'intersection-route-layer', type: 'line', source: 'intersection-route', layout: { 'line-join': 'round', 'line-cap': 'round' }, paint: { 'line-color': '#ACD10F', 'line-width': 13 } }); const carEl = document.createElement('div'); carEl.className = 'vehicle-icon-minimap'; carEl.innerHTML = `<img src="PNG/AVANCE.PNG" alt="Coche Mini">`; intersectionPreviewCarMarker = new mapboxgl.Marker({ element: carEl, anchor: 'center', rotationAlignment: 'viewport', rotation: -90 }).setLngLat([0, 0]).addTo(intersectionPreviewMap); const maneuverEl = document.createElement('div'); maneuverEl.style.cssText = `width: 49px; height: 49px; background-size: contain; background-repeat: no-repeat; background-position: center;`; intersectionPreviewManeuverMarker = new mapboxgl.Marker({ element: maneuverEl, anchor: 'center' }).setLngLat([0, 0]).addTo(intersectionPreviewMap); }); } }
                         const lockButton = document.getElementById('toggle-progress-bar-lock'); if (lockButton && !lockButton.dataset.listenerAttached) { lockButton.addEventListener('click', (e) => { e.stopPropagation(); handleProgressBarLockToggle(); }); lockButton.dataset.listenerAttached = 'true'; } updateProgressBarLockIcon();
                         const topInfoBar = document.getElementById('navigation-top-info-bar'); if (topInfoBar && !topInfoBar.dataset.listenerAttached) { topInfoBar.addEventListener('click', (e) => { e.stopPropagation(); if (nextManeuverStepForPreview && navigationCurrentRouteData?.routes?.[0]) { showIntersectionPreviewMap(nextManeuverStepForPreview, navigationCurrentRouteData.routes[0], true, 10000); } else { showToast("No hay una próxima maniobra que mostrar.", "info"); } }); topInfoBar.dataset.listenerAttached = 'true'; }
@@ -8858,7 +8864,7 @@ async function openNavigationMap(isRecovery = false) {
             } catch (initError) { const overlay = document.getElementById('route-recovery-overlay'); if (overlay) overlay.classList.add('hidden'); if (mapActualContainer) mapActualContainer.innerHTML = `<div style="color:red; text-align:center; padding:20px;"><h2>Error al cargar el mapa</h2><p>${initError.message}</p></div>`; isNavigationMapActive = false; reject(initError); }
         }
     }); 
-}    
+}
     
 //===================================================================
 // NOMBRE: updateTurnByTurnDisplay (VERSIÓN FINAL CON LÓGICA DE BOTÓN "T" CORRECTA)
