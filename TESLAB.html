@@ -1,4 +1,4 @@
-L04
+L05
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -3499,7 +3499,7 @@ async function calculateAndDrawRangeCircle(startPoint) {
         showToast("Punto de partida no definido.", "error");
         return;
     }
-    showToast("Calculando radio de acción (puede tardar unos segundos)...", "info", 0, false, "range-calc-toast");
+    showToast("Calculando radio de acción (considerando desnivel)...", "info", 0, false, "range-calc-toast");
     clearRangeCircleFromMap();
 
     const capacity = parseFloat(localStorage.getItem('rc_capacity'));
@@ -3515,17 +3515,25 @@ async function calculateAndDrawRangeCircle(startPoint) {
         return;
     }
     
-    const availableEnergyKWh = capacity * (usableChargePercent / 100);
-    const consumptionKWhKm = consumptionWhKm / 1000;
-    let baseRangeKm = availableEnergyKWh / consumptionKWhKm; // Rango en terreno plano
+    // 1. CALCULAR EL PRESUPUESTO DE ENERGÍA (¡LA CORRECCIÓN CLAVE!)
+    const totalAvailableEnergyKWh = capacity * (usableChargePercent / 100);
+    let energyBudgetForCalc = totalAvailableEnergyKWh;
+
+    if (isRoundTrip) {
+        // Para ida y vuelta, asignamos el 45% de la energía total para la ida.
+        // Esto deja un 55% para la vuelta y un margen de seguridad.
+        energyBudgetForCalc = totalAvailableEnergyKWh * 0.45;
+    }
     
-    const tortuosityFactor = 1.3; // Estimamos que la ruta por carretera es un 30% más larga que la línea recta.
+    // 2. CALCULAR RANGO BASE (SOLO COMO LÍMITE DE BÚSQUEDA)
+    const consumptionKwhPerKm = consumptionWhKm / 1000;
+    const baseRangeKm = (consumptionKwhPerKm > 0) ? (energyBudgetForCalc / consumptionKwhPerKm) : 0;
     
     const startPointTurf = turf.point([startPoint.lng, startPoint.lat]);
     const numRays = 16;
-    const sampleIntervalKm = 2; // Muestrear cada 2km
-    const elevationFactor = 1.2; // kWh consumidos por 100m de ascenso
-    const regenerationFactor = 0.65; // 65% de energía recuperada en descensos
+    const sampleIntervalKm = 2;
+    const elevationFactor = 1.2; // kWh/100m
+    const regenerationFactor = 0.65; // 65%
 
     const rayPromises = [];
     
@@ -3538,9 +3546,9 @@ async function calculateAndDrawRangeCircle(startPoint) {
             let totalNegativeElevation = 0;
             let lastElevation = navigationMapInstance.queryTerrainElevation({ lng: startPoint.lng, lat: startPoint.lat });
 
-            // Iteramos un poco más allá del rango base para tener margen
-            for (let distStraightLine = sampleIntervalKm; distStraightLine <= baseRangeKm * 1.2; distStraightLine += sampleIntervalKm) {
-                const currentPoint = turf.destination(startPointTurf, distStraightLine, bearing, { units: 'kilometers' });
+            // Buscamos un 50% más allá del rango base por si hay muchos descensos
+            for (let dist = sampleIntervalKm; dist <= baseRangeKm * 1.5; dist += sampleIntervalKm) {
+                const currentPoint = turf.destination(startPointTurf, dist, bearing, { units: 'kilometers' });
                 const currentCoords = currentPoint.geometry.coordinates;
                 const currentElevation = navigationMapInstance.queryTerrainElevation({ lng: currentCoords[0], lat: currentCoords[1] });
                 
@@ -3554,18 +3562,11 @@ async function calculateAndDrawRangeCircle(startPoint) {
                 }
                 lastElevation = currentElevation;
 
-                const roadDistanceKm = distStraightLine * tortuosityFactor; // Distancia estimada por carretera
-                
-                const consumptionDistanceKWh = roadDistanceKm * consumptionKWhKm;
+                const consumptionDistanceKWh = dist * consumptionKwhPerKm;
                 const consumptionElevationKWh = ((totalPositiveElevation / 100) * elevationFactor) - ((totalNegativeElevation / 100) * elevationFactor * regenerationFactor);
-                let totalConsumptionKWh = consumptionDistanceKWh + consumptionElevationKWh;
-
-                if (isRoundTrip) {
-                    // La penalización del 12.5% se aplica al consumo total estimado para la ida
-                    totalConsumptionKWh *= (1 + 0.125); 
-                }
+                const totalConsumptionKWh = consumptionDistanceKWh + consumptionElevationKWh;
                 
-                if (totalConsumptionKWh > availableEnergyKWh / (isRoundTrip ? 2 : 1)) {
+                if (totalConsumptionKWh > energyBudgetForCalc) {
                     return lastValidPoint.geometry.coordinates;
                 }
                 lastValidPoint = currentPoint;
