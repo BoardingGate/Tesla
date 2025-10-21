@@ -3436,6 +3436,163 @@ async function calculateAndDrawRangeCircle(startPoint) {
     showToast("Radio de acción calculado.", "success");
     drawRangePolygon(rangePolygon);
 }
+
+
+async function calculateAndDrawRangeCircle(startPoint) {
+    if (!startPoint) {
+        showToast("Punto de partida no definido.", "error");
+        return;
+    }
+    showToast("Calculando radio de acción (considerando desnivel, clima y carreteras)...", "info", 0, false, "range-calc-toast");
+    clearRangeCircleFromMap();
+
+    const params = currentRangeCalcParams;
+
+    // --- INICIO: OBTENER DATOS CLIMATOLÓGICOS (SIN API KEY USANDO WTTR.IN) ---
+    let weatherData = null;
+    try {
+        const weatherUrl = `https://wttr.in/${startPoint.lat},${startPoint.lng}?format=j1`;
+        const response = await fetch(weatherUrl);
+        if (response.ok) {
+            const data = await response.json();
+            // Mapeamos la estructura de wttr.in a la que necesitamos
+            weatherData = {
+                main: { temp: parseFloat(data.current_condition[0].temp_C) },
+                weather: [{ main: data.current_condition[0].weatherDesc[0].value, description: data.current_condition[0].weatherDesc[0].value.toLowerCase() }],
+                wind: { speed: parseFloat(data.current_condition[0].windspeedKmph) / 3.6, deg: parseFloat(data.current_condition[0].winddirDegree) } // Convertir km/h a m/s para consistencia
+            };
+            
+            const temp = weatherData.main.temp.toFixed(0);
+            const desc = weatherData.weather[0].description;
+            const windSpeed = (weatherData.wind.speed * 3.6).toFixed(0); // Mostrar en km/h
+            const windDir = weatherData.wind.deg;
+            const windArrow = ['↓', '↙', '←', '↖', '↑', '↗', '→', '↘'][Math.round(windDir / 45) % 8];
+            
+            showToast(`Clima aplicado: ${temp}°C, ${desc}. Viento: ${windSpeed} km/h (${windArrow})`, 'info', 7000);
+            // ==============================================================================
+            
+        } else {
+            showToast("No se pudo obtener el clima, se calculará sin factores climáticos.", "warning");
+        }
+    } catch (e) {
+        console.warn("Error al obtener datos del clima desde wttr.in:", e);
+        showToast("Error de red al obtener clima. Se calculará sin factores climáticos.", "warning");
+    }
+ 
+    const usableChargePercent = params.charge - params.reserve;
+    if (usableChargePercent <= 0) {
+        showToast("No hay suficiente carga para calcular un radio de acción.", "warning");
+        document.getElementById("range-calc-toast")?.remove();
+        return;
+    }
+    
+    let totalAvailableEnergyKWh = params.capacity * (usableChargePercent / 100);
+    
+    if (weatherData) {
+        const temp = weatherData.main.temp;
+        const weatherCondition = weatherData.weather[0].main.toLowerCase();
+        let penaltyPercent = 0;
+
+        if (temp < 10) { penaltyPercent += (10 - temp) * 1.5; }
+        if (temp < 0) { penaltyPercent += Math.abs(temp) * 2.5; }
+        if (temp > 30) { penaltyPercent += (temp - 30) * 0.75; }
+
+        if (weatherCondition.includes('rain') || weatherCondition.includes('drizzle') || weatherCondition.includes('llovizna') || weatherCondition.includes('lluvia')) penaltyPercent += 5;
+        if (weatherCondition.includes('snow') || weatherCondition.includes('nieve')) penaltyPercent += 12;
+        
+        penaltyPercent = Math.min(penaltyPercent, 60);
+        totalAvailableEnergyKWh *= (1 - (penaltyPercent / 100));
+    }
+    
+    let energyBudgetForCalc = totalAvailableEnergyKWh;
+    if (params.isRoundTrip) {
+        energyBudgetForCalc = totalAvailableEnergyKWh / 2;
+    }
+    
+    const consumptionKwhPerKm = params.consumptionWhKm / 1000;
+    const tortuosityFactor = 1.50;
+    const theoreticalRoadRangeKm = (consumptionKwhPerKm > 0) ? (energyBudgetForCalc / consumptionKwhPerKm) : 0;
+    const baseRangeKm = theoreticalRoadRangeKm / tortuosityFactor;
+
+    if (baseRangeKm <= 0) {
+        showToast("Con los parámetros actuales (y el clima), el rango de acción es cero.", "warning");
+        document.getElementById("range-calc-toast")?.remove();
+        return;
+    }
+    
+    const startPointTurf = turf.point([startPoint.lng, startPoint.lat]);
+    const numRays = 50;
+    const sampleIntervalKm = 2;
+    const elevationFactor = 1.5;
+    const regenerationFactor = 0.65;
+
+    const rayPromises = [];
+    
+    for (let i = 0; i < numRays; i++) {
+        const bearing = i * (360 / numRays);
+        
+        const processRay = async () => {
+            let lastValidPoint = startPointTurf;
+            let totalPositiveElevation = 0;
+            let totalNegativeElevation = 0;
+            let lastElevation = navigationMapInstance.queryTerrainElevation({ lng: startPoint.lng, lat: startPoint.lat });
+
+            for (let dist = sampleIntervalKm; dist <= baseRangeKm * 1.5; dist += sampleIntervalKm) {
+                const currentPoint = turf.destination(startPointTurf, dist, bearing, { units: 'kilometers' });
+                const currentCoords = currentPoint.geometry.coordinates;
+                const currentElevation = navigationMapInstance.queryTerrainElevation({ lng: currentCoords[0], lat: currentCoords[1] });
+                
+                if (currentElevation === null || currentElevation <= 0) {
+                    return lastValidPoint.geometry.coordinates;
+                }
+                
+                if (lastElevation !== null) {
+                    const elevationChange = currentElevation - lastElevation;
+                    if (elevationChange > 0) { totalPositiveElevation += elevationChange; } 
+                    else { totalNegativeElevation += Math.abs(elevationChange); }
+                }
+                lastElevation = currentElevation;
+
+                let windConsumptionFactor = 1.0;
+                if (weatherData && weatherData.wind) {
+                    const windSpeedKmh = weatherData.wind.speed * 3.6;
+                    const windDirection = weatherData.wind.deg;
+                    let angleDiff = Math.abs(bearing - windDirection);
+                    if (angleDiff > 180) angleDiff = 360 - angleDiff;
+                    const angleDiffRad = angleDiff * (Math.PI / 180);
+                    const effectiveWindSpeed = windSpeedKmh * Math.cos(angleDiffRad);
+                    const windPenalty = (effectiveWindSpeed / 100) * 0.5;
+                    windConsumptionFactor += windPenalty;
+                }
+
+                const roadDistanceKm = dist * tortuosityFactor;
+                const consumptionDistanceKWh = roadDistanceKm * (consumptionKwhPerKm * windConsumptionFactor);
+                const consumptionElevationKWh = ((totalPositiveElevation / 100) * elevationFactor) - ((totalNegativeElevation / 100) * regenerationFactor);
+                const totalConsumptionKWh = consumptionDistanceKWh + consumptionElevationKWh;
+                
+                if (totalConsumptionKWh > energyBudgetForCalc) {
+                    return lastValidPoint.geometry.coordinates;
+                }
+                lastValidPoint = currentPoint;
+            }
+            return lastValidPoint.geometry.coordinates;
+        };
+        rayPromises.push(processRay());
+    }
+
+    const points = await Promise.all(rayPromises);
+    points.push(points[0]);
+
+    const rangePolygon = turf.polygon([points]);
+    
+    const loadingToast = document.getElementById("range-calc-toast");
+    if (loadingToast) {
+        loadingToast.remove();
+        activeToasts = activeToasts.filter(t => t.id !== "range-calc-toast");
+    }
+    showToast("Radio de acción calculado.", "success");
+    drawRangePolygon(rangePolygon);
+}    
    
 
 function showRangeCalcModal() {
