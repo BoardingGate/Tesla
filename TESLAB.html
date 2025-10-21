@@ -7411,6 +7411,189 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recover
         attempt++; 
     }
 }    
+
+// ===================================================================
+// NOMBRE: recalculateAndDrawRoute (MODIFICADA - Lógica de recuperación dual)
+// RESUMEN: Contiene la nueva lógica para reconstruir la ruta, diferenciando entre recuperación "rica" y "ligera".
+// ===================================================================
+async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recoveryInfo = null) {
+    const RETRY_CADENCE_MS = 3000;
+    const MAX_RETRIES = 5;
+    let attempt = 1;
+
+    while (attempt <= MAX_RETRIES) {
+        isRecalculatingRoute = true;
+        clearAlternativeRoutesDisplay(); 
+        alternativeRoutesCache.clear();
+        selectedStageRoutes.clear();
+        
+        const toastId = `recalc-toast-${Date.now()}`;
+        showToast(`Calculando ruta... (Intento ${attempt}/${MAX_RETRIES})`, "info", 0, false, toastId);
+
+        const wasNavigatingBeforeRecalc = isNavigating;
+
+        try {
+            let waypointsForAPI = [];
+            let currentHeading = null;
+
+            if (recoveryInfo) {
+                const isSimulatedRecovery = recoveryInfo.simulationState && recoveryInfo.simulationState.isSimulating;
+            
+                if (isSimulatedRecovery) {
+                    waypointsForAPI = sanitizeWaypointsForStorage(recoveryInfo.route.waypoints);
+                    currentHeading = null; // No necesitamos rumbo de inicio
+                } else {
+                    const currentPos = await getGpsWithRetries();
+                    currentHeading = currentPos.heading;
+                    
+                    if (!recoveryInfo.isRichRecovery) {
+                        const tempRouteUrl = `${OSRM_SERVICE_URL}/driving/${navigationWaypoints.map(wp => `${wp.lng},${wp.lat}`).join(';')}?overview=full&geometries=geojson&steps=true`;
+                        const tempRouteResponse = await fetch(tempRouteUrl);
+                        const tempRouteData = await tempRouteResponse.json();
+                        
+                        if (tempRouteData.code === 'Ok' && tempRouteData.routes.length > 0) {
+                            const originalRouteLine = turf.lineString(tempRouteData.routes[0].geometry.coordinates);
+                            const carPoint = turf.point([currentPos.longitude, currentPos.latitude]);
+                            const carDistanceAlongOriginalRoute = turf.nearestPointOnLine(originalRouteLine, carPoint, { units: 'meters' }).properties.location;
+                            
+                            let cumulativeDistance = 0;
+                            tempRouteData.routes[0].legs.forEach((leg, legIndex) => {
+                                if (navigationWaypoints[legIndex + 1]) {
+                                    if (cumulativeDistance + leg.distance < carDistanceAlongOriginalRoute) {
+                                        navigationWaypoints[legIndex + 1].visited = true;
+                                    }
+                                    cumulativeDistance += leg.distance;
+                                }
+                            });
+                        }
+                    }
+                    
+                    let lastVisitedIndex = -1;
+                    navigationWaypoints.forEach((wp, index) => {
+                        if (wp && wp.visited && !wp.isInternal) {
+                            lastVisitedIndex = index;
+                        }
+                    });
+                    
+                    const waypointsBefore = navigationWaypoints.slice(0, lastVisitedIndex + 1);
+                    const waypointsAfter = navigationWaypoints.slice(lastVisitedIndex + 1);
+                    const invisibleWaypoint = { lat: currentPos.latitude, lng: currentPos.longitude, isInternal: true };
+                    waypointsForAPI = [...waypointsBefore, invisibleWaypoint, ...waypointsAfter];
+                }
+
+            } else if (!isNavigating) {
+                waypointsForAPI = [...navigationWaypoints];
+                currentHeading = null;
+            } else { 
+                if (navigationCurrentLocation) {
+                    currentHeading = navigationCurrentLocation.heading;
+                    waypointsForAPI.push({ lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude, isRecalculatedStart: true });
+                    waypointsForAPI.push(...navigationWaypoints.filter(wp => !wp.visited));
+                } else {
+                    waypointsForAPI = [...navigationWaypoints];
+                }
+            }
+            
+            const validWaypoints = waypointsForAPI.filter(wp => wp && typeof wp.lat === 'number' && typeof wp.lng === 'number');
+            if (validWaypoints.length < 2) { 
+                const existingToast = document.getElementById(toastId);
+                if (existingToast) existingToast.remove();
+                isRecalculatingRoute = false;
+                return; 
+            };
+
+            const coordsString = validWaypoints.map(wp => `${wp.lng},${wp.lat}`).join(';');
+            const result = await fetchRouteData(coordsString, currentHeading);
+            if (result.error) throw result.error;
+
+            const newRouteData = result.routeData;
+            const newRemainingRoute = newRouteData.routes[0];
+
+            navigationCurrentRouteData = newRouteData;
+            precalculateRouteStepDistances(navigationCurrentRouteData);
+
+            generateAndCacheCleanManeuverList(newRemainingRoute, navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart));
+            
+            await drawRouteOnMap(newRemainingRoute);
+            
+            const isRadaresRutaActive = document.getElementById('radares-ruta-checkbox').checked;
+
+            if (isRadaresRutaActive) {
+                let reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
+                const originalLength = reminders.length;
+                reminders = reminders.filter(r => !r.isDynamicRadar);
+                if (reminders.length < originalLength) {
+                    localStorage.setItem('reminders', JSON.stringify(reminders));
+                    markCacheAsDirty();
+                }
+            }
+            
+            if (preserveAccumulatedStats) {
+                accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
+            } else {
+                accumulatedDistanceBeforeCurrentSegment = 0;
+                navigationStartTimeForStats = new Date();
+                originalTripEtaTime = null;
+            }
+            
+            lastCarDistanceAlongRouteForNavLogic = 0;
+            currentLegIndexNav = 0;
+            currentStepIndexNav = 0;
+            previousLegIndexForEta = 0;
+            lastProcessedStepIdentifier = null;
+            lastProcessedStepForLock = null;
+            lastDisplayedManeuverIcon = null;
+
+            tripInitialOverallEtaTime = new Date(Date.now() + newRemainingRoute.duration * 1000);
+            if (newRemainingRoute.legs && newRemainingRoute.legs.length > 0) {
+                currentStageInitialExpectedEtaTime = new Date(Date.now() + newRemainingRoute.legs[0].duration * 1000);
+            } else {
+                currentStageInitialExpectedEtaTime = null;
+            }
+            
+            renderWaypointMarkers();
+
+            if (!recoveryInfo) {
+                updateNavigationProgressDisplay(newRemainingRoute, 0); 
+                updateTurnByTurnDisplay(newRemainingRoute, 0);
+            }
+            drawStaticMarkersOnProgressBar();
+            showDestinationName();
+            toggleRadaresRuta(document.getElementById('radares-ruta-checkbox').checked);
+            toggleTareasRuta(document.getElementById('tareas-ruta-checkbox').checked);
+            updateStartNavigationButtonState();
+            updateNavigationButtonColor();
+
+            deviationCheckGracePeriodUntil = Date.now() + 7000;
+            closeModalAndProceed();
+            return;
+            
+        } catch (error) {
+            console.error(`[RECALC] Fallo en intento #${attempt}:`, error);
+            if (attempt === MAX_RETRIES) {
+                showToast("Fallo al recalcular la ruta tras varios intentos. Comprueba tu conexión.", "error");
+                closeModalAndProceed();
+                throw new Error("Fallo al recalcular la ruta tras múltiples intentos.");
+            } else {
+                await new Promise(resolve => setTimeout(resolve, RETRY_CADENCE_MS));
+            }
+        } finally {
+            const existingToast = document.getElementById(toastId);
+            if (existingToast) existingToast.remove();
+            activeToasts = activeToasts.filter(t => t.id !== toastId);
+
+            isRecalculatingRoute = false;
+            isNavigating = wasNavigatingBeforeRecalc; 
+            
+            if (attempt > MAX_RETRIES) { 
+                 updateStartNavigationButtonState();
+                 updateNavigationButtonColor();
+            }
+        }
+        attempt++; 
+    }
+}
+    
     
 // ===================================================================
 // NOMBRE: checkAndIncrementPoiCount 
