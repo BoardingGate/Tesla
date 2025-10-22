@@ -1,4 +1,4 @@
-MI17
+MI18
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -22098,6 +22098,7 @@ function handleProgressBarLockToggle() {
         return formattedName || "Ubicación desconocida";
     }
 
+
 // ===================================================================
 // NOMBRE: addWaypoint (MODIFICADA - GESTIONA MODO LIBRE Y EDICIÓN EN RUTA)
 // RESUMEN: Añade un punto de ruta. Pausa el modo "Free Drive" si está activo y gestiona la inserción de etapas durante la navegación.
@@ -22140,20 +22141,55 @@ async function addWaypoint(latlng, displayName = null) {
         isRecalculatedStart: false
     };
 
-    if (isNavigating) {
-        let lastVisitedIndex = -1;
-        navigationWaypoints.forEach((wp, index) => {
-            if (wp && wp.visited) {
-                lastVisitedIndex = index;
+    const hasExistingRoute = navigationWaypoints.filter(wp => wp && !wp.isInternal).length >= 2;
+
+    if (hasExistingRoute) {
+        try {
+            const route = navigationCurrentRouteData?.routes?.[0];
+            if (!route || !route._turfLineString) {
+                throw new Error("Geometría de ruta no disponible para inserción inteligente.");
             }
-        });
-        const insertIndex = lastVisitedIndex + 1;
-        
-        navigationWaypoints.splice(insertIndex, 0, newWaypoint);
-        showToast(`'${newWaypoint.address}' añadido como próxima etapa.`, "success");
-        await updateWaypointTypesAndLabels();
-        renderWaypointMarkers();
-    
+            const routeLine = route._turfLineString;
+            
+            const newPoint = turf.point([newWaypoint.lng, newWaypoint.lat]);
+            const newWaypointDistanceOnRoute = turf.nearestPointOnLine(routeLine, newPoint, { units: 'meters' }).properties.location;
+
+            const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal);
+            const waypointDistances = actualWaypoints.map(wp => {
+                const wpPoint = turf.point([wp.lng, wp.lat]);
+                const distance = turf.nearestPointOnLine(routeLine, wpPoint, { units: 'meters' }).properties.location;
+                return { waypoint: wp, distance: distance };
+            });
+
+            let insertAfterIndex = -1;
+            for (let i = 0; i < waypointDistances.length - 1; i++) {
+                if (newWaypointDistanceOnRoute > waypointDistances[i].distance && newWaypointDistanceOnRoute < waypointDistances[i+1].distance) {
+                    insertAfterIndex = i;
+                    break;
+                }
+            }
+            if (insertAfterIndex === -1) {
+                insertAfterIndex = waypointDistances.length - 2;
+            }
+
+            const waypointToInsertAfter = actualWaypoints[insertAfterIndex];
+            const finalInsertIndex = navigationWaypoints.findIndex(wp => wp.id === waypointToInsertAfter.id);
+            if (finalInsertIndex !== -1) {
+                navigationWaypoints.splice(finalInsertIndex + 1, 0, newWaypoint);
+                showToast(`'${newWaypoint.address}' insertado en la ruta.`, "success");
+            } else {
+                throw new Error("No se pudo encontrar el punto de inserción.");
+            }
+        } catch (error) {
+            console.error("Fallo en la inserción inteligente de POI, usando fallback:", error);
+            const finalDestinationIndex = navigationWaypoints.findIndex(wp => wp.type === 'F');
+            if (finalDestinationIndex !== -1) {
+                navigationWaypoints.splice(finalDestinationIndex, 0, newWaypoint);
+            } else {
+                navigationWaypoints.push(newWaypoint);
+            }
+            showToast(`'${newWaypoint.address}' añadido como etapa. Recalculando...`, "success");
+        }
     } else {
         if (navigationWaypoints.length === 0 && navigationCurrentLocation) {
             const startPoint = {
@@ -22171,17 +22207,18 @@ async function addWaypoint(latlng, displayName = null) {
             };
             navigationWaypoints.push(startPoint);
         }
-
         navigationWaypoints.push(newWaypoint);
-        await updateWaypointTypesAndLabels();
-        renderWaypointMarkers();
-
+        
         if (navigationWaypoints.filter(wp => wp && !wp.isInternal).length >= 2) {
-            if (navigationWaypoints.filter(wp => wp && !wp.isInternal).length === 2) {
-                showToast("PULSACIÓN LARGA SOBRE LA ETAPA para ELIMINAR, COMPARTIR o BUSCAR RUTAS ALTERNATIVAS. ARRASTRE para RESITUARLA", "instructional", 3000);
-            }
-            recalculateAndDrawRoute();
+            showToast("PULSACIÓN LARGA SOBRE LA ETAPA para ELIMINAR, COMPARTIR o BUSCAR RUTAS ALTERNATIVAS. ARRASTRE para RESITUARLA", "instructional", 3000);
         }
+    }
+
+    await updateWaypointTypesAndLabels();
+    renderWaypointMarkers();
+
+    if (navigationWaypoints.filter(wp => wp && !wp.isInternal).length >= 2) {
+        recalculateAndDrawRoute(isNavigating);
     }
     
     updateStartNavigationButtonState();
