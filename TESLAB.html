@@ -1,4 +1,4 @@
-MI16
+MI17
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -21427,6 +21427,7 @@ function filterForCheapestPDRs() {
     displayChargingPointsOnMap();
 }    
 
+
 //===================================================
 // NOMBRE: addChargingPointToRoute (MODIFICADA - GESTIONA EDICIÓN EN RUTA)
 // RESUMEN: Añade un PDR como etapa. Si no hay ruta, crea una nueva. Si se navega, preserva estadísticas y permite la inserción.
@@ -21454,64 +21455,94 @@ async function addChargingPointToRoute(pointIndex) {
         isRecalculatedStart: false
     };
 
-    if (isNavigating) {
-        let lastVisitedIndex = -1;
-        navigationWaypoints.forEach((wp, index) => {
-            if (wp && wp.visited) {
-                lastVisitedIndex = index;
-            }
-        });
-        const insertIndex = lastVisitedIndex + 1;
-        navigationWaypoints.splice(insertIndex, 0, newWaypoint);
-        showToast(`'${newWaypoint.address}' añadido como próxima etapa.`, "success");
-        
-        await updateWaypointTypesAndLabels();
-        renderWaypointMarkers();
+    const hasExistingRoute = navigationWaypoints.filter(wp => wp && !wp.isInternal).length >= 2;
     
-    } else {
-        const noRouteLoaded = navigationWaypoints.length === 0;
+    if (hasExistingRoute) {
+        try {
+            const route = navigationCurrentRouteData?.routes?.[0];
+            if (!route || !route._turfLineString) {
+                throw new Error("Geometría de ruta no disponible para inserción inteligente.");
+            }
+            const routeLine = route._turfLineString;
+            
+            // 1. Calcular la distancia del nuevo PDR a lo largo de la ruta
+            const pdrPoint = turf.point([newWaypoint.lng, newWaypoint.lat]);
+            const pdrDistanceOnRoute = turf.nearestPointOnLine(routeLine, pdrPoint, { units: 'meters' }).properties.location;
 
-        if (noRouteLoaded) {
-            if (!navigationCurrentLocation) {
-                showToast("No se puede añadir el punto de carga sin una ubicación GPS inicial.", "error");
-                return;
+            // 2. Obtener las distancias de los waypoints existentes
+            const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal);
+            const waypointDistances = actualWaypoints.map(wp => {
+                const wpPoint = turf.point([wp.lng, wp.lat]);
+                const distance = turf.nearestPointOnLine(routeLine, wpPoint, { units: 'meters' }).properties.location;
+                return { waypoint: wp, distance: distance };
+            });
+
+            // 3. Encontrar el índice correcto para la inserción
+            let insertAfterIndex = -1;
+            for (let i = 0; i < waypointDistances.length - 1; i++) {
+                if (pdrDistanceOnRoute > waypointDistances[i].distance && pdrDistanceOnRoute < waypointDistances[i+1].distance) {
+                    insertAfterIndex = i;
+                    break;
+                }
+            }
+            
+            // Si el bucle no encuentra un hueco, significa que va después del penúltimo punto
+            if (insertAfterIndex === -1) {
+                insertAfterIndex = waypointDistances.length - 2;
             }
 
-            const startPoint = {
-                id: Date.now() - 1, lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude,
-                type: 'S', marker: null, label: 'S', address: 'Posición Actual (GPS)',
-                visited: true, isCriticalForRecalc: true, isInternal: false, isRecalculatedStart: false
-            };
-            navigationWaypoints.push(startPoint, newWaypoint);
-            showToast("Ruta creada desde tu posición hasta el punto de recarga.", "success");
+            const waypointToInsertAfter = actualWaypoints[insertAfterIndex];
+            const finalInsertIndex = navigationWaypoints.findIndex(wp => wp.id === waypointToInsertAfter.id);
 
-        } else {
-            let lastVisitedIndex = -1;
-            navigationWaypoints.forEach((wp, index) => { if (wp.visited) lastVisitedIndex = index; });
-            const insertIndex = lastVisitedIndex + 1;
-            navigationWaypoints.splice(insertIndex, 0, newWaypoint);
+            if (finalInsertIndex !== -1) {
+                navigationWaypoints.splice(finalInsertIndex + 1, 0, newWaypoint);
+                showToast(`'${newWaypoint.address}' insertado en la ruta.`, "success");
+            } else {
+                throw new Error("No se pudo encontrar el punto de inserción.");
+            }
+        } catch (error) {
+            // Fallback: si la lógica inteligente falla, lo añade al final (antes del destino)
+            console.error("Fallo en la inserción inteligente, usando fallback:", error);
+            const finalDestinationIndex = navigationWaypoints.findIndex(wp => wp.type === 'F');
+            if (finalDestinationIndex !== -1) {
+                navigationWaypoints.splice(finalDestinationIndex, 0, newWaypoint);
+            } else {
+                navigationWaypoints.push(newWaypoint);
+            }
             showToast(`'${newWaypoint.address}' añadido como etapa. Recalculando...`, "success");
         }
-        
-        updateWaypointTypesAndLabels();
-        renderWaypointMarkers();
-
-        try {
-            await recalculateAndDrawRoute(true);
-            const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
-            if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
-                toggleRadaresRuta(true);
-            }
-        } catch (e) {
-            showToast("Error recalculando la ruta tras añadir el punto de recarga.", "error");
+    } else {
+        if (!navigationCurrentLocation) {
+            showToast("No se puede añadir el punto de carga sin una ubicación GPS inicial.", "error");
+            return;
         }
+
+        const startPoint = {
+            id: Date.now() - 1, lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude,
+            type: 'S', marker: null, label: 'S', address: 'Posición Actual (GPS)',
+            visited: true, isCriticalForRecalc: true, isInternal: false, isRecalculatedStart: false
+        };
+        navigationWaypoints.push(startPoint, newWaypoint);
+        showToast("Ruta creada desde tu posición hasta el punto de recarga.", "success");
+    }
+
+    await updateWaypointTypesAndLabels();
+    renderWaypointMarkers();
+
+    try {
+        await recalculateAndDrawRoute(isNavigating);
+        const radaresRutaCheckbox = document.getElementById('radares-ruta-checkbox');
+        if (radaresRutaCheckbox && radaresRutaCheckbox.checked) {
+            toggleRadaresRuta(true);
+        }
+    } catch (e) {
+        showToast("Error recalculando la ruta tras añadir el punto de recarga.", "error");
     }
     
     clearChargingPoints();
     updateStartNavigationButtonState();
     updateNavigationButtonColor();
 }
-
     
 
     // ===================================================================
