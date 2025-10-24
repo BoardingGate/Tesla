@@ -1,4 +1,4 @@
-MI18
+v01
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -4170,6 +4170,301 @@ function buildOverpassQuery(osmTag) {
 }
 
 // ===================================================================
+// NOMBRE: initiateControlledReload (CON OPTIMIZACIÓN QUIRÚRGICA DE CAPTURA)
+// RESUMEN: Inicia el reinicio controlado. Prioriza la estabilidad sobre la estética,
+//          usando JPEG para la captura y con fallbacks para garantizar que el reinicio ocurra.
+// ===================================================================
+async function initiateControlledReload() {
+    if (isPerformingControlledReload) return;
+    isPerformingControlledReload = true; 
+
+    // Función interna para los pasos finales y el reinicio.
+    const finalizeAndReload = async () => {
+        try {
+            // Se actualiza el flag de recuperación con los datos más recientes.
+            const recoveryFlagJSON = localStorage.getItem('boardinggate_nav_recovery_flag');
+            if (recoveryFlagJSON) {
+                const recoveryData = JSON.parse(recoveryFlagJSON);
+                
+                recoveryData.route.waypoints = sanitizeWaypointsForStorage(navigationWaypoints);
+                if (navigationCurrentLocation) recoveryData.lastKnownLocation = navigationCurrentLocation;
+                
+                if (markerAnimationState && typeof markerAnimationState.currentMapBearing === 'number') {
+                    recoveryData.lastKnownBearing = markerAnimationState.currentMapBearing;
+                }
+
+                recoveryData.stats = { totalDistance: totalDistanceTravelledForStats, maxSpeed: maxSpeedDuringTrip, maxAltitude: maxAltitudeDuringTrip, minAltitude: minAltitudeDuringTrip, maxSpeedCoords: maxSpeedCoordinates };
+                recoveryData.tripStartTime = navigationStartTimeForStats ? navigationStartTimeForStats.getTime() : Date.now();
+                recoveryData.originalTripEtaTime = originalTripEtaTime ? originalTripEtaTime.getTime() : null;
+                recoveryData.tripContext = { graphLabels: graphLabels, graphDataPoints: graphDataPoints, minAvgSpeed: minAverageSpeedInTrip, maxAvgSpeed: maxAverageSpeedInTrip, accumulatedDeviationMs: accumulatedDeviationMs };
+                if (isSimulatingGpsLocation && automatedSimulationIntervalId) {
+                    recoveryData.simulationState = { isSimulating: true, speed: simulationSpeedKmph, distance: simulatedDistanceAlongRoute };
+                }
+                recoveryData.isRichRecovery = true;
+                localStorage.setItem('boardinggate_nav_recovery_flag', JSON.stringify(recoveryData));
+            }
+            
+            // Destrucción proactiva de instancias de mapa para liberar memoria.
+            await destroyAllMapInstances();
+
+            // Reinicio.
+            setTimeout(() => { location.reload(); }, 300); 
+        } catch (e) {
+            console.error("Error durante la finalización de la recarga controlada:", e);
+            await destroyAllMapInstances(); // Intento de limpieza incluso si falla
+            setTimeout(() => location.reload(), 300);
+        }
+    };
+
+     // Función interna para capturar la pantalla y luego proceder.
+    const captureAndProceed = async () => {
+        try {
+            const elementToCapture = document.body;
+            if (typeof html2canvas === 'undefined' || !elementToCapture) {
+                await finalizeAndReload();
+                return;
+            }
+            
+            const canvas = await html2canvas(elementToCapture, { useCORS: true, allowTaint: true, logging: false });
+            let dataUrl;
+
+            try {
+                // 1. Intento principal: JPEG a alta calidad (mucho más ligero que PNG).
+                dataUrl = canvas.toDataURL('image/jpeg', 0.60);
+                sessionStorage.setItem('recoveryScreenshot', dataUrl); 
+            } catch (e) {
+                try {
+                    // 2. Fallback: JPEG a calidad reducida si el primero falla.
+                    dataUrl = canvas.toDataURL('image/jpeg', 0.40);
+                    sessionStorage.setItem('recoveryScreenshot', dataUrl);
+                } catch (e2) {
+                    // 3. Failsafe: Si todo falla, no se guarda captura pero el reinicio continúa.
+                    console.error("Error al guardar incluso la captura JPEG. Se procederá sin captura de pantalla.", e2);
+                    sessionStorage.removeItem('recoveryScreenshot');
+                }
+            }
+
+            sessionStorage.setItem('isControlledReload', 'true');
+            await finalizeAndReload();
+
+        } catch (error) {
+            console.error("Error en html2canvas, procediendo sin captura:", error);
+            sessionStorage.setItem('isControlledReload', 'true');
+            sessionStorage.removeItem('recoveryScreenshot');
+            await finalizeAndReload();
+        }
+    };
+    
+    // Esperamos un evento de renderizado del mapa para obtener una captura limpia,
+    // con un timeout de seguridad por si el evento no se dispara.
+    if (navigationMapInstance && navigationMapInstance.isStyleLoaded()) {
+        const safetyTimeout = setTimeout(captureAndProceed, 400); 
+        navigationMapInstance.once('render', () => {
+            clearTimeout(safetyTimeout);
+            setTimeout(captureAndProceed, 200); // Pequeña pausa para que todo se asiente.
+        });
+        navigationMapInstance.triggerRepaint();
+    } else {
+        await captureAndProceed();
+    }
+}
+
+//===================================================================
+// NOMBRE: recalculateAndDrawRoute 
+// RESUMEN: Contiene la nueva lógica para reconstruir la ruta, diferenciando entre recuperación "rica" y "ligera".
+// ===================================================================
+async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recoveryInfo = null) {
+    const RETRY_CADENCE_MS = 3000;
+    const MAX_RETRIES = 5;
+    let attempt = 1;
+
+    while (attempt <= MAX_RETRIES) {
+        isRecalculatingRoute = true;
+        clearAlternativeRoutesDisplay(); 
+        alternativeRoutesCache.clear();
+        selectedStageRoutes.clear();
+        
+        const toastId = `recalc-toast-${Date.now()}`;
+        showToast(`Calculando ruta... (Intento ${attempt}/${MAX_RETRIES})`, "info", 0, false, toastId);
+
+        const wasNavigatingBeforeRecalc = isNavigating;
+
+        try {
+            let waypointsForAPI = [];
+            let currentHeading = null;
+
+            if (recoveryInfo) {
+                const isSimulatedRecovery = recoveryInfo.simulationState && recoveryInfo.simulationState.isSimulating;
+            
+                if (isSimulatedRecovery) {
+                    waypointsForAPI = sanitizeWaypointsForStorage(recoveryInfo.route.waypoints);
+                    currentHeading = null; // No necesitamos rumbo de inicio
+                } else {
+                    const currentPos = await getGpsWithRetries();
+                    
+                    currentHeading = currentPos.heading; // 1. Intentamos obtener el heading en tiempo real.
+                    
+                    // 2. Si el heading en tiempo real es nulo, usamos el 'bearing' guardado (más fiable).
+                    if (currentHeading === null && recoveryInfo && typeof recoveryInfo.lastKnownBearing === 'number') {
+                        currentHeading = recoveryInfo.lastKnownBearing;
+                        console.log(`[Recuperación] Usando 'bearing' de respaldo: ${currentHeading}°`);
+                    }
+                    // 3. Como último recurso, usamos el 'heading' de la última localización (menos fiable).
+                    else if (currentHeading === null && recoveryInfo && recoveryInfo.lastKnownLocation && recoveryInfo.lastKnownLocation.heading !== null) {
+                        currentHeading = recoveryInfo.lastKnownLocation.heading;
+                        console.log(`[Recuperación] Usando 'heading' de respaldo: ${currentHeading}°`);
+                    }
+                
+                    if (!recoveryInfo.isRichRecovery) {
+                        const tempRouteUrl = `${OSRM_SERVICE_URL}/driving/${navigationWaypoints.map(wp => `${wp.lng},${wp.lat}`).join(';')}?overview=full&geometries=geojson&steps=true`;
+                        const tempRouteResponse = await fetch(tempRouteUrl);
+                        const tempRouteData = await tempRouteResponse.json();
+                        
+                        if (tempRouteData.code === 'Ok' && tempRouteData.routes.length > 0) {
+                            const originalRouteLine = turf.lineString(tempRouteData.routes[0].geometry.coordinates);
+                            const carPoint = turf.point([currentPos.longitude, currentPos.latitude]);
+                            const carDistanceAlongOriginalRoute = turf.nearestPointOnLine(originalRouteLine, carPoint, { units: 'meters' }).properties.location;
+                            
+                            let cumulativeDistance = 0;
+                            tempRouteData.routes[0].legs.forEach((leg, legIndex) => {
+                                if (navigationWaypoints[legIndex + 1]) {
+                                    if (cumulativeDistance + leg.distance < carDistanceAlongOriginalRoute) {
+                                        navigationWaypoints[legIndex + 1].visited = true;
+                                    }
+                                    cumulativeDistance += leg.distance;
+                                }
+                            });
+                        }
+                    }
+                    
+                    let lastVisitedIndex = -1;
+                    navigationWaypoints.forEach((wp, index) => {
+                        if (wp && wp.visited && !wp.isInternal) {
+                            lastVisitedIndex = index;
+                        }
+                    });
+                    
+                    const waypointsBefore = navigationWaypoints.slice(0, lastVisitedIndex + 1);
+                    const waypointsAfter = navigationWaypoints.slice(lastVisitedIndex + 1);
+                    const invisibleWaypoint = { lat: currentPos.latitude, lng: currentPos.longitude, isInternal: true };
+                    waypointsForAPI = [...waypointsBefore, invisibleWaypoint, ...waypointsAfter];
+                }
+
+            } else if (!isNavigating) {
+                waypointsForAPI = [...navigationWaypoints];
+                currentHeading = null;
+            } else { 
+                if (navigationCurrentLocation) {
+                    currentHeading = navigationCurrentLocation.heading;
+                    waypointsForAPI.push({ lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude, isRecalculatedStart: true });
+                    waypointsForAPI.push(...navigationWaypoints.filter(wp => !wp.visited));
+                } else {
+                    waypointsForAPI = [...navigationWaypoints];
+                }
+            }
+            
+            const validWaypoints = waypointsForAPI.filter(wp => wp && typeof wp.lat === 'number' && typeof wp.lng === 'number');
+            if (validWaypoints.length < 2) { 
+                const existingToast = document.getElementById(toastId);
+                if (existingToast) existingToast.remove();
+                isRecalculatingRoute = false;
+                return; 
+            };
+
+            const coordsString = validWaypoints.map(wp => `${wp.lng},${wp.lat}`).join(';');
+            const result = await fetchRouteData(coordsString, currentHeading);
+            if (result.error) throw result.error;
+
+            const newRouteData = result.routeData;
+            const newRemainingRoute = newRouteData.routes[0];
+
+            navigationCurrentRouteData = newRouteData;
+            precalculateRouteStepDistances(navigationCurrentRouteData);
+
+            generateAndCacheCleanManeuverList(newRemainingRoute, navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart));
+            
+            await drawRouteOnMap(newRemainingRoute);
+            
+            const isRadaresRutaActive = document.getElementById('radares-ruta-checkbox').checked;
+
+            if (isRadaresRutaActive) {
+                let reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
+                const originalLength = reminders.length;
+                reminders = reminders.filter(r => !r.isDynamicRadar);
+                if (reminders.length < originalLength) {
+                    localStorage.setItem('reminders', JSON.stringify(reminders));
+                    markCacheAsDirty();
+                }
+            }
+            
+            if (preserveAccumulatedStats) {
+                accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
+            } else {
+                accumulatedDistanceBeforeCurrentSegment = 0;
+                navigationStartTimeForStats = new Date();
+                originalTripEtaTime = null;
+            }
+            
+            lastCarDistanceAlongRouteForNavLogic = 0;
+            currentLegIndexNav = 0;
+            currentStepIndexNav = 0;
+            previousLegIndexForEta = 0;
+            lastProcessedStepIdentifier = null;
+            lastProcessedStepForLock = null;
+            lastDisplayedManeuverIcon = null;
+
+            tripInitialOverallEtaTime = new Date(Date.now() + newRemainingRoute.duration * 1000);
+            if (newRemainingRoute.legs && newRemainingRoute.legs.length > 0) {
+                currentStageInitialExpectedEtaTime = new Date(Date.now() + newRemainingRoute.legs[0].duration * 1000);
+            } else {
+                currentStageInitialExpectedEtaTime = null;
+            }
+            
+            renderWaypointMarkers();
+
+            if (!recoveryInfo) {
+                updateNavigationProgressDisplay(newRemainingRoute, 0); 
+                updateTurnByTurnDisplay(newRemainingRoute, 0);
+            }
+            drawStaticMarkersOnProgressBar();
+            showDestinationName();
+            toggleRadaresRuta(document.getElementById('radares-ruta-checkbox').checked);
+            toggleTareasRuta(document.getElementById('tareas-ruta-checkbox').checked);
+            updateStartNavigationButtonState();
+            updateNavigationButtonColor();
+
+            deviationCheckGracePeriodUntil = Date.now() + 7000;
+            closeModalAndProceed();
+            return;
+            
+        } catch (error) {
+            console.error(`[RECALC] Fallo en intento #${attempt}:`, error);
+            if (attempt === MAX_RETRIES) {
+                showToast("Fallo al recalcular la ruta tras varios intentos. Comprueba tu conexión.", "error");
+                closeModalAndProceed();
+                throw new Error("Fallo al recalcular la ruta tras múltiples intentos.");
+            } else {
+                await new Promise(resolve => setTimeout(resolve, RETRY_CADENCE_MS));
+            }
+        } finally {
+            const existingToast = document.getElementById(toastId);
+            if (existingToast) existingToast.remove();
+            activeToasts = activeToasts.filter(t => t.id !== toastId);
+
+            isRecalculatingRoute = false;
+            isNavigating = wasNavigatingBeforeRecalc; 
+            
+            if (attempt > MAX_RETRIES) { 
+                 updateStartNavigationButtonState();
+                 updateNavigationButtonColor();
+            }
+        }
+        attempt++; 
+    }
+}
+    
+
+// ===================================================================
 // NOMBRE: fetchOverpassData 
 // RESUMEN: Realiza la petición a la API de Overpass y devuelve los resultados.
 async function fetchOverpassData(query) {
@@ -7477,363 +7772,7 @@ function precalculateRouteStepDistances(routeData) {
 }            
 
 
-//===================================================================
-// NOMBRE: recalculateAndDrawRoute (MODIFICADA - Lógica de recuperación dual)
-// RESUMEN: Contiene la nueva lógica para reconstruir la ruta, diferenciando entre recuperación "rica" y "ligera".
-// ===================================================================
-async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recoveryInfo = null) {
-    const RETRY_CADENCE_MS = 3000;
-    const MAX_RETRIES = 5;
-    let attempt = 1;
 
-    while (attempt <= MAX_RETRIES) {
-        isRecalculatingRoute = true;
-        clearAlternativeRoutesDisplay(); 
-        alternativeRoutesCache.clear();
-        selectedStageRoutes.clear();
-        
-        const toastId = `recalc-toast-${Date.now()}`;
-        showToast(`Calculando ruta... (Intento ${attempt}/${MAX_RETRIES})`, "info", 0, false, toastId);
-
-        const wasNavigatingBeforeRecalc = isNavigating;
-
-        try {
-            let waypointsForAPI = [];
-            let currentHeading = null;
-
-            if (recoveryInfo) {
-                const currentPos = await getGpsWithRetries();
-                currentHeading = currentPos.heading;
-                
-                // Si NO es una recuperación rica (crash), reconstruimos el estado 'visited'.
-                if (!recoveryInfo.isRichRecovery) {
-                    const tempRouteUrl = `${OSRM_SERVICE_URL}/driving/${navigationWaypoints.map(wp => `${wp.lng},${wp.lat}`).join(';')}?overview=full&geometries=geojson&steps=true`;
-                    const tempRouteResponse = await fetch(tempRouteUrl);
-                    const tempRouteData = await tempRouteResponse.json();
-                    
-                    if (tempRouteData.code === 'Ok' && tempRouteData.routes.length > 0) {
-                        const originalRouteLine = turf.lineString(tempRouteData.routes[0].geometry.coordinates);
-                        const carPoint = turf.point([currentPos.longitude, currentPos.latitude]);
-                        const carDistanceAlongOriginalRoute = turf.nearestPointOnLine(originalRouteLine, carPoint, { units: 'meters' }).properties.location;
-                        
-                        let cumulativeDistance = 0;
-                        tempRouteData.routes[0].legs.forEach((leg, legIndex) => {
-                            if (navigationWaypoints[legIndex + 1]) {
-                                if (cumulativeDistance + leg.distance < carDistanceAlongOriginalRoute) {
-                                    navigationWaypoints[legIndex + 1].visited = true;
-                                }
-                                cumulativeDistance += leg.distance;
-                            }
-                        });
-                    }
-                }
-                
-                let lastVisitedIndex = -1;
-                navigationWaypoints.forEach((wp, index) => {
-                    if (wp && wp.visited && !wp.isInternal) {
-                        lastVisitedIndex = index;
-                    }
-                });
-                
-                const waypointsBefore = navigationWaypoints.slice(0, lastVisitedIndex + 1);
-                const waypointsAfter = navigationWaypoints.slice(lastVisitedIndex + 1);
-                const invisibleWaypoint = { lat: currentPos.latitude, lng: currentPos.longitude, isInternal: true };
-                waypointsForAPI = [...waypointsBefore, invisibleWaypoint, ...waypointsAfter];
-
-            } else if (!isNavigating) {
-                waypointsForAPI = [...navigationWaypoints];
-                currentHeading = null;
-            } else { 
-                if (navigationCurrentLocation) {
-                    currentHeading = navigationCurrentLocation.heading;
-                    waypointsForAPI.push({ lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude, isRecalculatedStart: true });
-                    waypointsForAPI.push(...navigationWaypoints.filter(wp => !wp.visited));
-                } else {
-                    waypointsForAPI = [...navigationWaypoints];
-                }
-            }
-            
-            const validWaypoints = waypointsForAPI.filter(wp => wp && typeof wp.lat === 'number' && typeof wp.lng === 'number');
-            if (validWaypoints.length < 2) { 
-                const existingToast = document.getElementById(toastId);
-                if (existingToast) existingToast.remove();
-                isRecalculatingRoute = false;
-                return; 
-            };
-
-            const coordsString = validWaypoints.map(wp => `${wp.lng},${wp.lat}`).join(';');
-            const result = await fetchRouteData(coordsString, currentHeading);
-            if (result.error) throw result.error;
-
-            const newRouteData = result.routeData;
-            const newRemainingRoute = newRouteData.routes[0];
-
-            navigationCurrentRouteData = newRouteData;
-            precalculateRouteStepDistances(navigationCurrentRouteData);
-
-            generateAndCacheCleanManeuverList(newRemainingRoute, navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart));
-            
-            await drawRouteOnMap(newRemainingRoute);
-            
-            const isRadaresRutaActive = document.getElementById('radares-ruta-checkbox').checked;
-
-            if (isRadaresRutaActive) {
-                let reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
-                const originalLength = reminders.length;
-                reminders = reminders.filter(r => !r.isDynamicRadar);
-                if (reminders.length < originalLength) {
-                    localStorage.setItem('reminders', JSON.stringify(reminders));
-                    markCacheAsDirty();
-                }
-            }
-            
-            if (preserveAccumulatedStats) {
-                accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
-            } else {
-                accumulatedDistanceBeforeCurrentSegment = 0;
-                navigationStartTimeForStats = new Date();
-                originalTripEtaTime = null;
-            }
-            
-            lastCarDistanceAlongRouteForNavLogic = 0;
-            currentLegIndexNav = 0;
-            currentStepIndexNav = 0;
-            previousLegIndexForEta = 0;
-            lastProcessedStepIdentifier = null;
-            lastProcessedStepForLock = null;
-            lastDisplayedManeuverIcon = null;
-
-            tripInitialOverallEtaTime = new Date(Date.now() + newRemainingRoute.duration * 1000);
-            if (newRemainingRoute.legs && newRemainingRoute.legs.length > 0) {
-                currentStageInitialExpectedEtaTime = new Date(Date.now() + newRemainingRoute.legs[0].duration * 1000);
-            } else {
-                currentStageInitialExpectedEtaTime = null;
-            }
-            
-            renderWaypointMarkers();
-
-            if (!recoveryInfo) {
-                updateNavigationProgressDisplay(newRemainingRoute, 0); 
-                updateTurnByTurnDisplay(newRemainingRoute, 0);
-            }
-            drawStaticMarkersOnProgressBar();
-            showDestinationName();
-            toggleRadaresRuta(document.getElementById('radares-ruta-checkbox').checked);
-            toggleTareasRuta(document.getElementById('tareas-ruta-checkbox').checked);
-            updateStartNavigationButtonState();
-            updateNavigationButtonColor();
-
-            deviationCheckGracePeriodUntil = Date.now() + 7000;
-            closeModalAndProceed();
-            return;
-            
-        } catch (error) {
-            console.error(`[RECALC] Fallo en intento #${attempt}:`, error);
-            if (attempt === MAX_RETRIES) {
-                showToast("Fallo al recalcular la ruta tras varios intentos. Comprueba tu conexión.", "error");
-                closeModalAndProceed();
-                throw new Error("Fallo al recalcular la ruta tras múltiples intentos.");
-            } else {
-                await new Promise(resolve => setTimeout(resolve, RETRY_CADENCE_MS));
-            }
-        } finally {
-            const existingToast = document.getElementById(toastId);
-            if (existingToast) existingToast.remove();
-            activeToasts = activeToasts.filter(t => t.id !== toastId);
-
-            isRecalculatingRoute = false;
-            isNavigating = wasNavigatingBeforeRecalc; 
-            
-            if (attempt > MAX_RETRIES) { 
-                 updateStartNavigationButtonState();
-                 updateNavigationButtonColor();
-            }
-        }
-        attempt++; 
-    }
-}    
-
-// ===================================================================
-// NOMBRE: recalculateAndDrawRoute (MODIFICADA - Lógica de recuperación dual)
-// RESUMEN: Contiene la nueva lógica para reconstruir la ruta, diferenciando entre recuperación "rica" y "ligera".
-// ===================================================================
-async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recoveryInfo = null) {
-    const RETRY_CADENCE_MS = 3000;
-    const MAX_RETRIES = 5;
-    let attempt = 1;
-
-    while (attempt <= MAX_RETRIES) {
-        isRecalculatingRoute = true;
-        clearAlternativeRoutesDisplay(); 
-        alternativeRoutesCache.clear();
-        selectedStageRoutes.clear();
-        
-        const toastId = `recalc-toast-${Date.now()}`;
-        showToast(`Calculando ruta... (Intento ${attempt}/${MAX_RETRIES})`, "info", 0, false, toastId);
-
-        const wasNavigatingBeforeRecalc = isNavigating;
-
-        try {
-            let waypointsForAPI = [];
-            let currentHeading = null;
-
-            if (recoveryInfo) {
-                const isSimulatedRecovery = recoveryInfo.simulationState && recoveryInfo.simulationState.isSimulating;
-            
-                if (isSimulatedRecovery) {
-                    waypointsForAPI = sanitizeWaypointsForStorage(recoveryInfo.route.waypoints);
-                    currentHeading = null; // No necesitamos rumbo de inicio
-                } else {
-                    const currentPos = await getGpsWithRetries();
-                    currentHeading = currentPos.heading;
-                    
-                    if (!recoveryInfo.isRichRecovery) {
-                        const tempRouteUrl = `${OSRM_SERVICE_URL}/driving/${navigationWaypoints.map(wp => `${wp.lng},${wp.lat}`).join(';')}?overview=full&geometries=geojson&steps=true`;
-                        const tempRouteResponse = await fetch(tempRouteUrl);
-                        const tempRouteData = await tempRouteResponse.json();
-                        
-                        if (tempRouteData.code === 'Ok' && tempRouteData.routes.length > 0) {
-                            const originalRouteLine = turf.lineString(tempRouteData.routes[0].geometry.coordinates);
-                            const carPoint = turf.point([currentPos.longitude, currentPos.latitude]);
-                            const carDistanceAlongOriginalRoute = turf.nearestPointOnLine(originalRouteLine, carPoint, { units: 'meters' }).properties.location;
-                            
-                            let cumulativeDistance = 0;
-                            tempRouteData.routes[0].legs.forEach((leg, legIndex) => {
-                                if (navigationWaypoints[legIndex + 1]) {
-                                    if (cumulativeDistance + leg.distance < carDistanceAlongOriginalRoute) {
-                                        navigationWaypoints[legIndex + 1].visited = true;
-                                    }
-                                    cumulativeDistance += leg.distance;
-                                }
-                            });
-                        }
-                    }
-                    
-                    let lastVisitedIndex = -1;
-                    navigationWaypoints.forEach((wp, index) => {
-                        if (wp && wp.visited && !wp.isInternal) {
-                            lastVisitedIndex = index;
-                        }
-                    });
-                    
-                    const waypointsBefore = navigationWaypoints.slice(0, lastVisitedIndex + 1);
-                    const waypointsAfter = navigationWaypoints.slice(lastVisitedIndex + 1);
-                    const invisibleWaypoint = { lat: currentPos.latitude, lng: currentPos.longitude, isInternal: true };
-                    waypointsForAPI = [...waypointsBefore, invisibleWaypoint, ...waypointsAfter];
-                }
-
-            } else if (!isNavigating) {
-                waypointsForAPI = [...navigationWaypoints];
-                currentHeading = null;
-            } else { 
-                if (navigationCurrentLocation) {
-                    currentHeading = navigationCurrentLocation.heading;
-                    waypointsForAPI.push({ lat: navigationCurrentLocation.latitude, lng: navigationCurrentLocation.longitude, isRecalculatedStart: true });
-                    waypointsForAPI.push(...navigationWaypoints.filter(wp => !wp.visited));
-                } else {
-                    waypointsForAPI = [...navigationWaypoints];
-                }
-            }
-            
-            const validWaypoints = waypointsForAPI.filter(wp => wp && typeof wp.lat === 'number' && typeof wp.lng === 'number');
-            if (validWaypoints.length < 2) { 
-                const existingToast = document.getElementById(toastId);
-                if (existingToast) existingToast.remove();
-                isRecalculatingRoute = false;
-                return; 
-            };
-
-            const coordsString = validWaypoints.map(wp => `${wp.lng},${wp.lat}`).join(';');
-            const result = await fetchRouteData(coordsString, currentHeading);
-            if (result.error) throw result.error;
-
-            const newRouteData = result.routeData;
-            const newRemainingRoute = newRouteData.routes[0];
-
-            navigationCurrentRouteData = newRouteData;
-            precalculateRouteStepDistances(navigationCurrentRouteData);
-
-            generateAndCacheCleanManeuverList(newRemainingRoute, navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart));
-            
-            await drawRouteOnMap(newRemainingRoute);
-            
-            const isRadaresRutaActive = document.getElementById('radares-ruta-checkbox').checked;
-
-            if (isRadaresRutaActive) {
-                let reminders = JSON.parse(localStorage.getItem('reminders') || '[]');
-                const originalLength = reminders.length;
-                reminders = reminders.filter(r => !r.isDynamicRadar);
-                if (reminders.length < originalLength) {
-                    localStorage.setItem('reminders', JSON.stringify(reminders));
-                    markCacheAsDirty();
-                }
-            }
-            
-            if (preserveAccumulatedStats) {
-                accumulatedDistanceBeforeCurrentSegment = totalDistanceTravelledForStats;
-            } else {
-                accumulatedDistanceBeforeCurrentSegment = 0;
-                navigationStartTimeForStats = new Date();
-                originalTripEtaTime = null;
-            }
-            
-            lastCarDistanceAlongRouteForNavLogic = 0;
-            currentLegIndexNav = 0;
-            currentStepIndexNav = 0;
-            previousLegIndexForEta = 0;
-            lastProcessedStepIdentifier = null;
-            lastProcessedStepForLock = null;
-            lastDisplayedManeuverIcon = null;
-
-            tripInitialOverallEtaTime = new Date(Date.now() + newRemainingRoute.duration * 1000);
-            if (newRemainingRoute.legs && newRemainingRoute.legs.length > 0) {
-                currentStageInitialExpectedEtaTime = new Date(Date.now() + newRemainingRoute.legs[0].duration * 1000);
-            } else {
-                currentStageInitialExpectedEtaTime = null;
-            }
-            
-            renderWaypointMarkers();
-
-            if (!recoveryInfo) {
-                updateNavigationProgressDisplay(newRemainingRoute, 0); 
-                updateTurnByTurnDisplay(newRemainingRoute, 0);
-            }
-            drawStaticMarkersOnProgressBar();
-            showDestinationName();
-            toggleRadaresRuta(document.getElementById('radares-ruta-checkbox').checked);
-            toggleTareasRuta(document.getElementById('tareas-ruta-checkbox').checked);
-            updateStartNavigationButtonState();
-            updateNavigationButtonColor();
-
-            deviationCheckGracePeriodUntil = Date.now() + 7000;
-            closeModalAndProceed();
-            return;
-            
-        } catch (error) {
-            console.error(`[RECALC] Fallo en intento #${attempt}:`, error);
-            if (attempt === MAX_RETRIES) {
-                showToast("Fallo al recalcular la ruta tras varios intentos. Comprueba tu conexión.", "error");
-                closeModalAndProceed();
-                throw new Error("Fallo al recalcular la ruta tras múltiples intentos.");
-            } else {
-                await new Promise(resolve => setTimeout(resolve, RETRY_CADENCE_MS));
-            }
-        } finally {
-            const existingToast = document.getElementById(toastId);
-            if (existingToast) existingToast.remove();
-            activeToasts = activeToasts.filter(t => t.id !== toastId);
-
-            isRecalculatingRoute = false;
-            isNavigating = wasNavigatingBeforeRecalc; 
-            
-            if (attempt > MAX_RETRIES) { 
-                 updateStartNavigationButtonState();
-                 updateNavigationButtonColor();
-            }
-        }
-        attempt++; 
-    }
-}
     
     
 // ===================================================================
@@ -12037,103 +11976,7 @@ async function waitForMapStyleLoad(mapInstance) {
     }
 }
     
-
-// ===================================================================
-// NOMBRE: initiateControlledReload (CON OPTIMIZACIÓN QUIRÚRGICA DE CAPTURA)
-// RESUMEN: Inicia el reinicio controlado. Prioriza la estabilidad sobre la estética,
-//          usando JPEG para la captura y con fallbacks para garantizar que el reinicio ocurra.
-// ===================================================================
-async function initiateControlledReload() {
-    if (isPerformingControlledReload) return;
-    isPerformingControlledReload = true; 
-
-    // Función interna para los pasos finales y el reinicio.
-    const finalizeAndReload = async () => {
-        try {
-            // Se actualiza el flag de recuperación con los datos más recientes.
-            const recoveryFlagJSON = localStorage.getItem('boardinggate_nav_recovery_flag');
-            if (recoveryFlagJSON) {
-                const recoveryData = JSON.parse(recoveryFlagJSON);
-                
-                recoveryData.route.waypoints = sanitizeWaypointsForStorage(navigationWaypoints);
-                if (navigationCurrentLocation) recoveryData.lastKnownLocation = navigationCurrentLocation;
-                recoveryData.stats = { totalDistance: totalDistanceTravelledForStats, maxSpeed: maxSpeedDuringTrip, maxAltitude: maxAltitudeDuringTrip, minAltitude: minAltitudeDuringTrip, maxSpeedCoords: maxSpeedCoordinates };
-                recoveryData.tripStartTime = navigationStartTimeForStats ? navigationStartTimeForStats.getTime() : Date.now();
-                recoveryData.originalTripEtaTime = originalTripEtaTime ? originalTripEtaTime.getTime() : null;
-                recoveryData.tripContext = { graphLabels: graphLabels, graphDataPoints: graphDataPoints, minAvgSpeed: minAverageSpeedInTrip, maxAvgSpeed: maxAverageSpeedInTrip, accumulatedDeviationMs: accumulatedDeviationMs };
-                if (isSimulatingGpsLocation && automatedSimulationIntervalId) {
-                    recoveryData.simulationState = { isSimulating: true, speed: simulationSpeedKmph, distance: simulatedDistanceAlongRoute };
-                }
-                recoveryData.isRichRecovery = true;
-                localStorage.setItem('boardinggate_nav_recovery_flag', JSON.stringify(recoveryData));
-            }
-            
-            // Destrucción proactiva de instancias de mapa para liberar memoria.
-            await destroyAllMapInstances();
-
-            // Reinicio.
-            setTimeout(() => { location.reload(); }, 300); 
-        } catch (e) {
-            console.error("Error durante la finalización de la recarga controlada:", e);
-            await destroyAllMapInstances(); // Intento de limpieza incluso si falla
-            setTimeout(() => location.reload(), 300);
-        }
-    };
-
-     // Función interna para capturar la pantalla y luego proceder.
-    const captureAndProceed = async () => {
-        try {
-            const elementToCapture = document.body;
-            if (typeof html2canvas === 'undefined' || !elementToCapture) {
-                await finalizeAndReload();
-                return;
-            }
-            
-            const canvas = await html2canvas(elementToCapture, { useCORS: true, allowTaint: true, logging: false });
-            let dataUrl;
-
-            try {
-                // 1. Intento principal: JPEG a alta calidad (mucho más ligero que PNG).
-                dataUrl = canvas.toDataURL('image/jpeg', 0.60);
-                sessionStorage.setItem('recoveryScreenshot', dataUrl); 
-            } catch (e) {
-                try {
-                    // 2. Fallback: JPEG a calidad reducida si el primero falla.
-                    dataUrl = canvas.toDataURL('image/jpeg', 0.40);
-                    sessionStorage.setItem('recoveryScreenshot', dataUrl);
-                } catch (e2) {
-                    // 3. Failsafe: Si todo falla, no se guarda captura pero el reinicio continúa.
-                    console.error("Error al guardar incluso la captura JPEG. Se procederá sin captura de pantalla.", e2);
-                    sessionStorage.removeItem('recoveryScreenshot');
-                }
-            }
-
-            sessionStorage.setItem('isControlledReload', 'true');
-            await finalizeAndReload();
-
-        } catch (error) {
-            console.error("Error en html2canvas, procediendo sin captura:", error);
-            sessionStorage.setItem('isControlledReload', 'true');
-            sessionStorage.removeItem('recoveryScreenshot');
-            await finalizeAndReload();
-        }
-    };
     
-    // Esperamos un evento de renderizado del mapa para obtener una captura limpia,
-    // con un timeout de seguridad por si el evento no se dispara.
-    if (navigationMapInstance && navigationMapInstance.isStyleLoaded()) {
-        const safetyTimeout = setTimeout(captureAndProceed, 400); 
-        navigationMapInstance.once('render', () => {
-            clearTimeout(safetyTimeout);
-            setTimeout(captureAndProceed, 200); // Pequeña pausa para que todo se asiente.
-        });
-        navigationMapInstance.triggerRepaint();
-    } else {
-        await captureAndProceed();
-    }
-}
-    
-
     
 // ===================================================================
 // NOMBRE: hideRecoveryScreenshotOverlay 
