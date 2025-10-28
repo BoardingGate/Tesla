@@ -1,4 +1,4 @@
-m02
+m03
 <!DOCTY1PE html>
 <html lang="es">
 <head>
@@ -932,7 +932,7 @@ m02
     let currentRouteNameForSaving = null;
     let navigationMapClickHandler = null;
     let draggedStageLi = null;
-    const DEVIATION_THRESHOLD_METERS = 25;
+    const DEVIATION_THRESHOLD_METERS = 22;
     const DEVIATION_MIN_TIME_SECONDS = 0.1;
     let deviationStartTime = 0;
     let isRecalculatingRoute = false;
@@ -1202,7 +1202,11 @@ m02
     let isRangeCalcModeActive = false;
     let longPressTimer = null;
     let currentRangeCalcParams = {};
+    let deviationCheckTimerId = null;
+    let isHighAlertMode = false;
+    let highAlertTimeoutId = null;
 
+    
     const easeInOutQuad = t => t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
    
     const managedKeys = [ 
@@ -6109,69 +6113,50 @@ function rebuildProcessedRemindersCache() {
     }
 }
     
-// ===================================================================
-// NOMBRE: stopDeviationChecker 
-// RESUMEN: Detiene el temporizador de comprobación de desvío.
-function stopDeviationChecker() {
-    if (deviationCheckIntervalId) {
-        clearInterval(deviationCheckIntervalId); 
-        deviationCheckIntervalId = null;
-        deviationStartTime = 0;
-    }
-}
 
+//===================================================================
+// NOMBRE: startDeviationChecker (VERSIÓN ADAPTATIVA MEJORADA)
+// RESUMEN: Inicia un ciclo de comprobación de desvío con intervalo adaptativo.
 // ===================================================================
-// NOMBRE: startDeviationChecker 
-// RESUMEN: Inicia un temporizador FIJO que comprueba el desvío de ruta cada 5 segundos.
 function startDeviationChecker() {
-    stopDeviationChecker(); // Siempre nos aseguramos de limpiar cualquier temporizador anterior.
+    stopDeviationChecker(); // Limpia cualquier ciclo anterior
 
-    const CHECK_INTERVAL_MS = 5000; // Intervalo fijo de 5 segundos.
+    const NORMAL_CHECK_INTERVAL_MS = 5000;
+    const HIGH_ALERT_INTERVAL_MS = 500;
+    const HIGH_ALERT_DURATION_MS = 5000;
+    const WARNING_THRESHOLD_METERS = 12; // Nuevo umbral de "sospecha"
 
-    deviationCheckIntervalId = setInterval(() => {
-        const MIN_DISTANCE_FOR_DEVIATION_CHECK = 200; // 200 metros
-        if (totalDistanceTravelledForStats < MIN_DISTANCE_FOR_DEVIATION_CHECK) {
-            deviationStartTime = 0; 
-        return; }
-  
-        if (isArrivalSequenceStarted) {
-            stopDeviationChecker();
-            return;
-        }
-
-        if (Date.now() < deviationCheckGracePeriodUntil) {
-            return;
-        }
-
-        if (!isNavigating || !navigationCurrentLocation || isRecalculatingRoute || isDeviationModalActive || isAddReminderAtLocationModeActive) {
-            deviationStartTime = 0; // Reseteamos el contador de tiempo de desvío
+    const runDeviationCheck = () => {
+        // --- Cláusulas de guarda (sin cambios) ---
+        const MIN_DISTANCE_FOR_DEVIATION_CHECK = 200;
+        if (totalDistanceTravelledForStats < MIN_DISTANCE_FOR_DEVIATION_CHECK || isArrivalSequenceStarted || Date.now() < deviationCheckGracePeriodUntil || !isNavigating || !navigationCurrentLocation || isRecalculatingRoute || isDeviationModalActive || isAddReminderAtLocationModeActive) {
+            if (isHighAlertMode) { // Si estamos en alerta y una de estas condiciones se cumple, cancelamos la alerta.
+                clearTimeout(highAlertTimeoutId);
+                isHighAlertMode = false;
+            }
+            deviationCheckTimerId = setTimeout(runDeviationCheck, NORMAL_CHECK_INTERVAL_MS); // Reintentar en 5s
             return;
         }
 
         const route = navigationCurrentRouteData?.routes?.[0];
         if (!route || !route.legs || !route.legs[currentLegIndexNav] || !route.legs[currentLegIndexNav].steps[currentStepIndexNav] || typeof turf === 'undefined') {
-            return; 
+            deviationCheckTimerId = setTimeout(runDeviationCheck, NORMAL_CHECK_INTERVAL_MS); // Reintentar en 5s
+            return;
         }
         
+        // --- Lógica de cálculo de distancia (sin cambios) ---
         let distanceToRoute = 0;
         try {
             const carPoint = turf.point([navigationCurrentLocation.longitude, navigationCurrentLocation.latitude]);
-            
             const searchWindowCoords = [];
             const stepsToInclude = 5;
-            let legIdx = currentLegIndexNav;
-            let stepIdx = currentStepIndexNav;
-            
+            let legIdx = currentLegIndexNav, stepIdx = currentStepIndexNav;
             for (let i = 0; i < stepsToInclude && legIdx < route.legs.length; i++) {
                 const currentLeg = route.legs[legIdx];
                 if (stepIdx < currentLeg.steps.length) {
                     const currentStep = currentLeg.steps[stepIdx];
-                    if (currentStep.geometry && currentStep.geometry.coordinates) {
-                        if (searchWindowCoords.length > 0) {
-                            searchWindowCoords.push(...currentStep.geometry.coordinates.slice(1));
-                        } else {
-                            searchWindowCoords.push(...currentStep.geometry.coordinates);
-                        }
+                    if (currentStep.geometry?.coordinates) {
+                        searchWindowCoords.push(...(searchWindowCoords.length > 0 ? currentStep.geometry.coordinates.slice(1) : currentStep.geometry.coordinates));
                     }
                     stepIdx++;
                 } else {
@@ -6180,30 +6165,70 @@ function startDeviationChecker() {
                     i--; 
                 }
             }
-
-            if (searchWindowCoords.length < 2) {
-                distanceToRoute = 0;
-            } else {
-                const routeWindowLineString = turf.lineString(searchWindowCoords);
-                distanceToRoute = turf.pointToLineDistance(carPoint, routeWindowLineString, { units: 'meters' });
+            if (searchWindowCoords.length > 1) {
+                distanceToRoute = turf.pointToLineDistance(carPoint, turf.lineString(searchWindowCoords), { units: 'meters' });
             }
-
         } catch (e) {
-             distanceToRoute = DEVIATION_THRESHOLD_METERS + 1; // Forzar desvío si hay error
+             distanceToRoute = DEVIATION_THRESHOLD_METERS + 1;
         }
 
+        // --- NUEVA LÓGICA ADAPTATIVA ---
         if (distanceToRoute > DEVIATION_THRESHOLD_METERS) {
-            if (deviationStartTime === 0) {
-                deviationStartTime = Date.now();
-            } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
-                showDeviationModal();
-                deviationStartTime = 0; 
+            // Desvío confirmado, mostramos el modal. El ciclo se detiene.
+            showDeviationModal();
+            stopDeviationChecker(); // Detiene todos los temporizadores asociados a esta función.
+            return;
+
+        } else if (distanceToRoute > WARNING_THRESHOLD_METERS) {
+            // Entramos en MODO ALERTA si no lo estábamos ya
+            if (!isHighAlertMode) {
+                isHighAlertMode = true;
+                
+                // Programamos el reseteo a modo normal después de 5 segundos
+                highAlertTimeoutId = setTimeout(() => {
+                    isHighAlertMode = false;
+                    highAlertTimeoutId = null;
+                    // Si el próximo chequeo no se ha programado, lo hacemos aquí para evitar que se detenga el ciclo.
+                    if (deviationCheckTimerId) clearTimeout(deviationCheckTimerId);
+                    deviationCheckTimerId = setTimeout(runDeviationCheck, NORMAL_CHECK_INTERVAL_MS);
+                }, HIGH_ALERT_DURATION_MS);
             }
+            // Programamos el siguiente chequeo en 0.5 segundos
+            deviationCheckTimerId = setTimeout(runDeviationCheck, HIGH_ALERT_INTERVAL_MS);
+
         } else {
-            deviationStartTime = 0;
+            // Estamos en ruta
+            if (isHighAlertMode) {
+                // Si estábamos en alerta, era una falsa alarma. Cancelamos todo y volvemos a la normalidad.
+                clearTimeout(highAlertTimeoutId);
+                highAlertTimeoutId = null;
+                isHighAlertMode = false;
+            }
+            // Programamos el siguiente chequeo en 5 segundos (modo normal)
+            deviationCheckTimerId = setTimeout(runDeviationCheck, NORMAL_CHECK_INTERVAL_MS);
         }
-    }, CHECK_INTERVAL_MS);
-}    
+    };
+
+    // Primera llamada para iniciar el ciclo
+    runDeviationCheck();
+}
+
+// ===================================================================
+// NOMBRE: stopDeviationChecker (MODIFICADA PARA MODO ADAPTATIVO)
+// RESUMEN: Detiene todos los temporizadores de comprobación de desvío.
+function stopDeviationChecker() {
+    if (deviationCheckTimerId) {
+        clearTimeout(deviationCheckTimerId); 
+        deviationCheckTimerId = null;
+    }
+    if (highAlertTimeoutId) {
+        clearTimeout(highAlertTimeoutId);
+        highAlertTimeoutId = null;
+    }
+    isHighAlertMode = false;
+    deviationStartTime = 0; // Se mantiene por compatibilidad, aunque la lógica ya no lo usa.
+}
+    
     
 // ===================================================================
 // NOMBRE: saveCustomData 
