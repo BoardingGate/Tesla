@@ -41,7 +41,7 @@
     
     <link rel="stylesheet" href="tesla.css">
     
-<!-- REVISAR PERIODICAMENTE CADA 30 DIAS CUAL ES LA MÁS RECIENTE API DE MAPBOX -->
+<!-- REVISAR CADA 30 DIAS API DE MAPBOX -->
     
     <link href='https://api.mapbox.com/mapbox-gl-js/v3.16.0/mapbox-gl.css' rel='stylesheet' />
     <script src='https://api.mapbox.com/mapbox-gl-js/v3.16.0/mapbox-gl.js'></script>
@@ -55,8 +55,7 @@
 </head>
 
 <style>
-
-        
+    
 </style>
     
 </head>
@@ -102,6 +101,7 @@
         })();
     </script>
 
+  
     <div class="reminder-count-globe" id="reminder-count-globe" style="display: none;"></div>
 
     <div id="unified-reminder-window" role="alertdialog" aria-labelledby="reminder-window-title" aria-describedby="reminder-window-desc">
@@ -198,6 +198,11 @@
          <img src="PNG/Coche_Sat.PNG" alt="Toggle Panel Mapa">
     </div>
     <div id="reminders-location-map-content-wrapper">
+        
+       <div id="weather-widget-container" class="weather-widget-right">     
+                <div id="weather-widget-content"></div>
+        </div>
+        
         <div id="reminders-location-map-header">
              <div class="button-row">
                 <button id="close-reminders-location-map" class="reminders-map-button-action" title="Cerrar mapa y navegación"><img src="PNG/SALIR.PNG" alt="Salir"></button>
@@ -920,7 +925,7 @@
     let currentRouteNameForSaving = null;
     let navigationMapClickHandler = null;
     let draggedStageLi = null;
-    const DEVIATION_THRESHOLD_METERS = 25;
+    const DEVIATION_THRESHOLD_METERS = 22;
     const DEVIATION_MIN_TIME_SECONDS = 0.1;
     let deviationStartTime = 0;
     let isRecalculatingRoute = false;
@@ -1190,6 +1195,12 @@
     let isRangeCalcModeActive = false;
     let longPressTimer = null;
     let currentRangeCalcParams = {};
+    let deviationCheckTimerId = null;
+    let isHighAlertMode = false;
+    let highAlertTimeoutId = null;
+    let weatherUpdateTimer = null;
+    let lastWeatherCoords = { lat: 0, lon: 0 };
+    let weatherHideTimer = null; 
 
     const easeInOutQuad = t => t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
    
@@ -1357,7 +1368,170 @@ function setMapLighting(mapInstance) {
 }
 
 
+// ===================================================================
+// NOMBRE: getWeatherEmoji
+// RESUMEN: Convierte el código del tiempo de wttr.in en un emoji representativo.
+// ===================================================================
+function getWeatherEmoji(weatherCode) {
+    const code = parseInt(weatherCode, 10);
+    if (isNaN(code)) return '❓';
+    // Mapeo de códigos de wttr.in a emojis
+    if ([113].includes(code)) return '☀️'; // Soleado/Despejado
+    if ([116, 119, 122].includes(code)) return '☁️'; // Nublado
+    if ([143, 248, 260].includes(code)) return '🌁'; // Niebla
+    if ([176, 263, 266, 281, 284, 293, 296, 299, 302, 305, 308, 311, 353, 356, 359].includes(code)) return '🌧️'; // Lluvia
+    if ([179, 182, 185, 317, 320, 323, 326, 329, 332, 335, 338, 350, 368, 371, 374, 377].includes(code)) return '❄️'; // Nieve/Aguanieve
+    if ([200, 386, 389, 392, 395].includes(code)) return '⛈️'; // Tormenta
+    return '🌍'; 
+}
+function showWeatherWidgetTemporarily() {
+    if (navigationCurrentLocation) {
+        updateWeatherWidget(navigationCurrentLocation.latitude, navigationCurrentLocation.longitude);
+    } else {
+        showToast("Ubicación no disponible para mostrar el tiempo.", "warning");
+    }
+}
+
+// ===================================================================
+// NOMBRE: updateWeatherWidget (MODIFICADA: Autocierre y nuevo ID de contenedor)
+// RESUMEN: Obtiene y muestra los datos del tiempo, y programa su ocultación automática a los 30 segundos.
+async function updateWeatherWidget(lat, lon) {
+    const widget = document.getElementById('weather-widget-container'); // Sigue usando el mismo ID de contenedor
+    if (!widget) return;
+
+    // Limpia cualquier temporizador de ocultación anterior para reiniciar la cuenta
+    if (weatherHideTimer) {
+        clearTimeout(weatherHideTimer);
+        weatherHideTimer = null;
+    }
+
+    const distanceMoved = calculateDistance(lastWeatherCoords.lat, lastWeatherCoords.lon, lat, lon);
+    // Actualizamos solo si nos hemos movido lo suficiente O si el widget está actualmente oculto
+    if (distanceMoved < 5000 && widget.classList.contains('visible')) {
+        // Si ya es visible, simplemente reiniciamos su temporizador de ocultación
+        weatherHideTimer = setTimeout(() => {
+            widget.classList.remove('visible');
+        }, 30000);
+        return;
+    }
+    
+    lastWeatherCoords = { lat, lon };
+    
+    // Mostramos el widget
+    widget.classList.add('visible');
+
+    // Programamos que se oculte en 30 segundos
+    weatherHideTimer = setTimeout(() => {
+        widget.classList.remove('visible');
+    }, 30000);
+
+    try {
+        const response = await fetch(`https://wttr.in/${lat},${lon}?format=j1`);
+        if (!response.ok) throw new Error('No se pudo obtener el tiempo');
         
+        const data = await response.json();
+        const current = data.current_condition[0];
+        
+        const temp = Math.round(parseFloat(current.temp_C));
+        const feelsLike = Math.round(parseFloat(current.FeelsLikeC));
+        const emoji = getWeatherEmoji(current.weatherCode);
+        const humidity = current.humidity;
+        const windSpeed = current.windspeedKmph;
+        const windDirDegrees = current.winddirDegree;
+        const precipMM = parseFloat(current.precipMM);
+
+        let chanceOfRain = '0'; 
+        const now = new Date();
+        const currentHourValue = now.getHours() * 100;
+        
+        if (data.weather && data.weather[0] && data.weather[0].hourly) {
+            const currentHourForecast = data.weather[0].hourly.find(h => parseInt(h.time, 10) === currentHourValue);
+            if (currentHourForecast && currentHourForecast.chanceofrain) {
+                chanceOfRain = currentHourForecast.chanceofrain;
+            }
+        }
+        
+        const feelsLikeHtml = (temp !== feelsLike) ? `<span class="feels-like-temp">(${feelsLike}°)</span>` : '';
+        const precipHtml = (precipMM > 0) ? `-${precipMM}mm` : '';
+        
+        const days = ['Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb'];
+        const months = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic'];
+        const dayName = days[now.getDay()];
+        const dayNumber = now.getDate();
+        const monthName = months[now.getMonth()];
+        const formattedDate = `${dayName} ${dayNumber} ${monthName}`;
+
+        const content = document.getElementById('weather-widget-content');
+        content.innerHTML = `
+            <div class="weather-main-line">
+                <span class="weather-icon">${emoji}</span>
+                <span class="weather-temp">${temp}°C</span>
+                ${feelsLikeHtml}
+                <span class="weather-date">${formattedDate}</span>
+            </div>
+            <div class="weather-details">
+                <div class="detail-item" title="Humedad">
+                    <span class="detail-icon">💧</span>
+                    <span>${humidity}%</span>
+                </div>
+                <div class="detail-item" title="Probabilidad y cantidad de lluvia">
+                    <span class="detail-icon">☔️</span>
+                    <span>${chanceOfRain}%${precipHtml}</span>
+                </div>
+                <div class="detail-item" title="Viento">
+                    <span class="detail-icon">💨</span>
+                    <span>${windSpeed}km/h</span>
+                    <span class="wind-direction-arrow" style="transform: rotate(${windDirDegrees}deg);">↓</span>
+                </div>
+            </div>
+        `;
+
+    } catch (error) {
+        console.error("Error al actualizar el widget del tiempo:", error);
+        if (widget) {
+            widget.classList.remove('visible');
+        }
+    }
+}    
+
+// ===================================================================
+// NOMBRE: startWeatherUpdates / stopWeatherUpdates (MODIFICADAS)
+// RESUMEN: Inicia y detiene el ciclo de actualización del tiempo, manejando ambos temporizadores.
+// ===================================================================
+function startWeatherUpdates(initialCoords = null) {
+    stopWeatherUpdates(); 
+
+    const updatePeriodic = () => {
+        if (navigationCurrentLocation) {
+            updateWeatherWidget(navigationCurrentLocation.latitude, navigationCurrentLocation.longitude);
+        }
+    };
+    
+    // Primera llamada inmediata (se mostrará por 30s)
+    if (initialCoords) {
+        updateWeatherWidget(initialCoords.latitude, initialCoords.longitude);
+    } else {
+        updatePeriodic();
+    }
+    
+    // Siguientes llamadas cada 11 minutos
+    weatherUpdateTimer = setInterval(updatePeriodic, 11 * 60 * 1000); 
+}    
+function stopWeatherUpdates() {
+    if (weatherUpdateTimer) {
+        clearInterval(weatherUpdateTimer);
+        weatherUpdateTimer = null;
+    }
+    if (weatherHideTimer) {
+        clearTimeout(weatherHideTimer);
+        weatherHideTimer = null;
+    }
+    const widget = document.getElementById('weather-widget-container');
+    if (widget) {
+        widget.classList.remove('visible');
+    }
+}
+    
 // ===================================================================
 // NOMBRE: configureMapAtmosphere (VERSIÓN SIMPLIFICADA PARA TERRENO)
 // ===================================================================
@@ -1441,6 +1615,8 @@ function generateAndCacheCleanManeuverList(route, actualWaypoints) {
 function closeNavigationMap(force = false) {
     const aiModal = document.getElementById('ai-route-modal');
     if (aiModal) aiModal.classList.add('hidden');
+
+    stopWeatherUpdates();
     
     clearRecoveryFlag();
     hideAddressSuggestionsModal();
@@ -3058,10 +3234,8 @@ class CustomMapControlsGroup {
 } 
 
 // ===================================================================
-// NOMBRE: ZoomControl (VERSIÓN MODIFICADA CON PULSACIÓN LARGA)
+// NOMBRE: ZoomControl 
 // RESUMEN: Gestiona el zoom. Un clic en el número alterna el pitch.
-//          Una pulsación larga en el número ajusta el zoom a 5.5.
-// ===================================================================
 class ZoomControl {
     constructor(parentControl) {
         this.parentControl = parentControl;
@@ -3087,18 +3261,33 @@ class ZoomControl {
         levelDisplay.textContent = map.getZoom().toFixed(1);
 
         levelDisplay.style.cursor = 'pointer';
-        levelDisplay.title = 'Clic: Alternar inclinación (pitch) | Pulsación Larga: Zoom a vista continental (5.5)';
+        levelDisplay.title = 'Clic: Alternar inclinación (pitch) | Pulsación Larga: Alternar zoom (5.5 / 11)';
 
         let pressTimer = null;
         let isLongPress = false;
 
         const handlePressStart = (e) => {
-            e.preventDefault(); // Evita acciones por defecto como seleccionar texto
+            e.preventDefault(); 
             isLongPress = false;
             pressTimer = setTimeout(() => {
-                isLongPress = true; // Se marca que ha sido una pulsación larga
+                isLongPress = true; 
                 triggerManualMapInteraction();
-                map.easeTo({ zoom: 5.5, duration: 200 });
+                
+                const currentZoom = map.getZoom();
+                const continentalZoom = 5.5;
+                const regionalZoom = 11;
+                
+                let targetZoom;
+                let toastMessage;
+
+                if (currentZoom > ((continentalZoom + regionalZoom) / 2)) {
+                    targetZoom = continentalZoom;
+                } else {
+                    targetZoom = regionalZoom;
+                }
+                
+                map.easeTo({ zoom: targetZoom, duration: 400 });
+           
             }, 500); 
         };
 
@@ -3114,9 +3303,11 @@ class ZoomControl {
                     const modeName = Object.keys(MAP_VIEW_MODES).find(key => MAP_VIEW_MODES[key].mode === mapViewMode) || "Desconocido";
                     
                     map.easeTo({ pitch: defaultPitch });
+                    showToast(`Pitch restaurado al valor por defecto del modo (${modeName})`, 'info');
                     isPitchManuallyFlattened = false;
                 } else {
                     map.easeTo({ pitch: 0 });
+                    showToast('Pitch ajustado a 0° (vista cenital)', 'info');
                     isPitchManuallyFlattened = true;
                 }
             }
@@ -3126,7 +3317,6 @@ class ZoomControl {
         levelDisplay.addEventListener('mousedown', handlePressStart);
         levelDisplay.addEventListener('mouseup', handlePressEnd);
         levelDisplay.addEventListener('mouseleave', () => clearTimeout(pressTimer));
-
         levelDisplay.addEventListener('touchstart', handlePressStart, { passive: false });
         levelDisplay.addEventListener('touchend', handlePressEnd);
         levelDisplay.addEventListener('touchcancel', () => clearTimeout(pressTimer));
@@ -3157,6 +3347,27 @@ class ZoomControl {
         offsetBtn.title = 'Ajustar posición del coche en pantalla';
         offsetBtn.innerHTML = `<img src="PNG/picht.png" alt="Offset">`;
 
+        // === INICIO DE LA MODIFICACIÓN: Crear el nuevo botón del tiempo ===
+        const weatherBtn = document.createElement('div');
+        weatherBtn.id = 'show-weather-button';
+        weatherBtn.className = 'zoom-control-button';
+        weatherBtn.title = 'Mostrar/Ocultar el tiempo';
+        weatherBtn.style.backgroundColor = 'white';
+        weatherBtn.innerHTML = `🌤️`; // Usamos el emoji
+        weatherBtn.style.fontSize = '32px'; // Ajustamos el tamaño del emoji
+        weatherBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const widget = document.getElementById('weather-widget-container');
+            if (widget && widget.classList.contains('visible')) {
+                // Si está visible, lo ocultamos. stopWeatherUpdates() limpia timers y oculta.
+                stopWeatherUpdates();
+            } else {
+                // Si está oculto, lo mostramos.
+                showWeatherWidgetTemporarily();
+            }
+        });
+        // === FIN DE LA MODIFICACIÓN ===
+
         this._container.appendChild(zoomInBtn);
         this._container.appendChild(levelDisplay);
         this._container.appendChild(zoomOutBtn);
@@ -3165,6 +3376,7 @@ class ZoomControl {
         this._container.appendChild(toggleBtn);
         this._container.appendChild(settingsBtn);
         this._container.appendChild(offsetBtn);
+        this._container.appendChild(weatherBtn); // === AÑADIDO: Añadir el botón al final
         
         map.on('zoom', () => {
             levelDisplay.textContent = map.getZoom().toFixed(1);
@@ -3263,8 +3475,7 @@ class ZoomControl {
         return this._container;
     }
     onRemove() { if (this._container && this._container.parentNode) this._container.parentNode.removeChild(this._container); this._map = undefined; }
-}
-   
+}    
 // ===================================================================
 // NOMBRE: applyLayerVisibility
 // RESUMEN: Lee las preferencias del usuario y aplica la visibilidad a cada grupo de capas.
@@ -4221,10 +4432,11 @@ async function initiateControlledReload() {
         await captureAndProceed();
     }
 }
-
-//===================================================================
-// NOMBRE: recalculateAndDrawRoute 
-// RESUMEN: Contiene la nueva lógica para reconstruir la ruta, diferenciando entre recuperación "rica" y "ligera".
+    
+// ===================================================================
+// NOMBRE: recalculateAndDrawRoute (VERSIÓN CON REINICIO DEL DETECTOR)
+// RESUMEN: Recalcula la ruta y, al finalizar, reinicia el detector de desvíos.
+// ===================================================================
 async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recoveryInfo = null) {
     const RETRY_CADENCE_MS = 3000;
     const MAX_RETRIES = 5;
@@ -4250,21 +4462,17 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recover
             
                 if (isSimulatedRecovery) {
                     waypointsForAPI = sanitizeWaypointsForStorage(recoveryInfo.route.waypoints);
-                    currentHeading = null; // No necesitamos rumbo de inicio
+                    currentHeading = null; 
                 } else {
                     const currentPos = await getGpsWithRetries();
                     
-                    currentHeading = currentPos.heading; // 1. Intentamos obtener el heading en tiempo real.
+                    currentHeading = currentPos.heading;
                     
-                    // 2. Si el heading en tiempo real es nulo, usamos el 'bearing' guardado (más fiable).
                     if (currentHeading === null && recoveryInfo && typeof recoveryInfo.lastKnownBearing === 'number') {
                         currentHeading = recoveryInfo.lastKnownBearing;
-                        console.log(`[Recuperación] Usando 'bearing' de respaldo: ${currentHeading}°`);
                     }
-                    // 3. Como último recurso, usamos el 'heading' de la última localización (menos fiable).
                     else if (currentHeading === null && recoveryInfo && recoveryInfo.lastKnownLocation && recoveryInfo.lastKnownLocation.heading !== null) {
                         currentHeading = recoveryInfo.lastKnownLocation.heading;
-                        console.log(`[Recuperación] Usando 'heading' de respaldo: ${currentHeading}°`);
                     }
                 
                     if (!recoveryInfo.isRichRecovery) {
@@ -4387,6 +4595,11 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recover
 
             deviationCheckGracePeriodUntil = Date.now() + 7000;
             closeModalAndProceed();
+            
+            if (wasNavigatingBeforeRecalc || isSimulatingGpsLocation) {
+                startDeviationChecker();
+            }
+
             return;
             
         } catch (error) {
@@ -4413,8 +4626,7 @@ async function recalculateAndDrawRoute(preserveAccumulatedStats = false, recover
         }
         attempt++; 
     }
-}
-    
+}    
 
 // ===================================================================
 // NOMBRE: fetchOverpassData 
@@ -6097,69 +6309,50 @@ function rebuildProcessedRemindersCache() {
     }
 }
     
-// ===================================================================
-// NOMBRE: stopDeviationChecker 
-// RESUMEN: Detiene el temporizador de comprobación de desvío.
-function stopDeviationChecker() {
-    if (deviationCheckIntervalId) {
-        clearInterval(deviationCheckIntervalId); 
-        deviationCheckIntervalId = null;
-        deviationStartTime = 0;
-    }
-}
 
+//===================================================================
+// NOMBRE: startDeviationChecker (VERSIÓN ADAPTATIVA MEJORADA)
+// RESUMEN: Inicia un ciclo de comprobación de desvío con intervalo adaptativo.
 // ===================================================================
-// NOMBRE: startDeviationChecker 
-// RESUMEN: Inicia un temporizador FIJO que comprueba el desvío de ruta cada 5 segundos.
 function startDeviationChecker() {
-    stopDeviationChecker(); // Siempre nos aseguramos de limpiar cualquier temporizador anterior.
+    stopDeviationChecker(); // Limpia cualquier ciclo anterior
 
-    const CHECK_INTERVAL_MS = 5000; // Intervalo fijo de 5 segundos.
+    const NORMAL_CHECK_INTERVAL_MS = 5000;
+    const HIGH_ALERT_INTERVAL_MS = 500;
+    const HIGH_ALERT_DURATION_MS = 5000;
+    const WARNING_THRESHOLD_METERS = 12; // Nuevo umbral de "sospecha"
 
-    deviationCheckIntervalId = setInterval(() => {
-        const MIN_DISTANCE_FOR_DEVIATION_CHECK = 200; // 200 metros
-        if (totalDistanceTravelledForStats < MIN_DISTANCE_FOR_DEVIATION_CHECK) {
-            deviationStartTime = 0; 
-        return; }
-  
-        if (isArrivalSequenceStarted) {
-            stopDeviationChecker();
-            return;
-        }
-
-        if (Date.now() < deviationCheckGracePeriodUntil) {
-            return;
-        }
-
-        if (!isNavigating || !navigationCurrentLocation || isRecalculatingRoute || isDeviationModalActive || isAddReminderAtLocationModeActive) {
-            deviationStartTime = 0; // Reseteamos el contador de tiempo de desvío
+    const runDeviationCheck = () => {
+        // --- Cláusulas de guarda (sin cambios) ---
+        const MIN_DISTANCE_FOR_DEVIATION_CHECK = 200;
+        if (totalDistanceTravelledForStats < MIN_DISTANCE_FOR_DEVIATION_CHECK || isArrivalSequenceStarted || Date.now() < deviationCheckGracePeriodUntil || !isNavigating || !navigationCurrentLocation || isRecalculatingRoute || isDeviationModalActive || isAddReminderAtLocationModeActive) {
+            if (isHighAlertMode) { // Si estamos en alerta y una de estas condiciones se cumple, cancelamos la alerta.
+                clearTimeout(highAlertTimeoutId);
+                isHighAlertMode = false;
+            }
+            deviationCheckTimerId = setTimeout(runDeviationCheck, NORMAL_CHECK_INTERVAL_MS); // Reintentar en 5s
             return;
         }
 
         const route = navigationCurrentRouteData?.routes?.[0];
         if (!route || !route.legs || !route.legs[currentLegIndexNav] || !route.legs[currentLegIndexNav].steps[currentStepIndexNav] || typeof turf === 'undefined') {
-            return; 
+            deviationCheckTimerId = setTimeout(runDeviationCheck, NORMAL_CHECK_INTERVAL_MS); // Reintentar en 5s
+            return;
         }
         
+        // --- Lógica de cálculo de distancia (sin cambios) ---
         let distanceToRoute = 0;
         try {
             const carPoint = turf.point([navigationCurrentLocation.longitude, navigationCurrentLocation.latitude]);
-            
             const searchWindowCoords = [];
             const stepsToInclude = 5;
-            let legIdx = currentLegIndexNav;
-            let stepIdx = currentStepIndexNav;
-            
+            let legIdx = currentLegIndexNav, stepIdx = currentStepIndexNav;
             for (let i = 0; i < stepsToInclude && legIdx < route.legs.length; i++) {
                 const currentLeg = route.legs[legIdx];
                 if (stepIdx < currentLeg.steps.length) {
                     const currentStep = currentLeg.steps[stepIdx];
-                    if (currentStep.geometry && currentStep.geometry.coordinates) {
-                        if (searchWindowCoords.length > 0) {
-                            searchWindowCoords.push(...currentStep.geometry.coordinates.slice(1));
-                        } else {
-                            searchWindowCoords.push(...currentStep.geometry.coordinates);
-                        }
+                    if (currentStep.geometry?.coordinates) {
+                        searchWindowCoords.push(...(searchWindowCoords.length > 0 ? currentStep.geometry.coordinates.slice(1) : currentStep.geometry.coordinates));
                     }
                     stepIdx++;
                 } else {
@@ -6168,30 +6361,70 @@ function startDeviationChecker() {
                     i--; 
                 }
             }
-
-            if (searchWindowCoords.length < 2) {
-                distanceToRoute = 0;
-            } else {
-                const routeWindowLineString = turf.lineString(searchWindowCoords);
-                distanceToRoute = turf.pointToLineDistance(carPoint, routeWindowLineString, { units: 'meters' });
+            if (searchWindowCoords.length > 1) {
+                distanceToRoute = turf.pointToLineDistance(carPoint, turf.lineString(searchWindowCoords), { units: 'meters' });
             }
-
         } catch (e) {
-             distanceToRoute = DEVIATION_THRESHOLD_METERS + 1; // Forzar desvío si hay error
+             distanceToRoute = DEVIATION_THRESHOLD_METERS + 1;
         }
 
+        // --- NUEVA LÓGICA ADAPTATIVA ---
         if (distanceToRoute > DEVIATION_THRESHOLD_METERS) {
-            if (deviationStartTime === 0) {
-                deviationStartTime = Date.now();
-            } else if ((Date.now() - deviationStartTime) / 1000 > DEVIATION_MIN_TIME_SECONDS) {
-                showDeviationModal();
-                deviationStartTime = 0; 
+            // Desvío confirmado, mostramos el modal. El ciclo se detiene.
+            showDeviationModal();
+            stopDeviationChecker(); // Detiene todos los temporizadores asociados a esta función.
+            return;
+
+        } else if (distanceToRoute > WARNING_THRESHOLD_METERS) {
+            // Entramos en MODO ALERTA si no lo estábamos ya
+            if (!isHighAlertMode) {
+                isHighAlertMode = true;
+                
+                // Programamos el reseteo a modo normal después de 5 segundos
+                highAlertTimeoutId = setTimeout(() => {
+                    isHighAlertMode = false;
+                    highAlertTimeoutId = null;
+                    // Si el próximo chequeo no se ha programado, lo hacemos aquí para evitar que se detenga el ciclo.
+                    if (deviationCheckTimerId) clearTimeout(deviationCheckTimerId);
+                    deviationCheckTimerId = setTimeout(runDeviationCheck, NORMAL_CHECK_INTERVAL_MS);
+                }, HIGH_ALERT_DURATION_MS);
             }
+            // Programamos el siguiente chequeo en 0.5 segundos
+            deviationCheckTimerId = setTimeout(runDeviationCheck, HIGH_ALERT_INTERVAL_MS);
+
         } else {
-            deviationStartTime = 0;
+            // Estamos en ruta
+            if (isHighAlertMode) {
+                // Si estábamos en alerta, era una falsa alarma. Cancelamos todo y volvemos a la normalidad.
+                clearTimeout(highAlertTimeoutId);
+                highAlertTimeoutId = null;
+                isHighAlertMode = false;
+            }
+            // Programamos el siguiente chequeo en 5 segundos (modo normal)
+            deviationCheckTimerId = setTimeout(runDeviationCheck, NORMAL_CHECK_INTERVAL_MS);
         }
-    }, CHECK_INTERVAL_MS);
-}    
+    };
+
+    // Primera llamada para iniciar el ciclo
+    runDeviationCheck();
+}
+
+// ===================================================================
+// NOMBRE: stopDeviationChecker (MODIFICADA PARA MODO ADAPTATIVO)
+// RESUMEN: Detiene todos los temporizadores de comprobación de desvío.
+function stopDeviationChecker() {
+    if (deviationCheckTimerId) {
+        clearTimeout(deviationCheckTimerId); 
+        deviationCheckTimerId = null;
+    }
+    if (highAlertTimeoutId) {
+        clearTimeout(highAlertTimeoutId);
+        highAlertTimeoutId = null;
+    }
+    isHighAlertMode = false;
+    deviationStartTime = 0; // Se mantiene por compatibilidad, aunque la lógica ya no lo usa.
+}
+    
     
 // ===================================================================
 // NOMBRE: saveCustomData 
@@ -9000,6 +9233,9 @@ async function openNavigationMap(isRecovery = false) {
                         setNavigationMapClickHandler();
                         
                         let currentPos = await getInitialGpsPositionForMap();
+                        
+                        startWeatherUpdates(currentPos); 
+                        
                         setMapImmersiveMode(false); 
                         navigationFollowUser = true; 
                         shouldCenterOnUser = true; 
@@ -9013,7 +9249,7 @@ async function openNavigationMap(isRecovery = false) {
                         markerAnimationState.currentMapCenter = navigationMapInstance.getCenter(); markerAnimationState.currentMapZoom = navigationMapInstance.getZoom(); markerAnimationState.currentMapPitch = navigationMapInstance.getPitch(); markerAnimationState.currentMapBearing = navigationMapInstance.getBearing(); markerAnimationState.targetMapCenter = navigationMapInstance.getCenter(); markerAnimationState.targetMapZoom = navigationMapInstance.getZoom(); markerAnimationState.targetMapPitch = navigationMapInstance.getPitch(); markerAnimationState.targetMapBearing = navigationMapInstance.getBearing();
                         
                         updateInitialUserPosition(currentPos, navigationMapInstance); 
-                        startGpsWatching();
+                        startGpsWatching();               
                         resolve();
 
                     } catch (loadError) { 
@@ -9033,10 +9269,10 @@ async function openNavigationMap(isRecovery = false) {
     }); 
 }
 
-    
+
 //===================================================================
-// NOMBRE: updateTurnByTurnDisplay (VERSIÓN FINAL CON LÓGICA DE BOTÓN "T" CORRECTA)
-// RESUMEN: Gestiona la visibilidad de la UI de navegación. La lógica del minimapa, la mini-tarjeta y el botón "T" ha sido corregida y unificada.
+// NOMBRE: updateTurnByTurnDisplay 
+// RESUMEN: Gestiona la visibilidad de la UI de navegación, incluyendo ahora el widget del tiempo.
 //===================================================================
 function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     const topInfoBar = document.getElementById('navigation-top-info-bar');
@@ -9047,6 +9283,7 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     const maneuverCounterEl = document.getElementById('maneuver-counter-display');
     const minimapContainer = document.getElementById('minimap-container');
     const showMinimapButton = document.getElementById('force-show-minimap-button');
+    const weatherWidget = document.getElementById('weather-widget-container'); // OBTENEMOS EL WIDGET
 
     const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal && !wp.isRecalculatedStart);
     const totalStages = actualWaypoints.length > 1 ? actualWaypoints.length - 1 : 1;
@@ -9058,6 +9295,7 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
         if (showMinimapButton) showMinimapButton.classList.add('hidden');
         if (progressBar) progressBar.classList.remove('scaled-for-maneuver');
         if (compassControl) compassControl.classList.remove('hidden-for-maneuver');
+        if (weatherWidget) weatherWidget.classList.remove('hidden'); // Asegurarse de que se muestre si se sale de la navegación
         if (intersectionPreviewWindow && !intersectionPreviewWindow.classList.contains('hidden') && intersectionPreviewWindow.dataset.source !== 'click') hideIntersectionPreviewMap();
         if (maneuverCounterEl) maneuverCounterEl.style.display = 'none';
         nextManeuverStepForPreview = null;
@@ -9093,27 +9331,42 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     const infoOverlay = document.getElementById('map-info-overlay');
     const uniqueManeuverId = `${currentLegIndex}_${currentStepIndex}_${nextStepToDisplay.name}`;
     if (announceManeuverWithFlash && distanceToNextManeuver < 220 && maneuverFlashTriggeredId !== uniqueManeuverId) { maneuverFlashTriggeredId = uniqueManeuverId; const borderOverlay = document.getElementById('maneuver-flashing-border-overlay'); if (borderOverlay) { borderOverlay.classList.remove('hidden'); setTimeout(() => { borderOverlay.classList.add('hidden'); }, 3000); } }
+    
     const MANEUVER_ZONE_DISTANCE = 225;
-    if (isNavigating) { if (distanceToNextManeuver < MANEUVER_ZONE_DISTANCE) { progressBar.classList.add('scaled-for-maneuver'); if (compassControl && Date.now() > compassForceShowUntil) { compassControl.classList.add('hidden-for-maneuver'); } } else { progressBar.classList.remove('scaled-for-maneuver'); if (compassControl) compassControl.classList.remove('hidden-for-maneuver'); } } else { progressBar.classList.remove('scaled-for-maneuver'); if (compassControl) compassControl.classList.remove('hidden-for-maneuver'); }
+    if (isNavigating) { 
+        if (distanceToNextManeuver < MANEUVER_ZONE_DISTANCE) { 
+            progressBar.classList.add('scaled-for-maneuver'); 
+            if (compassControl && Date.now() > compassForceShowUntil) { 
+                compassControl.classList.add('hidden-for-maneuver'); 
+            }
+            if (weatherWidget) {
+                weatherWidget.classList.add('hidden'); // Ocultamos el widget del tiempo
+            }
+        } else { 
+            progressBar.classList.remove('scaled-for-maneuver'); 
+            if (compassControl) compassControl.classList.remove('hidden-for-maneuver');
+            if (weatherWidget && !isMapImmersiveModeActive) { // Solo lo mostramos si no estamos en modo inmersivo
+                weatherWidget.classList.remove('hidden'); // Mostramos el widget del tiempo
+            }
+        } 
+    } else {
+        progressBar.classList.remove('scaled-for-maneuver'); 
+        if (compassControl) compassControl.classList.remove('hidden-for-maneuver');
+        if (weatherWidget) weatherWidget.classList.remove('hidden');
+    }
 
     const shouldHideMainBar = !isProgressBarLocked && !isMapImmersiveModeActive && now > progressBarForceShowUntil && distanceToNextManeuver > 1000 && distanceIntoCurrentStep > 100;
     const isForcedVisible = Date.now() < minimapForceShowUntil;
 
     progressBar.classList.toggle('progress-bar-auto-hidden', shouldHideMainBar);
-
     miniNavCard.style.display = shouldHideMainBar ? 'flex' : 'none';
 
     const shouldShowMinimap = (shouldHideMainBar || isForcedVisible) && showRouteMinimapPreference;
-    if (minimapContainer) {
-        minimapContainer.classList.toggle('hidden', !shouldShowMinimap);
-    }
+    if (minimapContainer) minimapContainer.classList.toggle('hidden', !shouldShowMinimap);
 
     if (infoOverlay) {
-        if (shouldShowMinimap) {
-            infoOverlay.style.display = 'none';
-        } else if (isNavigating) {
-            infoOverlay.style.display = 'block';
-        }
+        if (shouldShowMinimap) infoOverlay.style.display = 'none';
+        else if (isNavigating) infoOverlay.style.display = 'block';
     }
     
     if (showMinimapButton) {
@@ -9239,7 +9492,7 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
         if (showMinimapButton) showMinimapButton.classList.add('hidden');
         if (intersectionPreviewWindow && !intersectionPreviewWindow.classList.contains('hidden') && intersectionPreviewWindow.dataset.source !== 'click') hideIntersectionPreviewMap();
     }
-}    
+}
     
 // ===================================================================
 // NOMBRE: showArrivalStatsModal 
@@ -13760,9 +14013,11 @@ function renderPollBubble(poll, currentUserId) {
     return pollBubble;
 }
     
+
 // ===================================================================
-// NOMBRE: showDeviationModal 
-// RESUMEN: Muestra un modal diferente si la ruta es simple o multietapa.
+// NOMBRE: showDeviationModal (VERSIÓN CON ESTILO DE CIERRE CORREGIDO)
+// RESUMEN: Muestra el modal de desvío con el botón 'X' redimensionado y reposicionado.
+// ===================================================================
 function showDeviationModal() {
     if (isDeviationModalActive) return;
     closeOtherModals('deviation-modal');
@@ -13782,13 +14037,26 @@ function showDeviationModal() {
         console.log("[MODAL DESVÍO] Ruta simple detectada. Mostrando modal informativo y comenzando recálculo automático.");
         modal.innerHTML = `
             <h2>Desvío Detectado</h2>
+            
+            <!-- BOTÓN 'X' ELIMINADO -->
+            
             ${iconHtml}
             <p id="deviation-modal-message">Recalculando nueva ruta...</p>
             <div id="deviation-status-spinner" style="border: 4px solid rgba(255, 255, 255, 0.2); border-left-color: #34c759; border-radius: 50%; width: 30px; height: 30px; animation: spin 1s linear infinite; margin: 1rem auto 0;"></div>
+            
+            <button id="deviation-cancel-simple" class="btn-modal-action-secondary" style="margin-top: 0.9rem; width: 100%;">Cancelar</button>
+            
             <style> @keyframes spin { 100% { transform: rotate(360deg); } } </style>
         `;
         modal.classList.remove('hidden');
-        recalculateAndDrawRoute(true); 
+
+        document.getElementById('deviation-cancel-simple').addEventListener('click', (e) => {
+            e.stopPropagation();
+            showToast("Recálculo cancelado. Se reintentará si sigues fuera de ruta.", "info");
+            closeModalAndProceed();
+        });
+
+        recalculateAndDrawRoute(wasSimulatingBeforeRecalc || isNavigating); 
 
     } else {
         const finalDestination = actualWaypoints[actualWaypoints.length - 1];
@@ -13851,7 +14119,8 @@ function showDeviationModal() {
         });
     }
 }
-        
+
+    
 // ===================================================================
 // NOMBRE: cleanUpOldChatMessages 
 // RESUMEN: Borra los mensajes (no encuestas) con más de 120 horas (ejecutado por el admin).
@@ -20248,36 +20517,36 @@ function toggleEnlargedGraph() {
     }
     updateNavigationGraphVisibilityAndMode();    
 }
-
 // ===================================================================
-// NOMBRE: setMapImmersiveMode (NUEVA FUNCIÓN)
-// RESUMEN: Activa o desactiva el modo inmersivo del mapa de forma explícita.
+// NOMBRE: SETMAPINMERSIVEMODE
+// RESUMEN:
 function setMapImmersiveMode(activate) {
     if (isMapImmersiveModeActive === activate) return;
 
     isMapImmersiveModeActive = activate;
     const mapModal = document.getElementById('reminders-location-map-modal');
+    
+    const weatherWidget = document.getElementById('weather-widget-container');
+    if (weatherWidget) {
+        weatherWidget.classList.toggle('hidden', activate);
+    }
+    
     if (mapModal) {
         mapModal.classList.toggle('immersive-mode-active', isMapImmersiveModeActive);
         
         if (!isMapImmersiveModeActive) {
             progressBarForceShowUntil = Date.now() + 20000;
             const progressBar = document.getElementById('navigation-bottom-progress-bar');
-            if (progressBar) {
-                progressBar.classList.remove('progress-bar-auto-hidden');
-            }
+            if (progressBar) progressBar.classList.remove('progress-bar-auto-hidden');
         }
         
         if (navigationMapInstance) {
             setTimeout(() => {
-                try {
-                    navigationMapInstance.resize();
-                } catch(e) { console.error("Error al redimensionar mapa en setMapImmersiveMode:", e); }
+                try { navigationMapInstance.resize(); } catch(e) {}
             }, 350);
         }
     }
 }
-
 
 /**============================================================
  * Pausa la ejecución durante un número determinado de milisegundos.
@@ -20327,28 +20596,28 @@ function hideAutoStartNavigationModal() {
 function toggleMapImmersiveMode() {
     isMapImmersiveModeActive = !isMapImmersiveModeActive;
     const mapModal = document.getElementById('reminders-location-map-modal');
+    const weatherWidget = document.getElementById('weather-widget-container');
+
+    if (weatherWidget) {
+        weatherWidget.classList.toggle('hidden', isMapImmersiveModeActive);
+    }
+
     if (mapModal) {
         mapModal.classList.toggle('immersive-mode-active', isMapImmersiveModeActive);
-        
-        if (isMapImmersiveModeActive && !navigationFollowUser) {
-            handleLocateMeClick(true); // Llamamos a la función para reactivar el seguimiento
-        } else {
-            showToast(isMapImmersiveModeActive ? 'Modo Inmersivo Activado' : 'Modo Inmersivo Desactivado', 'info');
-        }
-        
-        if (!isMapImmersiveModeActive) {
-            progressBarForceShowUntil = Date.now() + 20000;
-            const progressBar = document.getElementById('navigation-bottom-progress-bar');
-            if (progressBar) {
-                progressBar.classList.remove('progress-bar-auto-hidden');
+
+        if (isMapImmersiveModeActive) {
+            showToast('Modo Inmersivo Activado', 'info');
+            if (!navigationFollowUser) {
+                handleLocateMeClick(true);
             }
+        } else {
+            showToast('Modo Inmersivo Desactivado', 'info');
+            toggleMapHeaderRowsVisibility(true);
         }
-        
+
         if (navigationMapInstance) {
             setTimeout(() => {
-                try {
-                    navigationMapInstance.resize();
-                } catch(e) { console.error("Error al redimensionar mapa en toggleMapImmersiveMode:", e); }
+                try { navigationMapInstance.resize(); } catch(e) {}
             }, 350);
         }
     }
@@ -20830,18 +21099,19 @@ function stopAutomatedRouteSimulationInternal() {
    
     
 // ===================================================================
-// NOMBRE: handleSimulateGpsPositionClick 
-// RESUMEN: Maneja el clic en el mapa durante la simulación GPS manual.
+// NOMBRE: handleSimulateGpsPositionClick (VERSIÓN DEFINITIVA CORREGIDA)
+// RESUMEN: Detiene la navegación activa al simular un desvío manual.
+// ===================================================================
 function handleSimulateGpsPositionClick(e, forceExactPosition = false) {
     if (!isSimulatingGpsLocation || !navigationMapInstance) return;
+   
+    wasSimulatingBeforeRecalc = true;
 
     navigationFollowUser = true;
     shouldCenterOnUser = true;
     clearLocateMeReactivationTimer(); updateLocateMeButtonsUI(); 
 
-    
     if (automatedSimulationIntervalId) {
-        wasSimulatingBeforeRecalc = true;
         stopAutomatedRouteSimulationInternal();
         showToast("Simulación automática pausada. Forzando desvío...", "info");
     }
@@ -20870,8 +21140,8 @@ function handleSimulateGpsPositionClick(e, forceExactPosition = false) {
     };
     processSimulatedGpsPosition(true); 
     setNavigationMapClickHandler(); 
-}        
-
+}
+    
 // ===================================================================
 // NOMBRE: setNavigationMapClickHandler 
 // RESUMEN: Únicamente gestiona el estado visual del mapa (clases y cursor) según el modo actual.
@@ -21470,49 +21740,53 @@ function updateLocateMeButtonsUI() {
 }
 
 // ===================================================================
-// NOMBRE: clearLocateMeReactivationTimer (NUEVA FUNCIÓN)
+// NOMBRE: clearLocateMeReactivationTimer 
 // RESUMEN: Limpia los temporizadores de reactivación y el contador visual.
 function clearLocateMeReactivationTimer() {
+    const mapModal = document.getElementById('reminders-location-map-modal');
+    if (mapModal) {
+        mapModal.classList.remove('manual-override');
+    }
+   
     if (window.followMeReactivationTimer) {
         clearTimeout(window.followMeReactivationTimer);
         window.followMeReactivationTimer = null;
     }
-    if (manualZoomTimeout) {
-        clearTimeout(manualZoomTimeout);
-        manualZoomTimeout = null;
-    }
-    if (locateMeCountdownInterval) {
-        clearInterval(locateMeCountdownInterval);
-        locateMeCountdownInterval = null;
-    }
+
+    
+    if (manualZoomTimeout) { clearTimeout(manualZoomTimeout); manualZoomTimeout = null; }
+    if (locateMeCountdownInterval) { clearInterval(locateMeCountdownInterval); locateMeCountdownInterval = null; }
     const bottomButton = document.getElementById('zoom-locate-me-button');
     const countdownOverlay = bottomButton?.querySelector('.countdown-overlay');
-    if (countdownOverlay) {
-        countdownOverlay.remove();
-    }
+    if (countdownOverlay) { countdownOverlay.remove(); }
 }
-
+    
 // ===================================================================
-// NOMBRE: startLocateMeReactivationTimer (NUEVA FUNCIÓN)
+// NOMBRE: startLocateMeReactivationTimer 
 // RESUMEN: Inicia el temporizador de 30s y el contador visual para reactivar el seguimiento.
+
 function startLocateMeReactivationTimer() {
     clearLocateMeReactivationTimer();
 
     window.followMeReactivationTimer = setTimeout(() => {
+        setMapImmersiveMode(false); // Desactiva el modo inmersivo, restaurando todo a la normalidad
         const mapModal = document.getElementById('reminders-location-map-modal');
-        if (!navigationFollowUser && mapModal && !mapModal.classList.contains('map-modal-hidden')) {
-            handleLocateMeClick();
+        if (mapModal) {
+            mapModal.classList.remove('manual-override'); // Limpia la clase de anulación
+        }
+     
+        const mapModalVisible = document.getElementById('reminders-location-map-modal');
+        if (!navigationFollowUser && mapModalVisible && !mapModalVisible.classList.contains('map-modal-hidden')) {
+            handleLocateMeClick(true);
             showToast("Seguimiento automático reactivado.", "info");
         }
         clearLocateMeReactivationTimer();
     }, 30000);
     
     manualZoomTimeout = window.followMeReactivationTimer;
-
     let countdown = 30;
     const bottomButton = document.getElementById('zoom-locate-me-button');
     if (!bottomButton) return;
-
     let countdownOverlay = bottomButton.querySelector('.countdown-overlay');
     if (!countdownOverlay) {
         countdownOverlay = document.createElement('div');
@@ -21520,7 +21794,6 @@ function startLocateMeReactivationTimer() {
         bottomButton.appendChild(countdownOverlay);
     }
     countdownOverlay.textContent = countdown;
-
     locateMeCountdownInterval = setInterval(() => {
         countdown--;
         if (countdown > 0) {
@@ -21530,7 +21803,7 @@ function startLocateMeReactivationTimer() {
         }
     }, 1000);
 }
-
+    
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 // NOMBRE: triggerArrivalSequence (VERSIÓN MODIFICADA CON AJUSTE DE ZOOM)
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
@@ -21575,6 +21848,12 @@ function triggerManualMapInteraction() {
     navigationFollowUser = false;
     shouldCenterOnUser = false;
 
+    setMapImmersiveMode(true); // Activa el modo inmersivo para ocultar todo
+    const mapModal = document.getElementById('reminders-location-map-modal');
+    if (mapModal) {
+        mapModal.classList.add('manual-override'); // Añade la clase que rescata la botonera inferior
+    }
+  
     clearLocateMeReactivationTimer();
     
     if (navigationMapInstance) {
@@ -21597,23 +21876,22 @@ function triggerManualMapInteraction() {
   
     startLocateMeReactivationTimer();
     updateLocateMeButtonsUI();
-}    
-
+}
 // ===================================================================
 // NOMBRE: handleManualMapInteraction 
 // RESUMEN: Desactiva el seguimiento SOLO cuando detecta un gesto de arrastre o
 function handleManualMapInteraction() {
+    // Si ya estamos en modo manual, solo reinicia el timer.
     if (!navigationFollowUser) {
         startLocateMeReactivationTimer();
         return;
     }
-    isManualZoomActive = true;
-    navigationFollowUser = false;
-    shouldCenterOnUser = false;
     
-    updateLocateMeButtonsUI();
-    startLocateMeReactivationTimer();
+    // Si el seguimiento estaba activo, llamamos a la función
+    // que SÍ activa el modo inmersivo y gestiona los controles.
+    triggerManualMapInteraction();
 }
+    
 
 // ===================================================================
 // NOMBRE: generateBackup
@@ -23191,13 +23469,20 @@ function eliminarTareasDeBarraProgreso() {
     }
 }
 
+    
 // ===================================================================
 // NOMBRE: toggleMapHeaderRowsVisibility 
-// RESUMEN: Muestra/oculta la cabecera y llama a map.resize() de forma segura.
+// RESUMEN: Muestra/oculta la cabecera, llama a map.resize() y AHORA también ajusta la posición del widget del tiempo.
 function toggleMapHeaderRowsVisibility(show) {
     const header = document.getElementById('reminders-location-map-header');
     if (!header) return;
 
+    mapHeaderButtonsVisible = show;
+    header.querySelectorAll('.button-row').forEach(row => {
+        row.classList.toggle('hidden-map-header', !show);
+    });
+
+       
     const togglePanel = document.getElementById('toggle-map-header-buttons-panel');
 
     const removeCountdownOverlay = () => {
@@ -23231,7 +23516,7 @@ function toggleMapHeaderRowsVisibility(show) {
                 font-size: 48px; font-weight: bold;
                 color: rgba(189, 150, 24, 0.7);
                 z-index: 10; pointer-events: none;
-                text-shadow: 2px 2px 3px rgba(0,0,0,0.6);
+                text-shadow: 2px 2px 3px rgba(0,0,0,0.5);
             `;
             togglePanel.appendChild(countdownOverlay);
 
@@ -23271,7 +23556,8 @@ function toggleMapHeaderRowsVisibility(show) {
             }
         }, 350);
     }
-}    
+}
+
     
 // ===================================================================
 // NOMBRE: eliminarRadaresDeRuta 
@@ -23426,6 +23712,7 @@ function closeModalAndProceed() {
         }, 100);
     }
 }
+
  
 // ===================================================================
 // NOMBRE: preflightSync 
@@ -24503,7 +24790,7 @@ window.iniciarGuiaInteractivaCompleta = function() {
                 
                 { 
                     element: '#zoom-in-button',
-                    popover: { title: 'Zoom Manual', description: "Usa los botones <strong>'+'</strong> y <strong>'-'</strong> para acercar o alejar el mapa manualmente. El número del centro indica el nivel de zoom actual. Si pulsas en ese número se conmutará entre la inclinacion 0 grados y la definida del modo vista del mapa activo y si haces una pulsación larga pondrá el zoom a nivel 5.5", side: "top" }
+                    popover: { title: 'Zoom Manual', description: "Usa los botones <strong>'+'</strong> y <strong>'-'</strong> para acercar o alejar el mapa manualmente. El número del centro indica el nivel de zoom actual. Si pulsas en ese número se conmutará entre la inclinacion 0 grados y la definida del modo vista del mapa activo y si haces una pulsación larga pondrá el zoom a nivel 5.5 o 11, para acercar o alejar rápidamente", side: "top" }
                 },
                 { 
                     element: '#zoom-auto-button',
