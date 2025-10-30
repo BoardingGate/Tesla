@@ -1,4 +1,4 @@
-J14
+J15
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -22626,68 +22626,37 @@ async function addWaypoint(latlng, displayName = null) {
     const hasExistingRoute = navigationWaypoints.filter(wp => wp && !wp.isInternal).length >= 2;
     
     if (hasExistingRoute) {
+        // --- LÓGICA DEFINITIVA CON OPTIMIZACIÓN DE RUTA (OSRM Trip) ---
+        // 1. Recopilar todos los puntos de la ruta actual más el nuevo.
+        const allWaypointsForOptimization = [...navigationWaypoints.filter(wp => wp && !wp.isInternal), newWaypoint];
+        const coordsString = allWaypointsForOptimization.map(wp => `${wp.lng},${wp.lat}`).join(';');
+        
+        // 2. Pedir a OSRM que encuentre el orden óptimo, fijando solo el punto de partida.
+        const tripUrl = `${OSRM_SERVICE_URL}/trip/v1/driving/${coordsString}?source=first&roundtrip=false&overview=false`;
+
         try {
-            // === LÓGICA CORREGIDA Y DEFINITIVA: COMBINA LA INSERCIÓN INTELIGENTE CON EL CASO ESPECIAL DEL DESTINO FINAL ===
-            const route = navigationCurrentRouteData?.routes?.[0];
-            if (!route || !route._turfLineString) {
-                throw new Error("Geometría de ruta no disponible para inserción inteligente.");
-            }
-            const routeLine = route._turfLineString;
-            
-            const newPoint = turf.point([newWaypoint.lng, newWaypoint.lat]);
-            const newWaypointDistanceOnRoute = turf.nearestPointOnLine(routeLine, newPoint, { units: 'meters' }).properties.location;
+            const response = await fetch(tripUrl);
+            const data = await response.json();
 
-            const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal);
-            const lastWaypoint = actualWaypoints[actualWaypoints.length - 1];
-            const lastWaypointPoint = turf.point([lastWaypoint.lng, lastWaypoint.lat]);
-            const distanceToFinalWaypoint = turf.nearestPointOnLine(routeLine, lastWaypointPoint, { units: 'meters' }).properties.location;
-
-            // ESTA ES LA CONDICIÓN CLAVE QUE FALTABA
-            if (newWaypointDistanceOnRoute > distanceToFinalWaypoint) {
-                // Si el nuevo punto está MÁS ALLÁ del destino final actual, simplemente lo añadimos al final.
-                navigationWaypoints.push(newWaypoint);
-                showToast(`'${newWaypoint.address}' añadido como nuevo destino final.`, "success");
+            if (data.code === 'Ok' && data.waypoints) {
+                // 3. Reconstruir la lista de waypoints según el orden óptimo devuelto por OSRM.
+                const reorderedIndexes = data.waypoints.map(wp => wp.waypoint_index);
+                const reorderedWaypoints = reorderedIndexes.map(index => allWaypointsForOptimization[index]);
+                navigationWaypoints = reorderedWaypoints;
+                showToast(`Etapa añadida y ruta optimizada.`, "success");
             } else {
-                // Si está antes, usamos la lógica de inserción inteligente original, que funcionaba bien.
-                const waypointDistances = actualWaypoints.map(wp => {
-                    const wpPoint = turf.point([wp.lng, wp.lat]);
-                    const distance = turf.nearestPointOnLine(routeLine, wpPoint, { units: 'meters' }).properties.location;
-                    return { waypoint: wp, distance: distance };
-                });
-
-                let insertAfterIndex = -1;
-                for (let i = 0; i < waypointDistances.length - 1; i++) {
-                    if (newWaypointDistanceOnRoute > waypointDistances[i].distance && newWaypointDistanceOnRoute < waypointDistances[i+1].distance) {
-                        insertAfterIndex = i;
-                        break;
-                    }
-                }
-                
-                if (insertAfterIndex === -1) {
-                    insertAfterIndex = waypointDistances.length - 2;
-                }
-
-                const waypointToInsertAfter = actualWaypoints[insertAfterIndex];
-                const finalInsertIndex = navigationWaypoints.findIndex(wp => wp.id === waypointToInsertAfter.id);
-
-                if (finalInsertIndex !== -1) {
-                    navigationWaypoints.splice(finalInsertIndex + 1, 0, newWaypoint);
-                    showToast(`'${newWaypoint.address}' insertado en la ruta.`, "success");
-                } else {
-                    throw new Error("No se pudo encontrar el punto de inserción.");
-                }
+                // Fallback: si la optimización falla por alguna razón, lo añadimos al final.
+                console.warn("Fallo en la optimización de OSRM Trip, añadiendo al final.", data.message);
+                navigationWaypoints.push(newWaypoint);
+                showToast(`'${newWaypoint.address}' añadido como nueva etapa. No se pudo optimizar el orden.`, "warning");
             }
         } catch (error) {
-            // Fallback: si la lógica inteligente falla, lo añade al final.
-            console.error("Fallo en la inserción inteligente, usando fallback:", error);
-            const finalDestinationIndex = navigationWaypoints.findIndex(wp => wp.type === 'F');
-            if (finalDestinationIndex !== -1) {
-                navigationWaypoints.splice(finalDestinationIndex, 0, newWaypoint);
-            } else {
-                navigationWaypoints.push(newWaypoint);
-            }
-            showToast(`'${newWaypoint.address}' añadido como etapa. Recalculando...`, "success");
+            // Fallback por si hay un error de red.
+            console.error("Error de red al optimizar la ruta, añadiendo al final:", error);
+            navigationWaypoints.push(newWaypoint);
+            showToast(`'${newWaypoint.address}' añadido como nueva etapa. Error de red al optimizar.`, "warning");
         }
+        
     } else {
         // Lógica para crear una ruta desde cero (esto ya funcionaba correctamente).
         if (navigationWaypoints.length === 0 && navigationCurrentLocation) {
@@ -22713,7 +22682,7 @@ async function addWaypoint(latlng, displayName = null) {
         }
     }
 
-    // El resto de la función se encarga de aplicar los cambios.
+    // 4. Actualizar etiquetas (S, 1, 2, F...) y recalcular la ruta con el nuevo orden.
     await updateWaypointTypesAndLabels();
     renderWaypointMarkers();
 
@@ -22724,7 +22693,7 @@ async function addWaypoint(latlng, displayName = null) {
     updateStartNavigationButtonState();
     updateNavigationButtonColor();
 }
-
+    
 // ===================================================================
 // NOMBRE: fetchAddressSuggestions (VERSIÓN CORREGIDA CON MANEJO DE "NO RESULTADOS")
 // RESUMEN: En lugar de ocultar el modal cuando no hay resultados, lo mantiene
