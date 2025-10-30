@@ -1,4 +1,4 @@
-J22
+J23
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -9384,8 +9384,8 @@ function adaptMapboxRouteToOSRMFormat(mapboxRoute) {
 }  
 
 // ===================================================================
-// NOMBRE: openNavigationMap (VERSIÓN FINAL CON PULSACIÓN LARGA Y CORTA UNIFICADA)
-// RESUMEN: Abre el mapa. Gestiona correctamente la pulsación larga para añadir etapas sin interferir con el clic corto para interactuar con POIs, radares, etc.
+// NOMBRE: openNavigationMap (VERSIÓN FINAL CON GESTIÓN DE ARRASTRE ROBUSTA)
+// RESUMEN: Abre el mapa. Gestiona la pulsación larga cancelándola si se detecta un inicio de arrastre, zoom o inclinación.
 // ===================================================================
 async function openNavigationMap(isRecovery = false) {
     return new Promise(async (resolve, reject) => {
@@ -9528,82 +9528,65 @@ async function openNavigationMap(isRecovery = false) {
                     try {
                         await wait(300);
 
-                        // --- INICIO: LÓGICA UNIFICADA DE PULSACIÓN CORTA Y LARGA ---
-                        let pressTimer = null;
-                        let startPoint = null;
-                        let isDragging = false;
+                        // --- INICIO: LÓGICA DE PULSACIÓN CORTA/LARGA (VERSIÓN ROBUSTA CONTRA DRAG) ---
+                        let longPressTimer = null;
                         const LONG_PRESS_DURATION = 500;
-                        const MOVE_THRESHOLD = 10;
 
+                        const clearLongPressTimer = () => {
+                            if (longPressTimer) {
+                                clearTimeout(longPressTimer);
+                                longPressTimer = null;
+                            }
+                        };
+                        
+                        // 1. Al presionar, iniciamos el temporizador para la pulsación larga.
                         const handlePressStart = (e) => {
-                            clearTimeout(pressTimer);
-                            isDragging = false;
-                            const point = e.touches ? e.touches[0] : e;
-                            startPoint = { x: point.clientX, y: point.clientY, lngLat: e.lngLat };
-                            
-                            // Iniciar temporizador para la pulsación larga
-                            pressTimer = setTimeout(() => {
-                                if (isAddReminderAtLocationModeActive || isSimulatingGpsLocation || (isNavigating && !isAddingWaypointsDuringNav)) {
-                                    return; // No añadir punto en estos modos
-                                }
+                            if (isAddReminderAtLocationModeActive || isSimulatingGpsLocation || (isNavigating && !isAddingWaypointsDuringNav)) {
+                                return;
+                            }
+                            clearLongPressTimer();
+                            longPressTimer = setTimeout(() => {
                                 addWaypoint(e.lngLat);
-                                pressTimer = null; // Marcar que la acción de pulsación larga ya se ejecutó
+                                longPressTimer = null; 
                             }, LONG_PRESS_DURATION);
                         };
 
-                        const handlePressMove = (e) => {
-                            if (!pressTimer || !startPoint) return;
-                            const point = e.touches ? e.touches[0] : e;
-                            const deltaX = Math.abs(point.clientX - startPoint.x);
-                            const deltaY = Math.abs(point.clientY - startPoint.y);
-                            if (deltaX > MOVE_THRESHOLD || deltaY > MOVE_THRESHOLD) {
-                                isDragging = true;
-                                clearTimeout(pressTimer); // Cancelar si hay movimiento (es un arrastre)
-                                pressTimer = null;
-                            }
-                        };
-
-                        const handlePressEnd = async (e) => {
-                            // Si el temporizador sigue activo, significa que fue un clic corto
-                            if (pressTimer) {
-                                clearTimeout(pressTimer);
-                                pressTimer = null;
-
-                                if (!isDragging) {
-                                    // --- LÓGICA DEL CLIC CORTO (LO QUE ANTES ESTABA EN map.on('click')) ---
-                                    if (isAddReminderAtLocationModeActive) { handleMapClickToAddReminder(e); return; } 
-                                    if (isSimulatingGpsLocation) { handleSimulateGpsPositionClick(e); return; } 
-                                    
-                                    const point = e.point; 
-                                    const pdrLayers = ['pdr-simple-circle-layer', 'pdr-cards-layer-bg-halo', 'pdr-cards-layer-bg']; 
-                                    const pdrFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: pdrLayers }); 
-                                    if (pdrFeatures.length > 0) { const fullPdrData = window.lastOcmApiResponse.find(p => p.ID === pdrFeatures[0].properties.ocmId); if (fullPdrData) { showChargingPointModal(fullPdrData, pdrFeatures[0].properties.index); } return; } 
-                                    const alertLayers = ['traffic-alerts-layer']; 
-                                    const alertFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: alertLayers }); 
-                                    if (alertFeatures.length > 0) { const alertDetailsMap = { 1: 'Accidente de tráfico', 2: 'Coche averiado', 3: 'Control de tráfico / Radar', 4: 'Atasco', 5: 'Peligro indeterminado', 6: 'Carretera en mal estado', 7: 'Obras', 8: 'Vía / Carretera cerrada' }; showToast(alertDetailsMap[alertFeatures[0].properties.code] || 'Alerta de tráfico', 'warning', 4000); return; } 
-                                    const reminderLayers = ['reminders-icons-layer', 'radar-circles-layer']; 
-                                    const reminderFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: reminderLayers }); 
-                                    if (reminderFeatures.length > 0) { showReminderActionModal(reminderFeatures[0].properties.reminderId); return; } 
-                                    const mapboxPoiLayers = ['poi-label']; 
-                                    const features = navigationMapInstance.queryRenderedFeatures(point, { layers: mapboxPoiLayers }); 
-                                    const validPoiFeature = features.find(f => f.properties && (f.properties.name || f.properties.name_en || f.properties.text)); 
-                                    if (validPoiFeature) { const { name, name_en, text, poi_category, category, maki } = validPoiFeature.properties; const poiName = name || name_en || text; let categories = []; if (poi_category && Array.isArray(poi_category)) { categories = poi_category; } else if (category) { categories = category.split(',').map(c => c.trim()); } else if (maki) { categories.push(maki); } showPoiInfoModal({ properties: { name: poiName, categories: categories }, geometry: validPoiFeature.geometry }); }
-                                }
-                            }
-                            // Limpiar estado
-                            isDragging = false;
-                            startPoint = null;
-                        };
-                        
-                        // Asignar los nuevos listeners unificados
                         navigationMapInstance.on('mousedown', handlePressStart);
-                        navigationMapInstance.on('mousemove', handlePressMove);
-                        navigationMapInstance.on('mouseup', handlePressEnd);
                         navigationMapInstance.on('touchstart', handlePressStart);
-                        navigationMapInstance.on('touchmove', handlePressMove);
-                        navigationMapInstance.on('touchend', handlePressEnd);
-                        // --- FIN: LÓGICA UNIFICADA ---
 
+                        // 2. Si el mapa detecta el inicio de un arrastre, zoom o inclinación, CANCELAMOS el temporizador.
+                        navigationMapInstance.on('dragstart', clearLongPressTimer);
+                        navigationMapInstance.on('zoomstart', clearLongPressTimer);
+                        navigationMapInstance.on('pitchstart', clearLongPressTimer);
+
+                        // 3. Al soltar, también cancelamos. El evento 'click' se encargará del resto si fue un toque corto.
+                        navigationMapInstance.on('mouseup', clearLongPressTimer);
+                        navigationMapInstance.on('touchend', clearLongPressTimer);
+                        
+                        // 4. El evento 'click' SÓLO se dispara si no hubo arrastre ni pulsación larga.
+                        navigationMapInstance.on('click', async (e) => {
+                            // La lógica de la pulsación larga ya está cancelada en este punto.
+                            // Aquí va toda la lógica del clic corto que teníamos antes.
+                            if (isAddReminderAtLocationModeActive) { handleMapClickToAddReminder(e); return; } 
+                            if (isSimulatingGpsLocation) { handleSimulateGpsPositionClick(e); return; } 
+                            
+                            const point = e.point; 
+                            const pdrLayers = ['pdr-simple-circle-layer', 'pdr-cards-layer-bg-halo', 'pdr-cards-layer-bg']; 
+                            const pdrFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: pdrLayers }); 
+                            if (pdrFeatures.length > 0) { const fullPdrData = window.lastOcmApiResponse.find(p => p.ID === pdrFeatures[0].properties.ocmId); if (fullPdrData) { showChargingPointModal(fullPdrData, pdrFeatures[0].properties.index); } return; } 
+                            const alertLayers = ['traffic-alerts-layer']; 
+                            const alertFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: alertLayers }); 
+                            if (alertFeatures.length > 0) { const alertDetailsMap = { 1: 'Accidente de tráfico', 2: 'Coche averiado', 3: 'Control de tráfico / Radar', 4: 'Atasco', 5: 'Peligro indeterminado', 6: 'Carretera en mal estado', 7: 'Obras', 8: 'Vía / Carretera cerrada' }; showToast(alertDetailsMap[alertFeatures[0].properties.code] || 'Alerta de tráfico', 'warning', 4000); return; } 
+                            const reminderLayers = ['reminders-icons-layer', 'radar-circles-layer']; 
+                            const reminderFeatures = navigationMapInstance.queryRenderedFeatures(point, { layers: reminderLayers }); 
+                            if (reminderFeatures.length > 0) { showReminderActionModal(reminderFeatures[0].properties.reminderId); return; } 
+                            const mapboxPoiLayers = ['poi-label']; 
+                            const features = navigationMapInstance.queryRenderedFeatures(point, { layers: mapboxPoiLayers }); 
+                            const validPoiFeature = features.find(f => f.properties && (f.properties.name || f.properties.name_en || f.properties.text)); 
+                            if (validPoiFeature) { const { name, name_en, text, poi_category, category, maki } = validPoiFeature.properties; const poiName = name || name_en || text; let categories = []; if (poi_category && Array.isArray(poi_category)) { categories = poi_category; } else if (category) { categories = category.split(',').map(c => c.trim()); } else if (maki) { categories.push(maki); } showPoiInfoModal({ properties: { name: poiName, categories: categories }, geometry: validPoiFeature.geometry }); }
+                        });
+                        // --- FIN: LÓGICA UNIFICADA ---
+                        
                         const lockButton = document.getElementById('toggle-progress-bar-lock'); if (lockButton && !lockButton.dataset.listenerAttached) { lockButton.addEventListener('click', (e) => { e.stopPropagation(); handleProgressBarLockToggle(); }); lockButton.dataset.listenerAttached = 'true'; } updateProgressBarLockIcon();
                         const topInfoBar = document.getElementById('navigation-top-info-bar'); if (topInfoBar && !topInfoBar.dataset.listenerAttached) { topInfoBar.addEventListener('click', (e) => { e.stopPropagation(); if (nextManeuverStepForPreview && navigationCurrentRouteData?.routes?.[0]) { showIntersectionPreviewMap(nextManeuverStepForPreview, navigationCurrentRouteData.routes[0], true, 10000); } else { showToast("No hay una próxima maniobra que mostrar.", "info"); } }); topInfoBar.dataset.listenerAttached = 'true'; }
                         const initToast = document.getElementById("map-init-toast"); if (initToast) initToast.remove();
