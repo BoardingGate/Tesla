@@ -1,4 +1,4 @@
-J10
+J11
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -22580,7 +22580,150 @@ async function addWaypoint(latlng, displayName = null) {
     updateStartNavigationButtonState();
     updateNavigationButtonColor();
 }
+
+// ===================================================================
+// NOMBRE: addWaypoint (MODIFICADA - GESTIONA MODO LIBRE Y EDICIÓN EN RUTA)
+// RESUMEN: Añade un punto de ruta. Pausa el modo "Free Drive" si está activo y gestiona la inserción de etapas durante la navegación.
+async function addWaypoint(latlng, displayName = null) {
+    if (isNavigating && !isAddingWaypointsDuringNav) {
+        showToast("Para añadir etapas durante la navegación, primero activa el modo de edición (botón de búsqueda).", "warning");
+        return;
+    }
     
+    if (navigationFollowUser) {
+        triggerManualMapInteraction();
+        showToast("Seguimiento pausado para añadir puntos.", "info");
+    }
+
+    if (isFreeDriveActive) {
+        isFreeDrivePaused = true;
+        isFreeDriveActive = false;
+        showToast("Modo Conducción Libre en pausa.", "info");
+        updateStartNavigationButtonState();
+        updateNavigationButtonColor();
+        clearNavigationGraph();
+    }
+    
+    let address = displayName;
+    if (!address) {
+        address = await getAddressForWaypoint(latlng.lat, latlng.lng);
+    }
+
+    const newWaypoint = {
+        id: Date.now(),
+        lat: latlng.lat,
+        lng: latlng.lng,
+        type: '',
+        marker: null,
+        label: '',
+        address: address,
+        visited: false,
+        isCriticalForRecalc: true,
+        isInternal: false,
+        isRecalculatedStart: false
+    };
+
+    const hasExistingRoute = navigationWaypoints.filter(wp => wp && !wp.isInternal).length >= 2;
+    
+    if (hasExistingRoute) {
+        try {
+            // === INICIO DE LA LÓGICA MEJORADA ===
+            const route = navigationCurrentRouteData?.routes?.[0];
+            if (!route || !route._turfLineString) {
+                throw new Error("Geometría de ruta no disponible para inserción inteligente.");
+            }
+            const routeLine = route._turfLineString;
+            
+            const newPoint = turf.point([newWaypoint.lng, newWaypoint.lat]);
+            const newWaypointDistanceOnRoute = turf.nearestPointOnLine(routeLine, newPoint, { units: 'meters' }).properties.location;
+
+            const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal);
+            const lastWaypoint = actualWaypoints[actualWaypoints.length - 1];
+            const lastWaypointPoint = turf.point([lastWaypoint.lng, lastWaypoint.lat]);
+            const distanceToFinalWaypoint = turf.nearestPointOnLine(routeLine, lastWaypointPoint, { units: 'meters' }).properties.location;
+
+            // Comprueba si el nuevo punto está más allá del destino final actual
+            if (newWaypointDistanceOnRoute > distanceToFinalWaypoint) {
+                // Si es así, simplemente lo añadimos al final. La función de reetiquetado se encargará del resto.
+                navigationWaypoints.push(newWaypoint);
+                showToast(`'${newWaypoint.address}' añadido como nuevo destino final.`, "success");
+            } else {
+                // Si no, usamos la lógica existente para insertarlo entre los puntos actuales.
+                const waypointDistances = actualWaypoints.map(wp => {
+                    const wpPoint = turf.point([wp.lng, wp.lat]);
+                    const distance = turf.nearestPointOnLine(routeLine, wpPoint, { units: 'meters' }).properties.location;
+                    return { waypoint: wp, distance: distance };
+                });
+
+                let insertAfterIndex = -1;
+                for (let i = 0; i < waypointDistances.length - 1; i++) {
+                    if (newWaypointDistanceOnRoute > waypointDistances[i].distance && newWaypointDistanceOnRoute < waypointDistances[i+1].distance) {
+                        insertAfterIndex = i;
+                        break;
+                    }
+                }
+                
+                if (insertAfterIndex === -1) {
+                    insertAfterIndex = waypointDistances.length - 2;
+                }
+
+                const waypointToInsertAfter = actualWaypoints[insertAfterIndex];
+                const finalInsertIndex = navigationWaypoints.findIndex(wp => wp.id === waypointToInsertAfter.id);
+
+                if (finalInsertIndex !== -1) {
+                    navigationWaypoints.splice(finalInsertIndex + 1, 0, newWaypoint);
+                    showToast(`'${newWaypoint.address}' insertado en la ruta.`, "success");
+                } else {
+                    throw new Error("No se pudo encontrar el punto de inserción.");
+                }
+            }
+            // === FIN DE LA LÓGICA MEJORADA ===
+
+        } catch (error) {
+            // Fallback: si la lógica inteligente falla, lo añade al final (antes del destino)
+            console.error("Fallo en la inserción inteligente de POI, usando fallback:", error);
+            const finalDestinationIndex = navigationWaypoints.findIndex(wp => wp.type === 'F');
+            if (finalDestinationIndex !== -1) {
+                navigationWaypoints.splice(finalDestinationIndex, 0, newWaypoint);
+            } else {
+                navigationWaypoints.push(newWaypoint);
+            }
+            showToast(`'${newWaypoint.address}' añadido como etapa. Recalculando...`, "success");
+        }
+    } else {
+        if (navigationWaypoints.length === 0 && navigationCurrentLocation) {
+            const startPoint = {
+                id: Date.now() - 1,
+                lat: navigationCurrentLocation.latitude,
+                lng: navigationCurrentLocation.longitude,
+                type: 'S',
+                marker: null,
+                label: 'S',
+                address: 'Posición Actual (GPS)',
+                visited: true,
+                isCriticalForRecalc: true,
+                isInternal: false,
+                isRecalculatedStart: false
+            };
+            navigationWaypoints.push(startPoint);
+        }
+        navigationWaypoints.push(newWaypoint);
+        
+        if (navigationWaypoints.filter(wp => wp && !wp.isInternal).length >= 2) {
+            showToast("PULSACIÓN LARGA SOBRE LA ETAPA para ELIMINAR, COMPARTIR o BUSCAR RUTAS ALTERNATIVAS. ARRASTRE para RESITUARLA", "instructional", 3000);
+        }
+    }
+
+    await updateWaypointTypesAndLabels();
+    renderWaypointMarkers();
+
+    if (navigationWaypoints.filter(wp => wp && !wp.isInternal).length >= 2) {
+        recalculateAndDrawRoute(isNavigating);
+    }
+    
+    updateStartNavigationButtonState();
+    updateNavigationButtonColor();
+}    
 
 // ===================================================================
 // NOMBRE: fetchAddressSuggestions (VERSIÓN CORREGIDA CON MANEJO DE "NO RESULTADOS")
