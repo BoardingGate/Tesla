@@ -1,4 +1,4 @@
-J13
+J14
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -22626,34 +22626,68 @@ async function addWaypoint(latlng, displayName = null) {
     const hasExistingRoute = navigationWaypoints.filter(wp => wp && !wp.isInternal).length >= 2;
     
     if (hasExistingRoute) {
-        // --- LÓGICA DEFINITIVA CON OPTIMIZACIÓN DE RUTA ---
-        const allWaypointsForOptimization = [...navigationWaypoints.filter(wp => wp && !wp.isInternal), newWaypoint];
-        const coordsString = allWaypointsForOptimization.map(wp => `${wp.lng},${wp.lat}`).join(';');
-        const tripUrl = `${OSRM_SERVICE_URL}/trip/v1/driving/${coordsString}?source=first&destination=last&roundtrip=false&overview=false`;
-
         try {
-            const response = await fetch(tripUrl);
-            const data = await response.json();
+            // === LÓGICA CORREGIDA Y DEFINITIVA: COMBINA LA INSERCIÓN INTELIGENTE CON EL CASO ESPECIAL DEL DESTINO FINAL ===
+            const route = navigationCurrentRouteData?.routes?.[0];
+            if (!route || !route._turfLineString) {
+                throw new Error("Geometría de ruta no disponible para inserción inteligente.");
+            }
+            const routeLine = route._turfLineString;
+            
+            const newPoint = turf.point([newWaypoint.lng, newWaypoint.lat]);
+            const newWaypointDistanceOnRoute = turf.nearestPointOnLine(routeLine, newPoint, { units: 'meters' }).properties.location;
 
-            if (data.code === 'Ok' && data.waypoints) {
-                // El API nos devuelve los waypoints reordenados. Usamos este nuevo orden.
-                const reorderedIndexes = data.waypoints.map(wp => wp.waypoint_index);
-                const reorderedWaypoints = reorderedIndexes.map(index => allWaypointsForOptimization[index]);
-                navigationWaypoints = reorderedWaypoints;
-                showToast(`Etapa añadida y ruta optimizada.`, "success");
-            } else {
-                // Fallback: Si la optimización falla, añadimos al final.
-                console.warn("Fallo en la optimización de OSRM Trip, añadiendo al final.", data.message);
+            const actualWaypoints = navigationWaypoints.filter(wp => wp && !wp.isInternal);
+            const lastWaypoint = actualWaypoints[actualWaypoints.length - 1];
+            const lastWaypointPoint = turf.point([lastWaypoint.lng, lastWaypoint.lat]);
+            const distanceToFinalWaypoint = turf.nearestPointOnLine(routeLine, lastWaypointPoint, { units: 'meters' }).properties.location;
+
+            // ESTA ES LA CONDICIÓN CLAVE QUE FALTABA
+            if (newWaypointDistanceOnRoute > distanceToFinalWaypoint) {
+                // Si el nuevo punto está MÁS ALLÁ del destino final actual, simplemente lo añadimos al final.
                 navigationWaypoints.push(newWaypoint);
-                showToast(`'${newWaypoint.address}' añadido como nueva etapa. No se pudo optimizar el orden.`, "warning");
+                showToast(`'${newWaypoint.address}' añadido como nuevo destino final.`, "success");
+            } else {
+                // Si está antes, usamos la lógica de inserción inteligente original, que funcionaba bien.
+                const waypointDistances = actualWaypoints.map(wp => {
+                    const wpPoint = turf.point([wp.lng, wp.lat]);
+                    const distance = turf.nearestPointOnLine(routeLine, wpPoint, { units: 'meters' }).properties.location;
+                    return { waypoint: wp, distance: distance };
+                });
+
+                let insertAfterIndex = -1;
+                for (let i = 0; i < waypointDistances.length - 1; i++) {
+                    if (newWaypointDistanceOnRoute > waypointDistances[i].distance && newWaypointDistanceOnRoute < waypointDistances[i+1].distance) {
+                        insertAfterIndex = i;
+                        break;
+                    }
+                }
+                
+                if (insertAfterIndex === -1) {
+                    insertAfterIndex = waypointDistances.length - 2;
+                }
+
+                const waypointToInsertAfter = actualWaypoints[insertAfterIndex];
+                const finalInsertIndex = navigationWaypoints.findIndex(wp => wp.id === waypointToInsertAfter.id);
+
+                if (finalInsertIndex !== -1) {
+                    navigationWaypoints.splice(finalInsertIndex + 1, 0, newWaypoint);
+                    showToast(`'${newWaypoint.address}' insertado en la ruta.`, "success");
+                } else {
+                    throw new Error("No se pudo encontrar el punto de inserción.");
+                }
             }
         } catch (error) {
-            // Fallback por error de red.
-            console.error("Error de red al optimizar la ruta, añadiendo al final:", error);
-            navigationWaypoints.push(newWaypoint);
-            showToast(`'${newWaypoint.address}' añadido como nueva etapa. Error de red al optimizar.`, "warning");
+            // Fallback: si la lógica inteligente falla, lo añade al final.
+            console.error("Fallo en la inserción inteligente, usando fallback:", error);
+            const finalDestinationIndex = navigationWaypoints.findIndex(wp => wp.type === 'F');
+            if (finalDestinationIndex !== -1) {
+                navigationWaypoints.splice(finalDestinationIndex, 0, newWaypoint);
+            } else {
+                navigationWaypoints.push(newWaypoint);
+            }
+            showToast(`'${newWaypoint.address}' añadido como etapa. Recalculando...`, "success");
         }
-        
     } else {
         // Lógica para crear una ruta desde cero (esto ya funcionaba correctamente).
         if (navigationWaypoints.length === 0 && navigationCurrentLocation) {
@@ -22690,7 +22724,7 @@ async function addWaypoint(latlng, displayName = null) {
     updateStartNavigationButtonState();
     updateNavigationButtonColor();
 }
-    
+
 // ===================================================================
 // NOMBRE: fetchAddressSuggestions (VERSIÓN CORREGIDA CON MANEJO DE "NO RESULTADOS")
 // RESUMEN: En lugar de ocultar el modal cuando no hay resultados, lo mantiene
