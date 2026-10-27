@@ -3688,6 +3688,9 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
             isNavigating = true;
             startMemoryManagement(true); 
             startDeviationChecker(); 
+            // 28-oct: aviso de voz al pulsar «Iniciar navegación». El audio ya se desbloqueó al principio de
+            // toggleNavigationState (dentro del toque); en la recuperación automática no se anuncia.
+            if (!isRecovery) speakNavigationInstruction('Iniciando navegación.', ['f_iniciando_navegacion'], 'medium');
             mapHeaderButtonsVisible = false;
             toggleMapHeaderRowsVisibility(false);
             
@@ -7720,12 +7723,17 @@ function saveSettings() {
 //          Para probar en el PC: añadir ?voz=grabada (o ?voz=sintetizada) a la URL.
 //          En la consola: bgVoice.mode
 const VOICE_CLIPS_BASE_URL = 'https://boardinggate.github.io/Tesla/audio/';
-const VOICE_CLIPS_VERSION = '1';            // subir si se regeneran los audios (evita caché vieja)
+const VOICE_CLIPS_VERSION = '2';            // subir si se regeneran los audios (evita caché vieja)  [28-oct: 1 -> 2]
 const VOICE_DETECT_TIMEOUT_MS = 2000;       // espera máxima a que aparezcan voces
 const VOICE_TTS_START_TIMEOUT_MS = 1800;    // si speak() no llega a onstart en este tiempo -> clips
 const VOICE_IDLE_SUSPEND_MS = 1500;         // suspender el AudioContext tras hablar (0 = nunca)
-const VOICE_PRIORITY = { info: 1, far: 1, medium: 2, near: 3, arrival: 3 };
-const VOICE_TTL_MS   = { info: 6000, far: 8000, medium: 6000, near: 3000, arrival: 8000 };
+const VOICE_PRIORITY = { info: 1, far: 1, radar: 1.5, medium: 2, near: 3, arrival: 3 };   // 28-oct: + radar
+const VOICE_TTL_MS   = { info: 6000, far: 8000, radar: 5000, medium: 6000, near: 3000, arrival: 8000 };
+const VOICE_JOIN_OVERLAP_S = 0.10;          // 28-oct: solape entre clips encadenados (cada clip trae ≥0,12 s de silencio en cada extremo)
+const VOICE_RESUME_WARMUP_S = 0.15;         // 28-oct: margen tras reanudar un AudioContext suspendido (evita cortar la primera sílaba)
+const VOICE_FADE_OUT_S = 0.06;              // 28-oct: fundido al cortar un aviso por otro más urgente (sin «clic»)
+const VOICE_GAP_MS = 250;                   // 28-oct: pausa natural entre dos avisos seguidos de la cola
+const VOICE_QUEUE_MAX = 3;                  // 28-oct: avisos en espera como máximo (los demás caducan)
 const VOICE_TEXT_TO_CLIP = {                 // llamadas antiguas speakNavigationInstruction("texto")
     'Guiado por voz activado.': 'f_guiado_activado',
     'Has llegado a tu destino': 'f_has_llegado_destino',
@@ -7804,29 +7812,40 @@ function bgVoiceDetect() {
 function bgVoiceInit() { bgVoiceDetect(); }   // se llama desde loadSavedSettings
 
 // ---------- TTS con vigilancia: onerror o sin onstart -> clips ----------
-function bgVoiceSpeakTTS(text, clips, kind) {
+// 28-oct: ya NO corta lo que esté sonando; quien decide qué suena es la cola (bgVoiceEnqueue).
+// Además vigila que el aviso termine (algunos Chrome no disparan onend) para que la cola nunca se atasque.
+function bgVoiceSpeakTTS(item) {
     const token = ++bgVoice.ttsToken;
-    clearTimeout(bgVoice.ttsWatchdog);
-    bgVoiceStopAll();
-    try { if (voiceSynthesis.speaking || voiceSynthesis.pending) voiceSynthesis.cancel(); } catch (e) {}
-    let started = false;
+    clearTimeout(bgVoice.ttsWatchdog); clearInterval(bgVoice.ttsEndPoll);
+    let started = false, finished = false;
+    const t0 = Date.now();
+    const done = () => {
+        if (finished || token !== bgVoice.ttsToken) return;
+        finished = true; clearTimeout(bgVoice.ttsWatchdog); clearInterval(bgVoice.ttsEndPoll);
+        if (bgVoice.current === item) bgVoiceFinished();
+    };
     const fail = (why) => {
-        if (token !== bgVoice.ttsToken || bgVoice.mode !== 'tts') return;   // ya lo sustituyó otro aviso
-        clearTimeout(bgVoice.ttsWatchdog);
+        if (finished || token !== bgVoice.ttsToken || bgVoice.mode !== 'tts') return;   // ya lo sustituyó otro aviso
+        finished = true;
+        clearTimeout(bgVoice.ttsWatchdog); clearInterval(bgVoice.ttsEndPoll);
         bgVoice.ttsFailed = true;
         try { voiceSynthesis.cancel(); } catch (e) {}
         bgVoiceSetMode('clips', `speak() falló (${why})`);
         if (typeof showToast === 'function') showToast('Voz: grabada (este navegador no puede sintetizar voz)', 'info');
-        if (clips && clips.length) playVoiceClips(clips, kind);              // el mismo aviso, con clips
+        if (bgVoice.current !== item) return;
+        item.viaTTS = false;
+        if (item.keys && item.keys.length) bgVoiceStartClips(item);          // el mismo aviso, con clips
+        else bgVoiceFinished();
     };
     let utterance;
-    try { utterance = new SpeechSynthesisUtterance(text); } catch (e) { fail('SpeechSynthesisUtterance'); return; }
+    try { utterance = new SpeechSynthesisUtterance(item.text); } catch (e) { fail('SpeechSynthesisUtterance'); return; }
     utterance.lang = 'es-ES'; // Forzar español
     utterance.rate = 1.05;    // Ligeramente más rápido para naturalidad
     utterance.volume = 1;
     const voice = bgVoicePickVoice(bgVoiceGetVoices());
     if (voice) utterance.voice = voice;
     utterance.onstart = () => { started = true; if (token === bgVoice.ttsToken) clearTimeout(bgVoice.ttsWatchdog); };
+    utterance.onend = done;
     utterance.onerror = (e) => {
         const err = e && e.error;
         if (err === 'interrupted' || err === 'canceled') return;            // lo cortamos nosotros
@@ -7836,6 +7855,13 @@ function bgVoiceSpeakTTS(text, clips, kind) {
         let speaking = false; try { speaking = voiceSynthesis.speaking; } catch (e) {}
         if (!started && !speaking) fail(`sin onstart en ${VOICE_TTS_START_TIMEOUT_MS} ms`);
     }, VOICE_TTS_START_TIMEOUT_MS);
+    // Red de seguridad: si el motor dejó de hablar y no llegó onend, damos el aviso por terminado.
+    const maxMs = 4000 + String(item.text || '').length * 120;
+    bgVoice.ttsEndPoll = setInterval(() => {
+        if (finished || token !== bgVoice.ttsToken) { clearInterval(bgVoice.ttsEndPoll); return; }
+        let busy = true; try { busy = voiceSynthesis.speaking || voiceSynthesis.pending; } catch (e) {}
+        if ((started && !busy) || Date.now() - t0 > maxMs) done();
+    }, 500);
     try { voiceSynthesis.speak(utterance); } catch (e) { fail('speak() lanzó ' + (e && e.name)); }
 }
 
@@ -7930,43 +7956,111 @@ function bgVoiceGetAudioEl() {
     return a;
 }
 
+// Corte limpio (28-oct): fundido de 60 ms en Web Audio (sin «clic» ni sílabas a medias),
+// pausa en <audio> y cancel() en TTS. Lo usa la cola cuando llega un aviso más urgente.
 function bgVoiceStopAll() {
-    bgVoice.sources.forEach(s => { try { s.onended = null; s.stop(); } catch (e) {} });
+    const ctx = bgVoice.ctx;
+    let quietAt = 0;
+    bgVoice.sources.forEach(s => {
+        try {
+            s.onended = null;
+            if (ctx && s._gain && ctx.state === 'running') {
+                const now = ctx.currentTime;
+                quietAt = now + VOICE_FADE_OUT_S;
+                s._gain.gain.cancelScheduledValues(now);
+                s._gain.gain.setValueAtTime(s._gain.gain.value, now);
+                s._gain.gain.linearRampToValueAtTime(0, quietAt);
+                s.stop(quietAt + 0.01);
+            } else s.stop();
+        } catch (e) {}
+    });
+    bgVoice.quietAt = quietAt;                                    // el siguiente aviso no empieza antes del fundido
     bgVoice.sources = [];
     bgVoice.elementQueue = [];
     if (bgVoice.audio) { try { bgVoice.audio.pause(); } catch (e) {} }
+    if (bgVoice.current && bgVoice.current.viaTTS) {
+        bgVoice.ttsToken++; clearTimeout(bgVoice.ttsWatchdog); clearInterval(bgVoice.ttsEndPoll);
+        try { voiceSynthesis.cancel(); } catch (e) {}
+    }
+    clearTimeout(bgVoice.gapTimer);
     bgVoice.playing = false; bgVoice.current = null;
 }
 
-// Cola con prioridad: un aviso de prioridad >= al que suena lo corta; uno menor espera
-// (solo el más reciente) y se descarta si caduca antes de que le toque.
-function playVoiceClips(keys, kind = 'info') {
-    if (!keys || !keys.length) return;
-    const item = { keys: keys.filter(Boolean), prio: VOICE_PRIORITY[kind] || 1, expires: Date.now() + (VOICE_TTL_MS[kind] || 5000) };
-    if (bgVoice.playing && bgVoice.current && item.prio < bgVoice.current.prio) {
-        bgVoice.queue = [item];
+// ===================================================================
+// COLA DE VOZ (28-oct) — la misma para voz sintetizada (TTS) y grabada (clips):
+//  · Nunca suenan dos avisos a la vez.
+//  · Un aviso MÁS urgente (prioridad mayor, p. ej. «Ahora, gira…») corta el actual con un
+//    fundido corto y suena enseguida.
+//  · Uno de prioridad igual o menor NO corta: espera su turno (pausa de 250 ms) y se
+//    descarta si caduca antes (VOICE_TTL_MS). Un aviso nuevo del mismo tipo sustituye al
+//    que esperaba (el más reciente es el que vale). Repeticiones idénticas se ignoran.
+function bgVoiceEnqueue(text, keys, kind = 'info') {
+    keys = (keys || []).filter(Boolean);
+    if (!text && !keys.length) return;
+    const now = Date.now();
+    const item = { text, keys, kind, prio: VOICE_PRIORITY[kind] || 1,
+                   expires: now + (VOICE_TTL_MS[kind] || 5000), sig: (text || '') + '|' + keys.join(',') };
+    const cur = bgVoice.playing ? bgVoice.current : null;
+    if (cur && cur.sig === item.sig) return;                      // ese mismo aviso ya está sonando
+    bgVoice.queue = bgVoice.queue.filter(q => q.expires >= now && q.sig !== item.sig && q.kind !== item.kind);
+    if (cur && item.prio > cur.prio) {                            // más urgente: corta y suena ya
+        if (cur.reserved) bgVoice.queue.push(cur);                // estaba esperando la pausa: lo devolvemos a la cola
+        bgVoiceStopAll();
+        bgVoiceSortQueue();
+        bgVoiceStartItem(item);
         return;
     }
-    bgVoice.queue = [];
-    bgVoiceStopAll();
-    bgVoiceStart(item);
+    if (cur) {                                                    // igual o menos urgente: a la cola
+        bgVoice.queue.push(item);
+        bgVoiceSortQueue();
+        return;
+    }
+    bgVoiceStartItem(item);
 }
+function bgVoiceSortQueue() {
+    bgVoice.queue.sort((a, b) => b.prio - a.prio);                // estable: dentro de la misma prioridad, por orden de llegada
+    if (bgVoice.queue.length > VOICE_QUEUE_MAX) bgVoice.queue.length = VOICE_QUEUE_MAX;
+}
+function bgVoiceStartItem(item) {
+    clearTimeout(bgVoice.gapTimer); clearTimeout(bgVoice.idleTimer);
+    item.reserved = false;
+    bgVoice.playing = true; bgVoice.current = item;
+    if (bgVoice.mode === 'tts' && item.text) { item.viaTTS = true; bgVoiceSpeakTTS(item); return; }
+    item.viaTTS = false;
+    if (item.keys.length) { bgVoiceStartClips(item); return; }
+    bgVoiceFinished();
+}
+
+// Compatibilidad: reproducir solo clips (sin texto TTS).
+function playVoiceClips(keys, kind = 'info') { bgVoiceEnqueue(null, keys, kind); }
 
 function bgVoiceFinished() {
     bgVoice.playing = false; bgVoice.current = null;
-    while (bgVoice.queue.length) {
-        const next = bgVoice.queue.shift();
-        if (Date.now() <= next.expires) { bgVoiceStart(next); return; }
+    const now = Date.now();
+    bgVoice.queue = bgVoice.queue.filter(q => q.expires >= now);
+    const next = bgVoice.queue.shift();
+    if (next) {                                                   // siguiente aviso tras una pausa natural
+        next.reserved = true;
+        bgVoice.playing = true; bgVoice.current = next;           // reservado: nadie de igual prioridad se cuela
+        clearTimeout(bgVoice.gapTimer);
+        bgVoice.gapTimer = setTimeout(() => {
+            if (bgVoice.current !== next) return;
+            if (Date.now() > next.expires) { bgVoiceFinished(); return; }
+            bgVoiceStartItem(next);
+        }, VOICE_GAP_MS);
+        return;
     }
     clearTimeout(bgVoice.idleTimer);
     bgVoice.idleTimer = setTimeout(() => {
+        // Cerca de una maniobra no se suspende: el «Ahora» saldrá sin el retardo de reanudar el audio.
+        const nearManeuver = (typeof isNavigating !== 'undefined' && isNavigating) &&
+            (typeof distanceToNextManeuverOSRM === 'number' && distanceToNextManeuverOSRM < 700);
+        if (nearManeuver) return;
         if (!bgVoice.playing && bgVoice.ctx && bgVoice.ctx.state === 'running' && VOICE_IDLE_SUSPEND_MS > 0) bgVoice.ctx.suspend().catch(() => {});
     }, VOICE_IDLE_SUSPEND_MS);
 }
 
-async function bgVoiceStart(item) {
-    bgVoice.playing = true; bgVoice.current = item;
-    clearTimeout(bgVoice.idleTimer);
+async function bgVoiceStartClips(item) {
     await Promise.all(item.keys.map(k => bgVoiceLoadClip(k)));   // inmediato si ya estaban precargados
     if (bgVoice.current !== item) return;                         // otro aviso lo ha sustituido
     if (Date.now() > item.expires) { bgVoiceFinished(); return; }
@@ -7974,17 +8068,23 @@ async function bgVoiceStart(item) {
     const allDecoded = ctx && item.keys.every(k => bgVoice.buffers.has(k));
     if (allDecoded) {                                             // ---- Plan A: Web Audio
         try {
-            if (ctx.state !== 'running') await ctx.resume();
+            const wasSuspended = ctx.state !== 'running';
+            if (wasSuspended) await ctx.resume();
             if (bgVoice.current !== item) return;
             if (ctx.state === 'running') {
-                let t = ctx.currentTime + 0.05;
+                // Tras reanudar un AudioContext suspendido se deja más margen (si no, se come la 1.ª sílaba),
+                // y nunca antes de que acabe el fundido del aviso cortado.
+                let t = Math.max(ctx.currentTime + (wasSuspended ? VOICE_RESUME_WARMUP_S : 0.05), (bgVoice.quietAt || 0) + 0.03);
                 item.keys.forEach((k, i) => {
                     const src = ctx.createBufferSource();
                     src.buffer = bgVoice.buffers.get(k);
-                    src.connect(ctx.destination);
+                    const g = ctx.createGain();
+                    src.connect(g); g.connect(ctx.destination); src._gain = g;
                     src.start(t);
-                    t += src.buffer.duration;                     // encadenados sin huecos
-                    if (i === item.keys.length - 1) src.onended = () => { if (bgVoice.current === item) bgVoiceFinished(); };
+                    const isLast = i === item.keys.length - 1;
+                    // Encadenados con un leve solape: cada clip trae silencio en los extremos, así no queda hueco audible.
+                    t += src.buffer.duration - (isLast ? 0 : Math.min(VOICE_JOIN_OVERLAP_S, src.buffer.duration / 4));
+                    if (isLast) src.onended = () => { if (bgVoice.current === item) bgVoiceFinished(); };
                     bgVoice.sources.push(src);
                 });
                 return;
@@ -8027,8 +8127,8 @@ function speakNavigationInstruction(text, clips = null, kind = 'info') {
 }
 function bgVoiceDispatch(text, clips, kind) {
     if (!voiceGuidanceEnabled) return;
-    if (bgVoice.mode === 'tts' && text) { bgVoiceSpeakTTS(text, clips, kind); return; }
-    if (clips && clips.length) playVoiceClips(clips, kind);
+    if (bgVoice.mode === 'tts' && text) { bgVoiceEnqueue(text, clips, kind); return; }   // 28-oct: todo pasa por la cola
+    if (clips && clips.length) bgVoiceEnqueue(text, clips, kind);
 }
 
 // Distancia -> clip de prefijo ("En quinientos metros,").
@@ -8040,6 +8140,129 @@ function getDistanceVoiceClip(d) {
     let best = VOICE_DIST_CLIPS[0];
     for (const c of VOICE_DIST_CLIPS) if (Math.abs(c[0] - d) < Math.abs(best[0] - d)) best = c;
     return best[1];
+}
+// ---------- 28-oct: utilidades nuevas de voz (anticipación, «Ahora» de una pieza, radar, recálculo) ----------
+function getDistanceVoiceMeters(d) {           // metros del clip "En X metros" que se usará (para el texto TTS)
+    let best = VOICE_DIST_CLIPS[0];
+    for (const c of VOICE_DIST_CLIPS) if (Math.abs(c[0] - d) < Math.abs(best[0] - d)) best = c;
+    return best[0];
+}
+function voiceDistanceText(m) {
+    if (m >= 1000) return m === 1000 ? 'un kilómetro' : `${String(m / 1000).replace('.', ',')} kilómetros`;
+    return `${m} metros`;
+}
+// «Ahora, gira a la izquierda.» en UNA locución (audio v2). Si el clip combinado aún no está
+// en el manifest (JS subido antes que el audio), se usa el par antiguo prefijo + maniobra.
+function getNearVoiceClips(maneuverClip) {
+    if (!maneuverClip) return null;
+    const combined = maneuverClip.replace(/^f_/, 'c_ahora_');
+    if (Array.isArray(bgVoice.keys) && bgVoice.keys.includes(combined)) return [combined];
+    return ['c_ahora_prefijo', maneuverClip];
+}
+
+// Umbral del «Ahora»: 3 s antes de la maniobra a la velocidad actual, entre 30 y 50 m.
+const VOICE_NOW_LEAD_S = 3;
+const VOICE_NOW_MIN_M = 30;
+const VOICE_NOW_MAX_M = 50;
+// Velocidad para la voz: la del GPS si llega; si no (coords.speed = null deja currentSpeedKmh = 0),
+// se estima con lo que avanza el coche sobre la ruta.
+const voiceSpeedTracker = { d: null, t: 0, v: 0, tick: 1 };   // tick = cada cuánto llegan posiciones (s)
+function getVoiceSpeedMs(carDistance) {
+    const now = Date.now();
+    const tr = voiceSpeedTracker;
+    const dt = (now - tr.t) / 1000;
+    if (tr.d === null || dt >= 10 || dt < 0 || carDistance < tr.d - 100) { tr.d = carDistance; tr.t = now; }
+    else if (dt >= 0.5) {
+        tr.tick = 0.7 * tr.tick + 0.3 * Math.min(dt, 4);
+        const inst = Math.max(0, (carDistance - tr.d) / dt);
+        if (inst < 70) tr.v = tr.v ? 0.6 * tr.v + 0.4 * inst : inst;   // >250 km/h = salto de GPS, se ignora
+        tr.d = carDistance; tr.t = now;
+    }
+    const gps = (typeof window.currentSpeedKmh === 'number' && window.currentSpeedKmh > 0) ? window.currentSpeedKmh / 3.6 : 0;
+    return gps > 0 ? gps : tr.v;
+}
+function getNowVoiceDistance(speedMs) {
+    return Math.min(VOICE_NOW_MAX_M, Math.max(VOICE_NOW_MIN_M, (speedMs || 0) * VOICE_NOW_LEAD_S));
+}
+// ¿Toca decir «Ahora»? Se elige la posición del GPS más próxima al umbral: se dispara si ya estamos dentro,
+// o si la siguiente posición (dentro de ~tick s) quedaría más lejos del umbral que esta. Así, con GPS cada
+// 2 s, a 120 km/h no se salta el aviso y a 30 km/h no se dice a 15 m.
+function isNowVoiceDue(d, speedMs) {
+    const target = getNowVoiceDistance(speedMs);
+    return d <= target + (speedMs > 0 ? speedMs * voiceSpeedTracker.tick / 2 : 0);
+}
+
+// ---------- Radar por voz: «Atención, radar a 300 metros. Límite 50.» ----------
+const VOICE_RADAR_DISTS = [50, 100, 150, 200, 250, 300, 350, 400, 450, 500, 600, 700, 800, 900, 1000];
+const VOICE_RADAR_SPEEDS = [20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130];
+const VOICE_RADAR_COOLDOWN_MS = 10 * 60 * 1000;   // el mismo radar no se repite en 10 min
+const voiceRadarSpokenAt = new Map();              // "lat,lon" -> momento en que se dijo (los ids de Radares Ruta cambian)
+
+// Tipo y velocidad a partir del texto: «RADAR RUTA: F050 BBS…», «T120 …» (inicio de tramo), «T_IN … T090 …»
+// (tramo intermedio), «T_FI …» (fin de tramo), «P060 …» (túnel) o los del usuario «RADAR: DE 50 KM/H» / «DE TRAMO».
+function getRadarVoiceInfo(reminder) {
+    const raw = String((reminder && reminder.text) || '').replace(/<[^>]*>/g, ' ').toUpperCase();
+    if (!raw.includes('RADAR')) return null;
+    const okSpeed = s => (VOICE_RADAR_SPEEDS.includes(s) ? s : null);
+    let kind = 'radar', speed = null;
+    const code = raw.match(/(?:^|[\s:])([FTPCN])(\d{3}|_FI|_IN)\b/);
+    if (code) {
+        if (code[2] === '_FI') kind = 'fin';
+        else if (code[2] === '_IN') { const m = raw.match(/\bT(\d{3})\b/); speed = m ? okSpeed(parseInt(m[1], 10)) : null; }
+        else { speed = okSpeed(parseInt(code[2], 10)); if (code[1] === 'T') kind = 'tramo'; }
+    } else {
+        speed = okSpeed(extractSpeedFromRadarText(reminder.text));
+        if (raw.includes('TRAMO')) kind = 'tramo';
+    }
+    return { kind, speed };
+}
+function getRadarVoiceDistance(reminder) {
+    if (isNavigating && typeof reminder.distanceOnRoute === 'number') {
+        return reminder.distanceOnRoute - lastCarDistanceAlongRouteForNavLogic;   // por la ruta
+    }
+    const loc = reminder.locationCoordinates;
+    if (loc && navigationCurrentLocation) {                                          // en línea recta
+        return calculateDistance(navigationCurrentLocation.latitude, navigationCurrentLocation.longitude, Number(loc.latitude), Number(loc.longitude));
+    }
+    return null;
+}
+// Se llama con la misma lista que displayUnifiedReminderWindow. Anuncia solo el radar más cercano no anunciado.
+function announceRadarVoice(reminders) {
+    if (!voiceGuidanceEnabled || !Array.isArray(reminders)) return;
+    const now = Date.now();
+    let best = null;
+    for (const r of reminders) {
+        if (!r || !r.text) continue;
+        const info = getRadarVoiceInfo(r);
+        if (!info) continue;
+        const loc = r.locationCoordinates;
+        const id = loc ? `${Number(loc.latitude).toFixed(4)},${Number(loc.longitude).toFixed(4)}` : String(r.id);
+        const last = voiceRadarSpokenAt.get(id);
+        if (last && now - last < VOICE_RADAR_COOLDOWN_MS) continue;
+        const d = getRadarVoiceDistance(r);
+        if (d === null || !isFinite(d) || d < 25) continue;           // ya encima o pasado: no se dice
+        if (!best || d < best.d) best = { info, id, d };
+    }
+    if (!best) return;
+    voiceRadarSpokenAt.set(best.id, now);
+    const m = VOICE_RADAR_DISTS.reduce((a, b) => (Math.abs(b - best.d) < Math.abs(a - best.d) ? b : a));
+    const pref = { radar: 'r_radar_d_', tramo: 'r_tramo_d_', fin: 'r_fin_tramo_d_' }[best.info.kind];
+    const head = { radar: 'Atención, radar a', tramo: 'Inicio de radar de tramo a', fin: 'Fin del tramo a' }[best.info.kind];
+    const clips = [pref + m];
+    let text = `${head} ${voiceDistanceText(m)}.`;
+    if (best.info.speed && best.info.kind !== 'fin') { clips.push('r_lim_' + best.info.speed); text += ` Límite ${best.info.speed}.`; }
+    console.log(`[Voz] radar ${best.info.kind} a ${Math.round(best.d)} m (se dice ${m}) límite ${best.info.speed || '-'}`);
+    speakNavigationInstruction(text, clips, 'radar');
+}
+
+// ---------- Recálculo por desvío: «Recalculando la ruta.» (como mucho una vez cada 20 s) ----------
+const VOICE_REROUTE_DEBOUNCE_MS = 20000;
+let lastRerouteVoiceAt = 0;
+function announceRecalculationVoice() {
+    const now = Date.now();
+    if (now - lastRerouteVoiceAt < VOICE_REROUTE_DEBOUNCE_MS) return;
+    lastRerouteVoiceAt = now;
+    speakNavigationInstruction('Recalculando ruta', ['f_recalculando'], 'medium');
 }
 
 // Maniobra (type/modifier/exit de Mapbox/OSRM) -> clip. null = no se anuncia con clips.
@@ -11180,6 +11403,14 @@ function processRouteProgress(coords, mapInstanceToUse) {
         }
     }
    
+    // 28-oct: el radar se anuncia por voz aunque haya una maniobra a menos de 200 m (la ventana sigue esperando).
+    if (eventosEnRuta.length > 0 && proximoEventoEnRutaIndex < eventosEnRuta.length) {
+        const ev = eventosEnRuta[proximoEventoEnRutaIndex];
+        const dEv = ev.distanceOnRoute - lastCarDistanceAlongRouteForNavLogic;
+        if (dEv >= 0 && dEv <= (ev.radiusMeters || DEFAULT_LOCATION_RADIUS) && (!ev.dueTimeUTC || ev.dueTimeUTC <= Date.now()) && !ev.managedByUser) {
+            try { announceRadarVoice([ev]); } catch (e) { console.warn('[Voz] radar', e); }
+        }
+    }
     if (distanceToNextManeuverOSRM > 200) {
         if (eventosEnRuta.length > 0 && proximoEventoEnRutaIndex < eventosEnRuta.length) {
             const proximoEvento = eventosEnRuta[proximoEventoEnRutaIndex];
@@ -11593,7 +11824,8 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     let finalStepLegIndex = -1;
     let tempLegIdx = currentLegIndex;
     let tempStepIdx = currentStepIndex + 1;
-    while (true) { if (tempLegIdx >= route.legs.length) { finalStepToShow = route.legs[route.legs.length - 1].steps[route.legs[route.legs.length - 1].steps.length - 1]; finalStepLegIndex = route.legs.length - 1; break; } let leg = route.legs[tempLegIdx]; if (!leg.steps || tempStepIdx >= leg.steps.length) { tempLegIdx++; tempStepIdx = 0; continue; } const candidateStep = leg.steps[tempStepIdx]; const isArrival = candidateStep.maneuver.type === 'arrive'; const arrivalWaypoint = isArrival ? actualWaypoints[tempLegIdx + 1] : null; if (isArrival && arrivalWaypoint && arrivalWaypoint.isInternal) { tempStepIdx++; continue; } else { finalStepToShow = candidateStep; finalStepLegIndex = tempLegIdx; break; } }
+    let skippedInternalArrival = false;   // 28-oct: tras saltar la llegada a un punto interno, saltar también su 'depart'
+    while (true) { if (tempLegIdx >= route.legs.length) { finalStepToShow = route.legs[route.legs.length - 1].steps[route.legs[route.legs.length - 1].steps.length - 1]; finalStepLegIndex = route.legs.length - 1; break; } let leg = route.legs[tempLegIdx]; if (!leg.steps || tempStepIdx >= leg.steps.length) { tempLegIdx++; tempStepIdx = 0; continue; } const candidateStep = leg.steps[tempStepIdx]; const isArrival = candidateStep.maneuver.type === 'arrive'; const arrivalWaypoint = isArrival ? actualWaypoints[tempLegIdx + 1] : null; if (isArrival && arrivalWaypoint && arrivalWaypoint.isInternal) { tempStepIdx++; skippedInternalArrival = true; continue; } else if (skippedInternalArrival && candidateStep.maneuver.type === 'depart') { tempStepIdx++; continue; } else { finalStepToShow = candidateStep; finalStepLegIndex = tempLegIdx; break; } }
     let nextStepToDisplay = finalStepToShow;
     nextManeuverStepForPreview = nextStepToDisplay;
     const distanceToEndOfCurrentStepForProgress = (currentStepForProgress.cumulativeDistance || 0) + (currentStepForProgress.distance || 0);
@@ -11713,11 +11945,16 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
         }
 
         // --- LÓGICA DE VOZ (TTS si el navegador puede hablar; si no, clips pregrabados) ---
+        // 28-oct: avisos escalonados: ~2 km, ~500 m (300-550), ~200 m (≤220) y «Ahora» a 30-50 m según velocidad.
         if (isNavigating && voiceGuidanceEnabled) {
             if (!nextStepToDisplay._voiceFlags) {
-                nextStepToDisplay._voiceFlags = { far: false, medium: false, near: false };
+                nextStepToDisplay._voiceFlags = { far: false, medium: false, short: false, near: false };
             }
-            
+            const vf = nextStepToDisplay._voiceFlags;
+            const voiceSpeed = getVoiceSpeedMs(carDistance);           // m/s (GPS o estimada)
+            // Distancia a la maniobra que se anuncia (sin puntos internos coincide con distanceToNextManeuver).
+            const dVoice = Math.max(0, (typeof nextStepToDisplay.cumulativeDistance === 'number' ? nextStepToDisplay.cumulativeDistance : distanceToEndOfCurrentStepForProgress) - carDistance);
+
             // Texto para la voz sintetizada: igual que antes (incluye el nombre de la calle).
             let textToSpeak = maneuverText;
             
@@ -11738,21 +11975,27 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
             const voiceKind = type === 'arrive' ? 'arrival' : null;
             const nearClips = type === 'arrive'
                 ? [isIntermediateArrival ? 'c_has_llegado_a_la_etapa' : 'f_has_llegado_destino']
-                : (maneuverClip ? ['c_ahora_prefijo', maneuverClip] : null);
+                : getNearVoiceClips(maneuverClip);                      // «Ahora, gira…» en una sola locución
+            const logVoice = (etapa) => console.log(`[Voz] ${etapa}: ${Math.round(dVoice)} m a ${Math.round(voiceSpeed * 3.6)} km/h — ${maneuverText}`);
 
-            if (distanceToNextManeuver <= 2100 && distanceToNextManeuver > 1900 && !nextStepToDisplay._voiceFlags.far) {
-                speakNavigationInstruction(`En dos kilómetros, ${textToSpeak}`, maneuverClip ? ['f_en_2km', maneuverClip] : null, voiceKind || 'far');
-                nextStepToDisplay._voiceFlags.far = true;
-            }
-            
-            if (distanceToNextManeuver <= 550 && distanceToNextManeuver > 450 && !nextStepToDisplay._voiceFlags.medium) {
-                speakNavigationInstruction(`En quinientos metros, ${textToSpeak}`, maneuverClip ? ['f_en_500m', maneuverClip] : null, voiceKind || 'medium');
-                nextStepToDisplay._voiceFlags.medium = true;
-            }
-
-            if (distanceToNextManeuver <= 230 && distanceToNextManeuver > 150 && !nextStepToDisplay._voiceFlags.near) {
+            if (!vf.near && isNowVoiceDue(dVoice, voiceSpeed)) {
                 speakNavigationInstruction(`${textToSpeak} ahora`, nearClips, voiceKind || 'near');
-                nextStepToDisplay._voiceFlags.near = true;
+                vf.near = vf.short = vf.medium = vf.far = true;
+                logVoice('ahora');
+            } else if (!vf.short && dVoice <= 220 && dVoice > getNowVoiceDistance(voiceSpeed) + 60) {
+                const m = getDistanceVoiceMeters(dVoice);
+                speakNavigationInstruction(`En ${voiceDistanceText(m)}, ${textToSpeak}`, maneuverClip ? [getDistanceVoiceClip(dVoice), maneuverClip] : null, voiceKind || 'medium');
+                vf.short = vf.medium = vf.far = true;
+                logVoice('~200 m');
+            } else if (!vf.medium && dVoice <= 550 && dVoice > 300) {
+                const m = getDistanceVoiceMeters(dVoice);
+                speakNavigationInstruction(`En ${voiceDistanceText(m)}, ${textToSpeak}`, maneuverClip ? [getDistanceVoiceClip(dVoice), maneuverClip] : null, voiceKind || 'medium');
+                vf.medium = vf.far = true;
+                logVoice('~500 m');
+            } else if (!vf.far && dVoice <= 2100 && dVoice > 1900) {
+                speakNavigationInstruction(`En dos kilómetros, ${textToSpeak}`, maneuverClip ? ['f_en_2km', maneuverClip] : null, voiceKind || 'far');
+                vf.far = true;
+                logVoice('2 km');
             }
         }
         // ------------------------------------
@@ -16602,6 +16845,7 @@ function showDeviationModal() {
     if (isDeviationModalActive) return;
     closeOtherModals('deviation-modal');
     isDeviationModalActive = true;
+    if (isNavigating) announceRecalculationVoice();   // 28-oct: «Recalculando ruta» (como mucho una vez cada 20 s)
     let modal = document.getElementById('deviation-modal');
     if (!modal) {
         modal = document.createElement('div');
@@ -21565,6 +21809,7 @@ function extractSpeedFromRadarText(text) {
 //==================================================================   
 //NOMBRE: displayUnifiedReminderWindow
 function displayUnifiedReminderWindow(overdueReminders) {
+    try { announceRadarVoice(overdueReminders); } catch (e) { console.warn('[Voz] radar', e); }   // 28-oct: radar por voz
     const windowElement = document.getElementById('unified-reminder-window');
     const swiperContainer = document.getElementById('reminder-swiper-container');
     const countHeader = windowElement.querySelector('.reminder-count-header');
@@ -21605,7 +21850,7 @@ function displayUnifiedReminderWindow(overdueReminders) {
 
         if (isRadarAlert) {
             const radarSpeed = extractSpeedFromRadarText(reminder.text);
-            const validSpeeds = [20, 30, 50, 60, 70, 80, 90, 100, 110, 120];
+            const validSpeeds = [20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120, 130];   // 28-oct: faltaban 40 y 130
             const isStandardSpeed = radarSpeed !== null && validSpeeds.includes(radarSpeed);
 
             let speedLimitHtml = '';
