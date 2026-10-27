@@ -3552,6 +3552,7 @@ function handleZoomToggleButtonClick(button) {
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 // NOMBRE: toggleNavigationState 
 async function toggleNavigationState(isRecalculationStop = false, isRecovery = false) {
+    if (voiceGuidanceEnabled && !isNavigating) unlockVoiceAudio();   // pulsar «Iniciar» = toque que desbloquea el audio
     const startNavButton = document.getElementById('start-navigation-button');
     const startNavImg = startNavButton ? startNavButton.querySelector('img') : null;
     const mapContainer = document.getElementById('reminders-location-map-div');
@@ -7708,28 +7709,382 @@ function saveSettings() {
     markCacheAsDirty(); 
 }
 
-// ===================================================================
-// NOMBRE: speakNavigationInstruction
-// RESUMEN: Genera audio TTS para las indicaciones si está activado.
-function speakNavigationInstruction(text) {
-    if (!voiceGuidanceEnabled || !voiceSynthesis) return;
+// NOMBRE: Guiado por voz (BG Voice): TTS si el navegador puede hablar; si no, clips pregrabados
+// RESUMEN: Al cargar se comprueba si speechSynthesis tiene voces (getVoices() + evento
+//          voiceschanged, espera máx. VOICE_DETECT_TIMEOUT_MS).
+//            · bgVoice.mode = 'tts'   -> «Voz: sintetizada» (PC, móvil…). Igual que antes, con calles.
+//            · bgVoice.mode = 'clips' -> «Voz: grabada» (Tesla: 0 voces / 'synthesis-failed').
+//          Si estando en 'tts' un speak() da onerror o no llega a onstart en
+//          VOICE_TTS_START_TIMEOUT_MS, se pasa a 'clips' para el resto de la sesión y ese
+//          mismo aviso se repite con clips. Clips: Web Audio (plan A) o un <audio> (plan B).
+//          Para probar en el PC: añadir ?voz=grabada (o ?voz=sintetizada) a la URL.
+//          En la consola: bgVoice.mode
+const VOICE_CLIPS_BASE_URL = 'https://boardinggate.github.io/Tesla/audio/';
+const VOICE_CLIPS_VERSION = '1';            // subir si se regeneran los audios (evita caché vieja)
+const VOICE_DETECT_TIMEOUT_MS = 2000;       // espera máxima a que aparezcan voces
+const VOICE_TTS_START_TIMEOUT_MS = 1800;    // si speak() no llega a onstart en este tiempo -> clips
+const VOICE_IDLE_SUSPEND_MS = 1500;         // suspender el AudioContext tras hablar (0 = nunca)
+const VOICE_PRIORITY = { info: 1, far: 1, medium: 2, near: 3, arrival: 3 };
+const VOICE_TTL_MS   = { info: 6000, far: 8000, medium: 6000, near: 3000, arrival: 8000 };
+const VOICE_TEXT_TO_CLIP = {                 // llamadas antiguas speakNavigationInstruction("texto")
+    'Guiado por voz activado.': 'f_guiado_activado',
+    'Has llegado a tu destino': 'f_has_llegado_destino',
+    'Has llegado a tu destino.': 'f_has_llegado_destino'
+};
 
-    if (voiceSynthesis.speaking) {
-        voiceSynthesis.cancel();
-    }
+const bgVoice = {
+    mode: 'detectando', forced: null, detecting: null, ttsFailed: false, ttsToken: 0, ttsWatchdog: null,
+    ctx: null, ext: null, keys: null, buffers: new Map(), blobs: new Map(), sources: [], audio: null,
+    elementQueue: [], queue: [], current: null, playing: false, unlocked: false,
+    preloading: null, idleTimer: null, warned: false
+};
 
-    const utterance = new SpeechSynthesisUtterance(text);
+function bgVoiceGetVoices() {
+    try { return (voiceSynthesis && voiceSynthesis.getVoices()) || []; } catch (e) { return []; }
+}
+// Preferencia: es-ES local > es-ES Google > es-ES > es-* local > es-*. Si no hay española, la del sistema.
+function bgVoicePickVoice(voices) {
+    const isEsES = v => /^es[-_]ES/i.test(v.lang || '');
+    const isEs = v => /^es([-_]|$)/i.test(v.lang || '');
+    return voices.find(v => isEsES(v) && v.localService) || voices.find(v => isEsES(v) && /google/i.test(v.name)) ||
+           voices.find(isEsES) || voices.find(v => isEs(v) && v.localService) || voices.find(isEs) || null;
+}
+function bgVoiceSetMode(mode, reason) {
+    if (bgVoice.mode === mode) return;
+    bgVoice.mode = mode;
+    console.log(`[Voz] modo: ${mode === 'tts' ? 'sintetizada (speechSynthesis)' : 'grabada (clips)'} — ${reason}`);
+    if (mode === 'clips' && voiceGuidanceEnabled) bgVoicePreload();
+}
+function bgVoiceForcedMode() {          // ?voz=grabada | ?voz=sintetizada (solo para pruebas)
+    try {
+        const v = (new URLSearchParams(window.location.search).get('voz') || '').toLowerCase();
+        if (v === 'grabada' || v === 'clips') return 'clips';
+        if (v === 'sintetizada' || v === 'tts') return 'tts';
+    } catch (e) {}
+    return null;
+}
+
+// Detección asíncrona (se llama una vez; las siguientes devuelven la misma promesa).
+function bgVoiceDetect() {
+    if (bgVoice.detecting) return bgVoice.detecting;
+    bgVoice.detecting = new Promise(resolve => {
+        bgVoice.forced = bgVoiceForcedMode();
+        if (bgVoice.forced) { bgVoiceSetMode(bgVoice.forced, 'forzado con ?voz= en la URL'); resolve(bgVoice.mode); return; }
+        if (!voiceSynthesis || typeof window.SpeechSynthesisUtterance === 'undefined') {
+            bgVoiceSetMode('clips', 'el navegador no tiene speechSynthesis'); resolve(bgVoice.mode); return;
+        }
+        let done = false, timer = null;
+        const check = (isFinal) => {
+            if (done) return;
+            const voices = bgVoiceGetVoices();
+            if (voices.length) {
+                done = true;
+                const v = bgVoicePickVoice(voices);
+                bgVoiceSetMode('tts', `${voices.length} voces; se usará ${v ? v.name + ' (' + v.lang + ')' : 'la voz por defecto'}`);
+            } else if (isFinal) {
+                done = true;
+                bgVoiceSetMode('clips', `0 voces tras ${VOICE_DETECT_TIMEOUT_MS} ms`);
+            }
+            if (done) { clearTimeout(timer); resolve(bgVoice.mode); }
+        };
+        const onVoicesChanged = () => {
+            check(false);
+            // Voces que llegan tarde (PC lento): volver a TTS si nunca ha fallado.
+            if (done && bgVoice.mode === 'clips' && !bgVoice.ttsFailed && !bgVoice.forced && bgVoiceGetVoices().length) {
+                bgVoiceSetMode('tts', 'han aparecido voces después de la detección');
+            }
+        };
+        try { voiceSynthesis.addEventListener('voiceschanged', onVoicesChanged); }
+        catch (e) { try { voiceSynthesis.onvoiceschanged = onVoicesChanged; } catch (e2) {} }
+        timer = setTimeout(() => check(true), VOICE_DETECT_TIMEOUT_MS);
+        check(false);
+    });
+    return bgVoice.detecting;
+}
+function bgVoiceInit() { bgVoiceDetect(); }   // se llama desde loadSavedSettings
+
+// ---------- TTS con vigilancia: onerror o sin onstart -> clips ----------
+function bgVoiceSpeakTTS(text, clips, kind) {
+    const token = ++bgVoice.ttsToken;
+    clearTimeout(bgVoice.ttsWatchdog);
+    bgVoiceStopAll();
+    try { if (voiceSynthesis.speaking || voiceSynthesis.pending) voiceSynthesis.cancel(); } catch (e) {}
+    let started = false;
+    const fail = (why) => {
+        if (token !== bgVoice.ttsToken || bgVoice.mode !== 'tts') return;   // ya lo sustituyó otro aviso
+        clearTimeout(bgVoice.ttsWatchdog);
+        bgVoice.ttsFailed = true;
+        try { voiceSynthesis.cancel(); } catch (e) {}
+        bgVoiceSetMode('clips', `speak() falló (${why})`);
+        if (typeof showToast === 'function') showToast('Voz: grabada (este navegador no puede sintetizar voz)', 'info');
+        if (clips && clips.length) playVoiceClips(clips, kind);              // el mismo aviso, con clips
+    };
+    let utterance;
+    try { utterance = new SpeechSynthesisUtterance(text); } catch (e) { fail('SpeechSynthesisUtterance'); return; }
     utterance.lang = 'es-ES'; // Forzar español
     utterance.rate = 1.05;    // Ligeramente más rápido para naturalidad
     utterance.volume = 1;
+    const voice = bgVoicePickVoice(bgVoiceGetVoices());
+    if (voice) utterance.voice = voice;
+    utterance.onstart = () => { started = true; if (token === bgVoice.ttsToken) clearTimeout(bgVoice.ttsWatchdog); };
+    utterance.onerror = (e) => {
+        const err = e && e.error;
+        if (err === 'interrupted' || err === 'canceled') return;            // lo cortamos nosotros
+        fail(err || 'error');                                                // p. ej. 'synthesis-failed'
+    };
+    bgVoice.ttsWatchdog = setTimeout(() => {
+        let speaking = false; try { speaking = voiceSynthesis.speaking; } catch (e) {}
+        if (!started && !speaking) fail(`sin onstart en ${VOICE_TTS_START_TIMEOUT_MS} ms`);
+    }, VOICE_TTS_START_TIMEOUT_MS);
+    try { voiceSynthesis.speak(utterance); } catch (e) { fail('speak() lanzó ' + (e && e.name)); }
+}
 
-    const voices = voiceSynthesis.getVoices();
-    const googleVoice = voices.find(v => v.lang === 'es-ES' && v.name.includes('Google'));
-    if (googleVoice) {
-        utterance.voice = googleVoice;
+// ---------- Clips pregrabados (audio/) ----------
+function bgVoiceExt() {
+    if (bgVoice.ext) return bgVoice.ext;
+    const a = document.createElement('audio');
+    const mp3 = a.canPlayType ? a.canPlayType('audio/mpeg') : '';
+    const ogg = a.canPlayType ? a.canPlayType('audio/ogg; codecs="opus"') : '';
+    bgVoice.ext = mp3 ? 'mp3' : (ogg ? 'ogg' : 'mp3');
+    console.log(`[Voz] canPlayType mp3="${mp3}" ogg/opus="${ogg}" -> ${bgVoice.ext}`);
+    return bgVoice.ext;
+}
+function bgVoiceUrl(key) { return `${VOICE_CLIPS_BASE_URL}${key}.${bgVoiceExt()}?v=${VOICE_CLIPS_VERSION}`; }
+
+function bgVoiceGetCtx() {
+    if (bgVoice.ctx) return bgVoice.ctx;
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    try { bgVoice.ctx = new AC(); } catch (e) { bgVoice.ctx = null; }
+    return bgVoice.ctx;
+}
+
+// Descarga (y decodifica si hay Web Audio) un clip. Devuelve true si queda listo.
+async function bgVoiceLoadClip(key) {
+    if (bgVoice.buffers.has(key) || bgVoice.blobs.has(key)) return true;
+    try {
+        const resp = await fetch(bgVoiceUrl(key), { cache: 'force-cache' });
+        if (!resp.ok) return false;
+        const data = await resp.arrayBuffer();
+        bgVoice.blobs.set(key, URL.createObjectURL(new Blob([data], { type: bgVoiceExt() === 'mp3' ? 'audio/mpeg' : 'audio/ogg' })));
+        const ctx = bgVoiceGetCtx();
+        if (ctx) {
+            const buf = await new Promise((ok, ko) => ctx.decodeAudioData(data.slice(0), ok, ko)); // con callbacks: vale en Chromium antiguo
+            bgVoice.buffers.set(key, buf);
+        }
+        return true;
+    } catch (e) {
+        console.warn('[Voz] no se pudo cargar/decodificar', key, e && e.name);
+        return bgVoice.blobs.has(key);
     }
+}
 
-    voiceSynthesis.speak(utterance);
+// Precarga todo el catálogo (lista de audio/manifest.json). Solo se usa en modo clips.
+function bgVoicePreload() {
+    if (bgVoice.preloading) return bgVoice.preloading;
+    bgVoice.preloading = (async () => {
+        try {
+            const r = await fetch(`${VOICE_CLIPS_BASE_URL}manifest.json?v=${VOICE_CLIPS_VERSION}`, { cache: 'force-cache' });
+            bgVoice.keys = Object.keys((await r.json()).clips || {});
+        } catch (e) { bgVoice.keys = ['silencio', 'f_guiado_activado']; }
+        for (const key of bgVoice.keys) { await bgVoiceLoadClip(key); }
+        console.log(`[Voz] precargados ${bgVoice.buffers.size} AudioBuffer / ${bgVoice.blobs.size} blobs`);
+    })();
+    return bgVoice.preloading;
+}
+
+// Desbloqueo: llamar SIEMPRE dentro de un toque/click. En modo TTS no hace nada (no hace falta).
+function unlockVoiceAudio() {
+    if (bgVoice.mode === 'tts') return;
+    const ctx = bgVoiceGetCtx();
+    if (ctx) {
+        try {   // buffer vacío de 1 muestra + resume() dentro del gesto
+            const src = ctx.createBufferSource();
+            src.buffer = ctx.createBuffer(1, 1, 22050);
+            src.connect(ctx.destination); src.start(0);
+        } catch (e) {}
+        if (ctx.state !== 'running' && ctx.resume) ctx.resume().catch(() => {});
+    }
+    const a = bgVoiceGetAudioEl();     // plan B: "bendecir" también el <audio> con el clip de silencio
+    if (!bgVoice.playing) {
+        a.src = bgVoice.blobs.get('silencio') || bgVoiceUrl('silencio');
+        const p = a.play();
+        if (p && p.then) p.then(() => { bgVoice.unlocked = true; }).catch(() => {});
+    }
+    if (ctx && ctx.state === 'running') bgVoice.unlocked = true;
+    bgVoicePreload();
+}
+// Red de seguridad: si la navegación arrancó sin toque (recuperación/autoarranque),
+// el primer toque en cualquier sitio desbloquea el audio (solo en modo clips).
+document.addEventListener('pointerdown', () => {
+    if (voiceGuidanceEnabled && bgVoice.mode === 'clips' && (!bgVoice.unlocked || (bgVoice.ctx && bgVoice.ctx.state !== 'running'))) unlockVoiceAudio();
+}, { capture: true, passive: true });
+
+function bgVoiceGetAudioEl() {
+    if (bgVoice.audio) return bgVoice.audio;
+    const a = new Audio();
+    a.preload = 'auto';
+    a.addEventListener('ended', () => { if (bgVoice.playing) bgVoicePlayNextElement(); });
+    a.addEventListener('error', () => { console.warn('[Voz] error <audio>', a.error && a.error.code); if (bgVoice.playing) bgVoicePlayNextElement(); });
+    bgVoice.audio = a;
+    return a;
+}
+
+function bgVoiceStopAll() {
+    bgVoice.sources.forEach(s => { try { s.onended = null; s.stop(); } catch (e) {} });
+    bgVoice.sources = [];
+    bgVoice.elementQueue = [];
+    if (bgVoice.audio) { try { bgVoice.audio.pause(); } catch (e) {} }
+    bgVoice.playing = false; bgVoice.current = null;
+}
+
+// Cola con prioridad: un aviso de prioridad >= al que suena lo corta; uno menor espera
+// (solo el más reciente) y se descarta si caduca antes de que le toque.
+function playVoiceClips(keys, kind = 'info') {
+    if (!keys || !keys.length) return;
+    const item = { keys: keys.filter(Boolean), prio: VOICE_PRIORITY[kind] || 1, expires: Date.now() + (VOICE_TTL_MS[kind] || 5000) };
+    if (bgVoice.playing && bgVoice.current && item.prio < bgVoice.current.prio) {
+        bgVoice.queue = [item];
+        return;
+    }
+    bgVoice.queue = [];
+    bgVoiceStopAll();
+    bgVoiceStart(item);
+}
+
+function bgVoiceFinished() {
+    bgVoice.playing = false; bgVoice.current = null;
+    while (bgVoice.queue.length) {
+        const next = bgVoice.queue.shift();
+        if (Date.now() <= next.expires) { bgVoiceStart(next); return; }
+    }
+    clearTimeout(bgVoice.idleTimer);
+    bgVoice.idleTimer = setTimeout(() => {
+        if (!bgVoice.playing && bgVoice.ctx && bgVoice.ctx.state === 'running' && VOICE_IDLE_SUSPEND_MS > 0) bgVoice.ctx.suspend().catch(() => {});
+    }, VOICE_IDLE_SUSPEND_MS);
+}
+
+async function bgVoiceStart(item) {
+    bgVoice.playing = true; bgVoice.current = item;
+    clearTimeout(bgVoice.idleTimer);
+    await Promise.all(item.keys.map(k => bgVoiceLoadClip(k)));   // inmediato si ya estaban precargados
+    if (bgVoice.current !== item) return;                         // otro aviso lo ha sustituido
+    if (Date.now() > item.expires) { bgVoiceFinished(); return; }
+    const ctx = bgVoice.ctx;
+    const allDecoded = ctx && item.keys.every(k => bgVoice.buffers.has(k));
+    if (allDecoded) {                                             // ---- Plan A: Web Audio
+        try {
+            if (ctx.state !== 'running') await ctx.resume();
+            if (bgVoice.current !== item) return;
+            if (ctx.state === 'running') {
+                let t = ctx.currentTime + 0.05;
+                item.keys.forEach((k, i) => {
+                    const src = ctx.createBufferSource();
+                    src.buffer = bgVoice.buffers.get(k);
+                    src.connect(ctx.destination);
+                    src.start(t);
+                    t += src.buffer.duration;                     // encadenados sin huecos
+                    if (i === item.keys.length - 1) src.onended = () => { if (bgVoice.current === item) bgVoiceFinished(); };
+                    bgVoice.sources.push(src);
+                });
+                return;
+            }
+        } catch (e) { console.warn('[Voz] Web Audio falló, uso <audio>', e && e.name); }
+    }
+    bgVoice.elementQueue = item.keys.slice();                     // ---- Plan B: <audio> único
+    bgVoicePlayNextElement();
+}
+
+function bgVoicePlayNextElement() {
+    const a = bgVoiceGetAudioEl();
+    const key = bgVoice.elementQueue.shift();
+    if (!key) { if (bgVoice.playing) bgVoiceFinished(); return; }
+    a.src = bgVoice.blobs.get(key) || bgVoiceUrl(key);
+    const p = a.play();
+    if (p && p.catch) p.catch(err => {
+        if (err && err.name === 'AbortError') return;             // cortado por un aviso nuevo
+        console.warn('[Voz] play() rechazado', key, err && err.name);
+        bgVoice.elementQueue = []; bgVoice.unlocked = false; bgVoiceFinished();
+        if (!bgVoice.warned && typeof showToast === 'function') {
+            bgVoice.warned = true;
+            showToast('Toca la pantalla para activar la voz', 'warning');
+        }
+    });
+}
+
+// ===================================================================
+// NOMBRE: speakNavigationInstruction
+// RESUMEN: text = frase completa para TTS (con nombres de calle);
+//          clips = claves de audio/ para el modo grabado; kind = prioridad.
+function speakNavigationInstruction(text, clips = null, kind = 'info') {
+    if (!voiceGuidanceEnabled) return;
+    if (!clips && VOICE_TEXT_TO_CLIP[text]) clips = [VOICE_TEXT_TO_CLIP[text]];
+    if (bgVoice.mode === 'detectando') {                          // aún detectando: esperar (máx. ~1,8 s)
+        bgVoiceDetect().then(() => bgVoiceDispatch(text, clips, kind));
+        return;
+    }
+    bgVoiceDispatch(text, clips, kind);
+}
+function bgVoiceDispatch(text, clips, kind) {
+    if (!voiceGuidanceEnabled) return;
+    if (bgVoice.mode === 'tts' && text) { bgVoiceSpeakTTS(text, clips, kind); return; }
+    if (clips && clips.length) playVoiceClips(clips, kind);
+}
+
+// Distancia -> clip de prefijo ("En quinientos metros,").
+const VOICE_DIST_CLIPS = [[50, 'f_en_50m'], [100, 'f_en_100m'], [150, 'f_en_150m'], [200, 'f_en_200m'], [250, 'f_en_250m'],
+    [300, 'f_en_300m'], [400, 'f_en_400m'], [500, 'f_en_500m'], [600, 'f_en_600m'], [700, 'f_en_700m'], [800, 'f_en_800m'],
+    [900, 'f_en_900m'], [1000, 'f_en_1km'], [1500, 'f_en_1_5km'], [2000, 'f_en_2km'], [2500, 'f_en_2_5km'], [3000, 'f_en_3km'],
+    [4000, 'f_en_4km'], [5000, 'f_en_5km'], [6000, 'f_en_6km'], [8000, 'f_en_8km'], [10000, 'f_en_10km']];
+function getDistanceVoiceClip(d) {
+    let best = VOICE_DIST_CLIPS[0];
+    for (const c of VOICE_DIST_CLIPS) if (Math.abs(c[0] - d) < Math.abs(best[0] - d)) best = c;
+    return best[1];
+}
+
+// Maniobra (type/modifier/exit de Mapbox/OSRM) -> clip. null = no se anuncia con clips.
+function getManeuverVoiceClip(maneuver, isIntermediateArrival = false) {
+    if (!maneuver) return null;
+    const type = (maneuver.type || '').toLowerCase();
+    const mod = (maneuver.modifier || '').toLowerCase();
+    const side = mod.includes('right') ? 'der' : (mod.includes('left') ? 'izq' : '');
+    if (mod === 'uturn' || type === 'u turn') return 'f_cambio_sentido';
+    switch (type) {
+        case 'arrive':
+            if (isIntermediateArrival) return 'f_vas_a_llegar_etapa';
+            return side ? `f_vas_a_llegar_${side}` : 'f_vas_a_llegar';
+        case 'depart': case 'notification': return null;
+        case 'new name':
+            return (side && !mod.startsWith('slight')) ? `f_gira_${side}` : null;
+        case 'fork':
+            return side ? `f_bif_${side}` : 'f_bif_recto';
+        case 'merge':
+            return side ? `f_incorporate_${side}` : 'f_incorporate';
+        case 'on ramp':
+            return side ? `f_toma_rampa_${side}` : 'f_toma_rampa';
+        case 'off ramp':
+            return side ? `f_toma_salida_${side}` : 'f_toma_salida';
+        case 'end of road':
+            return side ? `f_final_via_${side}` : 'f_final_via';
+        case 'roundabout': case 'rotary': case 'roundabout turn': {
+            const exit = parseInt(maneuver.exit, 10);
+            if (exit >= 1 && exit <= 10) return `f_rot_en_${exit}`;
+            if (exit > 10) return 'f_rotonda_toma_salida';
+            if (type === 'roundabout turn') return side ? `f_rotonda_salida_${side}` : 'f_rotonda_recto';
+            return 'f_entra_rotonda';
+        }
+        case 'exit roundabout': case 'exit rotary': return 'f_sal_rotonda';
+        case 'use lane': return 'f_usa_carril';
+        case 'continue':
+            if (mod.startsWith('slight') && side) return `f_mantente_${side}`;
+            if (mod === 'straight' || !mod) return null;
+            break;
+    }
+    if (mod.startsWith('sharp') && side) return `f_giro_brusco_${side}`;
+    if (mod.startsWith('slight') && side) return `f_gira_lev_${side}`;
+    if (side) return `f_gira_${side}`;
+    if (mod === 'straight') return 'f_sigue_recto';
+    return type === 'turn' ? 'f_gira' : null;
 }
     
  
@@ -7755,6 +8110,7 @@ function loadSavedSettings() {
     
     const savedVoiceGuidance = localStorage.getItem(VOICE_GUIDANCE_KEY);
     voiceGuidanceEnabled = savedVoiceGuidance === 'true'; 
+     setTimeout(bgVoiceInit, 0);  
  
     baseCriticalRatio = parseInt(localStorage.getItem(PERFORMANCE_RATIO_CRITICAL_KEY)) || 3;
     performanceRatios.criticalUpdate = baseCriticalRatio;
@@ -11356,12 +11712,13 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
             }
         }
 
-        // --- LÓGICA DE VOZ INSERTADA AQUÍ ---
+        // --- LÓGICA DE VOZ (TTS si el navegador puede hablar; si no, clips pregrabados) ---
         if (isNavigating && voiceGuidanceEnabled) {
             if (!nextStepToDisplay._voiceFlags) {
                 nextStepToDisplay._voiceFlags = { far: false, medium: false, near: false };
             }
             
+            // Texto para la voz sintetizada: igual que antes (incluye el nombre de la calle).
             let textToSpeak = maneuverText;
             
             let streetForVoice = "";
@@ -11374,18 +11731,27 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
                 }
             }
 
+            // Clips para la voz grabada (sin nombre de calle: no se puede pregrabar).
+            const voiceArrivalWp = actualWaypoints[finalStepLegIndex + 1] || actualWaypoints[actualWaypoints.length - 1];
+            const isIntermediateArrival = type === 'arrive' && !!voiceArrivalWp && voiceArrivalWp.type === 'intermediate';
+            const maneuverClip = getManeuverVoiceClip(maneuver, isIntermediateArrival);
+            const voiceKind = type === 'arrive' ? 'arrival' : null;
+            const nearClips = type === 'arrive'
+                ? [isIntermediateArrival ? 'c_has_llegado_a_la_etapa' : 'f_has_llegado_destino']
+                : (maneuverClip ? ['c_ahora_prefijo', maneuverClip] : null);
+
             if (distanceToNextManeuver <= 2100 && distanceToNextManeuver > 1900 && !nextStepToDisplay._voiceFlags.far) {
-                speakNavigationInstruction(`En dos kilómetros, ${textToSpeak}`);
+                speakNavigationInstruction(`En dos kilómetros, ${textToSpeak}`, maneuverClip ? ['f_en_2km', maneuverClip] : null, voiceKind || 'far');
                 nextStepToDisplay._voiceFlags.far = true;
             }
             
             if (distanceToNextManeuver <= 550 && distanceToNextManeuver > 450 && !nextStepToDisplay._voiceFlags.medium) {
-                speakNavigationInstruction(`En quinientos metros, ${textToSpeak}`);
+                speakNavigationInstruction(`En quinientos metros, ${textToSpeak}`, maneuverClip ? ['f_en_500m', maneuverClip] : null, voiceKind || 'medium');
                 nextStepToDisplay._voiceFlags.medium = true;
             }
 
             if (distanceToNextManeuver <= 230 && distanceToNextManeuver > 150 && !nextStepToDisplay._voiceFlags.near) {
-                speakNavigationInstruction(`${textToSpeak} ahora`);
+                speakNavigationInstruction(`${textToSpeak} ahora`, nearClips, voiceKind || 'near');
                 nextStepToDisplay._voiceFlags.near = true;
             }
         }
@@ -13029,7 +13395,8 @@ function showNavigationMapHelpModal() {
             showToast(`Guiado por voz ${voiceGuidanceEnabled ? 'ACTIVADO' : 'DESACTIVADO'}.`, 'info');
             
             if (voiceGuidanceEnabled) {
-                speakNavigationInstruction("Guiado por voz activado.");
+                unlockVoiceAudio();   // estamos dentro del toque: desbloquea el audio (solo modo grabado)
+                speakNavigationInstruction("Guiado por voz activado.", ['f_guiado_activado']);
             }
         });
     }
