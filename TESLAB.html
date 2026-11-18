@@ -65,6 +65,8 @@
 
     
     <link rel="stylesheet" href="tesla.css">
+    <!-- TESLAB: anula filtro CSS del canvas y blur durante la ruta. No lo usa tesla.html. -->
+    <link rel="stylesheet" href="teslab.css">
     
 <!-- REVISAR CADA 30 DIAS API DE MAPBOX -->
     
@@ -691,16 +693,13 @@ body.recovering-map-session #auto-start-nav-modal {
                     const img = document.createElement('img');
                     img.src = screenshotData;
                   
-                    const savedSaturation = localStorage.getItem('boardinggate_map_saturation') || '1.6';
-                    const savedContrast = localStorage.getItem('boardinggate_map_contrast') || '1.2';
-                    const filterStyle = `saturate(${savedSaturation}) contrast(${savedContrast})`;
-
+                    /* La saturación ya va horneada en los píxeles del mapa (raster-saturation).
+                       No volver a filtrar la captura: sería un segundo pase y, en la recarga, un blur de más. */
                     img.style.cssText = `
                         width: 100%; 
                         height: 100%; 
                         object-fit: cover; 
-                        object-position: center; 
-                        filter: ${filterStyle};
+                        object-position: center;
                     `;
                     
                     overlayContainer.appendChild(img);
@@ -1388,7 +1387,12 @@ body.recovering-map-session #auto-start-nav-modal {
         targetMapAltitude: null,    
         lastTimestamp: null,
         lastCameraTimestamp: null,  
-        lastCompassUpdateTime: 0 
+        lastCompassUpdateTime: 0,
+        cachedCanvasWidth: 0,
+        lastCommittedCamera: null,
+        lastCommittedMarkerLng: null,
+        lastCommittedMarkerLat: null,
+        lastCommittedMarkerRot: null
     };
  
     let manualZoomLevelMemory = null;
@@ -1779,7 +1783,16 @@ const originalBookmarks = [
     let lastMapUpdateTime = 0;
     let MAP_UPDATE_INTERVAL_MS = 13; 
     let originalMapUpdateIntervalMs = 13; 
-    const PERFORMANCE_CAMERA_FPS_KEY = 'boardinggate_camera_fps'; 
+    const PERFORMANCE_CAMERA_FPS_KEY = 'boardinggate_camera_fps';
+    /* Tope de la cámara cerca de una maniobra (antes 45 fps, y 60 en el zoom del giro). */
+    const TESLAB_MANEUVER_CAMERA_FPS = 30;
+    const TESLAB_MAX_PIXEL_RATIO = 1;
+    const TESLAB_MAIN_TILE_CACHE = 28;
+    const TESLAB_DEM_MAXZOOM = 14;
+    const TESLAB_CAMERA_MOVE_EPSILON_M = 0.2;
+    const TESLAB_CAMERA_BEARING_EPSILON_DEG = 0.1;
+    const TESLAB_CAMERA_ZOOM_EPSILON = 0.001;
+    const TESLAB_CAMERA_PITCH_EPSILON_DEG = 0.05; 
 
     let originalTripEtaTime = null;   
     let isFlying = false;
@@ -2940,7 +2953,7 @@ async function configureMapAtmosphere() {
                 'type': 'raster-dem',
                 'url': 'mapbox://mapbox.terrain-rgb',
                 'tileSize': 512,
-                'maxzoom': 16 
+                'maxzoom': TESLAB_DEM_MAXZOOM
             });
         }
         
@@ -2952,6 +2965,41 @@ async function configureMapAtmosphere() {
             'high-color': '#58636B', 'space-color': '#B3E3FF', 'star-intensity': 0.15
         });
         setMapLighting(navigationMapInstance);
+    }
+    applyMapRasterGrade(navigationMapInstance);
+}
+
+/* Equivale a CSS saturate(s) / contrast(c) dentro del shader de teselas raster.
+   La fórmula es la inversa de saturationFactor/contrastFactor de Mapbox GL JS 3.33:
+   el filtro ya no se aplica al canvas entero (ver teslab.css). */
+function teslabCssGradeToRaster(cssSaturation, cssContrast) {
+    const sat = cssSaturation >= 1
+        ? Math.min(1, 1.001 - (1 / cssSaturation))
+        : Math.max(-1, cssSaturation - 1);
+    const contrast = cssContrast >= 1
+        ? Math.min(1, 1.001 - (1 / cssContrast))
+        : Math.max(-1, cssContrast - 1);
+    return { saturation: sat, contrast: contrast };
+}
+
+function applyMapRasterGrade(mapInstance) {
+    if (!mapInstance || typeof mapInstance.isStyleLoaded !== 'function' || !mapInstance.isStyleLoaded()) return;
+    const cssSat = parseFloat(localStorage.getItem('boardinggate_map_saturation') || '1.6');
+    const cssCon = parseFloat(localStorage.getItem('boardinggate_map_contrast') || '1.2');
+    const grade = teslabCssGradeToRaster(
+        Number.isFinite(cssSat) ? cssSat : 1.6,
+        Number.isFinite(cssCon) ? cssCon : 1.2
+    );
+    let style;
+    try { style = mapInstance.getStyle(); } catch (e) { return; }
+    if (!style || !style.layers) return;
+    for (const layer of style.layers) {
+        if (layer.type !== 'raster') continue;
+        try {
+            mapInstance.setPaintProperty(layer.id, 'raster-saturation', grade.saturation);
+            mapInstance.setPaintProperty(layer.id, 'raster-contrast', grade.contrast);
+            mapInstance.setPaintProperty(layer.id, 'raster-fade-duration', 0);
+        } catch (e) {}
     }
 } 
 
@@ -3083,6 +3131,8 @@ function createMinimapInstanceIfNeeded() {
             maxTileCacheSize: 6,
             antialias: false,
             preserveDrawingBuffer: false,
+            pixelRatio: Math.min(window.devicePixelRatio || 1, TESLAB_MAX_PIXEL_RATIO),
+            fadeDuration: 0,
             projection: 'mercator'
         });
 
@@ -5596,8 +5646,30 @@ async function initiateControlledReload() {
                 await finalizeAndReload();
                 return;
             }
-            
-            const canvas = await html2canvas(elementToCapture, { useCORS: true, allowTaint: true, logging: false });
+
+            const originalCanvases = Array.from(document.querySelectorAll('canvas.mapboxgl-canvas'));
+            const canvas = await html2canvas(elementToCapture, {
+                useCORS: true,
+                allowTaint: true,
+                logging: false,
+                onclone: (clonedDoc) => {
+                    const clonedCanvases = clonedDoc.querySelectorAll('canvas.mapboxgl-canvas');
+                    clonedCanvases.forEach((clonedCanvas, index) => {
+                        const url = teslabCaptureSnapshots.get(originalCanvases[index]);
+                        if (!url || !clonedCanvas.parentNode) return;
+                        const img = clonedDoc.createElement('img');
+                        img.src = url;
+                        img.alt = '';
+                        img.setAttribute('style', clonedCanvas.getAttribute('style') || '');
+                        img.style.width = '100%';
+                        img.style.height = '100%';
+                        img.style.display = 'block';
+                        img.style.objectFit = 'fill';
+                        img.style.filter = 'none';
+                        clonedCanvas.parentNode.replaceChild(img, clonedCanvas);
+                    });
+                }
+            });
             let dataUrl;
 
             try {
@@ -5623,16 +5695,62 @@ async function initiateControlledReload() {
         }
     };
     
-    if (navigationMapInstance && navigationMapInstance.isStyleLoaded()) {
-        const safetyTimeout = setTimeout(captureAndProceed, 100); 
-        navigationMapInstance.once('render', () => {
-            clearTimeout(safetyTimeout);
-            setTimeout(captureAndProceed, 100); // Pequeña pausa para que todo se asiente.
+    if (navigationMapInstance) {
+        teslabCaptureSnapshots = new Map();
+        const mapsToSnap = [navigationMapInstance];
+        if (typeof minimapInstance !== 'undefined' && minimapInstance) mapsToSnap.push(minimapInstance);
+        Promise.all(mapsToSnap.map(teslabArmMapSnapshot)).then(() => {
+            setTimeout(captureAndProceed, 50);
         });
-        navigationMapInstance.triggerRepaint();
     } else {
         await captureAndProceed();
     }
+}
+
+/* Sin preserveDrawingBuffer el canvas WebGL se vacía al presentar el frame.
+   Hay que copiarlo dentro del evento render, antes de que html2canvas lo lea. */
+let teslabCaptureSnapshots = new Map();
+
+function teslabSnapshotWebGLCanvas(glCanvas) {
+    if (!glCanvas || !glCanvas.width || !glCanvas.height) return null;
+    const snap = document.createElement('canvas');
+    snap.width = glCanvas.width;
+    snap.height = glCanvas.height;
+    const ctx = snap.getContext('2d', { alpha: false });
+    if (!ctx) return null;
+    ctx.drawImage(glCanvas, 0, 0);
+    return snap.toDataURL('image/jpeg', 0.55);
+}
+
+function teslabArmMapSnapshot(map) {
+    return new Promise((resolve) => {
+        if (!map || typeof map.once !== 'function' || typeof map.getCanvas !== 'function') {
+            resolve();
+            return;
+        }
+        let settled = false;
+        const finish = () => {
+            if (settled) return;
+            settled = true;
+            resolve();
+        };
+        const timer = setTimeout(finish, 350);
+        try {
+            map.once('render', () => {
+                clearTimeout(timer);
+                try {
+                    const canvas = map.getCanvas();
+                    const url = teslabSnapshotWebGLCanvas(canvas);
+                    if (url) teslabCaptureSnapshots.set(canvas, url);
+                } catch (e) {}
+                finish();
+            });
+            map.triggerRepaint();
+        } catch (e) {
+            clearTimeout(timer);
+            finish();
+        }
+    });
 }
 
 // ===================================================================
@@ -6170,13 +6288,21 @@ async function openNavigationMap(isRecovery = false) {
                     center: [ -97.1903, 30.3715],
                     zoom: 1.5, pitch: 0, bearing: 0, // <--- Globo completo desde el espacio
                     attributionControl: false, 
-                    pixelRatio: window.devicePixelRatio || 1,
-                    maxTileCacheSize: 50,
+                    /* TESLAB GPU: sin copia del framebuffer, como mucho 1x, menos teselas en VRAM
+                       y sin fundido de símbolos. Pitch, relieve, satélite y edificios no cambian. */
+                    pixelRatio: Math.min(window.devicePixelRatio || 1, TESLAB_MAX_PIXEL_RATIO),
+                    maxTileCacheSize: TESLAB_MAIN_TILE_CACHE,
                     antialias: false,
-                    preserveDrawingBuffer: true,
+                    preserveDrawingBuffer: false,
+                    fadeDuration: 0,
                     accessToken: mapboxgl.accessToken,
                     minzoom: 1.2, // <--- Permite alejamiento total
                     maxzoom: 19
+                });
+                navigationMapInstance.on('resize', () => {
+                    if (!navigationMapInstance) return;
+                    const canvas = navigationMapInstance.getCanvas();
+                    if (canvas) markerAnimationState.cachedCanvasWidth = canvas.clientWidth;
                 });
 
                 if (!isRecovery) { setMapImmersiveMode(true); }
@@ -6210,6 +6336,7 @@ async function openNavigationMap(isRecovery = false) {
                 navigationMapInstance.on('load', async function() {
                     try {
                         navigationMapInstance.resize();
+                        markerAnimationState.cachedCanvasWidth = navigationMapInstance.getCanvas().clientWidth;
                         setTimeout(() => { if (navigationMapInstance) navigationMapInstance.resize(); }, 200);
 
                         await wait(300);
@@ -10295,6 +10422,9 @@ function applyMapVisualSettings() {
     
     document.documentElement.style.setProperty('--map-saturation', savedSaturation);
     document.documentElement.style.setProperty('--map-contrast', savedContrast);
+    if (typeof navigationMapInstance !== 'undefined' && navigationMapInstance) {
+        applyMapRasterGrade(navigationMapInstance);
+    }
 }
  
 // ===================================================================
@@ -10528,7 +10658,7 @@ function updateInitialUserPosition(coords, mapInstanceToUse) {
     } else {
         const PROXIMITY_THRESHOLD_FPS = 310;
         if (isNavigating && distanceToNextManeuverOSRM < PROXIMITY_THRESHOLD_FPS) {
-            MAP_UPDATE_INTERVAL_MS = 1000 / 45;
+            MAP_UPDATE_INTERVAL_MS = 1000 / TESLAB_MANEUVER_CAMERA_FPS;
         } else {
             MAP_UPDATE_INTERVAL_MS = originalMapUpdateIntervalMs;
         }
@@ -13241,11 +13371,13 @@ function showNavigationMapHelpModal() {
     saturationSlider.addEventListener('input', () => {
         document.documentElement.style.setProperty('--map-saturation', saturationSlider.value);
         localStorage.setItem('boardinggate_map_saturation', saturationSlider.value);
+        applyMapRasterGrade(navigationMapInstance);
         markCacheAsDirty(); updateVisualLabels();
     });
     contrastSlider.addEventListener('input', () => {
         document.documentElement.style.setProperty('--map-contrast', contrastSlider.value);
         localStorage.setItem('boardinggate_map_contrast', contrastSlider.value);
+        applyMapRasterGrade(navigationMapInstance);
         updateVisualLabels(); markCacheAsDirty();
     });
     exaggerationSlider.addEventListener('input', async () => {
@@ -13685,6 +13817,53 @@ function updateNavigationProgressDisplay(route, carDistanceAlongTheRoute = 0) {
     }
 }        
     
+function teslabMetersBetween(lng1, lat1, lng2, lat2) {
+    const dLat = (lat2 - lat1) * 111320;
+    const dLng = (lng2 - lng1) * 111320 * Math.cos(((lat1 + lat2) * 0.5) * Math.PI / 180);
+    return Math.hypot(dLat, dLng);
+}
+
+function teslabAngleDelta(a, b) {
+    let d = a - b;
+    if (d > 180) d -= 360;
+    if (d < -180) d += 360;
+    return d;
+}
+
+function teslabMarkerNeedsDomUpdate() {
+    if (markerAnimationState.lastCommittedMarkerLng == null) return true;
+    const moved = teslabMetersBetween(
+        markerAnimationState.lastCommittedMarkerLng,
+        markerAnimationState.lastCommittedMarkerLat,
+        markerAnimationState.currentLngLat.lng,
+        markerAnimationState.currentLngLat.lat
+    );
+    const turned = Math.abs(teslabAngleDelta(
+        markerAnimationState.currentIconRotation,
+        markerAnimationState.lastCommittedMarkerRot || 0
+    ));
+    return moved >= TESLAB_CAMERA_MOVE_EPSILON_M || turned >= TESLAB_CAMERA_BEARING_EPSILON_DEG;
+}
+
+/* No cambia el pitch objetivo: sigue saliendo de mapPitchValue (ajuste del usuario
+   o el que llegue de la flota). Solo se omite el jumpTo si el paso es menor de 0,05°. */
+function teslabCameraMoveIsVisible(cameraOptions) {
+    const last = markerAnimationState.lastCommittedCamera;
+    if (!last || !cameraOptions.center) return true;
+    const moved = teslabMetersBetween(last.lng, last.lat, cameraOptions.center[0], cameraOptions.center[1]);
+    const turned = Math.abs(teslabAngleDelta(cameraOptions.bearing, last.bearing));
+    const zoomed = Math.abs(cameraOptions.zoom - last.zoom);
+    const pitched = Math.abs(cameraOptions.pitch - last.pitch);
+    const alt = cameraOptions.altitude;
+    const altChanged = (alt == null) !== (last.altitude == null)
+        || (alt != null && last.altitude != null && Math.abs(alt - last.altitude) >= 0.25);
+    return moved >= TESLAB_CAMERA_MOVE_EPSILON_M
+        || turned >= TESLAB_CAMERA_BEARING_EPSILON_DEG
+        || zoomed >= TESLAB_CAMERA_ZOOM_EPSILON
+        || pitched >= TESLAB_CAMERA_PITCH_EPSILON_DEG
+        || altChanged;
+}
+
 //==================================================================
 function animateMarkerAndMap(timestamp) {
     const now = timestamp || performance.now();
@@ -13695,6 +13874,7 @@ function animateMarkerAndMap(timestamp) {
     lastMapUpdateTime = now;
     
     if (!initialUserLocationMarker || !navigationMapInstance || isFlying) {
+        if (isFlying) markerAnimationState.lastCommittedCamera = null;
         markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
         return;
     }
@@ -13716,17 +13896,21 @@ function animateMarkerAndMap(timestamp) {
     if (markerAnimationState.currentLngLat && markerAnimationState.targetLngLat) {
         markerAnimationState.currentLngLat.lng += (markerAnimationState.targetLngLat.lng - markerAnimationState.currentLngLat.lng) * posLerpFactor;
         markerAnimationState.currentLngLat.lat += (markerAnimationState.targetLngLat.lat - markerAnimationState.currentLngLat.lat) * posLerpFactor;
-        initialUserLocationMarker.setLngLat(markerAnimationState.currentLngLat);
-        
-        if (groundAnchorMarker) {
-            groundAnchorMarker.setLngLat(markerAnimationState.currentLngLat);
-        }
      }
     let deltaIconRotation = markerAnimationState.targetIconRotation - markerAnimationState.currentIconRotation;
     if (deltaIconRotation > 180) deltaIconRotation -= 360;
     if (deltaIconRotation < -180) deltaIconRotation += 360;
     markerAnimationState.currentIconRotation += deltaIconRotation * rotLerpFactor;
-    initialUserLocationMarker.setRotation(markerAnimationState.currentIconRotation);
+    if (markerAnimationState.currentLngLat && teslabMarkerNeedsDomUpdate()) {
+        initialUserLocationMarker.setLngLat(markerAnimationState.currentLngLat);
+        if (groundAnchorMarker) {
+            groundAnchorMarker.setLngLat(markerAnimationState.currentLngLat);
+        }
+        initialUserLocationMarker.setRotation(markerAnimationState.currentIconRotation);
+        markerAnimationState.lastCommittedMarkerLng = markerAnimationState.currentLngLat.lng;
+        markerAnimationState.lastCommittedMarkerLat = markerAnimationState.currentLngLat.lat;
+        markerAnimationState.lastCommittedMarkerRot = markerAnimationState.currentIconRotation;
+    }
 
     if (shouldCenterOnUser || navigationFollowUser) {
         
@@ -13755,14 +13939,17 @@ function animateMarkerAndMap(timestamp) {
         let offsetXToUse = markerAnimationState.currentMapOffsetX;
         let offsetYToUse = markerAnimationState.currentMapOffsetY;
 
-        const viewModes = { '3D RELIEVE': { mode: 'relief' } };
-        const savedViewMode = localStorage.getItem(MAP_VIEW_MODE_KEY) || 'relief';
-        if (savedViewMode === viewModes['3D RELIEVE'].mode) {
+        if ((mapViewMode || 'relief') === 'relief') {
             offsetXToUse = Math.max(-10, Math.min(offsetXToUse, 10));
             offsetYToUse = Math.max(-20, Math.min(offsetYToUse, 20));
         }
 
-        const canvas = navigationMapInstance.getCanvas();
+        let canvasWidth = markerAnimationState.cachedCanvasWidth;
+        if (!canvasWidth) {
+            const canvas = navigationMapInstance.getCanvas();
+            canvasWidth = canvas ? canvas.clientWidth : 0;
+            if (canvasWidth) markerAnimationState.cachedCanvasWidth = canvasWidth;
+        }
         const pitchInRadians = (markerAnimationState.currentMapPitch * Math.PI) / 180;
         const cameraHeightAboveCar = 150; 
         
@@ -13770,7 +13957,7 @@ function animateMarkerAndMap(timestamp) {
         const groundDistanceOffset = (cameraHeightAboveCar * Math.tan(pitchInRadians)) * verticalOffsetFactor * -1; // Hacia atrás
 
         const metersPerPixel = 156543.03 * Math.cos(markerAnimationState.currentMapCenter.lat * Math.PI / 180) / Math.pow(2, markerAnimationState.currentMapZoom);
-        const pixelOffsetX = canvas.clientWidth * (offsetXToUse / 100);
+        const pixelOffsetX = canvasWidth * (offsetXToUse / 100);
         const horizontalDistanceOffset = metersPerPixel * pixelOffsetX * -1; // -1 para que el anclaje se mueva en dirección opuesta al coche
 
         const totalDistance = Math.sqrt(Math.pow(groundDistanceOffset, 2) + Math.pow(horizontalDistanceOffset, 2));
@@ -13793,7 +13980,17 @@ function animateMarkerAndMap(timestamp) {
             cameraOptions.altitude = markerAnimationState.currentMapAltitude;
         }
 
-        navigationMapInstance.jumpTo(cameraOptions);
+        if (teslabCameraMoveIsVisible(cameraOptions)) {
+            navigationMapInstance.jumpTo(cameraOptions);
+            markerAnimationState.lastCommittedCamera = {
+                lng: cameraOptions.center[0],
+                lat: cameraOptions.center[1],
+                zoom: cameraOptions.zoom,
+                bearing: cameraOptions.bearing,
+                pitch: cameraOptions.pitch,
+                altitude: cameraOptions.altitude == null ? null : cameraOptions.altitude
+            };
+        }
     }
     
     markerAnimationState.animationFrameId = requestAnimationFrame(animateMarkerAndMap);
@@ -14929,7 +15126,7 @@ function handleProgressiveManeuverZoom(currentStep, distanceToManeuver, carDista
         if (!isZoomedForManeuver) {
             isZoomedForManeuver = true;
             originalMapUpdateIntervalMs = MAP_UPDATE_INTERVAL_MS;
-            MAP_UPDATE_INTERVAL_MS = 1000 / 60; // Aumentamos FPS para la animación.
+            MAP_UPDATE_INTERVAL_MS = 1000 / TESLAB_MANEUVER_CAMERA_FPS;
             
             const currentAutoZoomMode = localStorage.getItem(AUTO_ZOOM_MODE_KEY) || 'off';
             if (currentAutoZoomMode === 'off' && manualZoomLevelMemory !== null) {
