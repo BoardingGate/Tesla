@@ -3598,7 +3598,7 @@ function handleZoomToggleButtonClick(button) {
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 // NOMBRE: toggleNavigationState 
 async function toggleNavigationState(isRecalculationStop = false, isRecovery = false) {
-    if (voiceGuidanceEnabled && !isNavigating && typeof unlockVoiceAudio === 'function') unlockVoiceAudio();
+    if (voiceGuidanceEnabled && !isNavigating) unlockVoiceAudio();   // pulsar «Iniciar» = toque que desbloquea el audio
     const startNavButton = document.getElementById('start-navigation-button');
     const startNavImg = startNavButton ? startNavButton.querySelector('img') : null;
     const mapContainer = document.getElementById('reminders-location-map-div');
@@ -3734,6 +3734,8 @@ async function toggleNavigationState(isRecalculationStop = false, isRecovery = f
             isNavigating = true;
             startMemoryManagement(true); 
             startDeviationChecker(); 
+            // 28-oct: aviso de voz al pulsar «Iniciar navegación». El audio ya se desbloqueó al principio de
+            // toggleNavigationState (dentro del toque); en la recuperación automática no se anuncia.
             if (!isRecovery) speakNavigationInstruction('Iniciando navegación.', ['f_iniciando_navegacion'], 'medium');
             mapHeaderButtonsVisible = false;
             toggleMapHeaderRowsVisibility(false);
@@ -6286,13 +6288,14 @@ async function openNavigationMap(isRecovery = false) {
                     center: [ -97.1903, 30.3715],
                     zoom: 1.5, pitch: 0, bearing: 0, // <--- Globo completo desde el espacio
                     attributionControl: false, 
-                    /* TESLAB GPU: sin copia del framebuffer y como mucho 1x.
-                       Caché, DEM y fadeDuration quedan como en tesla.html: bajarlos
-                       dejaba el relieve y los edificios planos (teselas DEM expulsadas). */
+                    /* Con terreno activo, Mapbox copia el framebuffer (copyTexSubImage2D)
+                       al drapar los fill-extrusion. En el GPU del Tesla esa copia sale
+                       vacía si preserveDrawingBuffer es false: el relieve sigue y los
+                       edificios se dibujan planos. pixelRatio sigue limitado a 1. */
                     pixelRatio: Math.min(window.devicePixelRatio || 1, TESLAB_MAX_PIXEL_RATIO),
                     maxTileCacheSize: 50,
                     antialias: false,
-                    preserveDrawingBuffer: false,
+                    preserveDrawingBuffer: true,
                     accessToken: mapboxgl.accessToken,
                     minzoom: 1.2, // <--- Permite alejamiento total
                     maxzoom: 19
@@ -11949,7 +11952,8 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
     let finalStepLegIndex = -1;
     let tempLegIdx = currentLegIndex;
     let tempStepIdx = currentStepIndex + 1;
-    while (true) { if (tempLegIdx >= route.legs.length) { finalStepToShow = route.legs[route.legs.length - 1].steps[route.legs[route.legs.length - 1].steps.length - 1]; finalStepLegIndex = route.legs.length - 1; break; } let leg = route.legs[tempLegIdx]; if (!leg.steps || tempStepIdx >= leg.steps.length) { tempLegIdx++; tempStepIdx = 0; continue; } const candidateStep = leg.steps[tempStepIdx]; const isArrival = candidateStep.maneuver.type === 'arrive'; const arrivalWaypoint = isArrival ? actualWaypoints[tempLegIdx + 1] : null; if (isArrival && arrivalWaypoint && arrivalWaypoint.isInternal) { tempStepIdx++; continue; } else { finalStepToShow = candidateStep; finalStepLegIndex = tempLegIdx; break; } }
+    let skippedInternalArrival = false;   // 28-oct: tras saltar la llegada a un punto interno, saltar también su 'depart'
+    while (true) { if (tempLegIdx >= route.legs.length) { finalStepToShow = route.legs[route.legs.length - 1].steps[route.legs[route.legs.length - 1].steps.length - 1]; finalStepLegIndex = route.legs.length - 1; break; } let leg = route.legs[tempLegIdx]; if (!leg.steps || tempStepIdx >= leg.steps.length) { tempLegIdx++; tempStepIdx = 0; continue; } const candidateStep = leg.steps[tempStepIdx]; const isArrival = candidateStep.maneuver.type === 'arrive'; const arrivalWaypoint = isArrival ? actualWaypoints[tempLegIdx + 1] : null; if (isArrival && arrivalWaypoint && arrivalWaypoint.isInternal) { tempStepIdx++; skippedInternalArrival = true; continue; } else if (skippedInternalArrival && candidateStep.maneuver.type === 'depart') { tempStepIdx++; continue; } else { finalStepToShow = candidateStep; finalStepLegIndex = tempLegIdx; break; } }
     let nextStepToDisplay = finalStepToShow;
     nextManeuverStepForPreview = nextStepToDisplay;
     const distanceToEndOfCurrentStepForProgress = (currentStepForProgress.cumulativeDistance || 0) + (currentStepForProgress.distance || 0);
@@ -12068,15 +12072,18 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
             }
         }
 
-        // Voz: TTS si hay voces; si no, clips (el navegador del Tesla no tiene speechSynthesis).
+        // --- LÓGICA DE VOZ (TTS si el navegador puede hablar; si no, clips pregrabados) ---
+        // 28-oct: avisos escalonados: ~2 km, ~500 m (300-550), ~200 m (≤220) y «Ahora» a 30-50 m según velocidad.
         if (isNavigating && voiceGuidanceEnabled) {
             if (!nextStepToDisplay._voiceFlags) {
                 nextStepToDisplay._voiceFlags = { far: false, medium: false, short: false, near: false };
             }
             const vf = nextStepToDisplay._voiceFlags;
-            const voiceSpeed = getVoiceSpeedMs(carDistance);
+            const voiceSpeed = getVoiceSpeedMs(carDistance);           // m/s (GPS o estimada)
+            // Distancia a la maniobra que se anuncia (sin puntos internos coincide con distanceToNextManeuver).
             const dVoice = Math.max(0, (typeof nextStepToDisplay.cumulativeDistance === 'number' ? nextStepToDisplay.cumulativeDistance : distanceToEndOfCurrentStepForProgress) - carDistance);
 
+            // Texto para la voz sintetizada: igual que antes (incluye el nombre de la calle).
             let textToSpeak = maneuverText;
             
             let streetForVoice = "";
@@ -12089,30 +12096,37 @@ function updateTurnByTurnDisplay(route, carDistanceAlongTheRoute = 0) {
                 }
             }
 
+            // Clips para la voz grabada (sin nombre de calle: no se puede pregrabar).
             const voiceArrivalWp = actualWaypoints[finalStepLegIndex + 1] || actualWaypoints[actualWaypoints.length - 1];
             const isIntermediateArrival = type === 'arrive' && !!voiceArrivalWp && voiceArrivalWp.type === 'intermediate';
             const maneuverClip = getManeuverVoiceClip(maneuver, isIntermediateArrival);
             const voiceKind = type === 'arrive' ? 'arrival' : null;
             const nearClips = type === 'arrive'
                 ? [isIntermediateArrival ? 'c_has_llegado_a_la_etapa' : 'f_has_llegado_destino']
-                : getNearVoiceClips(maneuverClip);
+                : getNearVoiceClips(maneuverClip);                      // «Ahora, gira…» en una sola locución
+            const logVoice = (etapa) => console.log(`[Voz] ${etapa}: ${Math.round(dVoice)} m a ${Math.round(voiceSpeed * 3.6)} km/h — ${maneuverText}`);
 
             if (!vf.near && isNowVoiceDue(dVoice, voiceSpeed)) {
                 speakNavigationInstruction(`${textToSpeak} ahora`, nearClips, voiceKind || 'near');
                 vf.near = vf.short = vf.medium = vf.far = true;
+                logVoice('ahora');
             } else if (!vf.short && dVoice <= 220 && dVoice > getNowVoiceDistance(voiceSpeed) + 60) {
                 const m = getDistanceVoiceMeters(dVoice);
                 speakNavigationInstruction(`En ${voiceDistanceText(m)}, ${textToSpeak}`, maneuverClip ? [getDistanceVoiceClip(dVoice), maneuverClip] : null, voiceKind || 'medium');
                 vf.short = vf.medium = vf.far = true;
+                logVoice('~200 m');
             } else if (!vf.medium && dVoice <= 550 && dVoice > 300) {
                 const m = getDistanceVoiceMeters(dVoice);
                 speakNavigationInstruction(`En ${voiceDistanceText(m)}, ${textToSpeak}`, maneuverClip ? [getDistanceVoiceClip(dVoice), maneuverClip] : null, voiceKind || 'medium');
                 vf.medium = vf.far = true;
+                logVoice('~500 m');
             } else if (!vf.far && dVoice <= 2100 && dVoice > 1900) {
                 speakNavigationInstruction(`En dos kilómetros, ${textToSpeak}`, maneuverClip ? ['f_en_2km', maneuverClip] : null, voiceKind || 'far');
                 vf.far = true;
+                logVoice('2 km');
             }
         }
+        // ------------------------------------
 
         if (turnIconDisplayEl) {
             const iconFilename = getManeuverIconFilename(maneuver);
@@ -13752,7 +13766,7 @@ function showNavigationMapHelpModal() {
             showToast(`Guiado por voz ${voiceGuidanceEnabled ? 'ACTIVADO' : 'DESACTIVADO'}.`, 'info');
             
             if (voiceGuidanceEnabled) {
-                if (typeof unlockVoiceAudio === 'function') unlockVoiceAudio();
+                unlockVoiceAudio();   // estamos dentro del toque: desbloquea el audio (solo modo grabado)
                 speakNavigationInstruction("Guiado por voz activado.", ['f_guiado_activado']);
             }
         });
