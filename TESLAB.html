@@ -2034,22 +2034,90 @@ function actualizarContadorPdrs(count) {
 }
 
 // ===================================================================
-// NOMBRE: add3DBuildingsLayer (VERSIÓN CORREGIDA Y ROBUSTA CON COALESCE)
+// NOMBRE: add3DBuildingsLayer
+// HÍBRIDO/SATÉLITE llevan ?optimize=true: ese estilo no dibuja 'building',
+// así que el source 'composite' llega sin esos features (y satellite-v9
+// ni siquiera tiene 'composite'). En esos modos se añade un vector propio,
+// mapbox-streets-v8 sin optimizar. CALLES sigue usando 'composite'.
+const BG_BUILDINGS_SOURCE_ID = 'bg-buildings';
+const BG_BUILDINGS_LAYER_ID = '3d-buildings';
+
+function teslabStyleWantsOwnBuildings(mapInstance) {
+    const key = localStorage.getItem(ACTIVE_MAP_LAYER_KEY) || 'HÍBRIDO';
+    if (/sat[eé]lite|satelite|h[ií]brido/i.test(key)) return true;
+    if (/calles/i.test(key)) return false;
+    try {
+        const style = mapInstance.getStyle() || {};
+        const hint = `${style.name || ''} ${style.sprite || ''}`;
+        if (/satellite/i.test(hint)) return true;
+    } catch (e) {}
+    return !mapInstance.getSource('composite');
+}
+
+function teslabBuildingsPaint() {
+    return {
+        'fill-extrusion-color': [
+            'interpolate', ['linear'], ['coalesce', ['get', 'height'], 0],
+            0, '#fcc2a4',
+            20, '#fcc2a4',
+            40, '#f3a070',
+            60, '#ef8f56',
+            120, '#ea7e3c',
+            150, '#e66d22'
+        ],
+        'fill-extrusion-height': [
+            'interpolate', ['linear'], ['zoom'],
+            14, 0,
+            15, ['*', ['coalesce', ['get', 'height'], 0], 1],
+            18.2, ['*', ['coalesce', ['get', 'height'], 0], 0.85],
+            18.5, ['*', ['coalesce', ['get', 'height'], 0], 0.30]
+        ],
+        'fill-extrusion-base': ['get', 'min_height'],
+        'fill-extrusion-opacity': [
+            'interpolate', ['linear'], ['zoom'],
+            15, 1,
+            18.2, 0.85,
+            18.5, 0
+        ]
+    };
+}
+
 async function add3DBuildingsLayer(mapInstance) {
     if (!mapInstance || !mapInstance.isStyleLoaded()) {
         return;
     }
 
-    const layerId = '3d-buildings';
-    if (mapInstance.getLayer(layerId)) {
-        try { mapInstance.removeLayer(layerId); } catch (e) {}
+    if (!mapInstance._bgBuildingsStyleHook) {
+        mapInstance._bgBuildingsStyleHook = true;
+        mapInstance.on('style.load', () => { add3DBuildingsLayer(mapInstance); });
     }
 
-    if (!mapInstance.getSource('composite')) {
-        return; // El estilo actual no tiene datos de edificios.
+    if (mapInstance.getLayer(BG_BUILDINGS_LAYER_ID)) {
+        try { mapInstance.removeLayer(BG_BUILDINGS_LAYER_ID); } catch (e) {}
     }
-    
-    const layers = mapInstance.getStyle().layers;
+
+    const ownSource = teslabStyleWantsOwnBuildings(mapInstance);
+    let sourceId = 'composite';
+
+    if (ownSource) {
+        sourceId = BG_BUILDINGS_SOURCE_ID;
+        if (!mapInstance.getSource(sourceId)) {
+            try {
+                mapInstance.addSource(sourceId, {
+                    type: 'vector',
+                    url: 'mapbox://mapbox.mapbox-streets-v8'
+                });
+            } catch (error) {
+                console.error('No se pudo añadir la fuente de edificios:', error);
+                return;
+            }
+        }
+    } else if (mapInstance.getSource(BG_BUILDINGS_SOURCE_ID)) {
+        try { mapInstance.removeSource(BG_BUILDINGS_SOURCE_ID); } catch (e) {}
+        if (!mapInstance.getSource('composite')) return;
+    }
+
+    const layers = mapInstance.getStyle().layers || [];
     let firstSymbolId;
     for (const layer of layers) {
         if (layer.type === 'symbol') {
@@ -2060,42 +2128,13 @@ async function add3DBuildingsLayer(mapInstance) {
 
     try {
         mapInstance.addLayer({
-            'id': layerId,
-            'source': 'composite',
+            id: BG_BUILDINGS_LAYER_ID,
+            source: sourceId,
             'source-layer': 'building',
-            'filter': ['==', 'extrude', 'true'],
-            'type': 'fill-extrusion',
-            'minzoom': 14,
-            'paint': {
-                'fill-extrusion-color': [
-                    'interpolate', ['linear'], ['coalesce', ['get', 'height'], 0], 
-                     0, '#fcc2a4',
-                    20, '#fcc2a4',
-                    40, '#f3a070',
-                    60, '#ef8f56',
-                    120, '#ea7e3c',
-                    150, '#e66d22',
-                ],   
-                
-                'fill-extrusion-height': [
-                    'interpolate', ['linear'], ['zoom'],
-                    14, 0,
-                    15, ['*', ['coalesce', ['get', 'height'], 0], 1], 
-                    18.2, ['*', ['coalesce', ['get', 'height'], 0], 0.85],
-                    18.5, ['*', ['coalesce', ['get', 'height'], 0], 0.30] 
-                ],
-
-                // 3. Base del edificio (Ya era robusto, no necesita cambios)
-                'fill-extrusion-base': ['get', 'min_height'],
-                
-                // 4. Opacidad dinámica (No depende de 'height', no necesita cambios)
-                'fill-extrusion-opacity': [
-                    'interpolate', ['linear'], ['zoom'],
-                    15, 1,
-                    18.2, 0.85,
-                    18.5, 0
-                ]
-            }
+            filter: ['==', 'extrude', 'true'],
+            type: 'fill-extrusion',
+            minzoom: ownSource ? 15 : 14,
+            paint: teslabBuildingsPaint()
         }, firstSymbolId);
     } catch (error) {
         console.error("Error al añadir la capa de edificios 3D:", error);
@@ -7855,6 +7894,8 @@ const VOICE_RESUME_WARMUP_S = 0.15;         // 28-oct: margen tras reanudar un A
 const VOICE_FADE_OUT_S = 0.06;              // 28-oct: fundido al cortar un aviso por otro más urgente (sin «clic»)
 const VOICE_GAP_MS = 250;                   // 28-oct: pausa natural entre dos avisos seguidos de la cola
 const VOICE_QUEUE_MAX = 3;                  // 28-oct: avisos en espera como máximo (los demás caducan)
+// +40 % de sonoridad percibida ≈ +5 dB → ganancia 10^(5/20) ≈ 1,78. Sube o baja este número.
+const VOICE_BOOST = 1.8;
 const VOICE_TEXT_TO_CLIP = {                 // llamadas antiguas speakNavigationInstruction("texto")
     'Guiado por voz activado.': 'f_guiado_activado',
     'Has llegado a tu destino': 'f_has_llegado_destino',
@@ -8002,8 +8043,35 @@ function bgVoiceGetCtx() {
     if (bgVoice.ctx) return bgVoice.ctx;
     const AC = window.AudioContext || window.webkitAudioContext;
     if (!AC) return null;
-    try { bgVoice.ctx = new AC(); } catch (e) { bgVoice.ctx = null; }
+    try {
+        bgVoice.ctx = new AC();
+        bgVoiceOutputNode(bgVoice.ctx);
+    } catch (e) { bgVoice.ctx = null; }
     return bgVoice.ctx;
+}
+
+// Cadena común: Gain (VOICE_BOOST) -> limitador -> destination.
+// El limitador (umbral -3 dB, ratio alto, ataque rápido) evita saturar al subir la ganancia.
+function bgVoiceOutputNode(ctx) {
+    if (!ctx) return null;
+    if (bgVoice.boostGain) return bgVoice.boostGain;
+    const gain = ctx.createGain();
+    gain.gain.value = VOICE_BOOST;
+    try {
+        const comp = ctx.createDynamicsCompressor();
+        comp.threshold.value = -3;
+        comp.knee.value = 0;
+        comp.ratio.value = 20;
+        comp.attack.value = 0.003;
+        comp.release.value = 0.08;
+        gain.connect(comp);
+        comp.connect(ctx.destination);
+        bgVoice.compressor = comp;
+    } catch (e) {
+        gain.connect(ctx.destination);
+    }
+    bgVoice.boostGain = gain;
+    return gain;
 }
 
 // Descarga (y decodifica si hay Web Audio) un clip. Devuelve true si queda listo.
@@ -8048,7 +8116,7 @@ function unlockVoiceAudio() {
         try {   // buffer vacío de 1 muestra + resume() dentro del gesto
             const src = ctx.createBufferSource();
             src.buffer = ctx.createBuffer(1, 1, 22050);
-            src.connect(ctx.destination); src.start(0);
+            src.connect(bgVoiceOutputNode(ctx) || ctx.destination); src.start(0);
         } catch (e) {}
         if (ctx.state !== 'running' && ctx.resume) ctx.resume().catch(() => {});
     }
@@ -8071,9 +8139,24 @@ function bgVoiceGetAudioEl() {
     if (bgVoice.audio) return bgVoice.audio;
     const a = new Audio();
     a.preload = 'auto';
+    a.volume = 1;
     a.addEventListener('ended', () => { if (bgVoice.playing) bgVoicePlayNextElement(); });
     a.addEventListener('error', () => { console.warn('[Voz] error <audio>', a.error && a.error.code); if (bgVoice.playing) bgVoicePlayNextElement(); });
     bgVoice.audio = a;
+    if (document.body && !a.parentNode) {
+        a.setAttribute('aria-hidden', 'true');
+        a.style.display = 'none';
+        document.body.appendChild(a);
+    }
+    const ctx = bgVoice.ctx || bgVoiceGetCtx();
+    if (ctx && ctx.createMediaElementSource && !bgVoice.mediaSrc) {
+        try {
+            bgVoice.mediaSrc = ctx.createMediaElementSource(a);
+            bgVoice.mediaSrc.connect(bgVoiceOutputNode(ctx) || ctx.destination);
+        } catch (e) {
+            a.volume = 1;
+        }
+    }
     return a;
 }
 
@@ -8200,7 +8283,7 @@ async function bgVoiceStartClips(item) {
                     const src = ctx.createBufferSource();
                     src.buffer = bgVoice.buffers.get(k);
                     const g = ctx.createGain();
-                    src.connect(g); g.connect(ctx.destination); src._gain = g;
+                    src.connect(g); g.connect(bgVoiceOutputNode(ctx) || ctx.destination); src._gain = g;
                     src.start(t);
                     const isLast = i === item.keys.length - 1;
                     // Encadenados con un leve solape: cada clip trae silencio en los extremos, así no queda hueco audible.
