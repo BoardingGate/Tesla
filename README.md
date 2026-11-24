@@ -134,40 +134,6 @@ El navegador integrado de Tesla presenta limitaciones de memoria y cambios de re
 
 ---
 
-## 📦 Despliegue y Configuración
-
-### 1. Configurar Claves de API
-Crea o edita el archivo de configuración `PNG/zbuildgs.js` con tus propias credenciales:
-
-```javascript
-window.APP_CONFIG = {
-  keys: {
-    mapbox: "TU_MAPBOX_ACCESS_TOKEN",
-    googleMaps: "TU_GOOGLE_MAPS_API_KEY",
-    openChargeMap: "TU_OPENCHARGEMAP_API_KEY"
-  },
-  endpoints: {
-    gemini: () => "https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent?key=TU_GEMINI_API_KEY"
-  },
-  firebase: {
-    apiKey: "TU_FIREBASE_API_KEY",
-    authDomain: "tu-proyecto.firebaseapp.com",
-    projectId: "tu-proyecto",
-    storageBucket: "tu-proyecto.appspot.com",
-    messagingSenderId: "...",
-    appId: "..."
-  }
-};
-
-2. Ejecución
-
-Sube los archivos a cualquier servidor estático o GitHub Pages:
-
-1.  Sube tesla.html, tesla.css, PNG/ y KLM/ a tu repositorio.
-2.  Activa GitHub Pages desde Settings > Pages.
-3.  Abre el enlace generado desde el navegador de tu Tesla y agrégalo a tus
-    favoritos.
-
 ⚠️ Descargo de Responsabilidad
 
 Esta aplicación es una herramienta de apoyo a la planificación y entretenimiento
